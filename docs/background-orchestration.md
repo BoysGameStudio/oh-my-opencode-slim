@@ -36,8 +36,7 @@ The task API and background-control tools are:
 |------|---------|
 | `task(..., background: true)` | Start a specialist in the background and immediately return a task ID |
 | hook-driven completion | OpenCode injects terminal background task results automatically |
-| `task_status` | Check the status of a tracked task (read-only fallback for owned untracked sessions after a restart) |
-| `task_result` | Retrieve a tracked task's result |
+| `task_status` | Check a tracked task (read-only fallback for owned untracked sessions after a restart); `result: true` retrieves its result |
 | `task_message` | Send a non-interrupting message and return `queued` (v2: steering acceptance with `delivery: "steer"`) |
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction |
@@ -78,7 +77,7 @@ Specialists do the work. The orchestrator manages the work.
 Moving a child session to another directory does not move its task ownership.
 The delegating parent's plugin instance still observes that tracked child's
 lifecycle, so completion and revived-run notifications do not require polling
-`task_result`. The destination directory handles its own permissions and runtime
+`task_status`. The destination directory handles its own permissions and runtime
 profiles; unrelated sessions remain excluded from the parent's event handling.
 
 ### Unattributed sessions and restart scope
@@ -99,7 +98,7 @@ parent's history still resolves its alias when it is the final non-empty line of
 that tool result (tail-anchored only), and `task_status` reports a read-only
 observed state for an owned session the board no longer tracks — completed or
 uncertain running-or-incomplete from transcript evidence (unknown when the
-live status read fails), never claiming definite running — pointing to `task_result` for completed text; it never
+live status read fails), never claiming definite running — pointing to a `task_status` result read for completed text; it never
 re-registers or prompts the task. One recovery channel is explicit:
 `task_revive` on a raw session ID verifies the
 session against the host (existence and parent ownership) and re-adopts an
@@ -239,8 +238,8 @@ The orchestrator should use background completion events to:
 - collect outputs before final response,
 - surface failures or blocked tasks clearly.
 
-Use `task_status` to inspect a task and `task_result` to collect its result.
-`task_result` is a read, not a required step before every continuation.
+Use `task_status` to inspect a task and `task_status` with `result: true` to collect its result.
+A result read is a read, not a required step before every continuation.
 `task_message` sends a non-interrupting message and does not stop the current
 generation. On v2 it accepts an optional `delivery`: the default `"queue"`
 waits for an idle boundary — `resume: false` never wakes the child, so
@@ -283,7 +282,7 @@ it is not an exactly-once delivery guarantee.
 To stop self-reinforcing acknowledgment loops, a brand-new `task` spawn is
 refused while the parent still owns an unreconciled terminal job with the same
 agent and an exactly matching objective. The refusal names the existing task ID
-and directs the caller to `task_result`; once that result has been retrieved,
+and directs the caller to `task_status` with `result: true`; once that result has been retrieved,
 the same objective may be dispatched again for follow-up work.
 
 Separately, the default-on orchestrator wake scheduler may prompt an

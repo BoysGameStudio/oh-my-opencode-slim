@@ -646,7 +646,7 @@ describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
     expect(turn.transformBytes).toContain('Background Job Board');
   });
 
-  test('off: checkpoint strategy registers completed jobs but never stopped ones', async () => {
+  test('off: checkpoint strategy never registers jobs; observed deliveries retire only completed ones', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({
       taskID: 'child-done',
@@ -658,6 +658,7 @@ describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
       taskID: 'child-done',
       state: 'completed',
       resultSummary: 'done',
+      now: BASE_TIME + 60_000,
     });
     board.registerLaunch({
       taskID: 'child-stopped',
@@ -669,11 +670,13 @@ describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
       taskID: 'child-stopped',
       state: 'stopped',
       resultSummary: 'stopped without a terminal result',
+      now: BASE_TIME + 60_000,
     });
     const hook = createHook(board, false);
 
-    // First real turn: the completed job registers for consumption; the
-    // stopped job must not (the recovery wake owns its delivery).
+    // First real turn: nothing registers against the prompt shape — both
+    // jobs stay unreconciled (the stopped job for the recovery wake, the
+    // completed job until its native delivery is observed).
     await runTurn(hook, [
       userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
     ]);
@@ -683,11 +686,35 @@ describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
       terminalUnreconciled: true,
     });
 
-    // Second real turn with an advanced prompt shape retires only the
-    // completed job; the stopped job stays for the recovery flow.
+    // A later turn still retires nothing on its own: retirement is
+    // observation-based, not prompt-shape-based. (The stale-terminal
+    // fallback cannot fire here — the terminal reports are newer than the
+    // fixture assistant turn.)
     await runTurn(hook, [
       userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
-      assistantMsg('msg_a_off_1', 'consumed the result', BASE_TIME + 1),
+      assistantMsg('msg_a_off_1', 'consumed the result', BASE_TIME + 1, 1, 10),
+      userMsg('msg_u_off_2', 'next step', BASE_TIME + 2),
+    ]);
+    expect(board.getState('child-done')).toBe('completed');
+    expect(board.getState('child-stopped')).toBe('stopped');
+    expect(board.get('child-stopped')).toMatchObject({
+      terminalUnreconciled: true,
+    });
+
+    // The host's native delivery for the completed job retires it; the
+    // stopped job stays for the recovery flow.
+    await runTurn(hook, [
+      userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
+      assistantMsg('msg_a_off_1', 'consumed the result', BASE_TIME + 1, 1, 10),
+      {
+        info: { id: 'msg_native_1', sessionID: SESSION, role: 'user' },
+        parts: [
+          {
+            type: 'text',
+            text: '<subagent sessionID="child-done" state="completed" description="map hooks">\ndone\n</subagent>',
+          },
+        ],
+      },
       userMsg('msg_u_off_2', 'next step', BASE_TIME + 2),
     ]);
     expect(board.getState('child-done')).toBe('reconciled');

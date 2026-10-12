@@ -57,7 +57,6 @@ const ORCHESTRATOR_DEFAULT_TOOL_NAMES = [
   'task_reply',
   'task_revive',
   'task_status',
-  'task_result',
   'acp_run',
 ] as const;
 const MARKETPLACE_TOOL_NAMES = [

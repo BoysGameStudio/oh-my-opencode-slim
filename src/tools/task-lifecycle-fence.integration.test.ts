@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { OhMyOpenCodeLite as plugin } from '../index';
 import { BackgroundJobBoard } from '../utils/background-job-board';
 import { createBackgroundJobTerminalGate } from '../utils/background-job-terminal-gate';
-import { createTaskResultTool } from './task-result';
+import { createTaskStatusTool } from './task-status';
 
 const PARENT = 'ses_parent';
 const CHILD = 'ses_child';
@@ -154,7 +154,7 @@ test('dispose after reconcile does not consume a restored terminal result', asyn
   const seen = deferred<void>();
   const read = deferred<{ data: { parentID: string } }>();
   let disposed = false;
-  const tool = createTaskResultTool({
+  const tool = createTaskStatusTool({
     input: {
       directory: '/tmp/omo-lifecycle-fence',
       client: {
@@ -171,7 +171,7 @@ test('dispose after reconcile does not consume a restored terminal result', asyn
     terminalGate: gate,
     isDisposed: () => disposed,
   });
-  const pending = tool.task_result.execute({ task_id: CHILD }, {
+  const pending = tool.task_status.execute({ task_id: CHILD, result: true }, {
     sessionID: PARENT,
     agent: 'orchestrator',
     callID: 'call_result',
@@ -182,7 +182,7 @@ test('dispose after reconcile does not consume a restored terminal result', asyn
   read.resolve({ data: { parentID: PARENT } });
   await expect(pending).resolves.toBe('CACHED-TEXT');
   expect(board.get(CHILD)?.lastUsedAt).toBe(20);
-  const fresh = createTaskResultTool({
+  const fresh = createTaskStatusTool({
     input: {
       directory: '/tmp/omo-lifecycle-fence',
       client: {
@@ -202,7 +202,7 @@ test('dispose after reconcile does not consume a restored terminal result', asyn
     }),
   });
   await expect(
-    fresh.task_result.execute({ task_id: CHILD }, {
+    fresh.task_status.execute({ task_id: CHILD, result: true }, {
       sessionID: PARENT,
       agent: 'orchestrator',
       callID: 'call_fresh',

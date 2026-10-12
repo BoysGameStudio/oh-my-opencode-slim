@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, jest, mock, spyOn, test } from 'bun:test';
 import { createCancelTaskTool } from '../../tools/cancel-task';
-import { createTaskResultTool } from '../../tools/task-result';
 import { createTaskReviveTool } from '../../tools/task-revive';
 import { createTaskStatusTool } from '../../tools/task-status';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
@@ -965,7 +964,7 @@ describe('session recovery', () => {
     }
   });
 
-  test('task_result and task_status keep a restored completed round, then revive starts a new one', async () => {
+  test('task_status result mode and status keep a restored completed round, then revive starts a new one', async () => {
     installClient();
     let reading = false;
     const { input, promptAsync } = host({
@@ -1010,11 +1009,11 @@ describe('session recovery', () => {
       backgroundJobBoard: board,
       input: input as never,
     });
-    const result = await createTaskResultTool({
+    const result = await createTaskStatusTool({
       input: input as never,
       backgroundJobBoard: board,
       terminalGate: gate,
-    }).task_result.execute({ task_id: CHILD }, context);
+    }).task_status.execute({ task_id: CHILD, result: true }, context);
     const status = await createTaskStatusTool({
       input: input as never,
       backgroundJobBoard: board,
@@ -1094,7 +1093,7 @@ describe('session recovery', () => {
     expect(board.list(PARENT)).toHaveLength(1);
   });
 
-  test('task_revive continues a known unreconciled completed session without task_result', async () => {
+  test('task_revive continues a known unreconciled completed session without a result read', async () => {
     installClient();
     const { input, promptAsync } = host();
     const board = new FixtureBoard();

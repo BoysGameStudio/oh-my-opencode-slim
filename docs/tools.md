@@ -63,8 +63,7 @@ conservatively passes the path through. Disable with
 | Tool | Description |
 |------|-------------|
 | `task` | Start a specialist task and return its task ID |
-| `task_status` | Check the status of a task |
-| `task_result` | Retrieve a task's result |
+| `task_status` | Check the status of a task; `result: true` retrieves its result |
 | `task_message` | Send a non-interrupting message and return `queued` (v2: steering acceptance with `delivery: "steer"`) |
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction |
@@ -214,8 +213,8 @@ continues with `subagent(sessionID)` even when it is not listed; an unknown
 id is read from the host and imported before that native call. Cancelled,
 errored, and stopped sessions still use `task_revive`. A failed lookup keeps
 the id and does not start another child. It verifies the original host
-session and continues there. `task_result` only reads a finished result; it
-is not required before that continuation.
+session and continues there. A `task_status` result read only retrieves a
+finished result and is not required before that continuation.
 
 A successful native delegation result may end with a `slim-child-ref:v1`
 marker so a later restart can resolve the alias. The marker is trusted only
@@ -226,7 +225,7 @@ and only when it matches that result's session ID and original agent argument.
 A numbered alias is issued only to children of a parent created while the
 plugin instance runs (see [Background Orchestration](background-orchestration.md));
 any other new task is still created and is referred to by its exact session ID.
-`task_status`, `task_result`, `task_message`, `task_reply`, `task_cancel`,
+`task_status`, `task_message`, `task_reply`, `task_cancel`,
 `task_revive`, and an explicit resume ID resolve a non-exact alias from the
 board first, else from the markers in one read of the parent's readable history,
 before reading or sending anything. On v1, the read covers the 1,000 most recent
@@ -293,7 +292,7 @@ The count is confirmed in `tool.execute.after`, so overlapping parallel
 calls cannot inflate it before their results are known.
 
 Exempt from the entire guard: the task-control and wait tools (`task`,
-`task_status`, `task_result`, `task_cancel`, `task_message`, `task_revive`,
+`task_status`, `task_cancel`, `task_message`, `task_revive`,
 `wait_for_user`, `wait_for_background_tasks`) — those legitimately re-issue
 identical calls while polling a long-running background task.
 

@@ -13,7 +13,6 @@ export {
 export { createWebfetchTool } from './smartfetch';
 export { createTaskMessageTool } from './task-message';
 export { createTaskReplyTool } from './task-reply';
-export { createTaskResultTool } from './task-result';
 export { createTaskReviveTool } from './task-revive';
 export { createTaskStatusTool } from './task-status';
 export { createWaitForUserTool } from './wait-for-user';

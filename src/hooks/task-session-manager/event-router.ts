@@ -417,8 +417,8 @@ export async function handleEvent(
       if (!pending && !deps.backgroundJobBoard.get(info.id)) {
         // No pending call can be attributed to this child (ambiguous
         // parallel launches, or the owning pending was consumed).
-        // Register a placeholder so task_status/task_result always
-        // resolve it; the matching tool.execute.after corrects the
+        // Register a placeholder so task_status always resolves it; the
+        // matching tool.execute.after corrects the description via
         // description via registerLaunch's existing-record update path
         // when it fires.
         const agent =

@@ -57,7 +57,7 @@ All modules depend on `BackgroundJobBoard` from `src/utils/background-job-board.
    - If no reusable task exists, allows fresh task creation
    - Refuses a brand-new spawn whose objective exactly matches an
      unreconciled terminal job from the same parent and agent (dispatch
-     loop guard, #1070); a `task_result` retrieval after that job's
+     loop guard, #1070); a result-mode read after that job's
      completion (`lastUsedAt > completedAt`) authorizes the retry
 
 2. **Task Launch (`tool.execute.after`)**

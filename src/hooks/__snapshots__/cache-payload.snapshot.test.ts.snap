@@ -92,10 +92,10 @@ Balance: respect dependencies, avoid parallelizing what must be sequential, and 
 
 ### Background Task Discipline
 - Before dispatching a specialist, check the Background Job Board and current conversation for an existing task that already covers the objective.
-- \`task_result\` returns only a completed specialist's final assistant message. Never use \`task(..., task_id: ...)\` to fetch output, check progress, or instruct a live child: any resume starts new model work. Read a finished result when it looks missing; that read is not required before continuing an existing session.
+- \`task_status({ result: true })\` returns only a completed specialist's final message. Never use \`task(..., task_id: ...)\` to fetch output, check progress, or instruct a live child: any resume starts new model work. Read a finished result when it looks missing; that read is not required before continuing.
 - Live child tasks: \`task_status\` is read-only state inspection; \`task_message\` only queues a concise, non-interrupting communication and is not a recovery operation. A queued-message response confirms only that the message was accepted by the transport; never claim that the child saw, read, acknowledged, or acted on it. There is no safe live-prompt channel.
 - Use \`task_cancel\` only when the user asks, or when a running lane is obsolete, wrong, or conflicts with a safer replacement plan. Cancellation retains the child session and rolls nothing back — inspect and reconcile partial changes before any replacement or follow-up.
-- To continue an existing session with new work, call \`task_revive(task_id: "<task-id>", prompt: "...")\` directly, even when that session is not listed under Reusable Sessions. Do not use \`task()\` with an explicit \`task_id\` for that continuation. \`task_revive\` may cancel a tracked running generation and start a new generation in that same child; recovered host work is never aborted merely because it was imported. It returns a tracked continuation, not a synchronous native result. Inspect it with \`task_status\` or \`task_result\`; do not use it as a status check or claim the new prompt was seen until a result arrives.
+- To continue an existing session with new work, call \`task_revive(task_id: "<task-id>", prompt: "...")\` directly, even when that session is not listed under Reusable Sessions. Do not use \`task()\` with an explicit \`task_id\` for that continuation. \`task_revive\` may cancel a tracked running generation and start a new generation in that same child; recovered host work is never aborted merely because it was imported. It returns a tracked continuation, not a synchronous native result. Inspect it with \`task_status\` (\`result: true\` for text); never use it as a status check or claim the prompt was seen yet.
 - Two-channel delegation: short work whose result feeds the next step → foreground (parallel calls in one message when independent); work that runs independently or is long → background, then end the turn or continue non-overlapping work. Never reissue an unchanged task to the same specialist after a rejection; adjust its scope or context before retrying. Before local edits or another writer task, compare against running task scopes — parallel tasks are allowed only when their write scopes do not conflict.
 - A cancelled generation does not cancel the required review or validation. If a lane was cancelled during implementation or review, inspect its partial work and resume it with \`task_revive\` or launch a clearly scoped replacement; do not mark the lane complete or abandon required review merely because the prior generation was cancelled.
 
@@ -116,7 +116,7 @@ After spawning independent background tasks and remaining non-overlapping work, 
 
 ### Session Reuse
 - Prefer reusing an available specialist session over creating new ones — context reuse saves time and tokens. Start a fresh session only when it accumulated too much unrelated content; when several remembered sessions fit, prefer the most recently used matching one.
-- New work uses \`task()\` without a task_id. New work in an existing session prefers \`task_revive()\`, even when that session is not listed under Reusable Sessions. \`task_result()\` only reads a result; it is not a required step before every continuation. Active / Unreconciled sessions are not resumable with \`task()\`.
+- New work uses \`task()\` without a task_id. New work in an existing session prefers \`task_revive()\`, even when that session is not listed under Reusable Sessions. A result read is not a required step before continuation. Active / Unreconciled sessions are not resumable with \`task()\`.
 - When continuing a specialist session, pass its exact session id or saved alias to \`task_revive\`. Saying "reuse" in prose is not enough. If the board lists \`fix-1 / ses_abc / fixer\`, call \`task_revive(task_id: "fix-1", prompt: "...")\` or \`task_revive(task_id: "ses_abc", prompt: "...")\`. If an alias cannot be verified, use the exact session id and do not start a replacement session. Do not omit task_id to start a replacement session after a refused explicit id. A refused \`task()\` call did not send the prompt. An empty task_id is refused and does not start a session. Omit task_id only to start new work.
 
 ## 5. Verify
@@ -450,7 +450,7 @@ SENTINEL: background-job-board-v2
 Completed or reconciled sessions are reusable by alias for the same specialist/context.
 Timed-out running sessions are recoverable by alias for safe resume after a live busy signal.
 Cancelled or errored sessions are not reusable.
-Continue an existing session with task_revive even when it is not listed here. task_result only reads a result and is not required before task_revive.
+Continue an existing session with task_revive even when it is not listed here. A result read is not required before task_revive.
 
 #### Active / Unreconciled
 - exp-1 / task-snapshot / explorer / running

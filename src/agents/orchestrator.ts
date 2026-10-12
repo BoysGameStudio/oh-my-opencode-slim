@@ -131,9 +131,9 @@ export function buildOrchestratorPrompt(
     : '- When work must pause while the user completes an external manual operation, first give the user concrete manual steps, then use the `question` tool as the blocking boundary and ask them to respond when finished. `wait_for_user` is disabled, so do not reference or call it.';
   const continueExistingSentence = directRevive
     ? `To continue an existing session with new work, call \`task_revive(${vocab.resumeParam}: "<task-id>", prompt: "...")\` directly, even when that session is not listed under Reusable Sessions. Do not use \`${vocab.tool}()\` with an explicit \`${vocab.resumeParam}\` for that continuation.`
-    : `A completed session continues with \`${vocab.tool}(${vocab.agentParam}: "<agent>", ${vocab.resumeParam}: "<task-id>", prompt: "...")\` even when it is not listed under Reusable Sessions. task_result is not required first. Cancelled, errored, and stopped sessions continue with task_revive.`;
+    : `A completed session continues with \`${vocab.tool}(${vocab.agentParam}: "<agent>", ${vocab.resumeParam}: "<task-id>", prompt: "...")\` even when it is not listed under Reusable Sessions. No result read is required first. Cancelled, errored, and stopped sessions continue with task_revive.`;
   const reusableListSentence = directRevive
-    ? 'New work uses `task()` without a task_id. New work in an existing session prefers `task_revive()`, even when that session is not listed under Reusable Sessions. `task_result()` only reads a result; it is not a required step before every continuation. Active / Unreconciled sessions are not resumable with `task()`.'
+    ? 'New work uses `task()` without a task_id. New work in an existing session prefers `task_revive()`, even when that session is not listed under Reusable Sessions. A result read is not a required step before continuation. Active / Unreconciled sessions are not resumable with `task()`.'
     : `Completed sessions continue with \`${vocab.tool}()\` by exact session id even when they are not listed. Cancelled, errored, and stopped sessions use task_revive. Active sessions are not resumable with \`${vocab.tool}()\`.`;
   const reuseInstruction = directRevive
     ? `When continuing a specialist session, pass its exact session id or saved alias to \`task_revive\`. Saying "reuse" in prose is not enough. ${
@@ -218,10 +218,10 @@ Balance: respect dependencies, avoid parallelizing what must be sequential, and 
 
 ### Background Task Discipline
 - Before dispatching a specialist, check ${boardChannel} for an existing task that already covers the objective.
-- \`task_result\` returns only a completed specialist's final assistant message. Never use \`${vocab.tool}(..., ${vocab.resumeParam}: ...)\` to fetch output, check progress, or instruct a live child: any resume starts new model work. Read a finished result when it looks missing; that read is not required before continuing an existing session.
+- \`task_status({ result: true })\` returns only a completed specialist's final message. Never use \`${vocab.tool}(..., ${vocab.resumeParam}: ...)\` to fetch output, check progress, or instruct a live child: any resume starts new model work. Read a finished result when it looks missing; that read is not required before continuing.
 ${liveTaskMessageInstruction}
 - Use \`task_cancel\` only when the user asks, or when a running lane is obsolete, wrong, or conflicts with a safer replacement plan. Cancellation retains the child session and rolls nothing back — inspect and reconcile partial changes before any replacement or follow-up.
-- ${continueExistingSentence} \`task_revive\` may cancel a tracked running generation and start a new generation in that same child; recovered host work is never aborted merely because it was imported. It returns a tracked continuation, not a synchronous native result. Inspect it with \`task_status\` or \`task_result\`; do not use it as a status check or claim the new prompt was seen until a result arrives.
+- ${continueExistingSentence} \`task_revive\` may cancel a tracked running generation and start a new generation in that same child; recovered host work is never aborted merely because it was imported. It returns a tracked continuation, not a synchronous native result. Inspect it with \`task_status\` (\`result: true\` for text); never use it as a status check or claim the prompt was seen yet.
 - Two-channel delegation: short work whose result feeds the next step → foreground (parallel calls in one message when independent); work that runs independently or is long → background, then end the turn or continue non-overlapping work. Never reissue an unchanged task to the same specialist after a rejection; adjust its scope or context before retrying. Before local edits or another writer task, compare against running task scopes — parallel tasks are allowed only when their write scopes do not conflict.
 - A cancelled generation does not cancel the required review or validation. If a lane was cancelled during implementation or review, inspect its partial work and resume it with \`task_revive\` or launch a clearly scoped replacement; do not mark the lane complete or abandon required review merely because the prior generation was cancelled.
 
@@ -380,7 +380,7 @@ ${agentsSection}<Workflow>
 ## Child sessions
 - Before dispatching, check \`task_status\` for an existing task covering the objective.
 - Continue a completed session with \`subagent(agent, sessionID, prompt)\` by exact id even when unlisted; cancelled/errored/stopped sessions use \`task_revive\`. If a session id is refused, do not respawn the same objective as new work. After a rejected delegation, adjust scope or context before retrying.
-- \`task_status\` is read-only inspection; \`task_result\` reads a finished result; neither launches, resumes, or instructs a child.
+- \`task_status\` inspects; with \`result: true\` it reads a finished result; neither launches, resumes, or instructs a child.
 - \`task_message\` sends a bounded note to a running child (\`delivery: "queue"\` waits for idle; \`"steer"\` lands at the next step boundary). Acceptance confirms transport only — never claim the child saw or acted on it. Amend a running lane this way, then reconcile against its result; if unaddressed, continue the same session id.
 - \`task_cancel\` only when the user asks or the lane is obsolete or conflicting. Cancellation keeps the session and rolls nothing back — inspect partial work first; the lane's required review and validation still happen.
 

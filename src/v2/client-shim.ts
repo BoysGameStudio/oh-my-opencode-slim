@@ -374,8 +374,8 @@ export function buildPluginInput(
   const client = {
     session: {
       // `get` is exposed only when the host provides session.get — callers
-      // like task-result probe method presence as the capability signal,
-      // so a degraded stub here would fake verification ability.
+      // like the result-mode probe use method presence as the capability
+      // signal, so a degraded stub here would fake verification ability.
       ...(s.get
         ? {
             get: async (args: Record<string, unknown>) => ({

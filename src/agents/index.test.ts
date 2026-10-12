@@ -690,7 +690,6 @@ describe('orchestrator agent', () => {
       'task_message',
       'task_revive',
       'task_status',
-      'task_result',
     ]) {
       expect(permission[toolName]).toBe('allow');
     }
@@ -1132,7 +1131,6 @@ describe('tool permissions', () => {
       'task_message',
       'task_revive',
       'task_status',
-      'task_result',
     ]) {
       expect(permission[toolName]).toBe('deny');
     }

@@ -561,7 +561,7 @@ never register there — the stopped-job recovery wake surfaces them and
 retirement goes through the recovery flow; reopen corrections (a previously
 terminal job running again) still deliver, in a board-free wording that
 points at `task_status`; and a natively delivered result lost host-side has
-no passive display fallback — check `task_status` or `task_result` if a
+no passive display fallback — check `task_status` if a
 completion looks missing.
 The wall-clock supervisor is separately opt-in and remains disabled unless
 `wallClockTimeoutMs` is set:

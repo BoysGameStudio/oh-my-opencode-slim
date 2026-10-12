@@ -209,7 +209,7 @@ describe('createAgents council seat pointer vocabulary', () => {
     const v2 = orchestratorPromptFor('v2');
 
     expect(v2).toContain(
-      '`task_status` is read-only inspection; `task_result` reads a finished result; neither launches, resumes, or instructs a child.',
+      '`task_status` inspects; with `result: true` it reads a finished result; neither launches, resumes, or instructs a child.',
     );
     expect(v2).toContain(
       'Continue a completed session with `subagent(agent, sessionID, prompt)` by exact id even when unlisted; cancelled/errored/stopped sessions use `task_revive`.',

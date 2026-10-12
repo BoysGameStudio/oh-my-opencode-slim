@@ -7,14 +7,27 @@ import {
   formatChildInputWaitDetail,
   listChildInputWaits,
 } from '../hooks/task-session-manager/child-input-wait';
+import { pluginDisposedMessage } from '../hooks/task-session-manager/session-recovery';
 import type { BackgroundJobStore } from '../utils/background-job-store';
-import { getRuntimeSessionStatusSnapshot } from '../utils/session-runtime-status';
+import {
+  type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
+  runtimeObservationFromSnapshot,
+} from '../utils/background-job-terminal-gate';
+import { getClient } from '../utils/opencode-client';
+import { SESSION_ID_PATTERN } from '../utils/session';
+import {
+  getRuntimeSessionStatusSnapshot,
+  type RuntimeSessionStatusSnapshot,
+  runtimeSessionStatus,
+} from '../utils/session-runtime-status';
 import type { TaskActivityTracker } from './task-activity';
 import { observationFromSnapshot, summarizeTaskStatus } from './task-policy';
 import {
   type CanonicalTaskResolver,
   idParamFor,
   readTaskRef,
+  resolveTaskRecord,
   taskRefArgs,
 } from './task-ref';
 import {
@@ -29,6 +42,7 @@ export function createTaskStatusTool(options: {
   input: PluginInput;
   backgroundJobBoard: BackgroundJobStore;
   activityTracker?: TaskActivityTracker;
+  terminalGate?: BackgroundJobTerminalGate;
   now?: () => number;
   statusTimeoutMs?: number;
   resolveCanonicalTaskRef?: CanonicalTaskResolver;
@@ -36,17 +50,40 @@ export function createTaskStatusTool(options: {
   readTimeoutMs?: number;
 }): Record<'task_status', ToolDefinition> {
   const idParam = idParamFor(options.input);
+  const gate =
+    options.terminalGate ??
+    createBackgroundJobTerminalGate({
+      backgroundJobBoard: options.backgroundJobBoard,
+      input: options.input,
+    });
+  const z = tool.schema;
   const task_status = tool({
     description:
-      'Read the current status of a tracked child task without resuming, prompting, or changing it. Accepts its task ID or parent-scoped alias. For a task the board no longer tracks (e.g. after a restart), verifies host ownership and reports a read-only observed state.',
+      "Inspect a tracked child task without resuming, prompting, or changing it. It accepts its task ID or parent-scoped alias. Pass result: true for a completed task's final text; refuses other terminals. For an untracked session (e.g. after a restart), reports a read-only observed state.",
     args: {
       ...taskRefArgs(idParam),
+      result: z
+        .boolean()
+        .optional()
+        .describe('Return the completed task’s final text.'),
     },
     async execute(args, toolContext) {
       const parentSessionID = toolContext?.sessionID;
       if (!parentSessionID) throw new Error('task_status requires sessionID');
       const requested = readTaskRef(args, idParam);
       if (!requested) throw new Error(`task_status requires ${idParam}`);
+      if (args.result === true)
+        return readTaskResult(
+          {
+            input: options.input,
+            gate,
+            board: options.backgroundJobBoard,
+            isDisposed: options.isDisposed,
+            readTimeoutMs: options.readTimeoutMs,
+            resolveCanonicalTaskRef: options.resolveCanonicalTaskRef,
+          },
+          { parentSessionID, idParam, requested },
+        );
       const canonical = options.resolveCanonicalTaskRef
         ? await options.resolveCanonicalTaskRef(parentSessionID, requested)
         : undefined;
@@ -58,7 +95,7 @@ export function createTaskStatusTool(options: {
       if (!job || job.parentSessionID !== parentSessionID) {
         // Read-only fallback for a session the board lost (e.g. a host or
         // plugin restart emptied the in-memory board): verify ownership
-        // like task_result's untracked path, then report observed
+        // like the result mode's untracked path, then report observed
         // evidence. The task is never registered, prompted, or aborted.
         return reportUntrackedTaskStatus(options, {
           requested,
@@ -131,6 +168,228 @@ export function createTaskStatusTool(options: {
   return { task_status };
 }
 
+function readonlyTerminalResult(
+  requested: string,
+  record:
+    | {
+        state?: string;
+        terminalState?: string;
+        resultSummary?: string;
+      }
+    | undefined,
+): string {
+  const state =
+    record?.state === 'reconciled' ? record.terminalState : record?.state;
+  const summary = record?.resultSummary?.trim();
+  if (state === 'completed' && summary) return summary;
+  throw new Error(
+    `Task ${requested} result was not consumed. No action was sent.`,
+  );
+}
+
+function runningResultRefusal(
+  idParam: string,
+  taskID: string,
+  uncertain: boolean,
+  status?: 'busy' | 'idle' | 'retry',
+  tracked = true,
+): string {
+  if (status === 'idle')
+    return [
+      `${idParam}: ${taskID}`,
+      'state: pending',
+      'message: Task is quiescent; wait for terminal reconciliation before retrieving its result.',
+      'next: retry task_status with { result: true } after the terminal notification',
+    ].join('\n');
+  return [
+    `${idParam}: ${taskID}`,
+    uncertain
+      ? 'state: running (unconfirmed)'
+      : `state: ${status === 'retry' ? 'retry' : 'running'}`,
+    uncertain
+      ? 'message: Live task status is uncertain; no definitive running state is available.'
+      : 'message: Task is still running. Wait for its terminal result.',
+    `next: ${!tracked ? 'retry task_status with { result: true } after the task finishes' : uncertain ? 'retry task_status with { result: true } or inspect the task without result' : 'inspect the task without result'}`,
+  ].join('\n');
+}
+
+interface TaskResultReadOptions {
+  input: PluginInput;
+  gate: BackgroundJobTerminalGate;
+  board: BackgroundJobStore;
+  isDisposed?: () => boolean;
+  readTimeoutMs?: number;
+  resolveCanonicalTaskRef?: CanonicalTaskResolver;
+}
+
+interface TaskResultReadRef {
+  parentSessionID: string;
+  idParam: string;
+  requested: string;
+}
+
+/** Result-mode read. Completed-only; never re-runs or re-prompts. */
+async function readTaskResult(
+  options: TaskResultReadOptions,
+  ref: TaskResultReadRef,
+): Promise<string> {
+  const { parentSessionID, idParam, requested } = ref;
+  const board = options.board;
+  const gate = options.gate;
+  const resolution = await resolveTaskRecord(
+    {
+      resolveCanonicalTaskRef: options.resolveCanonicalTaskRef,
+      isDisposed: options.isDisposed,
+      backgroundJobBoard: options.board,
+    },
+    parentSessionID,
+    requested,
+  );
+  if (resolution.kind === 'disposed') throw new Error(pluginDisposedMessage());
+  if (resolution.kind === 'refused') throw new Error(resolution.reason);
+  const { identity, canonical, job: tracked } = resolution;
+  if (tracked && tracked.parentSessionID !== parentSessionID) {
+    throw new Error(`Task ${identity} does not belong to this session`);
+  }
+  const taskID = tracked?.taskID ?? identity;
+  if (!SESSION_ID_PATTERN.test(taskID))
+    throw new Error(`Unknown task ID or alias: ${requested}`);
+
+  // Inspect every retained state BEFORE rejection, acknowledgement or text
+  // retrieval. Busy retracts even a consumed or timed-out publication.
+  let snapshot: RuntimeSessionStatusSnapshot | undefined;
+  if (
+    tracked &&
+    typeof getClient(options.input).session?.status === 'function'
+  ) {
+    const observation = gate.capture(tracked);
+    if (observation) {
+      snapshot = await getRuntimeSessionStatusSnapshot(options.input);
+      if (options.isDisposed?.()) throw new Error(pluginDisposedMessage());
+      gate.observe(
+        observation,
+        runtimeObservationFromSnapshot(
+          snapshot,
+          taskID,
+          observation.readStartedAt,
+        ),
+      );
+    }
+  }
+  if (options.isDisposed?.()) throw new Error(pluginDisposedMessage());
+  const result = tracked ? await gate.reconcile(tracked) : undefined;
+  if (options.isDisposed?.()) {
+    return readonlyTerminalResult(requested, tracked);
+  }
+  const current = canonical
+    ? board.get(taskID)
+    : board.resolve(parentSessionID, requested);
+  if (current && current.parentSessionID !== parentSessionID) {
+    throw new Error(`Task ${identity} does not belong to this session`);
+  }
+  if (
+    tracked &&
+    (!current ||
+      current.generation !== tracked.generation ||
+      result?.kind === 'stale')
+  ) {
+    throw new Error(
+      `Task ${requested} changed generation while its result was being retrieved`,
+    );
+  }
+  if (current?.state === 'running')
+    return runningResultRefusal(
+      idParam,
+      taskID,
+      current.statusUncertain,
+      snapshot && runtimeSessionStatus(snapshot, taskID),
+    );
+
+  const token = current ? gate.capture(current) : undefined;
+  const client = getClient(options.input);
+  if (typeof client.session.get === 'function') {
+    const response = await client.session.get({
+      path: { id: taskID },
+      query: { directory: options.input.directory },
+    });
+    if (response.data?.parentID !== parentSessionID)
+      throw new Error(`Task ${requested} does not belong to this session`);
+  } else if (!current)
+    throw new Error(
+      `Task ${requested} is not tracked by this session and cannot be verified`,
+    );
+
+  if (current) {
+    const latest = board.get(taskID);
+    const after = gate.capture(current);
+    if (
+      options.isDisposed?.() ||
+      (token === undefined && after === undefined)
+    ) {
+      return readonlyTerminalResult(requested, current);
+    }
+    if (
+      latest?.generation !== current.generation ||
+      latest.terminalRevision !== current.terminalRevision ||
+      after?.activityRevision !== token?.activityRevision ||
+      after?.attemptRevision !== token?.attemptRevision ||
+      after?.episode !== token?.episode
+    ) {
+      throw new Error(
+        `Task ${requested} changed generation or publication while its result was being retrieved; wait for its current terminal result instead of retrieving it.`,
+      );
+    }
+    const state =
+      current.state === 'reconciled' ? current.terminalState : current.state;
+    if (state === 'completed' && result?.kind !== 'committed')
+      return runningResultRefusal(idParam, taskID, true);
+    board.markUsed(parentSessionID, taskID);
+    if (state === 'error')
+      throw new Error(
+        `Task ${requested} ended in error: ${current.lastStatusError ?? current.resultSummary ?? 'no error details available'}`,
+      );
+    if (state === 'cancelled')
+      throw new Error(
+        `Task ${requested} was cancelled: ${current.resultSummary?.replace(/^cancelled:\s*/i, '') ?? 'cancelled'}`,
+      );
+    if (state !== 'completed' || !current.resultSummary?.trim())
+      throw new Error(`Task ${requested} has no confirmed completed result`);
+    return current.resultSummary;
+  }
+
+  // Untracked fallback: rendered from the same single read that the
+  // status fallback uses. Ownership is already verified above (the
+  // session.get parentID gate), so only the live probe and transcript
+  // classification run here.
+  const read = await readUntrackedEvidence(
+    { input: options.input, readTimeoutMs: options.readTimeoutMs },
+    taskID,
+  );
+  if (read.live.status === 'busy' || read.live.status === 'retry')
+    return runningResultRefusal(
+      idParam,
+      taskID,
+      false,
+      read.live.status,
+      false,
+    );
+  if (read.live.status === 'unknown')
+    return runningResultRefusal(idParam, taskID, true, undefined, false);
+  if (read.roundError) throw read.roundError;
+  const evidence = read.round;
+  if (!evidence || evidence.verdict === 'incomplete')
+    return runningResultRefusal(idParam, taskID, true, undefined, false);
+  const completedText =
+    evidence.verdict === 'completed' && 'text' in evidence
+      ? evidence.text
+      : undefined;
+  if (!completedText)
+    throw new Error(
+      `Task ${requested} shows no terminal evidence of completion; refusing to present partial output as its final result`,
+    );
+  return completedText;
+}
+
 interface UntrackedStatusOptions {
   input: PluginInput;
   now?: () => number;
@@ -142,8 +401,8 @@ interface UntrackedStatusOptions {
 /**
  * Read-only status for a task the board does not track: ownership and
  * evidence both come from the shared untracked-read module — the same
- * single implementation task_result's untracked path uses. Never
- * registers, prompts, or aborts anything.
+ * single implementation the task_status result mode's untracked path
+ * uses. Never registers, prompts, or aborts anything.
  */
 async function reportUntrackedTaskStatus(
   options: UntrackedStatusOptions,
@@ -198,7 +457,9 @@ async function reportUntrackedTaskStatus(
   // The host session's creation time, not its latest activity.
   if (ownership.createdAt !== undefined)
     details.push(`created_at: ${new Date(ownership.createdAt).toISOString()}`);
-  details.push("next: use task_result to read a completed task's final text");
+  details.push(
+    "next: use task_status with { result: true } for a completed task's final text",
+  );
   return details.join('\n');
 }
 

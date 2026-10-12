@@ -1453,7 +1453,11 @@ describe('tool execute bridge normalization', () => {
     await handler(context);
     await poll('task_status', 'poll-1', 'task_id: ses_child\nstate: busy');
     await handler(context);
-    await poll('task_result', 'poll-2', 'task_id: ses_child\nstate: running');
+    await poll(
+      'task_status',
+      'poll-2',
+      'task_id: ses_child\nstate: running\nresult: true',
+    );
     await handler(context);
     const third = await poll(
       'task_status',
@@ -1476,9 +1480,9 @@ describe('tool execute bridge normalization', () => {
       ),
     );
     const nextTurn = await poll(
-      'task_result',
+      'task_status',
       'poll-4',
-      'task_id: ses_child\nstate: running',
+      'task_id: ses_child\nstate: running\nresult: true',
     );
     expect(nextTurn).not.toContain(LOOP_GUARD_WARNING);
   });

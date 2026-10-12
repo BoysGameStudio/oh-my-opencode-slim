@@ -163,7 +163,7 @@ describe('v2 historical context', () => {
 });
 
 describe('v2 native resume through the setup bridge', () => {
-  test('an unacknowledged completed session continues without task_result or an early ack', async () => {
+  test('an unacknowledged completed session continues without a result read or an early ack', async () => {
     const board = new FixtureBoard();
     board.registerLaunch({
       taskID: CHILD,

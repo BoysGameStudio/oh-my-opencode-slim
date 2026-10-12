@@ -157,7 +157,7 @@ describe('tool-loop-guard', () => {
     }
   });
 
-  test('task_status and task_result share one stream for the same running task', async () => {
+  test('task_status and task_status result mode share one stream for the same running task', async () => {
     const statusOutput = makeTaskStatusOutput({ state: 'busy' });
     const resultOutput = [
       'task_id: ses_child1',
@@ -167,9 +167,9 @@ describe('tool-loop-guard', () => {
 
     for (let i = 1; i <= 3; i++) {
       const output = await runToolCall(
-        i % 2 === 1 ? 'task_status' : 'task_result',
+        'task_status',
         `poll${i}`,
-        { task_id: 'ses_child1' },
+        { task_id: 'ses_child1', ...(i % 2 === 0 ? { result: true } : {}) },
         i % 2 === 1 ? statusOutput : resultOutput,
       );
       if (i < 3) expect(output.output).not.toContain(LOOP_GUARD_WARNING);
@@ -206,9 +206,9 @@ describe('tool-loop-guard', () => {
       statusOutput,
     );
     const withinTurn = await runToolCall(
-      'task_result',
+      'task_status',
       'turn-1-result',
-      { task_id: 'ses_child1' },
+      { task_id: 'ses_child1', result: true },
       'task_id: ses_child1\nstate: running',
     );
     expect(withinTurn.output).not.toContain(LOOP_GUARD_WARNING);
@@ -222,9 +222,9 @@ describe('tool-loop-guard', () => {
     hook.resetTurn('s1');
 
     const newTurn = await runToolCall(
-      'task_result',
+      'task_status',
       'turn-2-result',
-      { task_id: 'ses_child1' },
+      { task_id: 'ses_child1', result: true },
       'task_id: ses_child1\nstate: running',
     );
     expect(newTurn.output).not.toContain(LOOP_GUARD_WARNING);
@@ -250,19 +250,19 @@ describe('tool-loop-guard', () => {
     }
   });
 
-  test('task_result called repeatedly for a running task warns on 3rd call and does not block at call 5 and beyond', async () => {
+  test('task_status result mode called repeatedly for a running task warns on 3rd call and does not block at call 5 and beyond', async () => {
     const runningOutput = [
       'task_id: ses_child1',
       'state: running',
       'message: Task is still running. Wait for its terminal result.',
-      'next: use task_status to inspect the task',
+      'next: inspect the task without result',
     ].join('\n');
 
     for (let i = 1; i <= 6; i++) {
       const output = await runToolCall(
-        'task_result',
+        'task_status',
         `r${i}`,
-        { task_id: 'ses_child1' },
+        { task_id: 'ses_child1', result: true },
         runningOutput,
       );
       if (i < 3) {

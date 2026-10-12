@@ -1828,7 +1828,7 @@ describe('task-session-manager hook', () => {
     expect(boardText(resetRequest)).toContain('completed, unreconciled');
   });
 
-  test('board-off still retires consumed terminal jobs without injecting any board part', async () => {
+  test('board-off retires an observed native delivery without injecting any board part', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({
       taskID: 'child-1',
@@ -1840,6 +1840,7 @@ describe('task-session-manager hook', () => {
       taskID: 'child-1',
       state: 'completed',
       resultSummary: 'done',
+      now: 1000,
     });
     const { hook } = createHook({
       backgroundJobBoard: board,
@@ -1847,8 +1848,9 @@ describe('task-session-manager hook', () => {
       idleReconcileDelayMs: 0,
     });
 
-    // First real orchestrator turn: no board part is placed, but the
-    // natively delivered terminal job registers for consumption.
+    // First real orchestrator turn, no delivery yet: no board part is
+    // placed and the terminal job stays unreconciled — nothing is
+    // registered against the prompt shape anymore.
     const firstRequest = createMessages('parent-1', 'first turn');
     await transformMessages(hook, firstRequest);
     expect(
@@ -1860,22 +1862,372 @@ describe('task-session-manager hook', () => {
       state: 'completed',
       terminalUnreconciled: true,
     });
+    expect(board.hasTerminalUnreconciled('parent-1')).toBe(true);
 
-    // Next real turn with an advanced prompt shape retires the job.
-    const secondRequest = createAnchoredMessages('parent-1', [
-      'first turn',
-      'consumed the native result',
-      'next step',
-    ]);
-    await transformMessages(hook, secondRequest);
+    // The host's native delivery lands in history: the observer retires
+    // the record on this transform, still with no board part placed.
+    const deliveredRequest = {
+      messages: [
+        ...firstRequest.messages,
+        {
+          info: {
+            id: 'delivery-1',
+            role: 'user',
+            agent: 'orchestrator',
+            sessionID: 'parent-1',
+          },
+          parts: [
+            {
+              type: 'text',
+              text: '<subagent sessionID="child-1" state="completed" description="map hooks">\ndone\n</subagent>',
+            },
+          ],
+        },
+      ],
+    };
+    await transformMessages(hook, deliveredRequest as never);
     expect(
-      secondRequest.messages.flatMap((message) =>
-        message.parts.filter((part) => isBoardPartForTest(part)),
+      deliveredRequest.messages.flatMap((message) =>
+        (message as { parts: unknown[] }).parts.filter((part) =>
+          isBoardPartForTest(part as { metadata?: Record<string, unknown> }),
+        ),
       ),
     ).toHaveLength(0);
     expect(board.get('child-1')).toMatchObject({
       state: 'reconciled',
       terminalUnreconciled: false,
+    });
+    expect(board.hasTerminalUnreconciled('parent-1')).toBe(false);
+
+    // Replaying the same history is a dedupe no-op.
+    await transformMessages(hook, deliveredRequest as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+    });
+  });
+
+  test('board-off ignores deliveries for unknown sessionIDs', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'done',
+      now: 1000,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      boardInjection: false,
+      idleReconcileDelayMs: 0,
+    });
+
+    const deliveredRequest = {
+      messages: [
+        {
+          info: {
+            role: 'user',
+            agent: 'orchestrator',
+            sessionID: 'parent-1',
+          },
+          parts: [{ type: 'text', text: 'first turn' }],
+        },
+        {
+          info: { id: 'delivery-unknown', role: 'user', sessionID: 'parent-1' },
+          parts: [
+            {
+              type: 'text',
+              text: '<subagent sessionID="child-unknown" state="completed" description="other">\ndone\n</subagent>',
+            },
+          ],
+        },
+      ],
+    };
+    await transformMessages(hook, deliveredRequest as never);
+    expect(board.get('child-unknown')).toBeUndefined();
+    expect(board.get('child-1')).toMatchObject({
+      state: 'completed',
+      terminalUnreconciled: true,
+    });
+  });
+
+  test('board-off ignores a mismatched delivery for a stopped record', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'stopped',
+      resultSummary: 'stopped without a terminal result',
+      now: 1000,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      boardInjection: false,
+      idleReconcileDelayMs: 0,
+    });
+
+    // Even a completed-shaped delivery for the stopped taskID cannot retire
+    // it: state equality fails, and stops retire only through the
+    // recovery-wake + task_revive ack flow.
+    const deliveredRequest = {
+      messages: [
+        {
+          info: {
+            role: 'user',
+            agent: 'orchestrator',
+            sessionID: 'parent-1',
+          },
+          parts: [{ type: 'text', text: 'first turn' }],
+        },
+        {
+          info: { id: 'delivery-1', role: 'user', sessionID: 'parent-1' },
+          parts: [
+            {
+              type: 'text',
+              text: '<subagent sessionID="child-1" state="completed" description="map hooks">\ndone\n</subagent>',
+            },
+          ],
+        },
+      ],
+    };
+    await transformMessages(hook, deliveredRequest as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'stopped',
+      terminalUnreconciled: true,
+    });
+  });
+
+  test('board-off pairs repeated deliveries FIFO across terminal revisions', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'first result',
+      now: 1000,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      boardInjection: false,
+      idleReconcileDelayMs: 0,
+    });
+    const firstRevision = board.get('child-1')?.terminalRevision;
+
+    const firstDelivery = {
+      info: { id: 'delivery-1', role: 'user', sessionID: 'parent-1' },
+      parts: [
+        {
+          type: 'text',
+          text: '<subagent sessionID="child-1" state="completed" description="map hooks">\nfirst result\n</subagent>',
+        },
+      ],
+    };
+    await transformMessages(hook, {
+      messages: [
+        createMessages('parent-1', 'first turn').messages[0],
+        firstDelivery,
+      ],
+    } as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+      terminalRevision: firstRevision,
+    });
+
+    // The run reopens and completes again: a second native delivery for
+    // the newer revision retires it, while replaying the first delivery is
+    // a dedupe no-op.
+    board.markRunningFromLiveSession('child-1', 1500);
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'second result',
+      now: 2000,
+    });
+    const secondRevision = board.get('child-1')?.terminalRevision;
+    expect(secondRevision).not.toBe(firstRevision);
+    expect(board.get('child-1')).toMatchObject({ terminalUnreconciled: true });
+
+    const secondDelivery = {
+      info: { id: 'delivery-2', role: 'user', sessionID: 'parent-1' },
+      parts: [
+        {
+          type: 'text',
+          text: '<subagent sessionID="child-1" state="completed" description="map hooks">\nsecond result\n</subagent>',
+        },
+      ],
+    };
+    const replayedHistory = {
+      messages: [
+        createMessages('parent-1', 'first turn').messages[0],
+        firstDelivery,
+        secondDelivery,
+      ],
+    };
+    await transformMessages(hook, replayedHistory as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+      terminalRevision: secondRevision,
+    });
+  });
+
+  test('board-off fallback retires a completed record older than the newest parent assistant turn', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'done',
+      now: 1000,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      boardInjection: false,
+      idleReconcileDelayMs: 0,
+    });
+
+    // No native delivery in history, but the parent demonstrably moved
+    // past the terminal report: unconditional retire.
+    const advancedRequest = {
+      messages: [
+        {
+          info: { id: 'm-1', role: 'user', sessionID: 'parent-1' },
+          parts: [{ type: 'text', text: 'first turn' }],
+        },
+        {
+          info: {
+            id: 'm-2',
+            role: 'assistant',
+            sessionID: 'parent-1',
+            time: { created: 2000 },
+          },
+          parts: [{ type: 'text', text: 'consumed the native result' }],
+        },
+      ],
+    };
+    await transformMessages(hook, advancedRequest as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+    });
+  });
+
+  test('board-off fallback fails closed without comparable timestamps', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'done',
+      now: 3000,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      boardInjection: false,
+      idleReconcileDelayMs: 0,
+    });
+
+    // The terminal report (3000) is NEWER than the newest assistant turn
+    // (2000): the parent has not moved past it, so it stays unreconciled.
+    const pendingRequest = {
+      messages: [
+        {
+          info: { id: 'm-1', role: 'user', sessionID: 'parent-1' },
+          parts: [{ type: 'text', text: 'first turn' }],
+        },
+        {
+          info: {
+            id: 'm-2',
+            role: 'assistant',
+            sessionID: 'parent-1',
+            time: { created: 2000 },
+          },
+          parts: [{ type: 'text', text: 'still working' }],
+        },
+      ],
+    };
+    await transformMessages(hook, pendingRequest as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'completed',
+      terminalUnreconciled: true,
+    });
+
+    // And history without any assistant timestamps cannot retire either.
+    await transformMessages(
+      hook,
+      createAnchoredMessages('parent-1', ['first turn', 'next step']) as never,
+    );
+    expect(board.get('child-1')).toMatchObject({
+      state: 'completed',
+      terminalUnreconciled: true,
+    });
+  });
+
+  test('board-on (v1) leaves an observed-shaped delivery to prompt-shape retirement', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'done',
+      now: 1000,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      idleReconcileDelayMs: 0,
+    });
+
+    // v1 never runs the native observer: the terminal job registers for
+    // consumption retirement exactly as before, even with a
+    // delivery-shaped part already in history.
+    const deliveredRequest = {
+      messages: [
+        {
+          info: { id: 'delivery-1', role: 'user', sessionID: 'parent-1' },
+          parts: [
+            {
+              type: 'text',
+              text: '<subagent sessionID="child-1" state="completed" description="map hooks">\ndone\n</subagent>',
+            },
+          ],
+        },
+      ],
+    };
+    await transformMessages(hook, deliveredRequest as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'completed',
+      terminalUnreconciled: true,
     });
   });
 
@@ -1902,11 +2254,10 @@ describe('task-session-manager hook', () => {
       idleReconcileDelayMs: 0,
     });
 
-    // A real user turn registers natively delivered terminal jobs — but a
-    // stop was never natively delivered, so it must stay unreconciled for
-    // the stopped-job recovery wake to surface (registering it would let
-    // the wake's isCurrent check drop the stop before the parent has seen
-    // it, and would clear the same-objective dispatch safeguard).
+    // A stop was never natively delivered, so it must stay unreconciled
+    // for the stopped-job recovery wake to surface (retiring it here would
+    // let the wake's isCurrent check drop the stop before the parent has
+    // seen it, and would clear the same-objective dispatch safeguard).
     await transformMessages(hook, createMessages('parent-1', 'first turn'));
     expect(board.get('child-1')).toMatchObject({
       state: 'stopped',
@@ -6393,7 +6744,9 @@ describe('task-session-manager hook', () => {
     } catch (error) {
       v1Message = (error as Error).message;
     }
-    expect(v1Message).toContain('Call task_result with task_id "child-1"');
+    expect(v1Message).toContain(
+      'Call task_status with result true and task_id "child-1"',
+    );
 
     const board = new BackgroundJobBoard();
     setupCompletedJob(board, {
@@ -6417,7 +6770,9 @@ describe('task-session-manager hook', () => {
     } catch (error) {
       message = (error as Error).message;
     }
-    expect(message).toContain('Call task_result with sessionID "child-1"');
+    expect(message).toContain(
+      'Call task_status with result true and sessionID "child-1"',
+    );
     expect(message).not.toContain('task_id');
   });
 

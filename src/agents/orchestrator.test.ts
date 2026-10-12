@@ -25,7 +25,7 @@ describe('orchestrator prompt', () => {
     expect(prompt).toContain('never claim the child saw or acted on it');
     expect(prompt).toContain('then reconcile against its result');
     expect(prompt).toContain(
-      '`task_status` is read-only inspection; `task_result` reads a finished result; neither launches, resumes, or instructs a child.',
+      '`task_status` inspects; with `result: true` it reads a finished result; neither launches, resumes, or instructs a child.',
     );
     expect(prompt).not.toContain('There is no safe live-prompt channel');
     expect(prompt).not.toContain("wait for that lane's terminal result. Then");
@@ -72,9 +72,7 @@ describe('orchestrator prompt', () => {
     expect(prompt).toContain(
       'even when that session is not listed under Reusable Sessions',
     );
-    expect(prompt).toContain(
-      'not required before continuing an existing session',
-    );
+    expect(prompt).toContain('not required before continuing');
     expect(prompt).not.toContain(
       'Only sessions listed under Reusable Sessions may be resumed',
     );

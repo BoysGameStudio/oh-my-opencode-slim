@@ -6,7 +6,6 @@ import { OhMyOpenCodeLite } from '../../index';
 import { createCancelTaskTool } from '../../tools/cancel-task';
 import { createTaskMessageTool } from '../../tools/task-message';
 import { createTaskReplyTool } from '../../tools/task-reply';
-import { createTaskResultTool } from '../../tools/task-result';
 import { createTaskReviveTool } from '../../tools/task-revive';
 import { createTaskStatusTool } from '../../tools/task-status';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
@@ -555,7 +554,7 @@ describe('canonical alias reference', () => {
       ...createCancelTaskTool(shared),
       ...createTaskMessageTool(shared),
       ...createTaskReplyTool(shared),
-      ...createTaskResultTool(shared),
+      ...createTaskStatusTool(shared),
       ...createTaskReviveTool({
         ...shared,
         revivedRunTracker: { captureBaseline: async () => 'baseline' } as never,
@@ -581,7 +580,10 @@ describe('canonical alias reference', () => {
       ),
     ).rejects.toThrow(/No action was sent/);
     await expect(
-      tools.task_result.execute({ task_id: 'fix-1' }, context as never),
+      tools.task_status.execute(
+        { task_id: 'fix-1', result: true },
+        context as never,
+      ),
     ).rejects.toThrow(/No action was sent/);
     await expect(
       tools.task_revive.execute(
@@ -830,7 +832,7 @@ describe('native create degrade', () => {
       sessionID: 'ses_created',
     });
     expect(marked).toContain('Refer by the exact session id ses_created.');
-    expect(marked).not.toContain('Call task_result');
+    expect(marked).not.toContain('Call task_status with result');
     expect(readAuthoritativeChildRef(marked)?.alias).toBe('ses_created');
   });
 

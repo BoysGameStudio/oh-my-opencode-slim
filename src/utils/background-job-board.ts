@@ -1577,7 +1577,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
           : ['Cancelled or errored sessions are not reusable.']),
         ...(this.delegationTool === 'task'
           ? [
-              'Continue an existing session with task_revive even when it is not listed here. task_result only reads a result and is not required before task_revive.',
+              'Continue an existing session with task_revive even when it is not listed here. A result read is not required before task_revive.',
             ]
           : [
               'Completed sessions continue with subagent() by exact session id even when they are not listed. Cancelled, errored, and stopped sessions use task_revive.',

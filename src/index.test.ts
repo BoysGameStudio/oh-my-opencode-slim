@@ -191,7 +191,6 @@ describe('plugin tool registration', () => {
     } as never);
 
     expect(hooks.tool?.task_status).toBeDefined();
-    expect(hooks.tool?.task_result).toBeDefined();
     expect(hooks.tool?.task_message).toBeDefined();
     expect(hooks.tool?.task_cancel).toBeDefined();
     expect(hooks.tool?.task_revive).toBeDefined();

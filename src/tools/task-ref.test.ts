@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { BackgroundJobBoard } from '../utils/background-job-board';
 import { createTaskMessageTool } from './task-message';
 import { idParamFor, readTaskRef, taskRefArgs } from './task-ref';
-import { createTaskResultTool } from './task-result';
 import { createTaskStatusTool } from './task-status';
 
 /**
@@ -19,12 +18,6 @@ function v2ControlTools() {
   const board = new BackgroundJobBoard();
   const input = { directory: '/test', client: {}, hostFlavor: 'v2' } as never;
   return [
-    {
-      name: 'task_result',
-      def: createTaskResultTool({ input, backgroundJobBoard: board })
-        .task_result,
-      base: {},
-    },
     {
       name: 'task_status',
       def: createTaskStatusTool({ input, backgroundJobBoard: board })

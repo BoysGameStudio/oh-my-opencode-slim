@@ -256,7 +256,7 @@ This applies to **every** prompt you supply:
 A prompt that hard-codes delegation calls is therefore **not portable** between
 v1 and v2 — keep a host-specific version for each.
 
-The control-tool names (`task_status`, `task_result`, `task_message`,
+The control-tool names (`task_status`, `task_message`,
 `task_reply`, `task_revive`, `task_cancel`) are identical on both hosts. On v2
 they take `sessionID` and also accept `task_id` as a deprecated alias (never
 emitted).
