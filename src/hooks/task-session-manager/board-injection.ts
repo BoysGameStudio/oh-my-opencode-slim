@@ -262,6 +262,10 @@ export function pruneReopenCorrectionState(
   parentSessionID: string,
 ): void {
   state.reportedTerminalRunsByParent?.delete(parentSessionID);
+  // Delivery keys are content-addressed, so a stale key can never
+  // mis-retire a recreated session — but retaining them leaks memory for
+  // dead parents. Keys for a recreated session are fresh message IDs.
+  state.observedNativeDeliveries?.delete(parentSessionID);
 }
 
 const HOST_MESSAGE_OCCURRENCE_PREFIX = 'host-message:';
@@ -297,11 +301,20 @@ export interface InjectionState {
   >;
   /**
    * Native v2 delivery parts already consumed by the observer
-   * (`reconcileObservedNativeDeliveries`), keyed by the delivery part's own
-   * message/part identity (byte-stable, persisted in history) — never by
-   * prompt shape. Optional for states built before the field existed.
+   * (`reconcileObservedNativeDeliveries`), keyed by parent session, then by
+   * the delivery part's own message/part identity (byte-stable, persisted in
+   * history) — never by prompt shape. Keys are consumed only once the
+   * delivery can actually act (retire, or is proven never-matchable), so a
+   * delivery observed while its record is still running retries on the next
+   * transform. Cleared per parent on session end; bounded per parent.
+   * Optional for states built before the field existed.
    */
-  observedNativeDeliveries?: Set<string>;
+  observedNativeDeliveries?: Map<string, Set<string>>;
+  /** Host flavor marker ('v2' on OpenCode v2 hosts). v2 board-off retires
+   *  by native delivery observation; v1 board-off keeps the prompt-shape
+   *  consumption path (untagged completion formats, no cancelled
+   *  fallback). */
+  hostFlavor?: string;
   /**
    * Terminal runs this parent has already consumed (reconciled through
    * `reconcileExecutionBatch`), keyed `${taskID}:${generation}`. Used to
@@ -1394,13 +1407,18 @@ function reconcileObservedNativeDeliveries(
   messages: unknown[],
 ): void {
   if (state.boardInjection !== false) return;
-  state.observedNativeDeliveries ??= new Set<string>();
-  const seen = state.observedNativeDeliveries;
+  state.observedNativeDeliveries ??= new Map<string, Set<string>>();
+  const seenByParent = state.observedNativeDeliveries;
   for (const message of messages) {
     if (!isMessageWithParts(message)) continue;
     const parentSessionID = message.info.sessionID;
     if (!parentSessionID || !state.shouldManageSession(parentSessionID)) {
       continue;
+    }
+    let seen = seenByParent.get(parentSessionID);
+    if (!seen) {
+      seen = new Set<string>();
+      seenByParent.set(parentSessionID, seen);
     }
     message.parts.forEach((part, partIndex) => {
       if (part.type !== 'text' || typeof part.text !== 'string') return;
@@ -1409,7 +1427,6 @@ function reconcileObservedNativeDeliveries(
       if (!delivery) return;
       const seenKey = nativeDeliverySeenKey(message, partIndex, part.text);
       if (seen.has(seenKey)) return;
-      seen.add(seenKey);
 
       const record = state.backgroundJobBoard.get(delivery.taskID);
       if (
@@ -1417,6 +1434,11 @@ function reconcileObservedNativeDeliveries(
         record.parentSessionID !== parentSessionID ||
         !record.terminalUnreconciled
       ) {
+        // Not consumable yet: an unknown child, a parent mismatch, or a
+        // record still running while its gate reconciles asynchronously.
+        // Leave the key unconsumed so a later transform retries once the
+        // board is ready — consuming here would forget the delivery
+        // forever, and cancelled records have no timestamp fallback.
         return;
       }
       // A delivery retires only the terminal run it reports: the record's
@@ -1424,14 +1446,22 @@ function reconcileObservedNativeDeliveries(
       // (older revision, reopened run, same-ID relaunch now running) never
       // matches and leaves the record for its own delivery or the fallback.
       const terminalState = record.terminalState ?? record.state;
-      if (terminalState !== delivery.state) return;
+      if (terminalState !== delivery.state) {
+        // Terminal but never matchable: consume so the scan stops
+        // reparsing it. The matching delivery carries its own key.
+        consumeDeliveryKey(state, parentSessionID, seenKey);
+        return;
+      }
       if (
         !NATIVE_DELIVERY_STATES.has(
           record.state as ObservedNativeDelivery['state'],
         )
       ) {
+        // stopped: can never retire through this channel; consume.
+        consumeDeliveryKey(state, parentSessionID, seenKey);
         return;
       }
+      consumeDeliveryKey(state, parentSessionID, seenKey);
       reconcileExecutionBatch(state, parentSessionID, [
         {
           taskID: record.taskID,
@@ -1440,6 +1470,23 @@ function reconcileObservedNativeDeliveries(
         },
       ]);
     });
+  }
+}
+
+/** Per-parent consumption-set bound; insertion-ordered, oldest evicted. */
+const OBSERVED_DELIVERY_KEYS_PER_PARENT = 128;
+
+function consumeDeliveryKey(
+  state: InjectionState,
+  parentSessionID: string,
+  seenKey: string,
+): void {
+  const seen = state.observedNativeDeliveries?.get(parentSessionID);
+  if (!seen) return;
+  seen.add(seenKey);
+  if (seen.size > OBSERVED_DELIVERY_KEYS_PER_PARENT) {
+    const oldest = seen.values().next().value;
+    if (oldest !== undefined) seen.delete(oldest);
   }
 }
 
@@ -1609,19 +1656,54 @@ function injectLatestBoard(state: InjectionState, messages: unknown[]): void {
   if (!textPart || isInternalInitiatorPart(textPart)) return;
 
   if (state.boardInjection === false) {
-    // Board injection disabled: the native background notifier owns
-    // completed/error/cancelled delivery (first publications are
-    // native-owned on both hosts), so no board part is placed. Terminal
-    // retirement is observation-based: `reconcileObservedNativeDeliveries`
-    // (above) retires records whose native delivery is already in history,
-    // and `retireStaleTerminalRecords` bounds a missed observation — no
-    // prompt-shape registration happens here.
+    if (state.hostFlavor === 'v2') {
+      // v2 board-off: the native background notifier owns completed/error/
+      // cancelled delivery (first publications are native-owned), so no
+      // board part is placed. Terminal retirement is observation-based:
+      // `reconcileObservedNativeDeliveries` (above) retires records whose
+      // native delivery is already in history, and
+      // `retireStaleTerminalRecords` bounds a missed observation — no
+      // prompt-shape registration happens here.
+      //
+      // Stopped jobs are EXCLUDED from every retirement channel here: the
+      // native notifier never delivers a stop, so a stop must survive until
+      // the stopped-job recovery wake surfaces it and `task_revive`'s ack
+      // retires it, keeping the same-objective dispatch safeguard active
+      // until actual recovery.
+      return;
+    }
+    // v1 board-off: the host delivers completions in untagged formats the
+    // observer cannot parse, and cancellations have no timestamp fallback
+    // — keep the prompt-shape consumption path so terminal records
+    // (including cancelled) still retire on the parent's next real
+    // activity. Without this, the store stays terminal/unreconciled
+    // forever and every hasTerminalUnreconciled consumer wedges: explicit
+    // task-id resumes are refused, same-objective dispatches stay
+    // deduplicated, and delegated-work detection never settles.
     //
-    // Stopped jobs are EXCLUDED from every retirement channel here: the
-    // native notifier never delivers a stop, so a stop must survive until
-    // the stopped-job recovery wake surfaces it and `task_revive`'s ack
-    // retires it, keeping the same-objective dispatch safeguard active
-    // until actual recovery.
+    // Stopped jobs are EXCLUDED here too: registering one would mark it
+    // reconciled before the parent has seen it — the stopped-job recovery
+    // wake's isCurrent check would then drop it and the stop would be
+    // silent. A stopped job retires through the recovery flow instead.
+    const nativeExecutions = (
+      state.backgroundJobBoard.formatForPromptWithMetadata(sessionID)
+        ?.terminalUnreconciledTaskIDs ?? []
+    ).filter((execution) => {
+      const record = state.backgroundJobBoard.get(execution.taskID);
+      return (
+        record !== undefined &&
+        record.generation === execution.generation &&
+        record.state !== 'stopped'
+      );
+    });
+    if (nativeExecutions.length > 0) {
+      rememberInjectedTerminalJobs(
+        state,
+        sessionID,
+        nativeExecutions,
+        shapeKey ?? promptShapeKey(realMessages(messages, state.metadataKey)),
+      );
+    }
     return;
   }
 
@@ -2015,17 +2097,38 @@ function injectCheckpointBoard(
   const replayBaseMessage = triggeringMessage ?? tailMessage;
 
   if (state.boardInjection === false) {
-    // Board injection disabled (see injectLatestBoard for the full
-    // rationale): no snapshot exists to place or replay in this mode, and
-    // no prompt-shape registration happens either — terminal retirement is
-    // observation-based (`reconcileObservedNativeDeliveries` plus the
-    // stale-terminal fallback, both run at the top of
-    // `injectBackgroundJobBoard`). Only the staleness notice below delivers
-    // here: reopen corrections are staleness notices, not board status —
-    // they deliver in the board-less variant here (see
-    // formatReopenCorrectionTextNoBoard). (#1314 keeps board-flavored
-    // notices off in this mode; child input waits and task_reply stay
-    // byte-compatible — this path neither reads nor writes them.)
+    if (state.hostFlavor === 'v2') {
+      // v2 board-off (see injectLatestBoard): observation-based retirement
+      // only; no prompt-shape registration.
+    } else {
+      // v1 board-off: keep the prompt-shape consumption path (see
+      // injectLatestBoard for the cancelled-record rationale).
+      const nativeExecutions = (
+        state.backgroundJobBoard.formatForPromptWithMetadata(sessionID)
+          ?.terminalUnreconciledTaskIDs ?? []
+      ).filter((execution) => {
+        const record = state.backgroundJobBoard.get(execution.taskID);
+        return (
+          record !== undefined &&
+          record.generation === execution.generation &&
+          record.state !== 'stopped'
+        );
+      });
+      if (nativeExecutions.length > 0) {
+        rememberInjectedTerminalJobs(
+          state,
+          sessionID,
+          nativeExecutions,
+          historyShapeKey(),
+        );
+      }
+    }
+    // Only the staleness notice below delivers here: reopen corrections
+    // are staleness notices, not board status — they deliver in the
+    // board-less variant here (see formatReopenCorrectionTextNoBoard).
+    // (#1314 keeps board-flavored notices off in this mode; child input
+    // waits and task_reply stay byte-compatible — this path neither reads
+    // nor writes them.)
     deliverReopenCorrections(
       state,
       sessionID,

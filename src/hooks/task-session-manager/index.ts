@@ -617,6 +617,7 @@ export function createTaskSessionManagerHook(
     maxRetainedSnapshots: options.maxRetainedSnapshots,
     strategy: options.strategy ?? 'latest',
     boardInjection: options.boardInjection !== false,
+    hostFlavor: options.hostFlavor,
     lifecycleLedger: rehydrateState,
     processedInjectedCompletions: rehydrateState.processedInjectedCompletions,
     processedInjectedCompletionOrder:

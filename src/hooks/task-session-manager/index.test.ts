@@ -30,6 +30,10 @@ import {
   PHASE_REMINDER_METADATA_KEY,
 } from '../phase-reminder';
 import {
+  type InjectionState,
+  pruneReopenCorrectionState,
+} from './board-injection';
+import {
   BACKGROUND_JOB_BOARD_METADATA_KEY,
   createTaskSessionManagerHook,
 } from './index';
@@ -1845,6 +1849,7 @@ describe('task-session-manager hook', () => {
     const { hook } = createHook({
       backgroundJobBoard: board,
       boardInjection: false,
+      hostFlavor: 'v2',
       idleReconcileDelayMs: 0,
     });
 
@@ -1924,6 +1929,7 @@ describe('task-session-manager hook', () => {
     const { hook } = createHook({
       backgroundJobBoard: board,
       boardInjection: false,
+      hostFlavor: 'v2',
       idleReconcileDelayMs: 0,
     });
 
@@ -1973,6 +1979,7 @@ describe('task-session-manager hook', () => {
     const { hook } = createHook({
       backgroundJobBoard: board,
       boardInjection: false,
+      hostFlavor: 'v2',
       idleReconcileDelayMs: 0,
     });
 
@@ -2024,6 +2031,7 @@ describe('task-session-manager hook', () => {
     const { hook } = createHook({
       backgroundJobBoard: board,
       boardInjection: false,
+      hostFlavor: 'v2',
       idleReconcileDelayMs: 0,
     });
     const firstRevision = board.get('child-1')?.terminalRevision;
@@ -2104,6 +2112,7 @@ describe('task-session-manager hook', () => {
     const { hook } = createHook({
       backgroundJobBoard: board,
       boardInjection: false,
+      hostFlavor: 'v2',
       idleReconcileDelayMs: 0,
     });
 
@@ -2150,6 +2159,7 @@ describe('task-session-manager hook', () => {
     const { hook } = createHook({
       backgroundJobBoard: board,
       boardInjection: false,
+      hostFlavor: 'v2',
       idleReconcileDelayMs: 0,
     });
 
@@ -2187,6 +2197,129 @@ describe('task-session-manager hook', () => {
       state: 'completed',
       terminalUnreconciled: true,
     });
+  });
+
+  test('v1 board-off (default flavor) retires cancelled records via prompt-shape consumption', async () => {
+    // Greptile P1-1 regression: v1 delivers completions in untagged formats
+    // the native-delivery observer cannot parse, and the stale-terminal
+    // fallback excludes cancelled — so v1 board-off must keep the
+    // prompt-shape consumption path or cancelled records stay unreconciled
+    // forever (pending delegated work, same-objective rejections).
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'cancelled',
+      resultSummary: 'cancelled by user',
+      now: 1000,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      boardInjection: false,
+      idleReconcileDelayMs: 0,
+    });
+
+    // First turn: the cancelled record registers against the prompt shape
+    // (cancelled is not stopped — the recovery wake does not own it).
+    await transformMessages(hook, createMessages('parent-1', 'first turn'));
+    expect(board.get('child-1')).toMatchObject({
+      state: 'cancelled',
+      terminalUnreconciled: true,
+    });
+
+    // The parent demonstrably moved past the shaped delivery: retire.
+    await transformMessages(
+      hook,
+      createAnchoredMessages('parent-1', ['first turn', 'next step']) as never,
+    );
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+    });
+  });
+
+  test('v2 board-off retries a delivery observed before its gate reconciled', async () => {
+    // Greptile P1-2 regression: child idle events start terminalGate.reconcile
+    // without awaiting it, so a delivery can reach a transform while the
+    // board still says running. The observer must NOT consume that delivery —
+    // a consumed-early key would forget it forever (cancelled has no
+    // timestamp fallback).
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      boardInjection: false,
+      hostFlavor: 'v2',
+      idleReconcileDelayMs: 0,
+    });
+
+    const raceRequest = {
+      messages: [
+        createMessages('parent-1', 'first turn').messages[0],
+        {
+          info: { id: 'delivery-1', role: 'user', sessionID: 'parent-1' },
+          parts: [
+            {
+              type: 'text',
+              text: '<subagent sessionID="child-1" state="completed" description="map hooks">\ndone\n</subagent>',
+            },
+          ],
+        },
+      ],
+    };
+    // Record still running: the delivery is present but not consumable.
+    await transformMessages(hook, raceRequest as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'running',
+      terminalUnreconciled: false,
+    });
+
+    // The gate finishes; the SAME delivery (still in history, still
+    // unconsumed) retires the record on the next transform.
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'done',
+      now: 1000,
+    });
+    expect(board.get('child-1')).toMatchObject({ terminalUnreconciled: true });
+    await transformMessages(hook, raceRequest as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+    });
+  });
+
+  test('v2 board-off clears consumed delivery keys when the parent session ends', () => {
+    // Greptile P2 regression: per-parent key sets must not outlive their
+    // parent. pruneReopenCorrectionState is the session-end hook (wired at
+    // task-session-manager/index.ts), so the keys die with the parent's
+    // other bookkeeping; a recreated session only ever produces fresh
+    // message IDs.
+    const state = {
+      reportedTerminalRunsByParent: new Map([
+        ['parent-1', new Map()],
+      ]) as unknown as InjectionState['reportedTerminalRunsByParent'],
+      observedNativeDeliveries: new Map([
+        ['parent-1', new Set(['delivery-1:0:abc'])],
+        ['parent-2', new Set(['delivery-2:0:def'])],
+      ]) as unknown as InjectionState['observedNativeDeliveries'],
+    } as never as InjectionState;
+    pruneReopenCorrectionState(state, 'parent-1');
+    expect(state.observedNativeDeliveries?.has('parent-1')).toBe(false);
+    // Other parents are untouched.
+    expect(state.observedNativeDeliveries?.has('parent-2')).toBe(true);
+    expect(state.reportedTerminalRunsByParent?.has('parent-1')).toBe(false);
   });
 
   test('board-on (v1) leaves an observed-shaped delivery to prompt-shape retirement', async () => {
@@ -2251,6 +2384,7 @@ describe('task-session-manager hook', () => {
     const { hook } = createHook({
       backgroundJobBoard: board,
       boardInjection: false,
+      hostFlavor: 'v2',
       idleReconcileDelayMs: 0,
     });
 

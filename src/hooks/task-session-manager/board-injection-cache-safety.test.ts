@@ -208,7 +208,11 @@ function describeTransition(label: string, prev: string, next: string) {
 
 // ── Hook + turn runner ────────────────────────────────────────────────
 
-function createHook(board: BackgroundJobBoard, boardInjection?: boolean) {
+function createHook(
+  board: BackgroundJobBoard,
+  boardInjection?: boolean,
+  hostFlavor?: string,
+) {
   return createTaskSessionManagerHook(
     {
       client: { session: { status: mock(async () => ({ data: {} })) } },
@@ -220,6 +224,7 @@ function createHook(board: BackgroundJobBoard, boardInjection?: boolean) {
       maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
       strategy: 'checkpoint-compatible',
       boardInjection,
+      hostFlavor,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
     },
@@ -624,7 +629,7 @@ describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
       agent: 'explorer',
       description: 'map hooks',
     });
-    const hook = createHook(board, false);
+    const hook = createHook(board, false, 'v2');
     const turn = await runTurn(hook, [
       userMsg('msg_u_sw_off', 'Coordinate the refactor work', BASE_TIME),
     ]);
@@ -672,7 +677,7 @@ describe('backgroundJobs.boardInjection switch (#1314 thread)', () => {
       resultSummary: 'stopped without a terminal result',
       now: BASE_TIME + 60_000,
     });
-    const hook = createHook(board, false);
+    const hook = createHook(board, false, 'v2');
 
     // First real turn: nothing registers against the prompt shape — both
     // jobs stay unreconciled (the stopped job for the recovery wake, the
