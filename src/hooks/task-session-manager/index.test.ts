@@ -2322,6 +2322,166 @@ describe('task-session-manager hook', () => {
     expect(state.reportedTerminalRunsByParent?.has('parent-1')).toBe(false);
   });
 
+  test('v2 board-off keeps a mismatched delivery pending until its run can match', async () => {
+    // Council-b blocker 1: a bare terminal-state mismatch must NOT consume
+    // the delivery key — the record can reopen and change terminal state,
+    // and cancelled records have no timestamp fallback. The delivery stays
+    // pending and retires the matching run when one arrives.
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'error',
+      resultSummary: 'failed',
+      now: 1000,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      boardInjection: false,
+      hostFlavor: 'v2',
+      idleReconcileDelayMs: 0,
+    });
+    const deliveredRequest = {
+      messages: [
+        createMessages('parent-1', 'first turn').messages[0],
+        {
+          info: { id: 'delivery-1', role: 'user', sessionID: 'parent-1' },
+          parts: [
+            {
+              type: 'text',
+              text: '<subagent sessionID="child-1" state="completed" description="map hooks">\ndone\n</subagent>',
+            },
+          ],
+        },
+      ],
+    };
+    await transformMessages(hook, deliveredRequest as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'error',
+      terminalUnreconciled: true,
+    });
+
+    // The run reopens and completes: the SAME delivery (still pending,
+    // never burned) now matches by state and retires the record.
+    board.markRunningFromLiveSession('child-1', 1500);
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'done',
+      now: 2000,
+    });
+    expect(board.get('child-1')).toMatchObject({ terminalUnreconciled: true });
+    await transformMessages(hook, deliveredRequest as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+    });
+  });
+
+  test('v2 board-off consumes a delivery provably older than the current launch', async () => {
+    // Council-b blocker 2: state equality alone can mis-pair an older
+    // run's delivery with a newer run. A delivery authored BEFORE the
+    // record's last launch predates the current run and every future one
+    // (lastLaunchedAt only advances), so it is consumed without retiring —
+    // and cannot mis-retire a reopened run of the same state.
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map hooks',
+      now: 500,
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'done',
+      now: 1000,
+    });
+    const { hook } = createHook({
+      backgroundJobBoard: board,
+      boardInjection: false,
+      hostFlavor: 'v2',
+      idleReconcileDelayMs: 0,
+    });
+    const staleDelivery = {
+      info: {
+        id: 'delivery-1',
+        role: 'user',
+        sessionID: 'parent-1',
+        time: { created: 400 },
+      },
+      parts: [
+        {
+          type: 'text',
+          text: '<subagent sessionID="child-1" state="completed" description="map hooks">\nold result\n</subagent>',
+        },
+      ],
+    };
+    await transformMessages(hook, {
+      messages: [
+        createMessages('parent-1', 'first turn').messages[0],
+        staleDelivery,
+      ],
+    } as never);
+    // time 400 < lastLaunchedAt 500: consumed as provably stale, no retire.
+    expect(board.get('child-1')).toMatchObject({
+      state: 'completed',
+      terminalUnreconciled: true,
+    });
+
+    // A later relaunch + same-state completion is NOT retired by the stale
+    // delivery: its key is burned and the timestamp check rejects it anyway.
+    board.markRunningFromLiveSession('child-1', 2000);
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'new result',
+      now: 2500,
+    });
+    await transformMessages(hook, {
+      messages: [
+        createMessages('parent-1', 'second turn').messages[0],
+        staleDelivery,
+      ],
+    } as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'completed',
+      terminalUnreconciled: true,
+    });
+
+    // The run's own delivery (newer than the relaunch) retires it.
+    await transformMessages(hook, {
+      messages: [
+        createMessages('parent-1', 'second turn').messages[0],
+        staleDelivery,
+        {
+          info: {
+            id: 'delivery-2',
+            role: 'user',
+            sessionID: 'parent-1',
+            time: { created: 3000 },
+          },
+          parts: [
+            {
+              type: 'text',
+              text: '<subagent sessionID="child-1" state="completed" description="map hooks">\nnew result\n</subagent>',
+            },
+          ],
+        },
+      ],
+    } as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+    });
+  });
+
   test('board-on (v1) leaves an observed-shaped delivery to prompt-shape retirement', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({

@@ -304,10 +304,13 @@ export interface InjectionState {
    * (`reconcileObservedNativeDeliveries`), keyed by parent session, then by
    * the delivery part's own message/part identity (byte-stable, persisted in
    * history) — never by prompt shape. Keys are consumed only once the
-   * delivery can actually act (retire, or is proven never-matchable), so a
-   * delivery observed while its record is still running retries on the next
-   * transform. Cleared per parent on session end; bounded per parent.
-   * Optional for states built before the field existed.
+   * delivery can actually act (retire, or is provably stale vs
+   * lastLaunchedAt, or its record already reconciled), so a delivery
+   * observed while its record is still running retries on the next
+   * transform. No size bound: consumed keys must survive so an evicted key
+   * can never re-pair against a newer run; growth is O(deliveries for the
+   * parent) and the set dies with the parent at session end. Optional for
+   * states built before the field existed.
    */
   observedNativeDeliveries?: Map<string, Set<string>>;
   /** Host flavor marker ('v2' on OpenCode v2 hosts). v2 board-off retires
@@ -1429,36 +1432,45 @@ function reconcileObservedNativeDeliveries(
       if (seen.has(seenKey)) return;
 
       const record = state.backgroundJobBoard.get(delivery.taskID);
-      if (
-        !record ||
-        record.parentSessionID !== parentSessionID ||
-        !record.terminalUnreconciled
-      ) {
-        // Not consumable yet: an unknown child, a parent mismatch, or a
-        // record still running while its gate reconciles asynchronously.
-        // Leave the key unconsumed so a later transform retries once the
-        // board is ready — consuming here would forget the delivery
-        // forever, and cancelled records have no timestamp fallback.
+      if (!record || record.parentSessionID !== parentSessionID) {
+        // Unknown child or parent mismatch: leave the key unconsumed (a
+        // later transform may know the child), bounded by session end.
+        return;
+      }
+      if (!record.terminalUnreconciled) {
+        // Running (its gate reconciles asynchronously — retry later) or
+        // already reconciled (consume the key: re-pairing is idempotent
+        // and this stops the per-transform reparse).
+        if (record.state !== 'running') {
+          consumeDeliveryKey(state, parentSessionID, seenKey);
+        }
+        return;
+      }
+      // Provably stale: authored before the record's last launch, so it
+      // predates the current run and every future one (lastLaunchedAt only
+      // advances). Consumption is safe; state equality alone is NOT proof —
+      // a record can reopen and change terminal state, so a bare mismatch
+      // stays pending (Greptile P1-2 / council-b: never burn a key that a
+      // later run could still match).
+      const deliveryTime = messageCreatedAt(message);
+      if (deliveryTime !== undefined && deliveryTime < record.lastLaunchedAt) {
+        consumeDeliveryKey(state, parentSessionID, seenKey);
         return;
       }
       // A delivery retires only the terminal run it reports: the record's
       // terminal state must equal the delivered state. A stale delivery
-      // (older revision, reopened run, same-ID relaunch now running) never
-      // matches and leaves the record for its own delivery or the fallback.
+      // (older revision, reopened run, same-ID relaunch now running) stays
+      // pending for its own delivery or the stale-terminal fallback.
       const terminalState = record.terminalState ?? record.state;
-      if (terminalState !== delivery.state) {
-        // Terminal but never matchable: consume so the scan stops
-        // reparsing it. The matching delivery carries its own key.
-        consumeDeliveryKey(state, parentSessionID, seenKey);
-        return;
-      }
+      if (terminalState !== delivery.state) return;
       if (
         !NATIVE_DELIVERY_STATES.has(
           record.state as ObservedNativeDelivery['state'],
         )
       ) {
-        // stopped: can never retire through this channel; consume.
-        consumeDeliveryKey(state, parentSessionID, seenKey);
+        // stopped: retires only through the recovery-wake + task_revive
+        // ack flow; keep pending (a relaunch moves lastLaunchedAt, letting
+        // the staleness check consume it later).
         return;
       }
       consumeDeliveryKey(state, parentSessionID, seenKey);
@@ -1473,21 +1485,16 @@ function reconcileObservedNativeDeliveries(
   }
 }
 
-/** Per-parent consumption-set bound; insertion-ordered, oldest evicted. */
-const OBSERVED_DELIVERY_KEYS_PER_PARENT = 128;
-
 function consumeDeliveryKey(
   state: InjectionState,
   parentSessionID: string,
   seenKey: string,
 ): void {
-  const seen = state.observedNativeDeliveries?.get(parentSessionID);
-  if (!seen) return;
-  seen.add(seenKey);
-  if (seen.size > OBSERVED_DELIVERY_KEYS_PER_PARENT) {
-    const oldest = seen.values().next().value;
-    if (oldest !== undefined) seen.delete(oldest);
-  }
+  // No size bound by design: consumed keys must survive so an evicted key
+  // can never re-pair against a newer run (council-b blocker). Growth is
+  // O(deliveries for this parent) and the set dies with the parent at
+  // session end (pruneReopenCorrectionState).
+  state.observedNativeDeliveries?.get(parentSessionID)?.add(seenKey);
 }
 
 /**
@@ -1565,10 +1572,13 @@ export async function injectBackgroundJobBoard(
 ): Promise<void> {
   const messages = Array.isArray(output.messages) ? output.messages : [];
 
-  // Native v2 observation runs first, before either strategy: deliveries
-  // already in history retire their records, and the stale-terminal
-  // fallback bounds a missed observation. Both passes are v2-only
-  // (boardInjection === false); the v1 path below is untouched.
+  // Native-delivery observation runs first, before either strategy:
+  // deliveries already in history retire their records, and the stale-
+  // terminal fallback bounds a missed observation. Both passes act on
+  // board-off only; on v1 board-off the observer is a near-no-op (v1
+  // completions are untagged) and the restored prompt-shape path below
+  // covers what the fallback cannot (cancelled), so running them here is
+  // harmless on both flavors.
   reconcileObservedNativeDeliveries(state, messages);
   retireStaleTerminalRecords(state, messages);
 
@@ -2100,9 +2110,12 @@ function injectCheckpointBoard(
     if (state.hostFlavor === 'v2') {
       // v2 board-off (see injectLatestBoard): observation-based retirement
       // only; no prompt-shape registration.
-    } else {
+    } else if (canSurface) {
       // v1 board-off: keep the prompt-shape consumption path (see
-      // injectLatestBoard for the cancelled-record rationale).
+      // injectLatestBoard for the cancelled-record rationale), gated on
+      // canSurface exactly as the pre-observer path was — an internal-
+      // initiator turn surfaces nothing and must not register a shape the
+      // parent never saw.
       const nativeExecutions = (
         state.backgroundJobBoard.formatForPromptWithMetadata(sessionID)
           ?.terminalUnreconciledTaskIDs ?? []
