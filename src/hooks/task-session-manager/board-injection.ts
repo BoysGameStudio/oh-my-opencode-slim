@@ -1320,7 +1320,7 @@ export function reconcileInjectedTerminalJobs(
   state.pendingInjectedTerminalJobsByParent.delete(parentSessionID);
 }
 
-// ── Native delivery observer (v2 boardInjection===false only) ──────────
+// ── Native delivery observer (board-off; v2 primary, v1 harmless) ──────
 //
 // On OpenCode v2 hosts the host itself delivers each background completion
 // exactly once as a synthetic session message in the parent's history:
@@ -1395,15 +1395,15 @@ function messageCreatedAt(message: MessageWithParts): number | undefined {
 
 /**
  * Reconcile tracked records against the native v2 deliveries already
- * present in the parent's message history. Deliveries are consumed in
- * history order (FIFO per sessionID): each delivery pairs with the
- * record's CURRENT terminal revision at observation time, requiring state
- * equality — the tag carries no generation/revision, so a delivery for a
- * stale revision can only retire the latest unreconciled run when its
- * state still matches. Already-reconciled records make later same-state
- * deliveries no-ops. Untracked sessionIDs are idempotent no-ops.
- * `stopped` records are ignored entirely (native never delivers stops;
- * they retire through the recovery-wake + task_revive ack flow).
+ * present in the parent's message history. Only ACTIONABLE deliveries are
+ * consumed (retire, provably stale, already reconciled); a bare state
+ * mismatch stays pending because the record can reopen and change terminal
+ * state. The tag carries no generation/revision, so pairing requires state
+ * equality against the record's CURRENT terminal run at observation time;
+ * already-reconciled records make later same-state deliveries no-ops.
+ * Untracked sessionIDs are idempotent no-ops. `stopped` records are never
+ * retired here (native never delivers stops; they retire through the
+ * recovery-wake + task_revive ack flow).
  */
 function reconcileObservedNativeDeliveries(
   state: InjectionState,
@@ -1469,8 +1469,10 @@ function reconcileObservedNativeDeliveries(
         )
       ) {
         // stopped: retires only through the recovery-wake + task_revive
-        // ack flow; keep pending (a relaunch moves lastLaunchedAt, letting
-        // the staleness check consume it later).
+        // ack flow; keep pending (a registerLaunch relaunch moves
+        // lastLaunchedAt, letting the staleness check consume it later;
+        // markRunningFromLiveSession reopens leave it unchanged, so the
+        // delivery drains via the run's own terminal flow instead).
         return;
       }
       consumeDeliveryKey(state, parentSessionID, seenKey);
