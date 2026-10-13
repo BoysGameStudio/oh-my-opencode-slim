@@ -1,8 +1,6 @@
 import {
-  DEFAULT_MAX_CONTEXT_LINES,
+  DEFAULT_CONTEXT_FILE_CAP,
   DEFAULT_MAX_SESSIONS_PER_AGENT,
-  DEFAULT_READ_CONTEXT_MAX_FILES,
-  DEFAULT_READ_CONTEXT_MIN_LINES,
   formatSystemReminder,
 } from '../config/constants';
 import { escapeRegExp } from './agent-variant';
@@ -21,8 +19,6 @@ import type { TaskOutputState } from './task';
 
 export interface ContextFile {
   path: string;
-  lineCount: number;
-  lineNumbers?: number[];
   lastReadAt: number;
 }
 
@@ -128,9 +124,6 @@ export interface BackgroundJobRecord {
 
 export interface BackgroundJobBoardOptions {
   maxReusablePerAgent?: number;
-  maxContextLines?: number;
-  readContextMinLines?: number;
-  readContextMaxFiles?: number;
   /** Delegation tool name for model-visible recovery guidance: `subagent` on
    * v2 hosts, `task` on v1/default. Only the two retained/recovery wording
    * lines vary; the board stays v1 by default. */
@@ -336,9 +329,6 @@ export class BackgroundJobBoard implements BackgroundJobStore {
   private mutationListeners: MutationListener[] = [];
 
   private readonly maxReusablePerAgent: number;
-  private readonly maxContextLines: number;
-  private readonly readContextMinLines: number;
-  private readonly readContextMaxFiles: number;
   private readonly delegationTool: string;
   private readonly deferNumberedAliases: boolean;
   private readonly onEvictedSession?:
@@ -351,11 +341,6 @@ export class BackgroundJobBoard implements BackgroundJobStore {
   constructor(options: BackgroundJobBoardOptions = {}) {
     this.maxReusablePerAgent =
       options.maxReusablePerAgent ?? DEFAULT_MAX_SESSIONS_PER_AGENT;
-    this.maxContextLines = options.maxContextLines ?? DEFAULT_MAX_CONTEXT_LINES;
-    this.readContextMinLines =
-      options.readContextMinLines ?? DEFAULT_READ_CONTEXT_MIN_LINES;
-    this.readContextMaxFiles =
-      options.readContextMaxFiles ?? DEFAULT_READ_CONTEXT_MAX_FILES;
     this.delegationTool = options.delegationTool ?? 'task';
     this.deferNumberedAliases = options.deferNumberedAliases === true;
     this.onEvictedSession = options.onEvictedSession;
@@ -1305,7 +1290,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     agent?: string,
   ): BackgroundJobRecord | undefined {
     const job = this.resolve(parentSessionID, taskIDOrAlias);
-    if (!job || !isReusable(job, this.maxContextLines)) return undefined;
+    if (!job || !isReusable(job)) return undefined;
     if (agent && job.agent !== agent) return undefined;
     return job;
   }
@@ -1371,7 +1356,6 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       if (previous) {
         existing.set(file.path, {
           ...previous,
-          lineCount: Math.max(previous.lineCount, file.lineCount),
           lastReadAt: Math.max(previous.lastReadAt, file.lastReadAt),
         });
       } else {
@@ -1379,14 +1363,8 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       }
     }
     const contextFiles = [...existing.values()]
-      .filter((file) => file.lineCount >= this.readContextMinLines)
-      .sort(
-        (a, b) =>
-          b.lineCount - a.lineCount ||
-          b.lastReadAt - a.lastReadAt ||
-          a.path.localeCompare(b.path),
-      )
-      .slice(0, this.readContextMaxFiles + 1);
+      .sort((a, b) => b.lastReadAt - a.lastReadAt || a.path.localeCompare(b.path))
+      .slice(0, DEFAULT_CONTEXT_FILE_CAP + 1);
     this.setJob({ ...job, contextFiles });
   }
 
@@ -1470,7 +1448,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
   }
 
   private listReusable(parent?: string): BackgroundJobRecord[] {
-    return this.list(parent).filter((j) => isReusable(j, this.maxContextLines));
+    return this.list(parent).filter((j) => isReusable(j));
   }
 
   /** Sessions the sidebar may surface as navigation destinations: canonical
@@ -1704,31 +1682,15 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     const job = this.jobs.get(taskID);
     if (!job) return;
 
-    // Evict sessions exceeding context budget before count cap.
-    // Runs regardless of the triggering job's reusability so that a
-    // bloated session cleans up after itself (and its peers) on
-    // completion. A leased record (a revive in flight) is never evicted.
-    for (const entry of this.list(job.parentSessionID)) {
-      if (
-        entry.agent === job.agent &&
-        !this.liveLeases.has(entry.taskID) &&
-        !entry.terminalUnreconciled &&
-        (entry.terminalState ?? terminalStateOf(entry.state)) !== undefined &&
-        sumContextLines(entry) > this.maxContextLines
-      ) {
-        this.evictRecord(entry);
-      }
-    }
-
     // Only apply the count cap when the triggering job is reusable
-    if (!isReusable(job, this.maxContextLines)) return;
+    if (!isReusable(job)) return;
 
     const reusable = this.list(job.parentSessionID)
       .filter(
         (candidate) =>
           candidate.agent === job.agent &&
           !this.liveLeases.has(candidate.taskID) &&
-          isReusable(candidate, this.maxContextLines),
+          isReusable(candidate),
       )
       .sort((a, b) => b.lastUsedAt - a.lastUsedAt);
     for (const stale of reusable.slice(this.maxReusablePerAgent)) {
@@ -1739,17 +1701,6 @@ export class BackgroundJobBoard implements BackgroundJobStore {
   private trimRetained(taskID: string): void {
     const job = this.jobs.get(taskID);
     if (!job || !isRetainedStopped(job)) return;
-
-    for (const entry of this.list(job.parentSessionID)) {
-      if (
-        entry.agent === job.agent &&
-        isRetainedStopped(entry) &&
-        !this.liveLeases.has(entry.taskID) &&
-        sumContextLines(entry) > this.maxContextLines
-      ) {
-        this.evictRecord(entry);
-      }
-    }
 
     const retained = this.list(job.parentSessionID)
       .filter(
@@ -1773,10 +1724,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       `- ${promptSafe(job.alias)} / ${promptSafe(job.taskID)} / ${promptSafe(job.agent)} / ${promptSafe(terminal ?? job.state)}, ${reconciliation}`,
       `  Objective: ${promptSafe(job.description || job.objective || '')}`,
     ];
-    const context = formatContextFiles(
-      job.contextFiles,
-      this.readContextMaxFiles,
-    );
+    const context = formatContextFiles(job.contextFiles);
     if (context) lines.push(`  Context read by ${job.alias}: ${context}`);
     return lines.join('\n');
   }
@@ -1791,10 +1739,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
             `  Recovery: no terminal result; recoverable with task_revive, not ${this.delegationTool}()`,
           ]),
     ];
-    const context = formatContextFiles(
-      job.contextFiles,
-      this.readContextMaxFiles,
-    );
+    const context = formatContextFiles(job.contextFiles);
     if (context) lines.push(`  Context read by ${job.alias}: ${context}`);
     return lines.join('\n');
   }
@@ -1941,24 +1886,11 @@ export function deriveFullObjective(input: {
   return firstPromptLine ?? undefined;
 }
 
-function sumContextLines(record: BackgroundJobRecord): number {
-  return record.contextFiles.reduce((sum, f) => sum + (f.lineCount ?? 0), 0);
-}
-
-function isReusable(
-  job: BackgroundJobRecord,
-  maxContextLines: number,
-): boolean {
+function isReusable(job: BackgroundJobRecord): boolean {
   const terminal = job.terminalState ?? terminalStateOf(job.state);
-  if (
-    terminal === undefined ||
-    job.terminalUnreconciled ||
-    job.statusUncertain
-  ) {
-    return false;
-  }
-
-  return sumContextLines(job) <= maxContextLines;
+  return (
+    terminal !== undefined && !job.terminalUnreconciled && !job.statusUncertain
+  );
 }
 
 /** Sidebar history: canonical terminal or stopped, not running or
@@ -2021,13 +1953,10 @@ function isCanonicalTerminalState(
   return CANONICAL_TERMINAL_STATES.has(state as TaskOutputState);
 }
 
-function formatContextFiles(files: ContextFile[], maxFiles: number): string {
-  if (maxFiles === 0) return '';
-  const shown = files.slice(0, maxFiles);
+function formatContextFiles(files: ContextFile[]): string {
+  const shown = files.slice(0, DEFAULT_CONTEXT_FILE_CAP);
   const rest = files.length - shown.length;
-  const rendered = shown.map(
-    (file) => `${promptSafe(file.path)} (${file.lineCount} lines)`,
-  );
+  const rendered = shown.map((file) => promptSafe(file.path));
   return `${rendered.join(', ')}${rest > 0 ? ` (+${rest} more)` : ''}`;
 }
 

@@ -1004,14 +1004,16 @@ describe('onWarning callback', () => {
     expect(config.backgroundJobs?.stopConfirmationMs).toBe(15_000);
   });
 
-  test('v2 host flavor derives lean board/wake defaults when no layer configures them', () => {
+  test('v2 host flavor derives lean wake defaults; boardInjection is handled at runtime', () => {
     const projectDir = path.join(tempDir, 'project');
     const config = loadPluginConfig(projectDir, {
       silent: true,
       hostFlavor: 'v2',
     });
 
-    expect(config.backgroundJobs?.boardInjection).toBe(false);
+    // boardInjection is no longer derived here: the v2 force-off (with a
+    // warning for explicit true) lives in RuntimeConfig.backgroundJobs.
+    expect(config.backgroundJobs?.boardInjection).toBe(true);
     expect(config.backgroundJobs?.orchestratorWake.periodicWakeEnabled).toBe(
       false,
     );
@@ -1063,7 +1065,6 @@ describe('onWarning callback', () => {
     );
 
     const config = loadPluginConfig(projectDir, {
-      silent: true,
       hostFlavor: 'v2',
     });
 
@@ -1071,6 +1072,33 @@ describe('onWarning callback', () => {
     expect(config.backgroundJobs?.orchestratorWake.periodicWakeEnabled).toBe(
       true,
     );
+  });
+
+  test('v2 host flavor warns when boardInjection is explicitly true', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({ backgroundJobs: { boardInjection: true } }),
+    );
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message: string) => warnings.push(message);
+    try {
+      loadPluginConfig(projectDir, { hostFlavor: 'v2' });
+      expect(
+        warnings.some((message) => message.includes('boardInjection')),
+      ).toBe(true);
+
+      // Non-v2 loads stay silent.
+      warnings.length = 0;
+      loadPluginConfig(projectDir);
+      expect(warnings).toHaveLength(0);
+    } finally {
+      console.warn = originalWarn;
+    }
   });
 
   test('explicit v2 opt-out still holds and v1 hosts keep board/wake defaults', () => {

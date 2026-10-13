@@ -557,24 +557,21 @@ watchdog covers stuck children and unreconciled jobs.
 On OpenCode v2 hosts the host's native background notifier already delivers
 each run's first terminal result (completed, error, or cancelled) to the
 parent: an idle parent gets a new turn, a busy parent gets a steer. Two plugin
-channels would duplicate that delivery, so on v2 they default **off** unless a
-config layer sets them explicitly:
-
-- `backgroundJobs.boardInjection` — the passive Background Job Board is not
-  injected into orchestrator prompts.
-- `backgroundJobs.orchestratorWake.periodicWakeEnabled` — the periodic idle
-  evaluation described above never runs.
+channels would duplicate that delivery, so on v2 the passive Background Job
+Board is never injected (`backgroundJobs.boardInjection` is v1-only; an
+explicit `true` is ignored with a warning), and
+`backgroundJobs.orchestratorWake.periodicWakeEnabled` defaults **off** unless
+a config layer sets it explicitly.
 
 Event-driven wakes keep working: stopped-job recovery, later terminal
 publications of the same run (for example a child that self-continued), and
 child-input asks still wake an idle parent, and their SDK-error retries still
-use the idle timer. v1 hosts are unchanged. To restore the previous behavior
-on v2, set the keys explicitly:
+use the idle timer. v1 hosts are unchanged. To restore the previous wake
+behavior on v2, set the key explicitly:
 
 ```jsonc
 {
   "backgroundJobs": {
-    "boardInjection": true,
     "orchestratorWake": { "periodicWakeEnabled": true }
   }
 }

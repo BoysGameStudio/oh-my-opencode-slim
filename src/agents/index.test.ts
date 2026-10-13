@@ -2040,12 +2040,22 @@ describe('PluginConfigSchema custom-agent-only prompt fields', () => {
     const result = PluginConfigSchema.safeParse({
       backgroundJobs: {
         maxSessionsPerAgent: 2,
-        readContextMinLines: 10,
-        readContextMaxFiles: 8,
       },
     });
 
     expect(result.success).toBe(true);
+  });
+
+  test('rejects removed backgroundJobs context keys', () => {
+    const result = PluginConfigSchema.safeParse({
+      backgroundJobs: {
+        readContextMinLines: 10,
+        readContextMaxFiles: 8,
+        maxContextLines: 50_000,
+      },
+    });
+
+    expect(result.success).toBe(false);
   });
 
   test('defaults ACP agent timeout to disabled', () => {

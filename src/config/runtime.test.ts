@@ -154,8 +154,10 @@ describe('RuntimeConfig', () => {
     expect(runtime.backgroundJobs.maxSessionsPerAgent).toBe(2);
     expect(runtime.backgroundJobs.strategy).toBe('latest');
     // v1-parity defaults: board injection and periodic wake evaluation stay
-    // enabled when no config layer sets them (v2 hosts derive otherwise at
-    // load time; RuntimeConfig itself is flavor-agnostic).
+    // enabled when no config layer sets them. This instance was constructed
+    // without a host flavor, so the v2 force-off in the getter does not
+    // apply; an explicitly configured true on a v2 flavor flips to false
+    // with a one-time warning (see the v2 force-off test below).
     expect(runtime.backgroundJobs.boardInjection).toBe(true);
     // Terminal-session GC is opt-in everywhere (no v2 default derivation).
     expect(runtime.backgroundJobs.pruneEvictedSessions).toBe(false);
@@ -537,5 +539,40 @@ describe('RuntimeConfig combinedModelInheritanceSource', () => {
     expect(
       runtime.combinedModelInheritanceSource('unconfigured-agent'),
     ).toBeUndefined();
+  });
+
+  test('v2 force-off: boardInjection flips to false for every v2 flavor, silently', () => {
+    resetRegistry();
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message: string) => warnings.push(message);
+    try {
+      // Explicit true: force-off happens here silently — the load-time
+      // warning lives in the loader (see loader.test.ts).
+      const explicit = RuntimeConfig.init(
+        DIRECTORY,
+        {
+          backgroundJobs: { boardInjection: true },
+        } as PluginConfig,
+        'v2',
+      );
+      expect(explicit.backgroundJobs.boardInjection).toBe(false);
+      expect(warnings).toHaveLength(0);
+
+      resetRegistry();
+      const silent = RuntimeConfig.init(DIRECTORY, {} as PluginConfig, 'v2');
+      expect(silent.backgroundJobs.boardInjection).toBe(false);
+      expect(warnings).toHaveLength(0);
+
+      resetRegistry();
+      const v1 = RuntimeConfig.init(DIRECTORY, {
+        backgroundJobs: { boardInjection: true },
+      } as PluginConfig);
+      expect(v1.backgroundJobs.boardInjection).toBe(true);
+      expect(warnings).toHaveLength(0); // v1 untouched
+    } finally {
+      console.warn = originalWarn;
+      resetRegistry();
+    }
   });
 });

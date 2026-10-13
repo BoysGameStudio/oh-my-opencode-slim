@@ -86,10 +86,9 @@ export const DEFAULT_DISABLED_AGENTS: string[] = ['observer'];
 
 // Background job defaults
 export const DEFAULT_MAX_SESSIONS_PER_AGENT = 2;
-export const DEFAULT_MAX_CONTEXT_LINES = 50_000;
-export const DEFAULT_READ_CONTEXT_MIN_LINES = 10;
-export const DEFAULT_READ_CONTEXT_MAX_FILES = 8;
 export const DEFAULT_MAX_RETAINED_SNAPSHOTS = 20;
+/** Internal display cap for the per-session read-context path list. */
+export const DEFAULT_CONTEXT_FILE_CAP = 8;
 
 /**
  * Maximum session metadata entries retained per plugin instance.

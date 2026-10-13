@@ -3,7 +3,6 @@ import type { ContextFile } from '../../utils';
 
 interface PendingContextFile {
   path: string;
-  lines: Set<number>;
   lastReadAt: number;
 }
 
@@ -22,16 +21,15 @@ export function createTaskContextTracker() {
         contextByTask.set(taskId, context);
       }
       for (const file of files) {
-        const pending = context.get(file.path) ?? {
-          path: file.path,
-          lines: new Set<number>(),
-          lastReadAt: file.lastReadAt,
-        };
-        for (const line of file.lineNumbers ?? []) {
-          pending.lines.add(line);
+        const pending = context.get(file.path);
+        if (pending) {
+          pending.lastReadAt = Math.max(pending.lastReadAt, file.lastReadAt);
+        } else {
+          context.set(file.path, {
+            path: file.path,
+            lastReadAt: file.lastReadAt,
+          });
         }
-        pending.lastReadAt = Math.max(pending.lastReadAt, file.lastReadAt);
-        context.set(file.path, pending);
       }
     },
 
@@ -54,7 +52,6 @@ export function createTaskContextTracker() {
       if (!context) return [];
       return [...context.values()].map((file) => ({
         path: file.path,
-        lineCount: file.lines.size,
         lastReadAt: file.lastReadAt,
       }));
     },
@@ -76,17 +73,9 @@ export function extractReadFiles(
       ? extractPath
       : relative;
 
-  const matchedLines = new Set<number>();
-  for (const match of output.output.matchAll(/^([0-9]+):/gm)) {
-    matchedLines.add(Number(match[1]));
-  }
-  const lineNumbers = [...matchedLines];
-
   return [
     {
       path: normalized,
-      lineCount: lineNumbers.length,
-      lineNumbers,
       lastReadAt: Date.now(),
     },
   ];

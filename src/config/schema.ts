@@ -502,9 +502,24 @@ export const BackgroundJobsConfigStrictSchema = z.object({
       'Board injection strategy. "latest" retains and replays one frozen board part per eligible turn without a cap; unchanged boards use a short marker for up to nine turns, then a full board. "checkpoint-compatible" appends only changed snapshots with a bounded cache epoch.',
     ),
   maxSessionsPerAgent: z.number().int().min(1).max(10).default(2),
-  maxContextLines: z.number().int().min(0).max(500_000).default(50_000),
-  readContextMinLines: z.number().int().min(0).max(1000).default(10),
-  readContextMaxFiles: z.number().int().min(0).max(50).default(8),
+  maxContextLines: z
+    .never({
+      error:
+        'backgroundJobs.maxContextLines was removed; reusability is state-based',
+    })
+    .optional(),
+  readContextMinLines: z
+    .never({
+      error:
+        'backgroundJobs.readContextMinLines was removed; the read-context list is path-only',
+    })
+    .optional(),
+  readContextMaxFiles: z
+    .never({
+      error:
+        'backgroundJobs.readContextMaxFiles was removed; the display cap is internal',
+    })
+    .optional(),
   maxRetainedSnapshots: z
     .number()
     .int()
@@ -611,7 +626,7 @@ export const BackgroundJobsConfigStrictSchema = z.object({
     .boolean()
     .default(true)
     .describe(
-      'When false, the Background Job Board reminder is never injected into prompts. Background task tracking, wake, and task_status all keep working; the orchestrator simply no longer passively sees the board. Default enabled; v2 hosts derive a disabled default when the key is not explicitly configured.',
+      'When false, the Background Job Board reminder is never injected into prompts. Background task tracking, wake, and task_status all keep working; the orchestrator simply no longer passively sees the board. Default enabled on v1 hosts; on v2 hosts the key is ignored with a warning because the native background notifier and inbox delivery replace it.',
     ),
   childInputWake: z
     .boolean()

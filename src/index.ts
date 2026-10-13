@@ -800,9 +800,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     });
     backgroundJobBoard = new BackgroundJobBoard({
       maxReusablePerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
-      maxContextLines: runtime.backgroundJobs.maxContextLines,
-      readContextMinLines: runtime.backgroundJobs.readContextMinLines,
-      readContextMaxFiles: runtime.backgroundJobs.readContextMaxFiles,
       delegationTool: delegation.tool,
       deferNumberedAliases: true,
       // Terminal-session GC (#1387 P2): when a retention trim evicts a
@@ -1079,8 +1076,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       strategy: runtime.backgroundJobs.strategy,
       maxSessionsPerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
       maxRetainedSnapshots: runtime.backgroundJobs.maxRetainedSnapshots,
-      readContextMinLines: runtime.backgroundJobs.readContextMinLines,
-      readContextMaxFiles: runtime.backgroundJobs.readContextMaxFiles,
       boardInjection: runtime.backgroundJobs.boardInjection,
       disabledHooks: [...runtime.disabledHooks],
       backgroundJobBoard: backgroundJobCoordinator,

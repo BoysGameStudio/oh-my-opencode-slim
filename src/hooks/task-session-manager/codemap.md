@@ -123,9 +123,8 @@ User task call → tool.execute.before → PendingTaskCall created → task ID r
 
 ### Configuration & Caps
 
-- `maxSessionsPerAgent`: Limits reusable sessions per agent type
-- `readContextMinLines`: Minimum lines to include in read context
-- `readContextMaxFiles`: Maximum files to include in read context
+- `maxSessionsPerAgent`: Limits reusable sessions per agent type (LRU eviction)
+- Read-context list: path-only, deduped per path, internal display cap (8) with a `(+N more)` tail; informational only
 - `shouldManageSession`: Predicate to determine which sessions are managed by this hook
 
 ### Events & Hooks

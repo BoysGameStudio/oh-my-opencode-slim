@@ -183,8 +183,6 @@ export function createTaskSessionManagerHook(
     strategy?: 'latest' | 'checkpoint-compatible';
     maxSessionsPerAgent: number;
     maxRetainedSnapshots: number;
-    readContextMinLines?: number;
-    readContextMaxFiles?: number;
     backgroundJobBoard?: BackgroundJobStore;
     terminalGate?: BackgroundJobTerminalGate;
     hostOutcomeClock?: 'shared-unix-ms';
@@ -255,8 +253,6 @@ export function createTaskSessionManagerHook(
     options.backgroundJobBoard ??
     new BackgroundJobBoard({
       maxReusablePerAgent: options.maxSessionsPerAgent,
-      readContextMinLines: options.readContextMinLines,
-      readContextMaxFiles: options.readContextMaxFiles,
     });
   const rehydrateState = getBackgroundJobLifecycleLedger(backgroundJobBoard);
   const rehydrateTombstones = rehydrateState.tombstones;

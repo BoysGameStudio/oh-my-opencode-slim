@@ -7346,11 +7346,8 @@ describe('task-session-manager hook', () => {
     expect(spawn.args.task_id).toBe('474bd269-eac6-40a9-9408-9fe430e8cd19');
   });
 
-  test('reads before and after launch attach with unique-line counts and caps', async () => {
-    const { hook } = createHook({
-      readContextMinLines: 5,
-      readContextMaxFiles: 1,
-    });
+  test('reads before and after launch attach a deduped path-only context list', async () => {
+    const { hook } = createHook();
     await hook.event({
       event: {
         type: 'session.created',
@@ -7415,10 +7412,12 @@ describe('task-session-manager hook', () => {
     const next = createMessages('parent-1', 'reuse');
     await transformMessages(hook, next);
     const prompt = boardText(next);
-    expect(prompt).not.toContain('small.ts');
-    expect(prompt).toContain('src/large.ts (12 lines)');
-    expect(prompt).not.toContain('src/large.ts (18 lines)');
-    expect(prompt).toContain('(+1 more)');
+    // Path-only list: every read file appears exactly once, no line counts.
+    expect(prompt).toContain('src/large.ts');
+    expect(prompt).toContain('src/medium.ts');
+    expect(prompt).toContain('src/small.ts');
+    expect(prompt.match(/src\/large\.ts/g)).toHaveLength(1);
+    expect(prompt).not.toContain('lines)');
   });
 
   test('reusable cap evicts only old reusable jobs, not active jobs', async () => {

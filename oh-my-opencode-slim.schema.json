@@ -1385,22 +1385,13 @@
           "maximum": 10
         },
         "maxContextLines": {
-          "default": 50000,
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 500000
+          "not": {}
         },
         "readContextMinLines": {
-          "default": 10,
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 1000
+          "not": {}
         },
         "readContextMaxFiles": {
-          "default": 8,
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 50
+          "not": {}
         },
         "maxRetainedSnapshots": {
           "default": 20,
@@ -1557,7 +1548,7 @@
         },
         "boardInjection": {
           "default": true,
-          "description": "When false, the Background Job Board reminder is never injected into prompts. Background task tracking, wake, and task_status all keep working; the orchestrator simply no longer passively sees the board. Default enabled; v2 hosts derive a disabled default when the key is not explicitly configured.",
+          "description": "When false, the Background Job Board reminder is never injected into prompts. Background task tracking, wake, and task_status all keep working; the orchestrator simply no longer passively sees the board. Default enabled on v1 hosts; on v2 hosts the key is ignored with a warning because the native background notifier and inbox delivery replace it.",
           "type": "boolean"
         },
         "childInputWake": {
