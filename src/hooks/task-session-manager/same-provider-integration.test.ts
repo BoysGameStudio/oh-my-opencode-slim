@@ -170,8 +170,6 @@ describe('same-provider background-to-foreground conversion (hook level)', () =>
   test('converted task follows the existing foreground bookkeeping path to a terminal board record', async () => {
     const board = new BackgroundJobBoard({
       maxReusablePerAgent: 2,
-      readContextMinLines: 10,
-      readContextMaxFiles: 8,
     });
     const hook = createHook({
       sameProviderPolicy: POLICY,

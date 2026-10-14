@@ -75,11 +75,12 @@ export interface LoadPluginConfigOptions {
   silent?: boolean;
 
   /**
-   * Host flavor marker ('v2' on OpenCode v2 hosts; absent on v1). Selects
-   * flavor-derived defaults for background-job keys that no config layer
-   * set explicitly: on v2 the native background notifier already delivers
-   * a run's first terminal publication, so board injection and periodic
-   * wake evaluation default off there. Explicit config always wins.
+   * Host flavor marker ('v2' on OpenCode v2 hosts; absent on v1). Drives one
+   * flavor-derived default: on v2 the native background notifier already
+   * delivers a run's first terminal publication, so the periodic wake
+   * evaluation defaults off there. The board needs no derivation — it is
+   * structural (v1 always renders it, v2 never does; an explicit
+   * boardInjection on v2 warns and is ignored). Explicit config always wins.
    * Unmarked hosts also use v1's worktree-bounded discovery.
    */
   hostFlavor?: string;

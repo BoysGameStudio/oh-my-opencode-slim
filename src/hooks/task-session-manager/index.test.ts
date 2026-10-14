@@ -141,10 +141,6 @@ function historicalRunningTaskPart(
 type HookOptions = {
   shouldManageSession?: (sessionID: string) => boolean;
   registerSessionAsOrchestrator?: (sessionID: string) => void;
-  readContextMinLines?: number;
-  readContextMaxFiles?: number;
-  strategy?: 'latest' | 'checkpoint-compatible';
-  maxRetainedSnapshots?: number;
   backgroundJobBoard?: BackgroundJobBoard;
   terminalGate?: BackgroundJobTerminalGate;
   hostOutcomeClock?: 'shared-unix-ms';
@@ -1605,7 +1601,7 @@ describe('task-session-manager hook', () => {
     expect(messages.messages.at(-1)?.parts[0].text).toBe('second turn');
   });
 
-  test('latest mode ignores maxRetainedSnapshots and replaces the board', async () => {
+  test('replaces the board on the same tail when the digest changes', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({
       taskID: 'child-1',
@@ -1615,7 +1611,6 @@ describe('task-session-manager hook', () => {
     });
     const { hook } = createHook({
       backgroundJobBoard: board,
-      maxRetainedSnapshots: 1,
     });
     const messages = createMessages('parent-1', 'first turn');
 
@@ -1691,7 +1686,7 @@ describe('task-session-manager hook', () => {
     ).toBe(false);
   });
 
-  test('clears checkpoint snapshots when a session is recreated', async () => {
+  test('clears retained board state when a session is recreated', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({
       taskID: 'child-1',
@@ -1701,7 +1696,6 @@ describe('task-session-manager hook', () => {
     });
     const { hook } = createHook({
       backgroundJobBoard: board,
-      strategy: 'checkpoint-compatible',
     });
 
     await hook.injectBackgroundJobBoard(
@@ -1731,7 +1725,7 @@ describe('task-session-manager hook', () => {
     expect(boardText(resetRequest)).toContain('completed, unreconciled');
   });
 
-  test('clears checkpoint snapshots when a session is deleted', async () => {
+  test('clears retained board state when a session is deleted', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({
       taskID: 'child-1',
@@ -1741,7 +1735,6 @@ describe('task-session-manager hook', () => {
     });
     const { hook } = createHook({
       backgroundJobBoard: board,
-      strategy: 'checkpoint-compatible',
     });
 
     await hook.injectBackgroundJobBoard(
@@ -2791,7 +2784,7 @@ describe('task-session-manager hook', () => {
     });
   });
 
-  test('reconciles terminal jobs after the first changed checkpoint snapshot', async () => {
+  test('reconciles terminal jobs after the first changed board digest', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({
       taskID: 'child-1',
@@ -2806,7 +2799,6 @@ describe('task-session-manager hook', () => {
     });
     const { hook } = createHook({
       backgroundJobBoard: board,
-      strategy: 'checkpoint-compatible',
       idleReconcileDelayMs: 0,
     });
 
@@ -4192,11 +4184,10 @@ describe('task-session-manager hook', () => {
     });
   });
 
-  test('checkpoint-compatible no-starvation via snapshot replay: child-1 synthetic; child-2 terminal no synthetic; second transform replays snapshot with child-2; board text has it; idle reconciles both', async () => {
+  test('frozen replay prevents starvation: child-1 synthetic; child-2 terminal no synthetic; second transform replays the frozen board with child-2; idle reconciles both', async () => {
     const board = new BackgroundJobBoard();
     const { hook, complete } = createHook({
       backgroundJobBoard: board,
-      strategy: 'checkpoint-compatible',
       idleReconcileDelayMs: 0,
     });
 

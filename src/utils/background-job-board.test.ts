@@ -775,47 +775,40 @@ describe('BackgroundJobBoard', () => {
     expect(board.get('ses_b')).toMatchObject({ state: 'stopped' });
   });
 
-  test.each([
-    ['reusable count', 0],
-    ['context', 20],
-  ])(
-    'a relaunch-leased record survives the %s cap through its ack and relaunch',
-    (_, lineCount) => {
-      const board = new BackgroundJobBoard({
-        maxReusablePerAgent: 1,
-        maxContextLines: 10,
+  test('a relaunch-leased record survives the reusable count cap through its ack and relaunch', () => {
+    const board = new BackgroundJobBoard({
+      maxReusablePerAgent: 1,
+    });
+    const completed = (taskID: string, completedAt: number) =>
+      board.restoreRetainedSession({
+        taskID,
+        parentSessionID: 'parent-1',
+        agent: 'oracle',
+        description: taskID,
+        state: 'completed',
+        background: true,
+        resultSummary: 'done',
+        launchedAt: completedAt - 10,
+        completedAt,
       });
-      const completed = (taskID: string, completedAt: number) =>
-        board.restoreRetainedSession({
-          taskID,
-          parentSessionID: 'parent-1',
-          agent: 'oracle',
-          description: taskID,
-          state: 'completed',
-          background: true,
-          resultSummary: 'done',
-          launchedAt: completedAt - 10,
-          completedAt,
-        });
-      const a = completed('ses_a', 100);
-      board.addContext('ses_a', [{ path: 'a.ts', lineCount, lastReadAt: 1 }]);
-      const lease = a && board.acquireRelaunchLease('ses_a', a.generation);
-      // While A's revive is admitted, B completes and is acknowledged later.
-      completed('ses_b', 200);
-      board.markReconciled('ses_b', 220);
-      // The host accepted A: acknowledge its old round, then relaunch it.
-      board.markReconciled('ses_a', 150, a?.generation);
-      expect(
-        board.registerLaunch({
-          taskID: 'ses_a',
-          parentSessionID: 'parent-1',
-          agent: 'oracle',
-          relaunchLease: lease,
-          now: 150,
-        }),
-      ).toMatchObject({ taskID: 'ses_a', state: 'running' });
-    },
-  );
+    const a = completed('ses_a', 100);
+    board.addContext('ses_a', [{ path: 'a.ts', lastReadAt: 1 }]);
+    const lease = a && board.acquireRelaunchLease('ses_a', a.generation);
+    // While A's revive is admitted, B completes and is acknowledged later.
+    completed('ses_b', 200);
+    board.markReconciled('ses_b', 220);
+    // The host accepted A: acknowledge its old round, then relaunch it.
+    board.markReconciled('ses_a', 150, a?.generation);
+    expect(
+      board.registerLaunch({
+        taskID: 'ses_a',
+        parentSessionID: 'parent-1',
+        agent: 'oracle',
+        relaunchLease: lease,
+        now: 150,
+      }),
+    ).toMatchObject({ taskID: 'ses_a', state: 'running' });
+  });
 
   test('does not expose unreconciled terminal jobs as reusable', () => {
     const board = new BackgroundJobBoard();
