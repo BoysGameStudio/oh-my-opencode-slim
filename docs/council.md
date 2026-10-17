@@ -97,8 +97,9 @@ positives without improving recall.
 The practical corollary when you build a lineup: **seat quality outranks
 seat count.** In testing, the spread between the strongest and weakest
 reviewer model was larger than the entire spread across all same-model
-setups, and the weakest reviewer scored below doing nothing. A seat that
-fails over to a weak model dilutes the council rather than adding to it.
+setups, and the weakest reviewer scored below baseline self-review. A seat
+that fails over to a weak model dilutes the council rather than adding
+to it.
 
 Full reasoning, evidence, and the alternatives that were ruled out:
 [ADR-002: Council seats stay independent](adr/002-council-seat-independence.md).

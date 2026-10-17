@@ -65,9 +65,10 @@ separation, not an oversight.
 Two existing mechanisms already cover the desire for seats to take
 different angles:
 
-- **Role prompts.** Each councillor accepts a `role` field appended to its
+- **Role prompts.** Each councillor accepts a `prompt` field appended to its
   system prompt, so seats can be specialized (reviewer / architect /
-  optimizer) while still answering independently.
+  optimizer) while still answering independently. The field is named
+  `prompt`, not `role` — see [Role Prompts](../docs/council.md#role-prompts).
 - **The synthesizer's disagreement report.** When seats diverge, the
   council report surfaces it explicitly instead of averaging it into a
   false consensus.
@@ -96,6 +97,6 @@ model identity are confounded.
 
 ## Related design
 
-See [`docs/adr/002-council-seat-independence.md`](../../docs/adr/002-council-seat-independence.md)
+See [`docs/adr/002-council-seat-independence.md`](../docs/adr/002-council-seat-independence.md)
 for the positive form of this decision — what Council Mode does instead,
 and the seat-quality guidance that goes with it.
