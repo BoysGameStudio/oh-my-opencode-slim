@@ -1,0 +1,310 @@
+{
+  "fileName": "src/hooks/foreground-fallback/index.ts",
+  "source": "            typeof info.providerID === 'string' &&\n              typeof info.modelID === 'string'\n              ? `${info.providerID}/${info.modelID}`\n              : undefined,\n            incidentID,\n          )\n        ) {\n          if (\n            this.bypassInitialFallbackDelay(sessionID, messageError) ||\n            !this.delayInitialFallback(\n              sessionID,\n              isUnknownLoop,\n              undefined,\n              messageError,\n              incidentID,\n            )\n          ) {\n            if (isUnknownLoop) {\n              await this.tryFallbackWithAbort(\n                sessionID,\n                messageError,\n                undefined,\n                incidentID,\n              );\n            } else {\n              await this.tryFallback(sessionID, messageError, incidentID);\n            }\n          }\n        } else if (\n          !isV2Host &&\n          isCompletedSuccessfulAssistant &&\n          noTools === false\n        ) {\n          // v2 completed-message synthesis is telemetry, not recovery evidence.\n          this.resetRecoveryState(sessionID);\n        }\n        break;\n      }\n\n      case 'message.part.updated': {\n        const part = (\n          event.properties as { part?: Record<string, unknown> } | undefined\n        )?.part;\n        if (!part) break;\n        const isInternalPart =\n          isInternalInitiatorPart(part) ||\n          (typeof part.text === 'string' &&\n            part.text.includes(SLIM_INTERNAL_INITIATOR_MARKER));\n        if (\n          isInternalPart &&\n          typeof part.sessionID === 'string' &&",
+  "mutants": [
+    {
+      "id": "1123",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["33", "37", "39"],
+      "location": {
+        "start": {
+          "line": 1,
+          "column": 13
+        },
+        "end": {
+          "line": 1,
+          "column": 48
+        }
+      },
+      "expectedOriginal": "typeof info.providerID === 'string'"
+    },
+    {
+      "id": "1124",
+      "mutatorName": "EqualityOperator",
+      "replacement": "typeof info.providerID !== 'string'",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["33", "37", "39"],
+      "location": {
+        "start": {
+          "line": 1,
+          "column": 13
+        },
+        "end": {
+          "line": 1,
+          "column": 48
+        }
+      },
+      "expectedOriginal": "typeof info.providerID === 'string'"
+    },
+    {
+      "id": "1125",
+      "mutatorName": "StringLiteral",
+      "replacement": "\"\"",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["33", "37", "39"],
+      "location": {
+        "start": {
+          "line": 1,
+          "column": 40
+        },
+        "end": {
+          "line": 1,
+          "column": 48
+        }
+      },
+      "expectedOriginal": "'string'"
+    },
+    {
+      "id": "1126",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["33", "37", "39"],
+      "location": {
+        "start": {
+          "line": 2,
+          "column": 15
+        },
+        "end": {
+          "line": 2,
+          "column": 47
+        }
+      },
+      "expectedOriginal": "typeof info.modelID === 'string'"
+    },
+    {
+      "id": "1127",
+      "mutatorName": "EqualityOperator",
+      "replacement": "typeof info.modelID !== 'string'",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["33", "37", "39"],
+      "location": {
+        "start": {
+          "line": 2,
+          "column": 15
+        },
+        "end": {
+          "line": 2,
+          "column": 47
+        }
+      },
+      "expectedOriginal": "typeof info.modelID === 'string'"
+    },
+    {
+      "id": "1128",
+      "mutatorName": "StringLiteral",
+      "replacement": "\"\"",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["33", "37", "39"],
+      "location": {
+        "start": {
+          "line": 2,
+          "column": 39
+        },
+        "end": {
+          "line": 2,
+          "column": 47
+        }
+      },
+      "expectedOriginal": "'string'"
+    },
+    {
+      "id": "1152",
+      "mutatorName": "StringLiteral",
+      "replacement": "\"\"",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["33", "37", "38"],
+      "location": {
+        "start": {
+          "line": 40,
+          "column": 12
+        },
+        "end": {
+          "line": 40,
+          "column": 34
+        }
+      },
+      "expectedOriginal": "'message.part.updated'"
+    },
+    {
+      "id": "1155",
+      "mutatorName": "BooleanLiteral",
+      "replacement": "part",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["41", "273"],
+      "location": {
+        "start": {
+          "line": 44,
+          "column": 13
+        },
+        "end": {
+          "line": 44,
+          "column": 18
+        }
+      },
+      "expectedOriginal": "!part"
+    },
+    {
+      "id": "1156",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["41", "273"],
+      "location": {
+        "start": {
+          "line": 44,
+          "column": 13
+        },
+        "end": {
+          "line": 44,
+          "column": 18
+        }
+      },
+      "expectedOriginal": "!part"
+    },
+    {
+      "id": "1157",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "false",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["41", "273"],
+      "location": {
+        "start": {
+          "line": 44,
+          "column": 13
+        },
+        "end": {
+          "line": 44,
+          "column": 18
+        }
+      },
+      "expectedOriginal": "!part"
+    },
+    {
+      "id": "1163",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["273"],
+      "location": {
+        "start": {
+          "line": 47,
+          "column": 12
+        },
+        "end": {
+          "line": 47,
+          "column": 41
+        }
+      },
+      "expectedOriginal": "typeof part.text === 'string'"
+    },
+    {
+      "id": "1164",
+      "mutatorName": "EqualityOperator",
+      "replacement": "typeof part.text !== 'string'",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["273"],
+      "location": {
+        "start": {
+          "line": 47,
+          "column": 12
+        },
+        "end": {
+          "line": 47,
+          "column": 41
+        }
+      },
+      "expectedOriginal": "typeof part.text === 'string'"
+    },
+    {
+      "id": "1165",
+      "mutatorName": "StringLiteral",
+      "replacement": "\"\"",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["273"],
+      "location": {
+        "start": {
+          "line": 47,
+          "column": 33
+        },
+        "end": {
+          "line": 47,
+          "column": 41
+        }
+      },
+      "expectedOriginal": "'string'"
+    },
+    {
+      "id": "1171",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["41", "273"],
+      "location": {
+        "start": {
+          "line": 51,
+          "column": 11
+        },
+        "end": {
+          "line": 51,
+          "column": 45
+        }
+      },
+      "expectedOriginal": "typeof part.sessionID === 'string'"
+    },
+    {
+      "id": "1172",
+      "mutatorName": "EqualityOperator",
+      "replacement": "typeof part.sessionID !== 'string'",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["41", "273"],
+      "location": {
+        "start": {
+          "line": 51,
+          "column": 11
+        },
+        "end": {
+          "line": 51,
+          "column": 45
+        }
+      },
+      "expectedOriginal": "typeof part.sessionID === 'string'"
+    },
+    {
+      "id": "1173",
+      "mutatorName": "StringLiteral",
+      "replacement": "\"\"",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["41", "273"],
+      "location": {
+        "start": {
+          "line": 51,
+          "column": 37
+        },
+        "end": {
+          "line": 51,
+          "column": 45
+        }
+      },
+      "expectedOriginal": "'string'"
+    }
+  ]
+}
