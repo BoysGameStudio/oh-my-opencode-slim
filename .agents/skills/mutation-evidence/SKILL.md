@@ -24,19 +24,20 @@ A later command includes the earlier phases.
 
 ## Routing
 
-| The user says | Do |
-|---|---|
-| a target and a word | that word on that target |
-| a target, no word | the full session: audit, then critique, then fix |
-| a word, no target | the target the conversation is about, else the last sweep's file set (`reports/mutation/mutation.json`); with neither, ask |
-| nothing to go on | show the words and ask for a target |
+Resolve in this order, and say what you resolved:
 
-Near-synonyms map to the nearest word ("criteria" → `critique`,
-"fixes" → `fix`, "compare" → `audit`); when two fit, ask once. A target
-is a file with a sibling test, or a change they name — their branch, a
-PR, uncommitted work, a commit range — resolved to its files that have
-tests. Stryker mutates whole files: when the change is narrower than its
-file, say so. Asking for the state re-renders the saved report with
+1. **The word** — exactly what they said, else the nearest ("criteria"
+   → `critique`, "fixes" → `fix`, "compare" → `audit`), else the whole
+   session: audit, then critique, then fix. Ask once only when two
+   words fit.
+2. **The target** — the one the conversation is about, else the last
+   sweep's file set (`reports/mutation/mutation.json`), else ask.
+
+A target is a file with a sibling test, or a change they name — their
+branch, a PR, uncommitted work, a commit range — resolved to its files
+that have tests. Stryker mutates whole files: when the change is
+narrower than its file, say so. Asking for the state re-renders the
+saved report with
 `bun src/mutation-evidence/report.ts reports/mutation/mutation.json` —
 no sweep.
 
