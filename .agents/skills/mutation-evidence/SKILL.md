@@ -1,7 +1,6 @@
 ---
 name: mutation-evidence
-description: Sweep a named target or a change set (PR, branch, committed range, uncommitted) for surviving mutants and walk each one to a human disposition in the ledger.
-argument-hint: "[--target <files...> | --pr N | --branch <name> | --committed [range] | --uncommitted]"
+description: Sweep a file or change set for surviving mutants and walk each one to a human disposition in the ledger.
 disable-model-invocation: true
 ---
 
@@ -9,30 +8,20 @@ disable-model-invocation: true
 
 A sweep answers one question per survivor: is this a missing test, an
 equivalent mutant, or an unreachable state? The collector reports; the
-human judges. Every `Survived` status leaves the run as a question or as a
-human-authored disposition.
+human judges.
 
 ## Scope
 
-Five modes; take the one the user names. `--target` sweeps code as-is
-with no diff involved; the others scope a change set:
-
-| Mode | Target |
-|---|---|
-| `--target <files...>` | the named files, exactly as given |
-| `--pr <N>` | changed files in PR N (`gh pr diff --name-only <N>`) |
-| `--branch <b>` | `git diff --name-only master...<b>` |
-| `--committed [<range>]` | `git diff --name-only <range>`, default `master..HEAD` |
-| `--uncommitted` | `git diff --name-only HEAD`, plus untracked source files |
-
-Stryker mutates whole files. When a change set is narrower than the file
-it touches, say so in the summary.
+The user names a file to sweep. When they name a change instead — their
+branch, a PR, uncommitted work, a commit range — resolve it to the files
+it touches. Stryker mutates whole files: when the change is narrower than
+its file, say so in the summary.
 
 ## Steps
 
 ### 1. Lock the scope
 
-Resolve the mode to a file list, keep the source files that have tests,
+Resolve the request to a file list, keep the source files that have tests,
 and show the list to the user.
 
 Done when: the user has confirmed the file list.
@@ -43,9 +32,8 @@ Done when: the user has confirmed the file list.
 MUTATION_MUTATE=<files> MUTATION_TESTS=<test files> bunx stryker run
 ```
 
-Pinned toolchain lives in `package.json` and `stryker.conf.mjs`
-(`@stryker-mutator/core@10.0.0`, `@hughescr/stryker-bun-runner@1.6.0`,
-`coverageAnalysis: perTest`). The json reporter writes
+The Stryker toolchain is pinned in `package.json` and `stryker.conf.mjs`
+on purpose; keep the pins. The json reporter writes
 `reports/mutation.json`.
 
 Done when: the report exists and its files match the scoped list.
@@ -61,7 +49,8 @@ Read the summary to the user: counts and score together, transitions
 against the baseline sweep when given (`newly-surviving` is the regression
 signal), and every survivor with its identityKey.
 
-Done when: the user has seen counts, score, transitions, and every survivor.
+Done when: the user has seen counts, score, transitions when a baseline
+was given, and every survivor.
 
 ### 4. Triage each survivor
 
