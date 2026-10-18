@@ -415,19 +415,31 @@ export interface LedgerLine {
  * Returns the merged records plus the ledger lines whose identityKey
  * matched no record (e.g. a mutation that stopped being generated), so
  * callers can review them instead of losing them silently.
+ *
+ * Throws an error if the ledger contains duplicate identityKeys: two
+ * different judgments for one mutation is a contradictory ledger, not
+ * something to resolve by pick-first.
  */
 export function applyLedger(
   records: readonly MutationRecord[],
   ledger: readonly LedgerLine[],
 ): { records: MutationRecord[]; unmatchedLedgerLines: LedgerLine[] } {
-  const byKey = new Map<string, MutationRecord>();
-  for (const record of records) byKey.set(record.identityKey, record);
+  const ledgerByKey = new Map<string, LedgerLine>();
+  for (const line of ledger) {
+    if (ledgerByKey.has(line.identityKey)) {
+      throw new Error(
+        `ledger contains duplicate identityKey: ${line.identityKey}. ` +
+          'Each mutation should have at most one ledger entry.',
+      );
+    }
+    ledgerByKey.set(line.identityKey, line);
+  }
 
   const matchedKeys = new Set<string>();
   const merged = records.map((record) => {
-    const line = ledger.find((l) => l.identityKey === record.identityKey);
+    const line = ledgerByKey.get(record.identityKey);
     if (line === undefined) return { ...record };
-    matchedKeys.add(line.identityKey);
+    matchedKeys.add(record.identityKey);
     return {
       ...record,
       reviewed: {
