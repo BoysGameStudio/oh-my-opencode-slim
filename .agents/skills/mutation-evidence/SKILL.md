@@ -1,7 +1,7 @@
 ---
 name: mutation-evidence
-description: Sweep a PR, branch, committed range, or uncommitted changes for surviving mutants and walk each one to a human disposition in the ledger.
-argument-hint: "[--pr N | --branch <name> | --committed [range] | --uncommitted]"
+description: Sweep a named target or a change set (PR, branch, committed range, uncommitted) for surviving mutants and walk each one to a human disposition in the ledger.
+argument-hint: "[--target <files...> | --pr N | --branch <name> | --committed [range] | --uncommitted]"
 disable-model-invocation: true
 ---
 
@@ -14,17 +14,19 @@ human-authored disposition.
 
 ## Scope
 
-Four modes; take the one the user names:
+Five modes; take the one the user names. `--target` sweeps code as-is
+with no diff involved; the others scope a change set:
 
 | Mode | Target |
 |---|---|
+| `--target <files...>` | the named files, exactly as given |
 | `--pr <N>` | changed files in PR N (`gh pr diff --name-only <N>`) |
 | `--branch <b>` | `git diff --name-only master...<b>` |
 | `--committed [<range>]` | `git diff --name-only <range>`, default `master..HEAD` |
 | `--uncommitted` | `git diff --name-only HEAD`, plus untracked source files |
 
-Stryker mutates whole files. When the diff is narrower than the file it
-touches, say so in the summary.
+Stryker mutates whole files. When a change set is narrower than the file
+it touches, say so in the summary.
 
 ## Steps
 
