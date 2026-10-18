@@ -124,6 +124,7 @@ This codemap covers the plugin repository itself and excludes the nested `openco
 - `README.md`: user-facing product overview, install docs, and agent descriptions.
 - `AGENTS.md`: agent operating conventions for this repository.
 - `biome.json`: formatting/lint policy.
+- `stryker.conf.mjs`: pinned Stryker sweep config (`@stryker-mutator/core@10.0.0`, `@hughescr/stryker-bun-runner@1.6.0`, perTest); scope per run via `MUTATION_MUTATE`/`MUTATION_TESTS`, driven by the user-invoked skill at `.agents/skills/mutation-evidence/`.
 - `tsconfig.json`: TypeScript compiler settings.
 - `.slim/codemap.json`: codemap change-detection state for this repository.
 - `scripts/verify-release-artifact.ts`: release artifact validation script.
