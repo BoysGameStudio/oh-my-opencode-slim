@@ -103,3 +103,7 @@ companion/target/
 .slim/deepwork/
 .codegraph/
 .worktrees/
+
+# Stray reviewer-probe test files (not part of the tracked suite)
+/test-duplicate-keys.test.ts
+/test-edge-case.test.ts

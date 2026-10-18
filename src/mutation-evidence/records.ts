@@ -90,6 +90,38 @@ export interface StrykerReport {
   files: Record<string, StrykerFile>;
 }
 
+/**
+ * The result of comparing a baseline sweep against a current sweep.
+ * Matching is by stable identity (identityKey), never by numeric mutant id.
+ */
+export interface SweepComparison {
+  /** Mutations present in both sweeps, with their explicit transition. */
+  matched: MatchedTransition[];
+  /** Mutations only in the current sweep. */
+  added: MutationRecord[];
+  /** Mutations only in the baseline sweep. */
+  removed: MutationRecord[];
+}
+
+/** How a matched mutation's status changed from baseline to current. */
+export type TransitionKind =
+  | 'newly-killed' // baseline not Killed -> current Killed
+  | 'already-killed' // baseline Killed -> current Killed
+  | 'newly-surviving' // baseline not Survived -> current Survived
+  | 'still-surviving' // baseline Survived -> current Survived
+  | 'other'; // any other status combination
+
+/** One matched mutation with baseline + current observed evidence. */
+export interface MatchedTransition {
+  identity: MutationIdentity;
+  identityKey: string;
+  baseline: ObservedEvidence;
+  current: ObservedEvidence;
+  transition: TransitionKind;
+  /** True when the covering test set changed between sweeps. */
+  coverageChanged: boolean;
+}
+
 function lineStarts(source: string): number[] {
   const starts = [0];
   for (let i = 0; i < source.length; i++) {
@@ -159,4 +191,85 @@ export function collectMutationRecords(
     }
   }
   return records;
+}
+
+function transitionOf(
+  baseline: StrykerStatus,
+  current: StrykerStatus,
+): TransitionKind {
+  const isKilled = (status: StrykerStatus) => status === 'Killed';
+  const isSurvived = (status: StrykerStatus) => status === 'Survived';
+
+  if (isKilled(current)) {
+    return isKilled(baseline) ? 'already-killed' : 'newly-killed';
+  }
+  if (isSurvived(current)) {
+    return isSurvived(baseline) ? 'still-surviving' : 'newly-surviving';
+  }
+  // Timeout, NoCoverage, Error, Ignored, Pending: statuses outside the
+  // kill/survive axis. Raw baseline and current statuses carry the detail.
+  return 'other';
+}
+
+// Coverage sets compare as sets: Stryker does not guarantee test order
+// stability between runs, so order-sensitive equality would produce
+// spurious coverage-change flags.
+function sameCoverage(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const setB = new Set(b);
+  for (const item of a) {
+    if (!setB.has(item)) return false;
+  }
+  return true;
+}
+
+/**
+ * Compare a baseline sweep and a current sweep of mutation records,
+ * matched by stable identity. Numeric mutant ids never affect the
+ * comparison outcome; they are carried through as observed evidence only.
+ */
+export function compareSweeps(
+  baseline: MutationRecord[],
+  current: MutationRecord[],
+): SweepComparison {
+  const byKey = (records: MutationRecord[]) => {
+    const map = new Map<string, MutationRecord>();
+    for (const record of records) map.set(record.identityKey, record);
+    return map;
+  };
+
+  const baselineByKey = byKey(baseline);
+  const currentByKey = byKey(current);
+
+  const matched: MatchedTransition[] = [];
+  for (const [idKey, baseRecord] of baselineByKey) {
+    const currentRecord = currentByKey.get(idKey);
+    if (currentRecord === undefined) continue;
+    matched.push({
+      identity: baseRecord.identity,
+      identityKey: idKey,
+      baseline: baseRecord.observed,
+      current: currentRecord.observed,
+      transition: transitionOf(
+        baseRecord.observed.status,
+        currentRecord.observed.status,
+      ),
+      coverageChanged: !sameCoverage(
+        baseRecord.observed.coveredBy,
+        currentRecord.observed.coveredBy,
+      ),
+    });
+  }
+
+  const added: MutationRecord[] = [];
+  for (const [idKey, currentRecord] of currentByKey) {
+    if (!baselineByKey.has(idKey)) added.push(currentRecord);
+  }
+
+  const removed: MutationRecord[] = [];
+  for (const [idKey, baseRecord] of baselineByKey) {
+    if (!currentByKey.has(idKey)) removed.push(baseRecord);
+  }
+
+  return { matched, added, removed };
 }
