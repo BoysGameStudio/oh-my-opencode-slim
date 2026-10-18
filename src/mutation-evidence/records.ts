@@ -1,5 +1,6 @@
 // Mutation evidence records: normalize a Stryker report into one record per
-// mutant with a stable identity. See docs/mutation-evidence-spec.md.
+// mutant with a stable identity. Design doc: docs/mutation-evidence-spec.md
+// on branch omos/mutation-evidence-spec; tickets #1597-#1602.
 //
 // Identity is source location + mutator + original + replacement. It never
 // depends on Stryker's numeric mutant id, which is recorded (observed.id) but
@@ -286,14 +287,25 @@ function sameCoverage(a: readonly string[], b: readonly string[]): boolean {
  * Compare a baseline sweep and a current sweep of mutation records,
  * matched by stable identity. Numeric mutant ids never affect the
  * comparison outcome; they are carried through as observed evidence only.
+ *
+ * Throws when either sweep carries two records under one identityKey: a
+ * matcher that silently keeps one would falsify the comparison.
  */
 export function compareSweeps(
   baseline: MutationRecord[],
   current: MutationRecord[],
 ): SweepComparison {
-  const byKey = (records: MutationRecord[]) => {
+  const byKey = (records: readonly MutationRecord[]) => {
     const map = new Map<string, MutationRecord>();
-    for (const record of records) map.set(record.identityKey, record);
+    for (const record of records) {
+      if (map.has(record.identityKey)) {
+        throw new Error(
+          'mutation evidence: duplicate mutation identity in sweep ' +
+            `(identityKey ${record.identityKey})`,
+        );
+      }
+      map.set(record.identityKey, record);
+    }
     return map;
   };
 
