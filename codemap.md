@@ -54,6 +54,7 @@ This codemap covers the plugin repository itself and excludes the nested `openco
 | `src/multiplexer/herdr/` | herdr backend implementation for pane lifecycle. | [View Map](src/multiplexer/herdr/codemap.md) |
 | `src/multiplexer/cmux/` | cmux new-generation TUI adapter only; no dedicated lifecycle, global state registry, or close policy. | [View Map](src/multiplexer/codemap.md) |
 | `src/multiplexer/client/` | Per-client pane lifecycle core in the TUI client process: admission, event filtering, readiness gating, stable-idle close, busy rebuilds, reconnect backfill, crash-leftover sweep, pane-title metadata, and diagnostics. | [View Map](src/multiplexer/client/codemap.md) |
+| `src/mutation-evidence/` | Mutation-evidence collector: Stryker-report normalization into stable-identity records, sweep comparison with explicit status transitions, status-semantics/score views, human-disposition ledger carry-through, and worked-example pilot fixtures (#1598-#1602). | [View Map](src/mutation-evidence/codemap.md) |
 | `src/skills/` | Bundled install-time OpenCode skills shipped as static payloads. | [View Map](src/skills/codemap.md) |
 | `src/skills/codemap/` | Repository-mapping skill package and codemap state-management script. | [View Map](src/skills/codemap/codemap.md) |
 | `src/skills/clonedeps/` | Workflow-only dependency source mirroring skill that routes discovery/ref resolution through explorer and direct orchestrator git operations. | [View Map](src/skills/clonedeps/codemap.md) |
