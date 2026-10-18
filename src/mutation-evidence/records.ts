@@ -46,6 +46,12 @@ export interface ObservedEvidence {
   status: StrykerStatus;
   static: boolean;
   coveredBy: readonly string[];
+  /**
+   * Test ids the runner recorded as killing the mutant, or null when the
+   * report carries no killedBy. First-failure attribution only: the runner
+   * bails at the first failing test, so this is never unique causality.
+   */
+  killedBy?: readonly string[] | null;
 }
 
 /**
@@ -78,6 +84,8 @@ export interface StrykerMutant {
   static: boolean;
   coveredBy: string[];
   location: SourceLocation;
+  /** Test ids that killed this mutant; present only on Killed mutants. */
+  killedBy?: string[];
 }
 
 export interface StrykerFile {
@@ -120,6 +128,56 @@ export interface MatchedTransition {
   transition: TransitionKind;
   /** True when the covering test set changed between sweeps. */
   coverageChanged: boolean;
+}
+
+/**
+ * Statuses that require flagging as distinct outcomes. They are never
+ * folded into detection: spec says Timeout counts toward the score's
+ * detected numerator, but a flag makes the distinction visible per
+ * record instead of hiding it inside arithmetic.
+ */
+export type FlaggedStatus = 'Timeout' | 'Error' | 'NoCoverage';
+
+/**
+ * Per-record detection view derived from the raw status. Also carries the
+ * first-failure attribution marker for killedBy.
+ */
+export interface DetectionView {
+  /** 'Detected' only per Stryker score semantics (Killed + Timeout). */
+  detected: boolean;
+  /** Non-null only for Timeout / Error / NoCoverage outcomes. */
+  flaggedStatus: FlaggedStatus | null;
+  /**
+   * 'first-failure' when killedBy is present: the runner bails at the
+   * first failing test, so the recorded test is the first failure, not
+   * proof of unique causality or that no other test would also kill.
+   */
+  killedByKind: 'first-failure' | null;
+}
+
+/**
+ * Mutation score as a derived view, always reported next to the raw
+ * status counts it was computed from. Stryker semantics: Timeout counts
+ * toward detection, Error is excluded entirely, NoCoverage counts as
+ * undetected. Ignored/Pending are excluded (outside the scoreable set).
+ */
+export interface MutationScore {
+  /** Killed + Timeout. */
+  detected: number;
+  /** Survived + NoCoverage. */
+  undetected: number;
+  /** detected + undetected; the score denominator. */
+  total: number;
+  /** detected / total, or null when total is zero (no scoreable set). */
+  value: number | null;
+}
+
+/** Score plus the raw counts and per-record views it was derived from. */
+export interface StatusSummary {
+  records: Array<MutationRecord & { detection: DetectionView }>;
+  /** Raw, untransformed status counts (the score is never reported alone). */
+  statusCounts: Record<StrykerStatus, number>;
+  score: MutationScore | null;
 }
 
 function lineStarts(source: string): number[] {
@@ -177,6 +235,7 @@ export function collectMutationRecords(
           status: mutant.status,
           static: mutant.static,
           coveredBy: mutant.coveredBy,
+          killedBy: mutant.killedBy ?? null,
         },
         reviewed: {
           disposition: null,
@@ -272,4 +331,120 @@ export function compareSweeps(
   }
 
   return { matched, added, removed };
+}
+
+const FLAGGED: ReadonlySet<StrykerStatus> = new Set([
+  'Timeout',
+  'Error',
+  'NoCoverage',
+] as FlaggedStatus[]);
+
+const EMPTY_COUNTS: Record<StrykerStatus, number> = {
+  Killed: 0,
+  Survived: 0,
+  NoCoverage: 0,
+  Timeout: 0,
+  Error: 0,
+  Ignored: 0,
+  Pending: 0,
+};
+
+function detectionView(record: MutationRecord): DetectionView {
+  const status = record.observed.status;
+  return {
+    detected: status === 'Killed' || status === 'Timeout',
+    flaggedStatus: FLAGGED.has(status) ? (status as FlaggedStatus) : null,
+    killedByKind: record.observed.killedBy != null ? 'first-failure' : null,
+  };
+}
+
+/**
+ * Derive per-record detection views, raw status counts, and the Stryker
+ * mutation score. The score is always returned alongside statusCounts —
+ * it is a derived view, never a standalone verdict. Errors are excluded
+ * from the score; Ignored and Pending are not scoreable. With no
+ * scoreable mutants at all, score is null rather than a fake 0/0.
+ */
+export function summarizeStatuses(
+  records: readonly MutationRecord[],
+): StatusSummary {
+  const statusCounts: Record<StrykerStatus, number> = { ...EMPTY_COUNTS };
+  for (const record of records) {
+    statusCounts[record.observed.status] += 1;
+  }
+
+  const detected = statusCounts.Killed + statusCounts.Timeout;
+  const undetected = statusCounts.Survived + statusCounts.NoCoverage;
+  const total = detected + undetected;
+  const score: MutationScore | null =
+    total === 0
+      ? null
+      : {
+          detected,
+          undetected,
+          total,
+          value: detected / total,
+        };
+
+  const withDetection = records.map((record) => ({
+    ...record,
+    detection: detectionView(record),
+  }));
+
+  return { records: withDetection, statusCounts, score };
+}
+
+/**
+ * One authored row of the human-disposition ledger. `disposition` and
+ * `rationale` are human judgments; a ledger entry is authored for a
+ * mutation identified by its stable identityKey.
+ */
+export interface LedgerLine {
+  identityKey: string;
+  disposition: Disposition;
+  rationale: string;
+}
+
+/**
+ * Carry authored human dispositions onto records of a fresh sweep,
+ * matched by stable identityKey. The tool never generates a disposition:
+ * a record with no matching ledger line (or no ledger at all) keeps a
+ * null `reviewed`, and a matched record takes the ledger's authored
+ * fields verbatim. Observed fields are never touched by a ledger apply.
+ *
+ * Returns the merged records plus the ledger lines whose identityKey
+ * matched no record (e.g. a mutation that stopped being generated), so
+ * callers can review them instead of losing them silently.
+ */
+export function applyLedger(
+  records: readonly MutationRecord[],
+  ledger: readonly LedgerLine[],
+): { records: MutationRecord[]; unmatchedLedgerLines: LedgerLine[] } {
+  const byKey = new Map<string, MutationRecord>();
+  for (const record of records) byKey.set(record.identityKey, record);
+
+  const matchedKeys = new Set<string>();
+  const merged = records.map((record) => {
+    const line = ledger.find((l) => l.identityKey === record.identityKey);
+    if (line === undefined) return { ...record };
+    matchedKeys.add(line.identityKey);
+    return {
+      ...record,
+      reviewed: {
+        disposition: line.disposition,
+        contract: record.reviewed.contract,
+        distinguishingCondition: record.reviewed.distinguishingCondition,
+        reachableSetup: record.reviewed.reachableSetup,
+        observableDifference: record.reviewed.observableDifference,
+        falsifierResult: record.reviewed.falsifierResult,
+        rationale: line.rationale,
+      },
+    };
+  });
+
+  const unmatchedLedgerLines = ledger.filter(
+    (line) => !matchedKeys.has(line.identityKey),
+  );
+
+  return { records: merged, unmatchedLedgerLines };
 }
