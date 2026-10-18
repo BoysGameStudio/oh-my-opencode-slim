@@ -97,11 +97,26 @@ export function renderReport(input: ReportInput): string {
   return lines.join('\n');
 }
 
+async function readReport(path: string): Promise<MutationRecord[]> {
+  return collectMutationRecords((await Bun.file(path).json()) as StrykerReport);
+}
+
+export async function summarizeReport(
+  reportPath: string,
+  opts: { baseline?: string; ledger?: string } = {},
+): Promise<string> {
+  const [records, baseline, ledger] = await Promise.all([
+    readReport(reportPath),
+    opts.baseline === undefined ? undefined : readReport(opts.baseline),
+    opts.ledger === undefined
+      ? Promise.resolve([] as LedgerLine[])
+      : (Bun.file(opts.ledger).json() as Promise<LedgerLine[]>),
+  ]);
+  return renderReport({ records, baseline, ledger });
+}
+
 if (import.meta.main) {
   const argv = process.argv.slice(2);
-  const readReport = async (path: string) =>
-    collectMutationRecords((await Bun.file(path).json()) as StrykerReport);
-
   const reportPath = argv[0];
   if (reportPath === undefined) {
     console.error(
@@ -111,15 +126,23 @@ if (import.meta.main) {
     process.exit(1);
   }
 
-  const baselineIdx = argv.indexOf('--baseline');
-  const ledgerIdx = argv.indexOf('--ledger');
-  const [records, baseline, ledger] = await Promise.all([
-    readReport(reportPath),
-    baselineIdx === -1 ? undefined : readReport(argv[baselineIdx + 1] ?? ''),
-    ledgerIdx === -1
-      ? Promise.resolve([] as LedgerLine[])
-      : (Bun.file(argv[ledgerIdx + 1] ?? '').json() as Promise<LedgerLine[]>),
-  ]);
+  const flagValue = (flag: string): string | undefined => {
+    const idx = argv.indexOf(flag);
+    if (idx === -1) {
+      return undefined;
+    }
+    const value = argv[idx + 1];
+    if (value === undefined) {
+      console.error(`missing value for ${flag}`);
+      process.exit(1);
+    }
+    return value;
+  };
 
-  console.log(renderReport({ records, baseline, ledger }));
+  console.log(
+    await summarizeReport(reportPath, {
+      baseline: flagValue('--baseline'),
+      ledger: flagValue('--ledger'),
+    }),
+  );
 }

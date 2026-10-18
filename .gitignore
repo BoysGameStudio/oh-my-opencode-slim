@@ -35,6 +35,7 @@ coverage/
 reports/
 
 # Temporary files
+.stryker-tmp/
 tmp/
 temp/
 local

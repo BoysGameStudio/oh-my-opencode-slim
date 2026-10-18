@@ -4,7 +4,9 @@
     "includes": [
       "**",
       "!oh-my-opencode-slim.schema.json",
-      "!openspec/changes/**/evidence"
+      "!openspec/changes/**/evidence",
+      "!reports",
+      "!.stryker-tmp"
     ]
   },
   "vcs": {

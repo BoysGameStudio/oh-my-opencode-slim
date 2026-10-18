@@ -54,7 +54,7 @@ This codemap covers the plugin repository itself and excludes the nested `openco
 | `src/multiplexer/herdr/` | herdr backend implementation for pane lifecycle. | [View Map](src/multiplexer/herdr/codemap.md) |
 | `src/multiplexer/cmux/` | cmux new-generation TUI adapter only; no dedicated lifecycle, global state registry, or close policy. | [View Map](src/multiplexer/codemap.md) |
 | `src/multiplexer/client/` | Per-client pane lifecycle core in the TUI client process: admission, event filtering, readiness gating, stable-idle close, busy rebuilds, reconnect backfill, crash-leftover sweep, pane-title metadata, and diagnostics. | [View Map](src/multiplexer/client/codemap.md) |
-| `src/mutation-evidence/` | Mutation-evidence collector: Stryker-report normalization into stable-identity records, sweep comparison with explicit status transitions, status-semantics/score views, human-disposition ledger carry-through, and worked-example pilot fixtures (#1598-#1602). | [View Map](src/mutation-evidence/codemap.md) |
+| `src/mutation-evidence/` | Mutation-evidence collector: Stryker-report normalization into stable-identity records, sweep comparison with explicit status transitions, status-semantics/score views, human-disposition ledger carry-through, and worked-example pilot fixtures (#1598-#1602); one-command sweep entry `bun run mutation:sweep`. | [View Map](src/mutation-evidence/codemap.md) |
 | `src/skills/` | Bundled install-time OpenCode skills shipped as static payloads. | [View Map](src/skills/codemap.md) |
 | `src/skills/codemap/` | Repository-mapping skill package and codemap state-management script. | [View Map](src/skills/codemap/codemap.md) |
 | `src/skills/clonedeps/` | Workflow-only dependency source mirroring skill that routes discovery/ref resolution through explorer and direct orchestrator git operations. | [View Map](src/skills/clonedeps/codemap.md) |
@@ -124,7 +124,7 @@ This codemap covers the plugin repository itself and excludes the nested `openco
 - `README.md`: user-facing product overview, install docs, and agent descriptions.
 - `AGENTS.md`: agent operating conventions for this repository.
 - `biome.json`: formatting/lint policy.
-- `stryker.conf.mjs`: pinned Stryker sweep config (`@stryker-mutator/core@10.0.0`, `@hughescr/stryker-bun-runner@1.6.0`, perTest); scope per run via `MUTATION_MUTATE`/`MUTATION_TESTS`, driven by the user-invoked skill at `.agents/skills/mutation-evidence/`.
+- `stryker.conf.mjs`: pinned Stryker sweep config (`@stryker-mutator/core@10.0.0`, `@hughescr/stryker-bun-runner@1.6.0`, perTest); scope per run via `MUTATION_MUTATE`/`MUTATION_TESTS`, set by the `mutation:sweep` entry; run through the user-invoked skill at `.agents/skills/mutation-evidence/`.
 - `tsconfig.json`: TypeScript compiler settings.
 - `.slim/codemap.json`: codemap change-detection state for this repository.
 - `scripts/verify-release-artifact.ts`: release artifact validation script.

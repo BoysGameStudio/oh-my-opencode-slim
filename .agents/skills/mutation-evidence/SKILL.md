@@ -29,30 +29,15 @@ Done when: the user has confirmed the file list.
 ### 2. Sweep
 
 ```
-MUTATION_MUTATE=<files> MUTATION_TESTS=<test files> bunx stryker run
+bun run mutation:sweep -- <files> [--baseline <previous report.json>]
 ```
 
-The Stryker toolchain is pinned in `package.json` and `stryker.conf.mjs`
-on purpose; keep the pins. The json reporter writes
-`reports/mutation.json`.
-
-Done when: the report exists and its files match the scoped list.
-
-### 3. Summarize
-
-```
-bun src/mutation-evidence/report.ts reports/mutation.json \
-  [--baseline <previous report.json>] [--ledger docs/mutation-ledger.json]
-```
-
-Read the summary to the user: counts and score together, transitions
-against the baseline sweep when given (`newly-surviving` is the regression
-signal), and every survivor with its identityKey.
+Read the summary to the user; `newly-surviving` is the regression signal.
 
 Done when: the user has seen counts, score, transitions when a baseline
 was given, and every survivor.
 
-### 4. Triage each survivor
+### 3. Triage each survivor
 
 Work the four evidence questions with the user, in order, per survivor:
 
@@ -74,12 +59,12 @@ a disposition.
 Done when: every survivor carries a disposition and a rationale, or the
 user explicitly defers it as `Unresolved`.
 
-### 5. Write the ledger
+### 4. Write the ledger
 
 Append the accepted lines to `docs/mutation-ledger.json`, each
 `{ identityKey, disposition, rationale }`. Carry existing entries through
 verbatim; two entries under one identityKey is a contradiction to resolve
 with the user, never a silent overwrite.
 
-Done when: rerunning step 3 with `--ledger` shows every new disposition
-attached and no existing entry changed.
+Done when: rerunning the sweep with `--ledger docs/mutation-ledger.json`
+shows every new disposition attached and no existing entry changed.
