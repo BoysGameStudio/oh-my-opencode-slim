@@ -1,0 +1,349 @@
+{
+  "example": "host-retry-ceiling",
+  "fileName": "src/hooks/foreground-fallback/index.ts",
+  "source": "            !isPermanentQuotaBillingError(retryError) &&\n            !isSpentQuotaError(retryError) &&\n            this.absorbHostRetry(\n              sessionID,\n              props.status?.next === undefined\n                ? undefined\n                : props.status.next - Date.now(),\n            )\n          ) {",
+  "mutants": [
+    {
+      "id": "1297",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": [
+        "17",
+        "22",
+        "18",
+        "43",
+        "70",
+        "42",
+        "44",
+        "47",
+        "46",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "271",
+        "264",
+        "265",
+        "174",
+        "115",
+        "242",
+        "243",
+        "248",
+        "249",
+        "250",
+        "201",
+        "212",
+        "214",
+        "223",
+        "222",
+        "221",
+        "203",
+        "216",
+        "215",
+        "205",
+        "210",
+        "207",
+        "204",
+        "120",
+        "122",
+        "128",
+        "125",
+        "126",
+        "132"
+      ],
+      "killedBy": ["70"],
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 15
+        },
+        "end": {
+          "line": 5,
+          "column": 47
+        }
+      },
+      "expectedOriginal": "props.status?.next === undefined"
+    },
+    {
+      "id": "1298",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "false",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": [
+        "17",
+        "22",
+        "18",
+        "43",
+        "70",
+        "42",
+        "44",
+        "47",
+        "46",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "271",
+        "264",
+        "265",
+        "174",
+        "115",
+        "242",
+        "243",
+        "248",
+        "249",
+        "250",
+        "201",
+        "212",
+        "214",
+        "223",
+        "222",
+        "221",
+        "203",
+        "216",
+        "215",
+        "205",
+        "210",
+        "207",
+        "204",
+        "120",
+        "122",
+        "128",
+        "125",
+        "126",
+        "132"
+      ],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 15
+        },
+        "end": {
+          "line": 5,
+          "column": 47
+        }
+      },
+      "expectedOriginal": "props.status?.next === undefined"
+    },
+    {
+      "id": "1299",
+      "mutatorName": "EqualityOperator",
+      "replacement": "props.status?.next !== undefined",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": [
+        "17",
+        "22",
+        "18",
+        "43",
+        "70",
+        "42",
+        "44",
+        "47",
+        "46",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "271",
+        "264",
+        "265",
+        "174",
+        "115",
+        "242",
+        "243",
+        "248",
+        "249",
+        "250",
+        "201",
+        "212",
+        "214",
+        "223",
+        "222",
+        "221",
+        "203",
+        "216",
+        "215",
+        "205",
+        "210",
+        "207",
+        "204",
+        "120",
+        "122",
+        "128",
+        "125",
+        "126",
+        "132"
+      ],
+      "killedBy": ["70"],
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 15
+        },
+        "end": {
+          "line": 5,
+          "column": 47
+        }
+      },
+      "expectedOriginal": "props.status?.next === undefined"
+    },
+    {
+      "id": "1300",
+      "mutatorName": "OptionalChaining",
+      "replacement": "props.status.next",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": [
+        "17",
+        "22",
+        "18",
+        "43",
+        "70",
+        "42",
+        "44",
+        "47",
+        "46",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "271",
+        "264",
+        "265",
+        "174",
+        "115",
+        "242",
+        "243",
+        "248",
+        "249",
+        "250",
+        "201",
+        "212",
+        "214",
+        "223",
+        "222",
+        "221",
+        "203",
+        "216",
+        "215",
+        "205",
+        "210",
+        "207",
+        "204",
+        "120",
+        "122",
+        "128",
+        "125",
+        "126",
+        "132"
+      ],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 15
+        },
+        "end": {
+          "line": 5,
+          "column": 33
+        }
+      },
+      "expectedOriginal": "props.status?.next"
+    }
+  ],
+  "ledger": [
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 15
+          },
+          "end": {
+            "line": 5,
+            "column": 47
+          }
+        },
+        "mutatorName": "ConditionalExpression",
+        "original": "props.status?.next === undefined",
+        "replacement": "true"
+      },
+      "disposition": "Detected",
+      "rationale": "condition to true always takes the undefined branch and absorbs a far-future backoff the ceiling should refuse; the existing long-backoff test kills it"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 15
+          },
+          "end": {
+            "line": 5,
+            "column": 47
+          }
+        },
+        "mutatorName": "ConditionalExpression",
+        "original": "props.status?.next === undefined",
+        "replacement": "false"
+      },
+      "disposition": "Equivalent-under-preconditions",
+      "rationale": "condition to false passes NaN instead of undefined when next is missing, but absorbHostRetry is the sole sink and (undefined ?? 0) > MAX and (NaN ?? 0) > MAX are both false"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 15
+          },
+          "end": {
+            "line": 5,
+            "column": 47
+          }
+        },
+        "mutatorName": "EqualityOperator",
+        "original": "props.status?.next === undefined",
+        "replacement": "props.status?.next !== undefined"
+      },
+      "disposition": "Detected",
+      "rationale": "equality inverted always takes the undefined branch, same observable as the true replacement; existing long-backoff test kills it"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 15
+          },
+          "end": {
+            "line": 5,
+            "column": 33
+          }
+        },
+        "mutatorName": "OptionalChaining",
+        "original": "props.status?.next",
+        "replacement": "props.status.next"
+      },
+      "disposition": "Equivalent-under-preconditions",
+      "rationale": "optional chaining removed throws on missing props.status, but the branch is guarded by isFailoverRetry which requires props.status present"
+    }
+  ]
+}

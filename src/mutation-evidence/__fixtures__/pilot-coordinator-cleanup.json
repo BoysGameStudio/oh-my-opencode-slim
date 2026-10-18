@@ -1,0 +1,169 @@
+{
+  "example": "coordinator-cleanup",
+  "fileName": "src/hooks/foreground-fallback/index.ts",
+  "source": "          });\n          this.sessionParent.delete(id);\n          // Without a lifecycle coordinator this event is the only deletion\n          // signal, so it must clear the retry/terminal state too.\n          if (!this.hasCoordinator) this.forgetSession(id);\n        }\n        break;\n      }\n    }",
+  "mutants": [
+    {
+      "id": "1351",
+      "mutatorName": "BooleanLiteral",
+      "replacement": "this.hasCoordinator",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["274", "270", "0"],
+      "killedBy": ["274"],
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 15
+        },
+        "end": {
+          "line": 5,
+          "column": 35
+        }
+      },
+      "expectedOriginal": "!this.hasCoordinator"
+    },
+    {
+      "id": "1352",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": ["274", "270", "0"],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 15
+        },
+        "end": {
+          "line": 5,
+          "column": 35
+        }
+      },
+      "expectedOriginal": "!this.hasCoordinator"
+    },
+    {
+      "id": "1353",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "false",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["274", "270", "0"],
+      "killedBy": ["274"],
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 15
+        },
+        "end": {
+          "line": 5,
+          "column": 35
+        }
+      },
+      "expectedOriginal": "!this.hasCoordinator"
+    },
+    {
+      "id": "1354",
+      "mutatorName": "CallExpression",
+      "replacement": ";",
+      "status": "Killed",
+      "static": false,
+      "coveredBy": ["274", "270", "0"],
+      "killedBy": ["274"],
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 37
+        },
+        "end": {
+          "line": 5,
+          "column": 60
+        }
+      },
+      "expectedOriginal": "this.forgetSession(id);"
+    }
+  ],
+  "ledger": [
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 15
+          },
+          "end": {
+            "line": 5,
+            "column": 35
+          }
+        },
+        "mutatorName": "BooleanLiteral",
+        "original": "!this.hasCoordinator",
+        "replacement": "this.hasCoordinator"
+      },
+      "disposition": "Detected",
+      "rationale": "boolean literal swap inverts the coordinator gate; existing deletion tests kill it"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 15
+          },
+          "end": {
+            "line": 5,
+            "column": 35
+          }
+        },
+        "mutatorName": "ConditionalExpression",
+        "original": "!this.hasCoordinator",
+        "replacement": "true"
+      },
+      "disposition": "Equivalent-under-preconditions",
+      "rationale": "condition to true forgets even when a coordinator owns deletion; double cleanup repeats idempotent map deletions and an extra turn increment that is unobservable after the first cleanup removes the prior-epoch maps (probe-backed for the examined lifecycle, not a universal proof)"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 15
+          },
+          "end": {
+            "line": 5,
+            "column": 35
+          }
+        },
+        "mutatorName": "ConditionalExpression",
+        "original": "!this.hasCoordinator",
+        "replacement": "false"
+      },
+      "disposition": "Detected",
+      "rationale": "condition to false never forgets on the event path; existing deletion tests kill it"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 37
+          },
+          "end": {
+            "line": 5,
+            "column": 60
+          }
+        },
+        "mutatorName": "CallExpression",
+        "original": "this.forgetSession(id);",
+        "replacement": ";"
+      },
+      "disposition": "Detected",
+      "rationale": "forgetSession call removed leaks retry state without a coordinator; existing deletion tests kill it"
+    }
+  ]
+}

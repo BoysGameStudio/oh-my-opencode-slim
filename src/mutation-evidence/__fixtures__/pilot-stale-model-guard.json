@@ -1,0 +1,631 @@
+{
+  "example": "stale-model-guard",
+  "fileName": "src/hooks/foreground-fallback/index.ts",
+  "source": "          const curModel = this.sessionModel.get(sessionID);\n          const lastTriggerTime = this.lastTrigger.get(sessionID) ?? 0;\n          const attempt = props.status?.attempt ?? 1;\n          const modelChanged =\n            prevModel !== undefined &&\n            curModel !== undefined &&\n            prevModel !== curModel;\n          const withinDedupWindow =\n            Date.now() - lastTriggerTime < DEDUP_WINDOW_MS;\n          if (modelChanged && withinDedupWindow && attempt > 1) {\n            // Model changed since last trigger, within dedup window, and",
+  "mutants": [
+    {
+      "id": "1243",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": [
+        "17",
+        "27",
+        "22",
+        "18",
+        "43",
+        "70",
+        "42",
+        "44",
+        "47",
+        "46",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "271",
+        "267",
+        "268",
+        "264",
+        "265",
+        "269",
+        "228",
+        "231",
+        "226",
+        "230",
+        "233",
+        "174",
+        "115",
+        "242",
+        "243",
+        "248",
+        "249",
+        "250",
+        "201",
+        "212",
+        "214",
+        "223",
+        "222",
+        "221",
+        "203",
+        "209",
+        "208",
+        "217",
+        "216",
+        "220",
+        "211",
+        "215",
+        "219",
+        "218",
+        "205",
+        "210",
+        "207",
+        "204",
+        "120",
+        "122",
+        "128",
+        "125",
+        "126",
+        "132",
+        "142"
+      ],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 13
+        },
+        "end": {
+          "line": 7,
+          "column": 35
+        }
+      },
+      "expectedOriginal": "prevModel !== undefined &&\n            curModel !== undefined &&\n            prevModel !== curModel"
+    },
+    {
+      "id": "1245",
+      "mutatorName": "LogicalOperator",
+      "replacement": "prevModel !== undefined && curModel !== undefined || prevModel !== curModel",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": [
+        "17",
+        "27",
+        "22",
+        "18",
+        "43",
+        "70",
+        "42",
+        "44",
+        "47",
+        "46",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "271",
+        "267",
+        "268",
+        "264",
+        "265",
+        "269",
+        "228",
+        "231",
+        "226",
+        "230",
+        "233",
+        "174",
+        "115",
+        "242",
+        "243",
+        "248",
+        "249",
+        "250",
+        "201",
+        "212",
+        "214",
+        "223",
+        "222",
+        "221",
+        "203",
+        "209",
+        "208",
+        "217",
+        "216",
+        "220",
+        "211",
+        "215",
+        "219",
+        "218",
+        "205",
+        "210",
+        "207",
+        "204",
+        "120",
+        "122",
+        "128",
+        "125",
+        "126",
+        "132",
+        "142"
+      ],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 13
+        },
+        "end": {
+          "line": 7,
+          "column": 35
+        }
+      },
+      "expectedOriginal": "prevModel !== undefined &&\n            curModel !== undefined &&\n            prevModel !== curModel"
+    },
+    {
+      "id": "1246",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": [
+        "17",
+        "27",
+        "22",
+        "18",
+        "43",
+        "70",
+        "42",
+        "44",
+        "47",
+        "46",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "271",
+        "267",
+        "268",
+        "264",
+        "265",
+        "269",
+        "228",
+        "231",
+        "226",
+        "230",
+        "233",
+        "174",
+        "115",
+        "242",
+        "243",
+        "248",
+        "249",
+        "250",
+        "201",
+        "212",
+        "214",
+        "223",
+        "222",
+        "221",
+        "203",
+        "209",
+        "208",
+        "217",
+        "216",
+        "220",
+        "211",
+        "215",
+        "219",
+        "218",
+        "205",
+        "210",
+        "207",
+        "204",
+        "120",
+        "122",
+        "128",
+        "125",
+        "126",
+        "132",
+        "142"
+      ],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 13
+        },
+        "end": {
+          "line": 6,
+          "column": 35
+        }
+      },
+      "expectedOriginal": "prevModel !== undefined &&\n            curModel !== undefined"
+    },
+    {
+      "id": "1247",
+      "mutatorName": "LogicalOperator",
+      "replacement": "prevModel !== undefined || curModel !== undefined",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": [
+        "17",
+        "27",
+        "22",
+        "18",
+        "43",
+        "70",
+        "42",
+        "44",
+        "47",
+        "46",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "271",
+        "267",
+        "268",
+        "264",
+        "265",
+        "269",
+        "228",
+        "231",
+        "226",
+        "230",
+        "233",
+        "174",
+        "115",
+        "242",
+        "243",
+        "248",
+        "249",
+        "250",
+        "201",
+        "212",
+        "214",
+        "223",
+        "222",
+        "221",
+        "203",
+        "209",
+        "208",
+        "217",
+        "216",
+        "220",
+        "211",
+        "215",
+        "219",
+        "218",
+        "205",
+        "210",
+        "207",
+        "204",
+        "120",
+        "122",
+        "128",
+        "125",
+        "126",
+        "132",
+        "142"
+      ],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 13
+        },
+        "end": {
+          "line": 6,
+          "column": 35
+        }
+      },
+      "expectedOriginal": "prevModel !== undefined &&\n            curModel !== undefined"
+    },
+    {
+      "id": "1248",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": [
+        "17",
+        "27",
+        "22",
+        "18",
+        "43",
+        "70",
+        "42",
+        "44",
+        "47",
+        "46",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "271",
+        "267",
+        "268",
+        "264",
+        "265",
+        "269",
+        "228",
+        "231",
+        "226",
+        "230",
+        "233",
+        "174",
+        "115",
+        "242",
+        "243",
+        "248",
+        "249",
+        "250",
+        "201",
+        "212",
+        "214",
+        "223",
+        "222",
+        "221",
+        "203",
+        "209",
+        "208",
+        "217",
+        "216",
+        "220",
+        "211",
+        "215",
+        "219",
+        "218",
+        "205",
+        "210",
+        "207",
+        "204",
+        "120",
+        "122",
+        "128",
+        "125",
+        "126",
+        "132",
+        "142"
+      ],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 5,
+          "column": 13
+        },
+        "end": {
+          "line": 5,
+          "column": 36
+        }
+      },
+      "expectedOriginal": "prevModel !== undefined"
+    },
+    {
+      "id": "1250",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": [
+        "27",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "267",
+        "231",
+        "226",
+        "233",
+        "207",
+        "204",
+        "128",
+        "142"
+      ],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 6,
+          "column": 13
+        },
+        "end": {
+          "line": 6,
+          "column": 35
+        }
+      },
+      "expectedOriginal": "curModel !== undefined"
+    },
+    {
+      "id": "1252",
+      "mutatorName": "ConditionalExpression",
+      "replacement": "true",
+      "status": "Survived",
+      "static": false,
+      "coveredBy": [
+        "27",
+        "48",
+        "49",
+        "50",
+        "59",
+        "45",
+        "60",
+        "267",
+        "231",
+        "226",
+        "233",
+        "207",
+        "204",
+        "128",
+        "142"
+      ],
+      "killedBy": null,
+      "location": {
+        "start": {
+          "line": 7,
+          "column": 13
+        },
+        "end": {
+          "line": 7,
+          "column": 35
+        }
+      },
+      "expectedOriginal": "prevModel !== curModel"
+    }
+  ],
+  "ledger": [
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 13
+          },
+          "end": {
+            "line": 7,
+            "column": 35
+          }
+        },
+        "mutatorName": "ConditionalExpression",
+        "original": "prevModel !== undefined &&\n            curModel !== undefined &&\n            prevModel !== curModel",
+        "replacement": "true"
+      },
+      "disposition": "Detected",
+      "rationale": "whole condition to true skips the retry in both reachable states; the two-case stale-guard test kills it"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 13
+          },
+          "end": {
+            "line": 7,
+            "column": 35
+          }
+        },
+        "mutatorName": "LogicalOperator",
+        "original": "prevModel !== undefined &&\n            curModel !== undefined &&\n            prevModel !== curModel",
+        "replacement": "prevModel !== undefined && curModel !== undefined || prevModel !== curModel"
+      },
+      "disposition": "Detected",
+      "rationale": "outer and to or lets a model switch alone open the dedup window; two-case test kills it"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 13
+          },
+          "end": {
+            "line": 6,
+            "column": 35
+          }
+        },
+        "mutatorName": "ConditionalExpression",
+        "original": "prevModel !== undefined &&\n            curModel !== undefined",
+        "replacement": "true"
+      },
+      "disposition": "Detected",
+      "rationale": "prev and cur group to true drops the comparison; two-case test kills it"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 13
+          },
+          "end": {
+            "line": 6,
+            "column": 35
+          }
+        },
+        "mutatorName": "LogicalOperator",
+        "original": "prevModel !== undefined &&\n            curModel !== undefined",
+        "replacement": "prevModel !== undefined || curModel !== undefined"
+      },
+      "disposition": "Detected",
+      "rationale": "inner and to or lets an undefined current model pass; two-case test kills it"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 5,
+            "column": 13
+          },
+          "end": {
+            "line": 5,
+            "column": 36
+          }
+        },
+        "mutatorName": "ConditionalExpression",
+        "original": "prevModel !== undefined",
+        "replacement": "true"
+      },
+      "disposition": "Detected",
+      "rationale": "prevModel !== undefined to true matches the reachable pre-seed state; two-case test kills it"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 6,
+            "column": 13
+          },
+          "end": {
+            "line": 6,
+            "column": 35
+          }
+        },
+        "mutatorName": "ConditionalExpression",
+        "original": "curModel !== undefined",
+        "replacement": "true"
+      },
+      "disposition": "Unreachable-under-invariant",
+      "rationale": "curModel !== undefined to true needs prevModel defined and curModel undefined; sessionModel.delete fires only inside forgetSession which also clears lastTriggerModel, so that state cannot occur"
+    },
+    {
+      "identity": {
+        "fileName": "src/hooks/foreground-fallback/index.ts",
+        "location": {
+          "start": {
+            "line": 7,
+            "column": 13
+          },
+          "end": {
+            "line": 7,
+            "column": 35
+          }
+        },
+        "mutatorName": "ConditionalExpression",
+        "original": "prevModel !== curModel",
+        "replacement": "true"
+      },
+      "disposition": "Detected",
+      "rationale": "prevModel !== curModel to true charges the budget for a real switch skip; two-case test kills it"
+    }
+  ]
+}
