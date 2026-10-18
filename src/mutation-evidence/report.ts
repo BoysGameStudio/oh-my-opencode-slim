@@ -1,8 +1,10 @@
 // Thin reporting entry over the collector. Piping Stryker JSON reports
 // through collect/compare/summarize is mechanical; the judgment lives in
 // the skill (`.agents/skills/mutation-evidence/`) and with the human.
-// Nothing here infers a disposition or mutates a ledger.
+// Nothing here infers a disposition or mutates a ledger. The baseline and
+// the ledger are set state: attached automatically whenever they exist.
 
+import { existsSync } from 'node:fs';
 import type {
   LedgerLine,
   MutationRecord,
@@ -15,6 +17,23 @@ import {
   compareSweeps,
   summarizeStatuses,
 } from './records';
+
+export const LEDGER_PATH = 'docs/mutation-ledger.json';
+const BASELINE_DIR = 'reports/mutation/baselines';
+
+// A baseline holds for exactly one file set: sorted, so the same
+// targets map to the same reference however they are named.
+export function baselinePathFor(files: readonly string[]): string {
+  const slug = [...files]
+    .sort()
+    .map((f) => f.replace(/[^a-zA-Z0-9]+/g, '_'))
+    .join('+');
+  return `${BASELINE_DIR}/${slug}.json`;
+}
+
+function fileSetOf(records: readonly MutationRecord[]): string[] {
+  return [...new Set(records.map((r) => r.identity.fileName))].sort();
+}
 
 export interface ReportInput {
   records: readonly MutationRecord[];
@@ -101,48 +120,23 @@ async function readReport(path: string): Promise<MutationRecord[]> {
   return collectMutationRecords((await Bun.file(path).json()) as StrykerReport);
 }
 
-export async function summarizeReport(
-  reportPath: string,
-  opts: { baseline?: string; ledger?: string } = {},
-): Promise<string> {
-  const [records, baseline, ledger] = await Promise.all([
-    readReport(reportPath),
-    opts.baseline === undefined ? undefined : readReport(opts.baseline),
-    opts.ledger === undefined
-      ? Promise.resolve([] as LedgerLine[])
-      : (Bun.file(opts.ledger).json() as Promise<LedgerLine[]>),
+export async function summarizeReport(reportPath: string): Promise<string> {
+  const records = await readReport(reportPath);
+  const baselinePath = baselinePathFor(fileSetOf(records));
+  const [baseline, ledger] = await Promise.all([
+    existsSync(baselinePath) ? readReport(baselinePath) : undefined,
+    existsSync(LEDGER_PATH)
+      ? (Bun.file(LEDGER_PATH).json() as Promise<LedgerLine[]>)
+      : Promise.resolve([] as LedgerLine[]),
   ]);
   return renderReport({ records, baseline, ledger });
 }
 
 if (import.meta.main) {
-  const argv = process.argv.slice(2);
-  const reportPath = argv[0];
+  const reportPath = process.argv[2];
   if (reportPath === undefined) {
-    console.error(
-      'usage: bun src/mutation-evidence/report.ts <report.json> ' +
-        '[--baseline <report.json>] [--ledger <ledger.json>]',
-    );
+    console.error('usage: bun src/mutation-evidence/report.ts <report.json>');
     process.exit(1);
   }
-
-  const flagValue = (flag: string): string | undefined => {
-    const idx = argv.indexOf(flag);
-    if (idx === -1) {
-      return undefined;
-    }
-    const value = argv[idx + 1];
-    if (value === undefined) {
-      console.error(`missing value for ${flag}`);
-      process.exit(1);
-    }
-    return value;
-  };
-
-  console.log(
-    await summarizeReport(reportPath, {
-      baseline: flagValue('--baseline'),
-      ledger: flagValue('--ledger'),
-    }),
-  );
+  console.log(await summarizeReport(reportPath));
 }

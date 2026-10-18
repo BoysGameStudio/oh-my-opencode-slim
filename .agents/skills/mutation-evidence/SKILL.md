@@ -1,45 +1,41 @@
 ---
 name: mutation-evidence
-description: Sweep a file or change set for surviving mutants and walk each one to a human disposition in the ledger.
+description: Audit, critique, fix, or baseline the mutation evidence for a file or change set — sweep survivors, judge them with the four evidence questions, and carry human dispositions in the ledger.
 disable-model-invocation: true
 ---
 
-# Mutation evidence sweep
+# Mutation evidence
 
 A sweep answers one question per survivor: is this a missing test, an
 equivalent mutant, or an unreachable state? The collector reports; the
-human judges.
+human judges. The ledger and the baseline are set state, never passed.
 
-## Scope
+## Commands
 
-The user names a file to sweep. When they name a change instead — their
-branch, a PR, uncommitted work, a commit range — resolve it to the files
-it touches. Stryker mutates whole files: when the change is narrower than
-its file, say so in the summary.
+| Command | Does |
+|---|---|
+| `audit` | Sweep and report the facts: counts, score, transitions vs the baseline, every survivor. Read-only. |
+| `critique` | Judge the survivors with the four evidence questions and present the review. Read-only. |
+| `fix` | Take the survivors the user picks (some or all) to dispositions, land the killing tests, write the ledger. |
+| `baseline` | Sweep and make this run the reference; later runs compare against it automatically. |
 
-## Steps
+Every phase runs the same sweep: `bun run mutation:sweep -- <files>`.
+The user names the file in their own words — nothing to parse. With no
+command word, run the full session: audit, then critique, then fix. When
+they name a change instead of a file (their branch, a PR, uncommitted
+work, a commit range), resolve it to the files it touches. Stryker
+mutates whole files: when the change is narrower than its file, say so.
 
-### 1. Lock the scope
+## State
 
-Resolve the request to a file list, keep the source files that have tests,
-and show the list to the user.
+- `reports/mutation/baseline.json` — the reference run. The first sweep
+  sets it; `baseline` replaces it. Every sweep compares automatically.
+- `docs/mutation-ledger.json` — human memory. Attaches to every summary
+  automatically; `fix` appends to it.
 
-Done when: the user has confirmed the file list.
+## The four evidence questions
 
-### 2. Sweep
-
-```
-bun run mutation:sweep -- <files> [--baseline <previous report.json>]
-```
-
-Read the summary to the user; `newly-surviving` is the regression signal.
-
-Done when: the user has seen counts, score, transitions when a baseline
-was given, and every survivor.
-
-### 3. Triage each survivor
-
-Work the four evidence questions with the user, in order, per survivor:
+Work them in order, per survivor:
 
 1. **Semantic difference** — the state where original and replacement
    behave differently.
@@ -51,20 +47,22 @@ Work the four evidence questions with the user, in order, per survivor:
 4. **Detection** — which test fails against the exact mutant, and what
    that failure proves.
 
-Record one disposition per survivor with a rationale the user endorses:
-`Detected`, `Equivalent-under-preconditions`,
-`Unreachable-under-invariant`, or `Unresolved`. A status alone never picks
-a disposition.
+## fix
 
-Done when: every survivor carries a disposition and a rationale, or the
-user explicitly defers it as `Unresolved`.
+Present the survivors as options, grouped where they share a boundary;
+the user picks some or all. For each picked survivor record a
+disposition the user endorses — `Detected`,
+`Equivalent-under-preconditions`, `Unreachable-under-invariant`, or
+`Unresolved` — with a rationale. A status alone never picks a
+disposition.
 
-### 4. Write the ledger
+For `Detected`, land the test that kills the exact mutant and re-sweep:
+`newly-killed` against the baseline is the proof. Append each accepted
+line to `docs/mutation-ledger.json`, `{ identityKey, disposition,
+rationale }`. Carry existing entries verbatim; two lines under one
+identityKey is a contradiction to resolve with the user, never a silent
+overwrite. Unpicked survivors end the run as `Unresolved` — say so.
 
-Append the accepted lines to `docs/mutation-ledger.json`, each
-`{ identityKey, disposition, rationale }`. Carry existing entries through
-verbatim; two entries under one identityKey is a contradiction to resolve
-with the user, never a silent overwrite.
-
-Done when: rerunning the sweep with `--ledger docs/mutation-ledger.json`
-shows every new disposition attached and no existing entry changed.
+Done when: every picked survivor has a disposition and a rationale, the
+unpicked are explicitly deferred, and a re-sweep shows the new ledger
+lines attached with no existing entry changed.
