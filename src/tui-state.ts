@@ -33,6 +33,13 @@ export interface TuiSnapshot {
   updatedAt: number;
   agentModels: Record<string, string>;
   agentVariants: Record<string, string>;
+  /**
+   * Canonical agent ID → visible display name, for the sidebar label only.
+   * Keyed by the same canonical ID as `agentModels`/`activeSessions` so model
+   * lookup, row expansion and click handling keep using the canonical name;
+   * a missing or identical entry falls back to the ID.
+   */
+  agentDisplayNames: Record<string, string>;
   activeSessions: Record<string, string>;
   /**
    * Recording process per activity; used to sweep crash residue.
@@ -103,6 +110,7 @@ function emptySnapshot(): TuiSnapshot {
     updatedAt: Date.now(),
     agentModels: {},
     agentVariants: {},
+    agentDisplayNames: {},
     activeSessions: {},
     activityPids: {},
     sessionParents: {},
@@ -220,6 +228,7 @@ function parseSnapshot(value: string): TuiSnapshot {
       typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
     agentModels: parsed.agentModels ?? {},
     agentVariants: parsed.agentVariants ?? {},
+    agentDisplayNames: parseStringRecord(parsed.agentDisplayNames),
     activeSessions: parsed.activeSessions ?? {},
     activityPids: parsePidRecord(parsed.activityPids),
     sessionParents: parseStringRecord(parsed.sessionParents),
@@ -452,6 +461,8 @@ export function snapshotSectionsEqual(a: TuiSnapshot, b: TuiSnapshot): boolean {
   return (
     JSON.stringify(a.agentModels) === JSON.stringify(b.agentModels) &&
     JSON.stringify(a.agentVariants) === JSON.stringify(b.agentVariants) &&
+    JSON.stringify(a.agentDisplayNames) ===
+      JSON.stringify(b.agentDisplayNames) &&
     JSON.stringify(a.activeSessions) === JSON.stringify(b.activeSessions) &&
     JSON.stringify(a.activityPids) === JSON.stringify(b.activityPids) &&
     JSON.stringify(a.sessionParents) === JSON.stringify(b.sessionParents) &&
@@ -546,12 +557,17 @@ export function recordTuiAgentModels(
   input: {
     agentModels: Record<string, string>;
     agentVariants?: Record<string, string>;
+    /** Canonical ID → display name; omitted callers keep the last-known map. */
+    agentDisplayNames?: Record<string, string>;
   },
   projectDir: string,
 ): void {
   updateSnapshot(projectDir, (snapshot) => {
     snapshot.agentModels = { ...input.agentModels };
     snapshot.agentVariants = { ...(input.agentVariants ?? {}) };
+    if (input.agentDisplayNames !== undefined) {
+      snapshot.agentDisplayNames = { ...input.agentDisplayNames };
+    }
   });
 }
 

@@ -1548,7 +1548,10 @@ export function renderSidebar(
                 ? sidebarSiblingAnnotation(sessions[0])
                 : undefined;
             const rowOptions: AgentRowOptions = {
-              label: agentName,
+              // Label only: every lookup below stays keyed by the canonical
+              // agent ID so models, activity, expansion and history keep
+              // resolving.
+              label: snapshot.agentDisplayNames?.[agentName] || agentName,
               model,
               modelName: modelNames?.get(model),
               variant,
