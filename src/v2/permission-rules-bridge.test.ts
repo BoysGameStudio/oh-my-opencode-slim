@@ -373,6 +373,19 @@ describe('built-in agent permission-rule derivation matrix', () => {
     expect(rules.every((rule) => rule.effect !== 'allow')).toBe(true);
   });
 
+  test('fixer and designer derive question deny rules (default flip)', () => {
+    for (const name of ['fixer', 'designer'] as const) {
+      const rules = deriveExactPermissionRules(
+        maps.get(name) as AgentPermissionMap,
+      );
+      expect(rules).toContainEqual({
+        action: 'question',
+        resource: '*',
+        effect: 'deny',
+      });
+    }
+  });
+
   test('explorer row (incident): bridge applies the derived rules to the child session', async () => {
     const calls: RulesCall[] = [];
     const bridge = createPermissionRulesBridge(

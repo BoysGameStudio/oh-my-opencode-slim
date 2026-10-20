@@ -1227,7 +1227,7 @@ describe('tool permissions', () => {
     }
   });
 
-  test('custom subagents follow the question deny default; explicit allow wins', () => {
+  test('custom subagents follow the question deny default; explicit config wins', () => {
     const config: PluginConfig = {
       agents: {
         reviewer: { model: 'openai/gpt-5.5', prompt: 'You are a reviewer.' },
@@ -1235,6 +1235,11 @@ describe('tool permissions', () => {
           model: 'openai/gpt-5.5',
           prompt: 'You ask.',
           permission: { question: 'allow' },
+        },
+        verifier: {
+          model: 'openai/gpt-5.5',
+          prompt: 'You verify.',
+          permission: { question: 'ask' },
         },
       },
     };
@@ -1247,6 +1252,23 @@ describe('tool permissions', () => {
       ).config.permission;
     expect(permissionOf('reviewer').question).toBe('deny');
     expect(permissionOf('asker').question).toBe('allow');
+    expect(permissionOf('verifier').question).toBe('ask');
+  });
+
+  test('orchestrator explicit question deny is preserved', () => {
+    const agents = createAgents(
+      runtimeFor({
+        agents: { orchestrator: { permission: { question: 'deny' } } },
+      }),
+    );
+    const orchestrator = agents.find((a) => a.name === 'orchestrator');
+    expect(
+      (
+        orchestrator as {
+          config: { permission: Record<string, unknown> };
+        }
+      ).config.permission.question,
+    ).toBe('deny');
   });
 
   test('council agent has synthesis-only (deny-all) permissions', () => {

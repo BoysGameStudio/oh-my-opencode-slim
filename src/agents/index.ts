@@ -682,8 +682,8 @@ function applyDefaultPermissions(
     disabledSkills,
   );
 
-  // Subagents never ask the human: a parked child question has no
-  // headless answerer. Mirrors wait_for_user; explicit config wins.
+  // Subagents don't ask the human by default: a parked child question
+  // has no headless answerer. Explicit config wins.
   const questionPerm =
     agent.name === 'orchestrator'
       ? (existing.question ?? 'allow')

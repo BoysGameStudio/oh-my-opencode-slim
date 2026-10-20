@@ -579,9 +579,9 @@ prompt-shape consumption instead.
 Child-input wakes wait 250 ms before notifying the parent, on both host
 versions. Per-kind policy applies: by default only question asks wake the
 parent; permission asks do not (#1504). Built-in subagents no longer receive
-the `question` tool at all (`question` is denied for every non-orchestrator
-agent), so question wakes fire only for agents with an explicit `question`
-allow/ask override. Requests answered during that window by
+the `question` tool by default (`question` defaults to `deny` for every
+non-orchestrator agent), so question wakes fire only for agents with an
+explicit `question` allow/ask override. Requests answered during that window by
 the host, a UI auto-replier, or another caller are discarded. Requests still
 open are checked again before delivery. Duplicate events enrich the queued
 notice without restarting the deadline. Stopped-job recovery and
