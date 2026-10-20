@@ -72,7 +72,8 @@ export const RECENT_TASK_HANDLE_LIMIT = 5;
  * Parent-scoped enumeration of the most recently launched tracked handles,
  * appended to unknown-handle errors so the model can retry with a live alias
  * instead of guessing one. Alias + agent + effective state only — never
- * session IDs or objectives — and the line is prefixed `recent: ` so the
+ * objectives; adopted records carry their session ID as the alias. The line
+ * is prefixed `recent: ` so the
  * tool-loop-guard's taskID/state parsers (anchored on `task_id:`/
  * `sessionID:`/`Task (`/`state:`) can never capture it.
  */
