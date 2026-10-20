@@ -291,20 +291,84 @@ Separately, the default-on orchestrator wake scheduler may prompt an
 idle parent with incomplete todos after continuous idle time; it does not depend
 on the local job board.
 
-After a full OpenCode or plugin restart, persisted running background-task
-history is rehydrated into the local job board and immediately reconciled against
-live host session status. A missing or idle child is a stop candidate: after a
+After a full OpenCode or plugin restart, persisted background-task history is
+recovered into the local job board in two complementary ways. At plugin
+startup, the scan unions plugin-owned child identities recorded at background
+launch with host child sessions when `session.list` is available. The persisted
+identity is minimal: task ID, parent session ID, original agent, description,
+objective, launch time, and a terminal-delivery marker. On stock v2 hosts
+without `session.list`, a persisted identity still restores a running child;
+its host outcome (when `session.get` exposes one) or transcript determines
+whether the child is running or terminal. List-only
+candidates require parent transcript launch evidence; a terminal child with no
+persisted identity is historical history, not a restart event, and is not
+replayed. On the next parent message transform, the same evidence is parsed
+from that parent's history. Before re-owning a launch, both paths inspect the
+full available parent history for a trusted delivery belonging to the same
+run; a delivered run stays silent instead of being resurrected as running.
+Both paths read history without rewriting it: v1 `task` tool parts and v2
+native tool-call/tool-result pairs are recognized. If a
+transform adopts a child before the startup scan settles it, the scan validates
+the running row against the host state and corrects it to terminal instead of
+skipping the correction.
+
+A native child is recovered only when persisted evidence proves background
+execution: the host's background launch sentence, or an explicit
+`background: true` on the call or result. Default-background calls are therefore
+recoverable while running (the launch sentence is present); a completed
+default-background result without either signal is left alone rather than
+guessed. Recovery preserves the original agent and parent ownership. Startup
+adoption restores a running child even when its idle parent never sends another
+message, and the plugin owns the eventual completion wake for that adopted run
+because the host's native notifier did not survive the restart. A child that
+reached a terminal outcome while the plugin was down is restored and its parent
+is woken once only when a persisted identity proves the child was plugin-owned;
+the delivery marker prevents replay on later restarts. The marker is written
+only after an accepted parent-visible wake, or when a trusted delivery for the
+current run is found in the parent history; native notification ownership
+alone is not delivery evidence, and a restored terminal row alone does not
+acknowledge delivery. A busy, throttled, or failed publication keeps its
+execution pending. Publication retries survive a parent busy-to-idle transition
+even when periodic wakes are disabled. A startup correction from running to
+terminal also releases the recovered child's concurrency slot. The wake body
+names the task IDs it covers, and the
+eventual accepted retry acknowledges exactly that captured batch; a child
+finishing while the send is in flight stays pending for its own wake. At most
+256 executions are named by one wake; any remainder stays pending and is
+named by a later accepted wake instead of being discarded. If trusted
+deliveries retire every queued execution before an attempt sends, that
+attempt is skipped rather than sending a generic terminal-publication wake.
+The skipped attempt also releases its wake reservation, so stale aborts do
+not consume the no-progress cap. Declined or skipped wakes leave the identity
+undelivered so a later restart
+can retry it. The launch fence is preserved across recovery and advances on
+relaunch, so an old delivery cannot acknowledge a newer run. If the host refuses
+a relaunch, the prior persisted identity and delivery marker are restored.
+
+Recovery is idempotent: board presence, generation checks, and the persisted
+delivery marker prevent a second adoption or duplicate wake. Delivery is
+at-least-once across a crash between the wake and marker write; it is not
+claimed crash-atomic. A missing or idle child is a stop candidate: after a
 5s confirmation grace it is surfaced as `stopped, unreconciled`, while a busy
-child remains running; status lookup failures remain uncertain rather than being
-treated as completion. When the host client exposes `session.get`, each newly
-rehydrated task is also probed for existence: a session deleted while the plugin
-was down is tombstoned and torn down instead of resurrecting as a
-forever-running ghost, and a session that already reached a terminal host
-outcome is settled to it (the typed NotFound classification is a v2
-in-process artifact — on v1 hosts the probe harmlessly never tombstones). On
-OpenCode v2 hosts with the optional `ctx.storage` domain, deletion tombstones
-and epochs additionally persist across host restarts (see the
+child remains running; status lookup failures remain uncertain rather than
+being treated as completion. A listed child without a terminal host outcome is
+classified from its transcript: an incomplete latest round proves it is still
+running, while an unreadable transcript is skipped rather than adopted. When
+the host client exposes `session.get`, each newly recovered task is also probed
+for existence: a session deleted while the plugin was down is tombstoned and
+torn down instead of resurrecting as a forever-running ghost, and a session
+that already reached a terminal host outcome is settled to it (the typed
+NotFound classification is a v2 in-process artifact — on v1 hosts the probe
+harmlessly never tombstones). A tombstone fences both startup adoption and
+later transforms from restoring that child.
+
+On OpenCode v2 hosts with the optional `ctx.storage` domain, deletion
+tombstones, deletion epochs, minimal owned-child identities, and terminal
+delivery markers persist across host restarts. `ctx.storage` never stores the
+job board itself (see the
 [v2 compatibility doc](opencode-v2-compatibility.md#background-job-state-rehydrate-probe-and-persistence)).
+Hosts that expose neither `session.list` nor persisted child identities cannot
+be startup-scanned; transform-time recovery remains the fallback.
 
 Specialist outputs are inputs, not final truth. The orchestrator reconciles them
 against each other and the original user goal.

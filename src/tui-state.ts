@@ -553,6 +553,30 @@ export function updateSnapshot(
   }
 }
 
+/**
+ * Project the registry's canonical→display identity table into the sidebar
+ * map. Only labels whose display differs from the canonical ID are stored;
+ * routing, model lookup, activity, expansion, and history keep canonical keys.
+ */
+export function collectAgentDisplayNames(
+  identities: Readonly<Record<string, string>> | undefined,
+): Record<string, string> {
+  const displayNames: Record<string, string> = {};
+  for (const [name, display] of Object.entries(identities ?? {})) {
+    if (display && display !== name) displayNames[name] = display;
+  }
+  return displayNames;
+}
+
+export function recordTuiAgentDisplayNames(
+  displayNames: Record<string, string>,
+  projectDir: string,
+): void {
+  updateSnapshot(projectDir, (snapshot) => {
+    snapshot.agentDisplayNames = { ...displayNames };
+  });
+}
+
 export function recordTuiAgentModels(
   input: {
     agentModels: Record<string, string>;

@@ -1814,6 +1814,7 @@ describe('task-session-manager hook', () => {
       parentSessionID: 'parent-1',
       agent: 'explorer',
       description: 'map hooks',
+      now: 500,
     });
     board.updateStatus({
       taskID: 'child-1',
@@ -1855,6 +1856,7 @@ describe('task-session-manager hook', () => {
             role: 'user',
             agent: 'orchestrator',
             sessionID: 'parent-1',
+            time: { created: 2000 },
           },
           parts: [
             {
@@ -2011,6 +2013,7 @@ describe('task-session-manager hook', () => {
       parentSessionID: 'parent-1',
       agent: 'explorer',
       description: 'map hooks',
+      now: 500,
     });
     board.updateStatus({
       taskID: 'child-1',
@@ -2027,7 +2030,12 @@ describe('task-session-manager hook', () => {
     const firstRevision = board.get('child-1')?.terminalRevision;
 
     const firstDelivery = {
-      info: { id: 'delivery-1', role: 'user', sessionID: 'parent-1' },
+      info: {
+        id: 'delivery-1',
+        role: 'user',
+        sessionID: 'parent-1',
+        time: { created: 1100 },
+      },
       parts: [
         {
           type: 'text',
@@ -2067,7 +2075,12 @@ describe('task-session-manager hook', () => {
     expect(board.get('child-1')).toMatchObject({ terminalUnreconciled: true });
 
     const secondDelivery = {
-      info: { id: 'delivery-2', role: 'user', sessionID: 'parent-1' },
+      info: {
+        id: 'delivery-2',
+        role: 'user',
+        sessionID: 'parent-1',
+        time: { created: 2100 },
+      },
       parts: [
         {
           type: 'text',
@@ -2349,6 +2362,7 @@ describe('task-session-manager hook', () => {
       parentSessionID: 'parent-1',
       agent: 'explorer',
       description: 'map hooks',
+      now: 500,
     });
     const { hook } = createHook({
       backgroundJobBoard: board,
@@ -2361,7 +2375,12 @@ describe('task-session-manager hook', () => {
       messages: [
         createMessages('parent-1', 'first turn').messages[0],
         {
-          info: { id: 'delivery-1', role: 'user', sessionID: 'parent-1' },
+          info: {
+            id: 'delivery-1',
+            role: 'user',
+            sessionID: 'parent-1',
+            time: { created: 2000 },
+          },
           parts: [
             {
               type: 'text',

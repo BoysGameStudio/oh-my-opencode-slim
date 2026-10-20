@@ -26,6 +26,7 @@ import {
   test,
 } from 'bun:test';
 import * as loggerModule from '../../utils/logger';
+import { createTimerHarness } from '../../utils/test-timers';
 import { resetUserWaitGateForTests } from '../task-session-manager/user-wait-gate';
 import {
   createOrchestratorWakeScheduler,
@@ -147,11 +148,24 @@ function createPublicationScheduler(options: {
   hostFlavor?: string;
   intervalMs?: number;
   wakeOnTerminalPublication?: boolean;
+  periodicWakeEnabled?: boolean;
   publicationWakeMinIntervalMs?: number;
   sessionClient: SessionClient;
   shouldManageSession?: (id: string) => boolean;
   hasInputWait?: (id: string) => boolean;
   isFallbackInProgress?: (id: string) => boolean;
+  onPublicationAccepted?: Parameters<
+    typeof createOrchestratorWakeScheduler
+  >[1]['onPublicationAccepted'];
+  isPublicationCurrent?: Parameters<
+    typeof createOrchestratorWakeScheduler
+  >[1]['isPublicationCurrent'];
+  setTimeout?: Parameters<
+    typeof createOrchestratorWakeScheduler
+  >[1]['setTimeout'];
+  clearTimeout?: Parameters<
+    typeof createOrchestratorWakeScheduler
+  >[1]['clearTimeout'];
 }) {
   const ctx = {
     directory: '/project',
@@ -166,6 +180,9 @@ function createPublicationScheduler(options: {
       ...(options.wakeOnTerminalPublication === undefined
         ? {}
         : { wakeOnTerminalPublication: options.wakeOnTerminalPublication }),
+      ...(options.periodicWakeEnabled === undefined
+        ? {}
+        : { periodicWakeEnabled: options.periodicWakeEnabled }),
       ...(options.publicationWakeMinIntervalMs === undefined
         ? {}
         : {
@@ -176,6 +193,14 @@ function createPublicationScheduler(options: {
     shouldManageSession: options.shouldManageSession ?? (() => true),
     hasInputWait: options.hasInputWait ?? (() => false),
     isFallbackInProgress: options.isFallbackInProgress,
+    ...(options.onPublicationAccepted
+      ? { onPublicationAccepted: options.onPublicationAccepted }
+      : {}),
+    ...(options.isPublicationCurrent
+      ? { isPublicationCurrent: options.isPublicationCurrent }
+      : {}),
+    ...(options.setTimeout ? { setTimeout: options.setTimeout } : {}),
+    ...(options.clearTimeout ? { clearTimeout: options.clearTimeout } : {}),
   });
 
   return { scheduler };
@@ -436,7 +461,7 @@ describe('terminal-publication wake', () => {
     expect(call.body.agent).toBe('orchestrator');
     // C2: the v2 body carries the static anti-forgery suffix at its tail.
     expect(call.body.parts[0]?.text).toBe(
-      `${ORCHESTRATOR_CHILDREN_WAKE_TEXT}\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+      `${ORCHESTRATOR_CHILDREN_WAKE_TEXT}\nBackground task results available: child-1.\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
   });
 
@@ -462,7 +487,7 @@ describe('terminal-publication wake', () => {
     };
     expect(call.modelSelection).toBe('inherit');
     expect(call.body.parts[0]?.text).toBe(
-      `${ORCHESTRATOR_WAKE_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+      `${ORCHESTRATOR_WAKE_TEXT}\nBackground task results available: child-1.\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
   });
 
@@ -515,9 +540,11 @@ describe('terminal-publication wake', () => {
     },
   );
 
-  test('parent busy cancels the failed-publication retry instead of waking an empty v2 parent', async () => {
+  test('parent busy preserves the failed-publication retry for the next idle', async () => {
+    let fail = true;
     const promptAsync = mock(async () => {
-      throw new Error('transport down');
+      if (fail) throw new Error('transport down');
+      return {};
     });
     const { scheduler } = createPublicationScheduler({
       hostFlavor: 'v2',
@@ -527,6 +554,7 @@ describe('terminal-publication wake', () => {
       }),
     });
     await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 1);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
     await scheduler.event({
       event: {
         type: 'session.status',
@@ -542,8 +570,9 @@ describe('terminal-publication wake', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    fail = false;
     await clock.advance(120_000);
-    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
   });
 
   test('a delivered publication retry clears its reason before the next timer', async () => {
@@ -564,6 +593,79 @@ describe('terminal-publication wake', () => {
     await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(2);
     await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+  });
+
+  test('a failed publication retained across busy is delivered after idle with periodic wakes disabled', async () => {
+    // Repo timer harness: fully deterministic, no real delay. The scheduler
+    // takes the timer seam directly so unrelated hooks that still schedule on
+    // the global timers cannot enqueue work into this harness.
+    const harness = createTimerHarness();
+    let fail = true;
+    const bodies: string[] = [];
+    const promptAsync = mock(async (args: Record<string, unknown>) => {
+      if (fail) throw new Error('transport down');
+      const body = args.body as { parts?: Array<{ text?: string }> };
+      bodies.push(body.parts?.[0]?.text ?? '');
+      return {};
+    });
+    const accepted: Array<Record<string, unknown>> = [];
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 1_000,
+      // The bug: the idle reschedule would take the periodic path, which
+      // is disabled by default on v2 hosts, and drop the retained fact.
+      periodicWakeEnabled: false,
+      publicationWakeMinIntervalMs: 0,
+      setTimeout: harness.setTimeout as unknown as Parameters<
+        typeof createOrchestratorWakeScheduler
+      >[1]['setTimeout'],
+      clearTimeout: harness.clearTimeout as unknown as Parameters<
+        typeof createOrchestratorWakeScheduler
+      >[1]['clearTimeout'],
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [terminalChild('child-1')],
+      }),
+      onPublicationAccepted: (publication) => accepted.push(publication),
+    });
+
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 3, 4);
+    await harness.tick();
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(accepted).toHaveLength(0);
+
+    // Busy bumps the generation and clears the generation-scoped retry
+    // reason. The execution stays retained and must survive to idle.
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'idle' } },
+      },
+    });
+
+    fail = false;
+    await harness.advance(1_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain('Background task results available: child-1.');
+    expect(accepted).toEqual([
+      {
+        sessionID: 'p1',
+        taskID: 'child-1',
+        generation: 3,
+        terminalRevision: 4,
+      },
+    ]);
+
+    // The periodic gate is still disabled: no extra idle evaluation runs.
+    await harness.advance(1_000);
     expect(promptAsync).toHaveBeenCalledTimes(2);
   });
 
@@ -597,6 +699,11 @@ describe('terminal-publication wake', () => {
     });
     rejectFirst?.(new Error('late rejection'));
     await publication;
+    // The failed attempt belongs to the pre-busy generation: it must not
+    // stamp its reason on the new one.
+    expect(
+      scheduler._test.localSessions.get('p1')?.retryReason,
+    ).toBeUndefined();
     await scheduler.event({
       event: {
         type: 'session.status',
@@ -607,7 +714,9 @@ describe('terminal-publication wake', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
-    expect(promptAsync).toHaveBeenCalledTimes(1);
+    // The publication itself is still retained, so the idle reschedule
+    // evaluates it as a publication without a stale reason.
+    expect(promptAsync).toHaveBeenCalledTimes(2);
   });
 
   test('P6b: repeated failed publications on an unchanged terminal snapshot keep the backstop alive', async () => {
@@ -657,6 +766,280 @@ describe('terminal-publication wake', () => {
     await scheduler.triggerTerminalPublicationWake('p1', 'child-2', 1);
     await clock.advance(0);
     expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('busy publication retains its execution until the timer lands', async () => {
+    const promptAsync = mock(async () => ({}));
+    const accepted: Array<Record<string, unknown>> = [];
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 1_000,
+      publicationWakeMinIntervalMs: 1,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [terminalChild('child-1')],
+      }),
+      onPublicationAccepted: (publication) => accepted.push(publication),
+    });
+
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 3, 4);
+    await clock.advance(0);
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(accepted).toHaveLength(0);
+
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'idle' } },
+      },
+    });
+    await clock.advance(1_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(accepted).toEqual([
+      {
+        sessionID: 'p1',
+        taskID: 'child-1',
+        generation: 3,
+        terminalRevision: 4,
+      },
+    ]);
+  });
+
+  test('acknowledges only the publications named in the accepted body', async () => {
+    const gate = deferred<void>();
+    const bodies: string[] = [];
+    const promptAsync = mock(async (args: Record<string, unknown>) => {
+      const body = args.body as { parts?: Array<{ text?: string }> };
+      bodies.push(body.parts?.[0]?.text ?? '');
+      if (bodies.length === 1) await gate.promise;
+      return {};
+    });
+    const accepted: Array<Record<string, unknown>> = [];
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 1_000,
+      publicationWakeMinIntervalMs: 1_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [terminalChild('child-a'), terminalChild('child-b')],
+      }),
+      onPublicationAccepted: (publication) => accepted.push(publication),
+    });
+
+    const first = scheduler.triggerTerminalPublicationWake(
+      'p1',
+      'child-a',
+      1,
+      1,
+    );
+    await clock.advance(0);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain('child-a');
+    expect(bodies[0]).not.toContain('child-b');
+
+    // B arrives while A's send is in flight: it was not covered by A's
+    // body and must remain pending.
+    const second = scheduler.triggerTerminalPublicationWake(
+      'p1',
+      'child-b',
+      2,
+      1,
+    );
+    await clock.advance(0);
+    expect(bodies).toHaveLength(1);
+
+    gate.resolve();
+    await first;
+    expect(accepted.map((entry) => entry.taskID)).toEqual(['child-a']);
+    await second;
+
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'idle' } },
+      },
+    });
+    await clock.advance(1_000);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toContain('child-b');
+    expect(bodies[1]).not.toContain('child-a');
+    expect(accepted.map((entry) => entry.taskID)).toEqual([
+      'child-a',
+      'child-b',
+    ]);
+  });
+
+  test('throttled publication is acknowledged only after its retry lands', async () => {
+    const promptAsync = mock(async () => ({}));
+    const accepted: Array<Record<string, unknown>> = [];
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      publicationWakeMinIntervalMs: 60_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [terminalChild('child-1'), terminalChild('child-2')],
+      }),
+      onPublicationAccepted: (publication) => accepted.push(publication),
+    });
+
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 1, 1);
+    await clock.advance(0);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(accepted.map((entry) => entry.taskID)).toEqual(['child-1']);
+
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-2', 2, 1);
+    await clock.advance(0);
+    expect(accepted.map((entry) => entry.taskID)).toEqual(['child-1']);
+
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(accepted.map((entry) => entry.taskID)).toEqual([
+      'child-1',
+      'child-2',
+    ]);
+  });
+
+  test('a stale retained publication is dropped without acknowledgement', async () => {
+    const promptAsync = mock(async () => ({}));
+    const accepted: Array<Record<string, unknown>> = [];
+    let current = false;
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 1_000,
+      publicationWakeMinIntervalMs: 60_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [terminalChild('child-1')],
+      }),
+      isPublicationCurrent: () => current,
+      onPublicationAccepted: (publication) => accepted.push(publication),
+    });
+
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 3, 4);
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'idle' } },
+      },
+    });
+    await clock.advance(1_000);
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(accepted).toHaveLength(0);
+
+    current = true;
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 5, 1);
+    await clock.advance(0);
+    expect(accepted.map((entry) => entry.generation)).toEqual([5]);
+  });
+
+  test('an empty stale batch gives back the wake reservation', async () => {
+    const promptAsync = mock(async () => ({}));
+    const accepted: Array<Record<string, unknown>> = [];
+    let current = false;
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 1_000,
+      publicationWakeMinIntervalMs: 1_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [terminalChild('child-1')],
+      }),
+      isPublicationCurrent: () => current,
+      onPublicationAccepted: (publication) => accepted.push(publication),
+    });
+
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 3, 4);
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'idle' } },
+      },
+    });
+    await clock.advance(1_000);
+    // Repeated stale attempts must not consume the no-progress cap.
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 3, 4);
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 3, 4);
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 3, 4);
+
+    current = true;
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 5, 1);
+    await clock.advance(0);
+    expect(accepted.map((entry) => entry.generation)).toEqual([5]);
+  });
+
+  test('chunks overflow publications instead of evicting pending facts', async () => {
+    const promptAsync = mock(async () => ({}));
+    const accepted: Array<Record<string, unknown>> = [];
+    const ids = Array.from({ length: 257 }, (_, index) => `child-${index}`);
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 1_000,
+      publicationWakeMinIntervalMs: 1,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: ids.map((id) => terminalChild(id)),
+      }),
+      onPublicationAccepted: (publication) => accepted.push(publication),
+    });
+
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    for (const id of ids) {
+      await scheduler.triggerTerminalPublicationWake('p1', id, 1, 1);
+    }
+    expect(promptAsync).not.toHaveBeenCalled();
+
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'idle' } },
+      },
+    });
+    await clock.advance(1_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const first = (
+      promptAsync.mock.calls as unknown as Array<[Record<string, unknown>]>
+    )[0]?.[0] as { body: { parts: Array<{ text: string }> } };
+    expect(first.body.parts[0]?.text).toContain(
+      'Background task results available:',
+    );
+    expect(first.body.parts[0]?.text).toContain('child-0');
+    expect(first.body.parts[0]?.text).not.toContain('child-256');
+    expect(first.body.parts[0]?.text).toContain('1 more pending delivery.');
+    expect(accepted).toHaveLength(256);
+
+    await clock.advance(1_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    const second = (
+      promptAsync.mock.calls as unknown as Array<[Record<string, unknown>]>
+    )[1]?.[0] as { body: { parts: Array<{ text: string }> } };
+    expect(second.body.parts[0]?.text).toContain('child-256');
+    expect(second.body.parts[0]?.text).not.toContain('more pending delivery');
+    expect(accepted.map((entry) => entry.taskID)).toContain('child-256');
+    expect(accepted).toHaveLength(257);
   });
 
   test('busy parent is skipped entirely (native steer already delivered)', async () => {
@@ -715,15 +1098,25 @@ describe('terminal-publication wake', () => {
     });
 
     // First publication while an input wait is open: suppressed.
-    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 1);
+    const suppressed = await scheduler.triggerTerminalPublicationWake(
+      'p1',
+      'child-1',
+      1,
+    );
     await clock.advance(0);
+    expect(suppressed).toBe(false);
     expect(promptAsync).not.toHaveBeenCalled();
 
     // The wait clears; the very next publication still wakes: the
     // suppressed attempt must not have consumed the throttle window.
     inputWait = false;
-    await scheduler.triggerTerminalPublicationWake('p1', 'child-2', 1);
+    const delivered = await scheduler.triggerTerminalPublicationWake(
+      'p1',
+      'child-2',
+      1,
+    );
     await clock.advance(0);
+    expect(delivered).toBe(true);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
 

@@ -266,12 +266,17 @@ export interface V2Context {
     wait?(input: { sessionID: string }): Promise<void>;
     /** v2 session.remove — DELETE /api/session/:id (runtime-probed). */
     remove?(input: { sessionID: string }): Promise<unknown>;
-    /** v2 session.list — query-filtered listing (runtime-probed).
-     * `parentID` accepts a session id or `null`/the literal `"null"`
-     * string for root-only listing. */
+    /** v2 session.list — query-filtered, cursor-paginated listing
+     * (runtime-probed; exposed natively from v2.1). `parentID` is a
+     * session id or a real `null` for root-only listing; the shim
+     * normalizes the legacy `"null"` sentinel before calling. `limit`
+     * defaults to 50; `cursor` is the opaque `cursor.next` from the
+     * previous page (it carries the previous page's filters). */
     list?(input: {
       directory?: string;
       parentID?: string | null;
+      limit?: number;
+      cursor?: string;
     }): Promise<unknown>;
     /** v2 session.interrupt — `resume: false` aborts the active run. */
     interrupt?(input: {

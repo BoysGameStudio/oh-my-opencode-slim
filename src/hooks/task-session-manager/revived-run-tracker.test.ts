@@ -27,6 +27,7 @@ function createHarness(
       taskID: string,
       generation: number,
     ) => void;
+    onNotificationAccepted?: (taskID: string) => void;
     resolveSelection?: (sessionID: string) => Promise<{
       agent?: string;
       model?: { providerID: string; modelID: string };
@@ -941,6 +942,7 @@ describe('revived run tracker', () => {
     const capture = captureTransportLogs();
     try {
       const released = mock(() => {});
+      const accepted = mock(() => {});
       const harness = createHarness(
         () => ({ data: [] }),
         mock(async () => {
@@ -950,6 +952,7 @@ describe('revived run tracker', () => {
         {
           maxNotificationRetries: 3,
           onOwnershipReleased: released,
+          onNotificationAccepted: accepted,
         },
       );
       publish(harness);
@@ -969,6 +972,7 @@ describe('revived run tracker', () => {
         1,
       );
       expect(released).toHaveBeenCalledTimes(1);
+      expect(accepted).not.toHaveBeenCalled();
       harness.tracker.dispose();
     } finally {
       capture.restore();
@@ -979,10 +983,14 @@ describe('revived run tracker', () => {
     const clock = installCapturedTimers();
     const capture = captureTransportLogs();
     try {
-      const success = createHarness(() => ({ data: [] }));
+      const accepted = mock(() => {});
+      const success = createHarness(() => ({ data: [] }), undefined, true, {
+        onNotificationAccepted: accepted,
+      });
       publish(success);
       await clock.settle();
       expect(capture.matching('notification accepted')).toHaveLength(1);
+      expect(accepted).toHaveBeenCalledWith('ses_child', expect.any(Number));
       success.tracker.dispose();
 
       const hung = createHarness(

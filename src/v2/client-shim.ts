@@ -37,6 +37,14 @@ import type { V2Context } from './types';
 const HISTORY_PAGE_SIZE = 100;
 const MAX_HISTORY_PAGES = 10;
 const HISTORY_READ_TIMEOUT_MS = 4_000;
+// v2.1 `session.list` pages at 50 and returns `cursor.next` on every
+// nonempty page (even the final data page); an empty page is the terminal
+// signal. The v1-shaped shim must hand legacy callers a complete `{data}`
+// page, so it drains with its own budget (never shared with the history
+// read): at most 20 data pages (1000 sessions), one terminal probe, 4s.
+const SESSION_LIST_PAGE_SIZE = 50;
+const MAX_SESSION_LIST_PAGES = 20;
+const SESSION_LIST_READ_TIMEOUT_MS = 4_000;
 
 /** v2 model reference accepted by `ctx.generate.text`. */
 export interface V2GenerateModelRef {
@@ -317,12 +325,28 @@ function toV1SessionInfo(
  * v1 `client.session.list` over v2 `session.list`. Accepts the v1
  * `{query}` call shape (or a flat query object); passes through the
  * filters shim callers use — `directory` and the `parentID` filter
- * (session id or root-only: the literal `"null"` string, with a real
- * `null` normalized to it) — and wraps the mapped page in the v1
- * `{data}` envelope. Hosts without `session.list` keep the v1-parity
- * empty page (honest absence, not a fake success) after a one-time
- * per-generation warning — stock v2 hosts match this path because the
- * plugin session domain does not expose `list` (see the notice above).
+ * (session id, or root-only as a real `null`; the legacy literal `"null"`
+ * sentinel is normalized to `null` because v2.1 `Session.ID` never accepts
+ * that string) — and wraps the mapped page in the v1 `{data}` envelope.
+ *
+ * v2.1 lists in bounded cursor pages ({data, cursor:{previous?, next?}},
+ * default 50). Core emits `cursor.next` on every nonempty page, including
+ * the final data page; only an empty page terminates the scan. The v1
+ * envelope has no cursor and every in-tree legacy caller (dashboard
+ * discovery, wake child enumeration) needs the complete set, so the shim
+ * drains `cursor.next` (the cursor carries the filters) and returns one
+ * complete `{data}` page. Draining is bounded to 20 data pages of 50 plus
+ * one terminal probe, with its own 4s budget; repeated cursors, malformed
+ * pages, a probe that reveals more data, and exhausted budgets reject
+ * instead of returning a silently incomplete page. Hosts without cursors
+ * (bare arrays, `{data}`-only old hosts) still complete in one read.
+ *
+ * No in-tree caller supplies `limit`/`cursor` (they are not part of the v1
+ * contract this shim serves); the shim owns pagination. Hosts without
+ * `session.list` keep the v1-parity empty page (honest absence, not a fake
+ * success) after a one-time per-generation warning — stock v2 hosts
+ * before 2.1 match this path because the plugin session domain did not
+ * expose `list` (see the notice above).
  */
 export function createSessionListShim(
   s: V2Context['session'],
@@ -340,25 +364,106 @@ export function createSessionListShim(
     const query = ((args?.query as Record<string, unknown> | undefined) ??
       (args as Record<string, unknown> | undefined) ??
       {}) as Record<string, unknown>;
-    const input: Record<string, unknown> = {};
+    const filters: Record<string, unknown> = {};
     if (typeof query.directory === 'string' && query.directory) {
-      input.directory = query.directory;
+      filters.directory = query.directory;
     }
-    if (query.parentID === null) {
-      input.parentID = 'null'; // root-only sentinel on the wire
+    if (query.parentID === null || query.parentID === 'null') {
+      // v2.1 roots are a real null; "null" is not a valid Session.ID.
+      filters.parentID = null;
     } else if (typeof query.parentID === 'string' && query.parentID !== '') {
-      input.parentID = query.parentID;
+      filters.parentID = query.parentID;
     }
-    const output = (await s.list(input)) as
-      | { data?: unknown }
-      | Array<Record<string, unknown>>
-      | undefined;
-    const infos = Array.isArray(output)
-      ? output
-      : isRecord(output) && Array.isArray(output.data)
-        ? (output.data as Array<Record<string, unknown>>)
-        : [];
-    return { data: infos.filter(isRecord).map(toV1SessionInfo) };
+    const infos: Array<Record<string, unknown>> = [];
+    const cursors = new Set<string>();
+    const deadline = performance.now() + SESSION_LIST_READ_TIMEOUT_MS;
+    const budgetError = '[v2] session.list read budget exceeded';
+    const capacityError = `[v2] session.list exceeded its ${
+      MAX_SESSION_LIST_PAGES * SESSION_LIST_PAGE_SIZE
+    }-session capacity`;
+    let dataPages = 0;
+    let cursor: string | undefined;
+    do {
+      const remainingMs = deadline - performance.now();
+      if (remainingMs <= 0) {
+        throw new Error(budgetError);
+      }
+      // A v2.1 cursor carries the filters of the page that produced it, so
+      // only the first request needs them (filters sent with a cursor are
+      // ignored by the host). Older cursorless hosts also get the first
+      // request's filters.
+      const page = await withTimeout(
+        s.list(
+          cursor
+            ? { limit: SESSION_LIST_PAGE_SIZE, cursor }
+            : { ...filters, limit: SESSION_LIST_PAGE_SIZE },
+        ),
+        remainingMs,
+        budgetError,
+      );
+      if (performance.now() >= deadline) {
+        throw new Error(budgetError);
+      }
+      const pageRecord = isRecord(page) ? page : undefined;
+      const entries = Array.isArray(page)
+        ? page
+        : pageRecord && Array.isArray(pageRecord.data)
+          ? (pageRecord.data as Array<Record<string, unknown>>)
+          : undefined;
+      if (!(Array.isArray(entries) && entries.every(isRecord))) {
+        throw new Error(
+          '[v2] session.list did not return a valid session page',
+        );
+      }
+      let next: string | undefined;
+      if (pageRecord && pageRecord.cursor !== undefined) {
+        const pageCursor = pageRecord.cursor;
+        if (!isRecord(pageCursor)) {
+          throw new Error(
+            '[v2] session.list did not return a valid session cursor',
+          );
+        }
+        if ('next' in pageCursor) {
+          if (
+            typeof pageCursor.next !== 'string' ||
+            pageCursor.next.length === 0
+          ) {
+            if (pageCursor.next !== undefined && pageCursor.next !== '') {
+              throw new Error(
+                '[v2] session.list did not return a valid session cursor',
+              );
+            }
+          } else {
+            next = pageCursor.next;
+          }
+        }
+      }
+      if (next && entries.length > SESSION_LIST_PAGE_SIZE) {
+        throw new Error(
+          '[v2] session.list returned more than one page in a page',
+        );
+      }
+      if (next && entries.length === 0) {
+        throw new Error(
+          '[v2] session.list returned an empty page with a next cursor',
+        );
+      }
+      if (entries.length === 0) break; // v2.1 terminal page
+      if (dataPages >= MAX_SESSION_LIST_PAGES) {
+        // The one allowed terminal probe returned data: more than the
+        // stated capacity. Reject rather than return a 1000-item prefix.
+        throw new Error(capacityError);
+      }
+      dataPages++;
+      infos.push(...entries);
+      if (!next) break; // cursorless old host: one complete page
+      if (cursors.has(next)) {
+        throw new Error('[v2] session.list repeated a cursor');
+      }
+      cursors.add(next);
+      cursor = next;
+    } while (cursor);
+    return { data: infos.map(toV1SessionInfo) };
   };
 }
 

@@ -427,6 +427,14 @@ export type OrchestratorWakeConfig = {
   publicationWakeMinIntervalMs?: number;
 };
 
+export type WakeSchedulerTimers = {
+  setTimeout: (
+    callback: () => void,
+    delay: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearTimeout: (timer: ReturnType<typeof setTimeout>) => void;
+};
+
 export type OrchestratorWakeOptions = {
   config: OrchestratorWakeConfig;
   shouldManageSession: (sessionID: string) => boolean;
@@ -454,6 +462,10 @@ export type OrchestratorWakeOptions = {
   hasPendingDelegatedWork?: (sessionID: string) => boolean;
   /** Test seam: override interval without changing config validation. */
   intervalMs?: number;
+  /** Scheduling seam for deterministic tests. Defaults to the global timer
+   * functions, resolved at call time. */
+  setTimeout?: WakeSchedulerTimers['setTimeout'];
+  clearTimeout?: WakeSchedulerTimers['clearTimeout'];
   /** Whether the Background Job Board is injected into orchestrator
    * prompts. Stopped-recovery and overflow wake texts reference the board
    * only when it is actually visible to the model; otherwise they point at
@@ -469,6 +481,23 @@ export type OrchestratorWakeOptions = {
    * `backgroundJobs.childInputWakeKinds`). Absent means the shipped
    * default: permission asks off, question asks on (#1504). */
   childInputWakeKinds?: { permission: boolean; question: boolean };
+  /** One terminal publication this scheduler accepted delivery for. The
+   * caller acknowledges exactly these executions, never every child that
+   * happens to be terminal when a generic wake lands. */
+  onPublicationAccepted?: (publication: {
+    sessionID: string;
+    taskID: string;
+    generation: number;
+    terminalRevision?: number;
+  }) => void;
+  /** Revalidate a retained publication immediately before acknowledging
+   * it: the record must still be the same terminal execution. */
+  isPublicationCurrent?: (publication: {
+    sessionID: string;
+    taskID: string;
+    generation: number;
+    terminalRevision?: number;
+  }) => boolean;
 };
 
 /**
@@ -947,6 +976,12 @@ export function createOrchestratorWakeScheduler(
     options.childInputWakeKinds ?? DEFAULT_CHILD_INPUT_WAKE_KINDS;
   const directory = ctx.directory;
   const sessionSdk = (ctx.client as OpencodeClient).session;
+  const scheduleTimeout: WakeSchedulerTimers['setTimeout'] =
+    options.setTimeout ??
+    ((callback, delay) =>
+      setTimeout(callback, delay) as ReturnType<typeof setTimeout>);
+  const cancelTimeout: WakeSchedulerTimers['clearTimeout'] =
+    options.clearTimeout ?? ((timer) => clearTimeout(timer));
 
   /** Static host-surface capability record (the client never changes). */
   const capabilities = probeSessionApis(
@@ -1002,6 +1037,90 @@ export function createOrchestratorWakeScheduler(
    * deliveries all consume the window; failed attempts do not. */
   const lastPublicationWakeAt = new Map<string, number>();
 
+  /** Executions awaiting an accepted terminal publication. Busy/throttled/
+   * failed attempts retain them; a later timer/waiter/direct acceptance of
+   * a publication wake acknowledges exactly the facts still current. */
+  type PendingPublication = {
+    sessionID: string;
+    taskID: string;
+    generation: number;
+    terminalRevision?: number;
+  };
+  const pendingPublications = new Map<
+    string,
+    Map<string, PendingPublication>
+  >();
+  /** Maximum executions named by one wake body; the rest stay pending. */
+  const MAX_PUBLICATIONS_PER_WAKE = 256;
+
+  function pendingPublicationKey(publication: PendingPublication): string {
+    return `${publication.taskID}:${publication.generation}:${
+      publication.terminalRevision ?? ''
+    }`;
+  }
+
+  function retainPendingPublication(publication: PendingPublication): void {
+    const existing = pendingPublications.get(publication.sessionID);
+    const facts = existing ?? new Map<string, PendingPublication>();
+    facts.set(pendingPublicationKey(publication), publication);
+    pendingPublications.set(publication.sessionID, facts);
+    const state = touchLocal(publication.sessionID);
+    state.continuousIdle = true;
+    state.retryReason = 'publication';
+    schedule(publication.sessionID);
+  }
+
+  /** Snapshot the executions a publication body is about to cover. Entries
+   * are revalidated now; a delivery that arrived earlier must not be
+   * published a second time. The snapshot is never mutated by arrivals
+   * during the send. */
+  function snapshotPendingPublications(
+    sessionID: string,
+  ): PendingPublication[] {
+    const facts = pendingPublications.get(sessionID);
+    if (!facts) return [];
+    const current: PendingPublication[] = [];
+    for (const [key, fact] of facts) {
+      if (options.isPublicationCurrent?.(fact) === false) {
+        facts.delete(key);
+        continue;
+      }
+      current.push(fact);
+    }
+    if (facts.size === 0) pendingPublications.delete(sessionID);
+    return current.slice(0, MAX_PUBLICATIONS_PER_WAKE);
+  }
+
+  function pendingPublicationCount(sessionID: string): number {
+    return pendingPublications.get(sessionID)?.size ?? 0;
+  }
+
+  function hasPendingPublications(sessionID: string): boolean {
+    return pendingPublicationCount(sessionID) > 0;
+  }
+
+  /** Acknowledge exactly the snapshot carried by the accepted body. A new
+   * execution queued while promptAsync was in flight remains pending. */
+  function acknowledgePendingPublications(
+    sessionID: string,
+    batch: readonly PendingPublication[],
+  ): void {
+    const facts = pendingPublications.get(sessionID);
+    if (!facts) return;
+    for (const fact of batch) {
+      const key = pendingPublicationKey(fact);
+      const current = facts.get(key);
+      if (current !== fact) continue;
+      if (options.isPublicationCurrent?.(fact) === false) {
+        facts.delete(key);
+        continue;
+      }
+      facts.delete(key);
+      options.onPublicationAccepted?.(fact);
+    }
+    if (facts.size === 0) pendingPublications.delete(sessionID);
+  }
+
   const childInputCurrent = options.isChildInputWaitCurrent;
   /** Sessions with a background child awaiting an input-wait wake, carrying
    * the self-contained ask deltas (see `formatChildInputWaitDelta`),
@@ -1028,7 +1147,7 @@ export function createOrchestratorWakeScheduler(
   function clearChildInputTimer(sessionID: string): void {
     const timer = childInputTimers.get(sessionID);
     if (timer === undefined) return;
-    clearTimeout(timer);
+    cancelTimeout(timer);
     childInputTimers.delete(sessionID);
   }
 
@@ -1105,7 +1224,7 @@ export function createOrchestratorWakeScheduler(
 
   function clearTimer(state: LocalSessionState): void {
     if (state.timer !== undefined) {
-      clearTimeout(state.timer);
+      cancelTimeout(state.timer);
       state.timer = undefined;
     }
   }
@@ -1137,6 +1256,7 @@ export function createOrchestratorWakeScheduler(
     clearWakeSession(sessionID);
     pendingStoppedRecoveries.delete(sessionID);
     lastPublicationWakeAt.delete(sessionID);
+    pendingPublications.delete(sessionID);
     pendingChildInputWakes.delete(sessionID);
     reportedScheduleBlockers.delete(sessionID);
   }
@@ -1259,6 +1379,22 @@ export function createOrchestratorWakeScheduler(
     }
   }
 
+  /** Reason for the next armed timer. Retained publications are durable
+   * pending work: a busy transition bumps the generation, which clears the
+   * generation-scoped `retryReason`, but the executions stay in
+   * `pendingPublications` until an accepted delivery. Deriving 'publication'
+   * from that retained state keeps the idle reschedule (and any reschedule
+   * after a generation-bumping lifecycle event) off the periodic path, which
+   * is disabled by default on v2 hosts and would otherwise strand the
+   * pending delivery. Deletion/archive clear or suppress the state instead of
+   * preserving a stale reason. */
+  function scheduledWakeReason(sessionID: string): WakeReason {
+    const retryReason = localSessions.get(sessionID)?.retryReason;
+    if (retryReason) return retryReason;
+    if (hasPendingPublications(sessionID)) return 'publication';
+    return 'periodic';
+  }
+
   function schedule(sessionID: string): void {
     const blocker = scheduleBlocker(sessionID);
     if (blocker) {
@@ -1270,10 +1406,10 @@ export function createOrchestratorWakeScheduler(
     if (getWakeProgress(sessionID).stopped) return;
 
     const generation = state.generation;
-    const timer = setTimeout(() => {
+    const timer = scheduleTimeout(() => {
       state.timer = undefined;
       if (state.generation !== generation) return;
-      const reason = state.retryReason ?? 'periodic';
+      const reason = scheduledWakeReason(sessionID);
       // Periodic-arm gate only: recovery/publication wakes that failed on
       // an SDK error ride this same timer through `retryReason` and must
       // still deliver while the periodic evaluation is disabled.
@@ -2075,6 +2211,33 @@ export function createOrchestratorWakeScheduler(
             : wakeMode === 'children'
               ? ORCHESTRATOR_CHILDREN_WAKE_TEXT
               : ORCHESTRATOR_WAKE_TEXT;
+      // Snapshot the publications this body covers BEFORE the send. A
+      // terminal publication arriving during promptAsync is not in this
+      // batch and must retain its own pending acknowledgement.
+      const publicationBatch =
+        reason === 'publication' ? snapshotPendingPublications(sessionID) : [];
+      if (reason === 'publication' && publicationBatch.length === 0) {
+        // Every queued execution was retired by a trusted delivery while this
+        // attempt waited. Do not emit a generic forced publication wake, and
+        // give the wake reservation back so the abort does not consume it.
+        rollbackWakeReservation(sessionID, owner);
+        if (state.generation === generation) state.retryReason = undefined;
+        return false;
+      }
+      const remainingPublications = Math.max(
+        0,
+        pendingPublicationCount(sessionID) - publicationBatch.length,
+      );
+      const publicationDetails =
+        publicationBatch.length > 0
+          ? `Background task results available: ${publicationBatch
+              .map((publication) => publication.taskID)
+              .join(', ')}.${
+              remainingPublications > 0
+                ? ` ${remainingPublications} more pending delivery.`
+                : ''
+            }`
+          : '';
       // Snapshot keys/values at send time. Do not detach the map: a stop
       // arriving during promptAsync lands in the same entry and must survive
       // confirmation. After delivery, retire only the keys that were sent.
@@ -2136,6 +2299,7 @@ export function createOrchestratorWakeScheduler(
           ? WRITER_LANE_VERIFICATION_TEXT
           : '';
       const recoveryDetails = [
+        publicationDetails,
         overflowDelta,
         recoveryDelta,
         inputOverflowDelta,
@@ -2256,6 +2420,14 @@ export function createOrchestratorWakeScheduler(
       if (reason === 'publication') {
         lastPublicationWakeAt.set(sessionID, Date.now());
         boundTrackedMap(lastPublicationWakeAt);
+        acknowledgePendingPublications(sessionID, publicationBatch);
+        if (hasPendingPublications(sessionID)) {
+          if (state.generation === generation) {
+            state.retryReason = 'publication';
+            state.continuousIdle = true;
+          }
+          schedule(sessionID);
+        }
       }
       return true;
     } catch (error) {
@@ -2427,7 +2599,7 @@ export function createOrchestratorWakeScheduler(
       // Keep the first deadline: duplicates enrich the queued delta, and
       // bursts cannot postpone a genuinely blocked child indefinitely.
       if (childInputTimers.has(sessionID)) return;
-      const timer = setTimeout(() => {
+      const timer = scheduleTimeout(() => {
         childInputTimers.delete(sessionID);
         const batch = queue.batches.get(sessionID);
         if (!batch) return;
@@ -2491,7 +2663,8 @@ export function createOrchestratorWakeScheduler(
     sessionID: string,
     taskID: string,
     generation: number,
-  ): Promise<void> {
+    terminalRevision?: number,
+  ): Promise<boolean> {
     if (
       disposed ||
       !enabled ||
@@ -2499,8 +2672,18 @@ export function createOrchestratorWakeScheduler(
       !capabilities.ready ||
       !canObserveSelection(sessionID)
     ) {
-      return;
+      return false;
     }
+    // Retain the execution until a publication actually lands: this direct
+    // trigger may be throttled, lose the busy race, or fail its SDK send,
+    // and the eventual timer retry must acknowledge the same execution.
+    const publication = {
+      sessionID,
+      taskID,
+      generation,
+      ...(terminalRevision !== undefined ? { terminalRevision } : {}),
+    };
+    retainPendingPublication(publication);
     // Busy parent: native steer already delivered the first completion for
     // this job; a queued wake on top would double-inject.
     if (isParentActiveByEvents(sessionID)) {
@@ -2512,7 +2695,7 @@ export function createOrchestratorWakeScheduler(
         verdict: 'skipped',
         reason: 'parent-busy',
       });
-      return;
+      return false;
     }
     const now = Date.now();
     const lastWakeAt = lastPublicationWakeAt.get(sessionID);
@@ -2530,10 +2713,10 @@ export function createOrchestratorWakeScheduler(
         reason: 'throttled',
         windowMs: publicationWakeMinIntervalMs,
       });
-      return;
+      return false;
     }
     if (localSessions.get(sessionID)?.archived) {
-      return;
+      return false;
     }
     const blocker = scheduleBlocker(sessionID, {
       // The fingerprint comparison inside evaluate is the authoritative
@@ -2549,7 +2732,7 @@ export function createOrchestratorWakeScheduler(
         verdict: 'skipped',
         reason: blocker,
       });
-      return;
+      return false;
     }
     // evaluate consumes the throttle on every publication delivery. A
     // suppressed or failed attempt burns nothing; the one-flight gate
@@ -2559,12 +2742,26 @@ export function createOrchestratorWakeScheduler(
     clearTimer(state);
     bumpGeneration(state);
     state.continuousIdle = true;
+    const evaluationGeneration = state.generation;
     const delivered = await evaluate(
       sessionID,
-      state.generation,
+      evaluationGeneration,
       'publication',
     );
-    if (!delivered) return;
+    if (!delivered) {
+      // A concurrent evaluation can consume this attempt. If no lifecycle
+      // event advanced the generation, keep the publication armed so the
+      // shared timer retries it.
+      if (
+        state.generation === evaluationGeneration &&
+        hasPendingPublications(sessionID)
+      ) {
+        state.retryReason = 'publication';
+        state.continuousIdle = true;
+        schedule(sessionID);
+      }
+      return false;
+    }
     log('[orchestrator-wake] terminal publication wake', {
       sessionID,
       taskID,
@@ -2572,6 +2769,7 @@ export function createOrchestratorWakeScheduler(
       trigger: 'terminal-publication',
       verdict: 'waking',
     });
+    return true;
   }
 
   /**

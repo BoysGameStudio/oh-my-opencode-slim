@@ -19,6 +19,7 @@ export interface BackgroundJobSupervisorOptions {
 
 interface RunTimers {
   generation: number;
+  runStartedAt: number;
   parentSessionID: string;
   deadlineTimer?: TimerHandle;
   graceTimer?: TimerHandle;
@@ -59,11 +60,16 @@ export class BackgroundJobSupervisor {
     }
 
     const current = this.runs.get(record.taskID);
-    if (current?.generation === record.generation) return;
+    if (
+      current?.generation === record.generation &&
+      current.runStartedAt === record.runStartedAt
+    )
+      return;
     this.clear(record.taskID);
 
     const run: RunTimers = {
       generation: record.generation,
+      runStartedAt: record.runStartedAt,
       parentSessionID: record.parentSessionID,
     };
     if (record.deadlineExceededAt !== undefined) {
