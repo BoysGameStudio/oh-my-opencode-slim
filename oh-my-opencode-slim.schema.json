@@ -1727,39 +1727,6 @@
           "default": true,
           "description": "When false, skip registering this enhanced webfetch so OpenCode uses its built-in version.",
           "type": "boolean"
-        },
-        "model": {
-          "description": "Dedicated model(s) for smartfetch secondary-model summarization. Same shape as agent model config (string, array of strings/objects with id+variant). Takes priority over small_model and agents.explorer.model.",
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "minItems": 1,
-              "type": "array",
-              "items": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "id": {
-                        "type": "string"
-                      },
-                      "variant": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "id"
-                    ]
-                  }
-                ]
-              }
-            }
-          ]
         }
       },
       "additionalProperties": false

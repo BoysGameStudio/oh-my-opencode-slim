@@ -337,7 +337,7 @@ describe('loadPluginConfig', () => {
     fs.writeFileSync(
       path.join(userConfigPath, 'oh-my-opencode-slim.json'),
       JSON.stringify({
-        webfetch: { model: 'user/provider-model' },
+        webfetch: { enabled: false },
       }),
     );
     fs.writeFileSync(
@@ -351,7 +351,6 @@ describe('loadPluginConfig', () => {
 
     expect(config.webfetch).toEqual({
       enabled: true,
-      model: 'user/provider-model',
     });
   });
 
@@ -426,7 +425,7 @@ describe('loadPluginConfig', () => {
     fs.writeFileSync(
       path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
       JSON.stringify({
-        webfetch: { model: 'project/provider-model' },
+        webfetch: {},
       }),
     );
 
@@ -434,7 +433,6 @@ describe('loadPluginConfig', () => {
 
     expect(config.webfetch).toEqual({
       enabled: false,
-      model: 'project/provider-model',
     });
   });
 

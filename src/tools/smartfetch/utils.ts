@@ -208,28 +208,6 @@ export function cleanFetchedText(input: string): string {
   return trimBlankRuns(input);
 }
 
-export function joinRenderedContent(
-  metadata: string,
-  content: string,
-  format: 'text' | 'markdown' | 'html',
-): string {
-  if (!metadata) return content;
-  if (!content) {
-    return format === 'html' ? `<!--\n${metadata.trim()}\n-->` : metadata;
-  }
-  if (format === 'html') {
-    const comment = `<!--\n${metadata.trim()}\n-->\n`;
-    const xmlDecl = content.match(/^\s*(<\?xml[\s\S]*?\?>\s*)/i);
-    if (xmlDecl) {
-      return `${xmlDecl[1]}${comment}${content.slice(xmlDecl[0].length)}`;
-    }
-    return `${comment}${content}`;
-  }
-  const startsWithFrontmatter = /^---(?:\r?\n|$)/.test(content);
-  if (!startsWithFrontmatter) return `${metadata}${content}`;
-  return `${metadata}Source content:\n\n${content}`;
-}
-
 export function renderMessageForFormat(
   content: string,
   format: 'text' | 'markdown' | 'html',
@@ -250,14 +228,6 @@ export function buildRedirectResultMessage(
     `Status: ${statusCode}`,
     '',
     'Re-run webfetch with the redirect URL to continue.',
-  ].join('\n');
-}
-
-export function buildLlmsRequiredMessage(originalUrl: string, reason?: string) {
-  return [
-    'Required llms.txt content was unavailable.',
-    `Original URL: ${originalUrl}`,
-    ...(reason ? [`Reason: ${reason}`] : []),
   ].join('\n');
 }
 

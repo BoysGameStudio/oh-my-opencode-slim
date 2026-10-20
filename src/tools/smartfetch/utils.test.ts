@@ -3,8 +3,6 @@ import { loadJSDOM } from '../../utils/jsdom';
 import {
   cleanFetchedMarkdown,
   extractFromHtml,
-  extractHeadingsFromMarkdown,
-  joinRenderedContent,
   withCssTreeWarningsSuppressed,
   withJsdomCssParsingErrorsSuppressed,
 } from './utils';
@@ -46,7 +44,7 @@ describe('smartfetch/utils', () => {
     }
   });
 
-  test('bounds fourteen 1 MiB markdown and heading generators below one second', () => {
+  test('bounds markdown cleaning generators below one second', () => {
     const mib = 1024 * 1024;
     const PL = '"Permanent link")';
     const generators: Array<
@@ -59,11 +57,6 @@ describe('smartfetch/utils', () => {
       ],
       ['lone CR', (n) => ' \r'.repeat(n / 2), cleanFetchedMarkdown],
       ['hashes', (n) => '#'.repeat(n), cleanFetchedMarkdown],
-      [
-        'heading pilcrows',
-        (n) => `# ${'¶'.repeat(Math.floor(n / 2) - 2)}#`,
-        extractHeadingsFromMarkdown,
-      ],
       [
         'permalink prefix',
         (n) => `${'#'.repeat(n - 7)}[¶](#`,
@@ -115,26 +108,6 @@ describe('smartfetch/utils', () => {
     }
   });
 
-  test('extracts cleaned headings from markdown', () => {
-    const headings = extractHeadingsFromMarkdown(
-      ['# Intro', '## Details ###', '### C#', 'plain text'].join('\n'),
-    );
-
-    expect(headings).toEqual(['Intro', 'Details', 'C#']);
-  });
-
-  test('injects metadata comments after an XML declaration in html output', () => {
-    const result = joinRenderedContent(
-      '---\nsource: "smartfetch"\n---\n\n',
-      '<?xml version="1.0"?><root>ok</root>',
-      'html',
-    );
-
-    expect(result).toStartWith('<?xml version="1.0"?>');
-    expect(result).toContain('<!--\n---\nsource: "smartfetch"\n---\n-->');
-    expect(result).toContain('<root>ok</root>');
-  });
-
   test('suppresses css-tree warnings and preserves F10 unextracted HTML', async () => {
     const originalWarn = console.warn;
     const originalError = console.error;
@@ -146,7 +119,6 @@ describe('smartfetch/utils', () => {
       const result = await extractFromHtml(
         CSS_TREE_WARNING_HTML,
         'https://example.com/',
-        false,
       );
 
       const cssTreeWarnings = warnCalls.filter((args) =>
@@ -182,11 +154,7 @@ describe('smartfetch/utils', () => {
   test('restores the original console.warn after extraction', async () => {
     const originalWarn = console.warn;
     try {
-      await extractFromHtml(
-        CSS_TREE_WARNING_HTML,
-        'https://example.com/',
-        true,
-      );
+      await extractFromHtml(CSS_TREE_WARNING_HTML, 'https://example.com/');
 
       expect(console.warn).toBe(originalWarn);
     } finally {
@@ -199,14 +167,11 @@ describe('smartfetch/utils', () => {
     const errorCalls: unknown[][] = [];
     console.error = (...args: unknown[]) => errorCalls.push(args);
     try {
-      for (const extractMain of [false, true]) {
-        const result = await extractFromHtml(
-          CSS_PARSING_ERROR_HTML,
-          'https://example.com/',
-          extractMain,
-        );
-        expect(result.text).toContain('Hello');
-      }
+      const result = await extractFromHtml(
+        CSS_PARSING_ERROR_HTML,
+        'https://example.com/',
+      );
+      expect(result.text).toContain('Hello');
       expect(errorCalls).toEqual([]);
       const { VirtualConsole } = await loadJSDOM();
       withJsdomCssParsingErrorsSuppressed((vc) => {
@@ -231,7 +196,7 @@ describe('smartfetch/utils', () => {
 
   test('skips Readability for documents with over 15k elements', async () => {
     const html = `<html><body><article><h1>Large page</h1><p>Content</p>${'<span>x</span>'.repeat(15_001)}</article></body></html>`;
-    const result = await extractFromHtml(html, 'https://example.com/', true);
+    const result = await extractFromHtml(html, 'https://example.com/');
     expect(result.extractedMain).toBe(false);
     expect(result.html).toBe(html);
     expect(result.text).toContain('Content');

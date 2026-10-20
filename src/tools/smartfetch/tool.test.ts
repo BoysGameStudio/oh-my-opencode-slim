@@ -1,15 +1,6 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
 import { buildCacheKey, CACHE } from './cache';
 import { createWebfetchTool } from './tool';
-
-let mockV2Client: Record<string, unknown>;
-
-mock.module('../../utils/opencode-client', () => ({
-  getClient: () => mockV2Client,
-}));
 
 function createExecutionContext() {
   return {
@@ -19,6 +10,8 @@ function createExecutionContext() {
     directory: '/tmp/smartfetch-test',
   } as any;
 }
+
+const cacheOptions = { format: 'markdown' as const, save_binary: false };
 
 async function expireCached(key: string) {
   const entry = CACHE.get(key);
@@ -53,10 +46,10 @@ describe('smartfetch/tool', () => {
       { url: 'https://docs.example.com/page' },
       createExecutionContext(),
     );
-    expect(result).toContain('requested_url:');
-    expect(result).toContain('extracted_main: true');
+    expect(result).toContain('title: "Docs"');
     expect(result).toContain('Welcome');
     expect(result).not.toContain('Navigation only');
+    expect(result).not.toContain('final_url:');
     expect(visited).toEqual([
       'https://docs.example.com/llms-full.txt',
       'https://docs.example.com/llms.txt',
@@ -85,10 +78,7 @@ describe('smartfetch/tool', () => {
       },
     ) as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    const args = {
-      url: 'https://example.com/article',
-      prefer_llms_txt: 'never' as const,
-    };
+    const args = { url: 'https://example.com/article' };
     const markdown = await webfetch.execute(
       { ...args, format: 'markdown' },
       createExecutionContext(),
@@ -98,8 +88,8 @@ describe('smartfetch/tool', () => {
       createExecutionContext(),
     );
     expect(markdown).toContain('# Markdown heading');
-    expect(markdown).toContain('source_kind: "text"');
     expect(html).toContain('HTML heading');
+    expect(html).not.toContain('---\n');
     expect(accepts).toHaveLength(2);
     expect(accepts[0]).toStartWith('text/markdown');
     expect(accepts[1]).toStartWith('text/html');
@@ -123,7 +113,7 @@ describe('smartfetch/tool', () => {
           { url: 'https://docs.example.com/page', format },
           createExecutionContext(),
         ),
-      ).toContain('used_llms_txt: true');
+      ).toContain('# Docs');
     }
     expect(accepts).toEqual(
       Array(3).fill('text/plain, text/markdown;q=0.9, */*;q=0.1'),
@@ -155,10 +145,7 @@ describe('smartfetch/tool', () => {
       );
     }
     for (const result of outputs)
-      expect(result).toContain('used_llms_txt: true');
-    expect(outputs[0]).toContain('cache_hit: false');
-    expect(outputs[1]).toContain('cache_hit: true');
-    expect(outputs[2]).toContain('cache_hit: true');
+      expect(result).toContain('# Shared llms docs');
     expect(requests).toEqual([
       [
         'https://docs.example.com/llms-full.txt',
@@ -218,7 +205,7 @@ describe('smartfetch/tool', () => {
     globalThis.fetch = fetchMock as typeof fetch;
     await expect(
       createWebfetchTool({ client: {} } as any).execute(
-        { url: 'https://example.com/page', prefer_llms_txt: 'never' },
+        { url: 'https://example.com/page' },
         createExecutionContext(),
       ),
     ).rejects.toThrow(
@@ -235,17 +222,7 @@ describe('smartfetch/tool', () => {
     const ctx = { ...createExecutionContext(), abort: controller.signal };
     const webfetch = createWebfetchTool({ client: {} } as any);
     await expect(
-      webfetch.execute(
-        {
-          url: 'https://example.com/page',
-          format: 'text',
-          extract_main: false,
-          prefer_llms_txt: 'never',
-          include_metadata: true,
-          save_binary: false,
-        },
-        ctx,
-      ),
+      webfetch.execute({ url: 'https://example.com/page' }, ctx),
     ).rejects.toThrow('pre-aborted');
     expect(ctx.ask).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -262,14 +239,7 @@ describe('smartfetch/tool', () => {
     const webfetch = createWebfetchTool({ client: {} } as any);
     await expect(
       webfetch.execute(
-        {
-          url: 'https://example.com/page',
-          format: 'text',
-          extract_main: false,
-          prefer_llms_txt: 'never',
-          include_metadata: true,
-          save_binary: false,
-        },
+        { url: 'https://example.com/page' },
         createExecutionContext(),
       ),
     ).rejects.toThrow('Request failed with status code: 304');
@@ -300,24 +270,12 @@ describe('smartfetch/tool', () => {
     );
     globalThis.fetch = fetchMock as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    const args = {
-      url: 'https://example.com/page',
-      prefer_llms_txt: 'never' as const,
-    };
+    const args = { url: 'https://example.com/page' };
     const invoke = () => webfetch.execute(args, createExecutionContext());
     expect(await invoke()).toContain('first body');
-    const key = buildCacheKey(args.url, {
-      format: 'markdown',
-      extract_main: true,
-      prefer_llms_txt: 'never',
-      save_binary: false,
-    });
+    const key = buildCacheKey(args.url, cacheOptions);
     await expireCached(key);
-    const revalidated = await invoke();
-    expect(revalidated).toContain('first body');
-    expect(revalidated).toContain('etag: "\\"renewed\\""');
-    expect(revalidated).toContain('cache_hit: true');
-    expect(revalidated).toContain('revalidated: true');
+    expect(await invoke()).toContain('first body');
     expect(await invoke()).toContain('first body');
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -336,16 +294,8 @@ describe('smartfetch/tool', () => {
       },
     ) as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    const args = {
-      url: 'https://example.com/replace',
-      prefer_llms_txt: 'never' as const,
-    };
-    const key = buildCacheKey(args.url, {
-      format: 'markdown',
-      extract_main: true,
-      prefer_llms_txt: 'never',
-      save_binary: false,
-    });
+    const args = { url: 'https://example.com/replace' };
+    const key = buildCacheKey(args.url, cacheOptions);
     const invoke = () => webfetch.execute(args, createExecutionContext());
     await invoke();
     await expireCached(key);
@@ -371,17 +321,9 @@ describe('smartfetch/tool', () => {
     );
     globalThis.fetch = fetchMock as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    const args = {
-      url: 'https://example.com/retry-revalidation',
-      prefer_llms_txt: 'never' as const,
-    };
+    const args = { url: 'https://example.com/retry-revalidation' };
     await webfetch.execute(args, createExecutionContext());
-    const key = buildCacheKey(args.url, {
-      format: 'markdown',
-      extract_main: true,
-      prefer_llms_txt: 'never',
-      save_binary: false,
-    });
+    const key = buildCacheKey(args.url, cacheOptions);
     await expireCached(key);
     await expect(
       webfetch.execute(args, createExecutionContext()),
@@ -390,7 +332,6 @@ describe('smartfetch/tool', () => {
     expect(seen).toEqual([null, '"original"', '"original"']);
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(retried).toContain('original body');
-    expect(retried).toContain('revalidated: true');
   });
 
   test('stale entry without validators rejects an unsolicited 304 (R2)', async () => {
@@ -403,17 +344,9 @@ describe('smartfetch/tool', () => {
     );
     globalThis.fetch = fetchMock as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    const args = {
-      url: 'https://example.com/no-validators-304',
-      prefer_llms_txt: 'never' as const,
-    };
+    const args = { url: 'https://example.com/no-validators-304' };
     await webfetch.execute(args, createExecutionContext());
-    const key = buildCacheKey(args.url, {
-      format: 'markdown',
-      extract_main: true,
-      prefer_llms_txt: 'never',
-      save_binary: false,
-    });
+    const key = buildCacheKey(args.url, cacheOptions);
     await expireCached(key);
     await expect(
       webfetch.execute(args, createExecutionContext()),
@@ -443,17 +376,9 @@ describe('smartfetch/tool', () => {
       },
     ) as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    const args = {
-      url: 'https://example.com/page',
-      prefer_llms_txt: 'never' as const,
-    };
+    const args = { url: 'https://example.com/page' };
     await webfetch.execute(args, createExecutionContext());
-    const key = buildCacheKey(args.url, {
-      format: 'markdown',
-      extract_main: true,
-      prefer_llms_txt: 'never',
-      save_binary: false,
-    });
+    const key = buildCacheKey(args.url, cacheOptions);
     await expireCached(key);
     const updated = await webfetch.execute(args, createExecutionContext());
     expect(updated).toContain('new body');
@@ -481,16 +406,8 @@ describe('smartfetch/tool', () => {
       },
     ) as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    const args = {
-      url: 'https://example.com/no-etag',
-      prefer_llms_txt: 'never' as const,
-    };
-    const key = buildCacheKey(args.url, {
-      format: 'markdown',
-      extract_main: true,
-      prefer_llms_txt: 'never',
-      save_binary: false,
-    });
+    const args = { url: 'https://example.com/no-etag' };
+    const key = buildCacheKey(args.url, cacheOptions);
     await webfetch.execute(args, createExecutionContext());
     await expireCached(key);
     expect(await webfetch.execute(args, createExecutionContext())).toContain(
@@ -521,15 +438,12 @@ describe('smartfetch/tool', () => {
     const args = { url: 'https://docs.example.com/page' };
     await webfetch.execute(args, createExecutionContext());
     const key = buildCacheKey(args.url, {
+      ...cacheOptions,
       format: undefined,
-      extract_main: true,
-      prefer_llms_txt: 'auto',
-      save_binary: false,
     });
     await expireCached(key);
     const result = await webfetch.execute(args, createExecutionContext());
-    expect(result).toContain('used_llms_txt: true');
-    expect(result).toContain('cache_hit: false');
+    expect(result).toContain('# Fresh docs');
     expect(calls).toEqual([
       ['https://docs.example.com/llms-full.txt', null],
       ['https://docs.example.com/llms-full.txt', null],
@@ -561,412 +475,22 @@ describe('smartfetch/tool', () => {
     const webfetch = createWebfetchTool({ client: {} } as any);
     const args = { url: 'https://docs.example.com/reprobe' };
     expect(await webfetch.execute(args, createExecutionContext())).toContain(
-      'used_llms_txt: true',
+      '# Old llms docs',
     );
     const key = buildCacheKey(args.url, {
+      ...cacheOptions,
       format: undefined,
-      extract_main: true,
-      prefer_llms_txt: 'auto',
-      save_binary: false,
     });
     await expireCached(key);
     probeAvailable = false;
     const fallback = await webfetch.execute(args, createExecutionContext());
     expect(fallback).toContain('fresh page body');
-    expect(fallback).toContain('used_llms_txt: false');
     expect(calls).toEqual([
       ['https://docs.example.com/llms-full.txt', null],
       ['https://docs.example.com/llms-full.txt', null],
       ['https://docs.example.com/llms.txt', null],
       ['https://docs.example.com/reprobe', null],
     ]);
-  });
-
-  test('unsaved binary metadata includes the same download limit as saved binaries', async () => {
-    globalThis.fetch = mock(
-      async () =>
-        new Response(new Uint8Array([0, 1, 2]), {
-          headers: { 'content-type': 'image/png' },
-        }),
-    ) as typeof fetch;
-    const webfetch = createWebfetchTool({ client: {} } as any);
-    const result = await webfetch.execute(
-      {
-        url: 'https://example.com/figure.png',
-        format: 'markdown',
-        extract_main: true,
-        prefer_llms_txt: 'never',
-        include_metadata: true,
-        save_binary: false,
-      },
-      createExecutionContext(),
-    );
-    expect(result).toContain('download_limit_bytes: 2097152');
-    expect(result).toContain('save_binary: false');
-    expect(result).toContain('cache_hit: false');
-  });
-
-  test('a small PNG attaches only for a direct-routed multimodal v1 model, with per-call cached decisions', async () => {
-    const image = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10, 42]);
-    const fetchMock = mock(
-      async () =>
-        new Response(image, { headers: { 'content-type': 'image/png' } }),
-    );
-    globalThis.fetch = fetchMock as typeof fetch;
-    const webfetch = createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    });
-    const ctx = createExecutionContext();
-    ctx.extra = { model: { capabilities: { input: { image: true } } } };
-    const args = {
-      url: 'https://example.com/image',
-      prefer_llms_txt: 'never' as const,
-    };
-    const result = await webfetch.execute(args, ctx);
-    expect(typeof result).toBe('object');
-    if (typeof result === 'string') throw new Error('expected inline image');
-    expect(result.attachments).toEqual([
-      {
-        type: 'file',
-        mime: 'image/png',
-        url: `data:image/png;base64,${Buffer.from(image).toString('base64')}`,
-        filename: undefined,
-      },
-    ]);
-    expect(result.output).toContain('cache_hit: false');
-    const textCtx = createExecutionContext();
-    textCtx.extra = { model: { capabilities: { input: { image: false } } } };
-    const text = await webfetch.execute(args, textCtx);
-    expect(text).toContain('inline_image_skipped: "model_not_multimodal"');
-    expect(text).toContain('cache_hit: true');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  test('mislabeled PNG with octet-stream attaches inline with sniffed source type', async () => {
-    const png = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10, 42);
-    globalThis.fetch = mock(
-      async () =>
-        new Response(png, {
-          headers: { 'content-type': 'application/octet-stream' },
-        }),
-    ) as typeof fetch;
-    const ctx = createExecutionContext();
-    ctx.extra = { model: { capabilities: { input: { image: true } } } };
-    const result = await createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    }).execute(
-      { url: 'https://example.com/mislabeled-png', prefer_llms_txt: 'never' },
-      ctx,
-    );
-    expect(typeof result).toBe('object');
-    if (typeof result === 'string') throw new Error('expected inline PNG');
-    expect(result.output).toContain('binary_kind: "image"');
-    expect(result.output).toContain('source_content_type: "image/png"');
-    expect(result.attachments?.[0]?.url).toBe(
-      `data:image/png;base64,${Buffer.from(png).toString('base64')}`,
-    );
-  });
-
-  test('undeclared image PNG attaches inline with sniffed source type', async () => {
-    const png = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10, 42);
-    globalThis.fetch = mock(async () => new Response(png)) as typeof fetch;
-    const ctx = createExecutionContext();
-    ctx.extra = { model: { capabilities: { input: { image: true } } } };
-    const result = await createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    }).execute(
-      { url: 'https://example.com/undeclared-png', prefer_llms_txt: 'never' },
-      ctx,
-    );
-    expect(typeof result).toBe('object');
-    if (typeof result === 'string') throw new Error('expected inline PNG');
-    expect(result.output).toContain('binary_kind: "image"');
-    expect(result.output).toContain('source_content_type: "image/png"');
-    expect(result.attachments?.[0]?.mime).toBe('image/png');
-  });
-
-  test('short JPEG magic bytes beat octet-stream text heuristic', async () => {
-    const jpeg = Uint8Array.of(255, 216, 255, 224, 9);
-    globalThis.fetch = mock(
-      async () =>
-        new Response(jpeg, {
-          headers: { 'content-type': 'application/octet-stream' },
-        }),
-    ) as typeof fetch;
-    const ctx = createExecutionContext();
-    ctx.extra = { model: { capabilities: { input: { image: true } } } };
-    const result = await createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    }).execute(
-      { url: 'https://example.com/mislabeled-jpeg', prefer_llms_txt: 'never' },
-      ctx,
-    );
-    expect(typeof result).toBe('object');
-    if (typeof result === 'string') throw new Error('expected inline JPEG');
-    expect(result.output).toContain('source_content_type: "image/jpeg"');
-    expect(result.attachments?.[0]?.url).toStartWith('data:image/jpeg;base64,');
-  });
-
-  test('mislabeled PNG saved to disk uses the sniffed .png extension', async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'smartfetch-sniff-'));
-    const png = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10, 42);
-    try {
-      globalThis.fetch = mock(
-        async () =>
-          new Response(png, {
-            headers: { 'content-type': 'application/octet-stream' },
-          }),
-      ) as typeof fetch;
-      const result = await createWebfetchTool({ client: {} } as any, {
-        binaryDir: directory,
-      }).execute(
-        {
-          url: 'https://example.com/download',
-          prefer_llms_txt: 'never',
-          save_binary: true,
-        },
-        createExecutionContext(),
-      );
-      expect(typeof result).toBe('string');
-      expect(result).toContain('source_content_type: "image/png"');
-      expect(result).toMatch(/saved_path: .*\.png/);
-      const files = await readdir(directory);
-      expect(files).toHaveLength(1);
-      const filename = files[0];
-      if (!filename) throw new Error('missing saved image');
-      expect(filename).toEndWith('.png');
-      expect(await readFile(path.join(directory, filename))).toEqual(
-        Buffer.from(png),
-      );
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  test('mislabeled PNG without model capabilities remains an image with unknown capability', async () => {
-    globalThis.fetch = mock(
-      async () =>
-        new Response(Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10, 42), {
-          headers: { 'content-type': 'application/octet-stream' },
-        }),
-    ) as typeof fetch;
-    const result = await createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    }).execute(
-      { url: 'https://example.com/v2-mislabeled', prefer_llms_txt: 'never' },
-      createExecutionContext(),
-    );
-    expect(result).toContain('binary_kind: "image"');
-    expect(result).toContain('source_content_type: "image/png"');
-    expect(result).toContain(
-      'inline_image_skipped: "model_capability_unknown"',
-    );
-  });
-
-  test('octet-stream control bytes without image magic remain generic binary', async () => {
-    globalThis.fetch = mock(
-      async () =>
-        new Response(Uint8Array.of(0, 1, 2, 3), {
-          headers: { 'content-type': 'application/octet-stream' },
-        }),
-    ) as typeof fetch;
-    const result = await createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    }).execute(
-      { url: 'https://example.com/not-an-image', prefer_llms_txt: 'never' },
-      createExecutionContext(),
-    );
-    expect(result).toContain('binary_kind: "binary"');
-    expect(result).not.toContain('inline_image_skipped');
-  });
-
-  test('the inclusive base64 limit permits 786432 raw bytes but refuses 786433', async () => {
-    const payload = (size: number) => {
-      const data = new Uint8Array(size);
-      data.set([137, 80, 78, 71, 13, 10, 26, 10]);
-      return data;
-    };
-    globalThis.fetch = mock(
-      async (url: string | URL | Request) =>
-        new Response(payload(String(url).endsWith('/max') ? 786432 : 786433), {
-          headers: { 'content-type': 'image/png' },
-        }),
-    ) as typeof fetch;
-    const ctx = createExecutionContext();
-    ctx.extra = { model: { capabilities: { input: { image: true } } } };
-    const webfetch = createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    });
-    const atLimit = await webfetch.execute(
-      { url: 'https://example.com/max', prefer_llms_txt: 'never' },
-      ctx,
-    );
-    expect(typeof atLimit).toBe('object');
-    if (typeof atLimit === 'string') throw new Error('expected inline image');
-    expect(atLimit.attachments?.[0]?.url.length).toBeGreaterThan(1048576);
-    expect(
-      atLimit.attachments?.[0]?.url.slice('data:image/png;base64,'.length)
-        .length,
-    ).toBe(1048576);
-    const overLimit = await webfetch.execute(
-      { url: 'https://example.com/over', prefer_llms_txt: 'never' },
-      ctx,
-    );
-    expect(overLimit).toContain('inline_image_skipped: "exceeds_inline_limit"');
-    expect(overLimit).toContain('Re-run with save_binary=true');
-  });
-
-  test('inline MIME comes from magic bytes even if the server claims PNG', async () => {
-    globalThis.fetch = mock(
-      async () =>
-        new Response(Uint8Array.of(255, 216, 255, 224, 9), {
-          headers: { 'content-type': 'image/png' },
-        }),
-    ) as typeof fetch;
-    const ctx = createExecutionContext();
-    ctx.extra = { model: { capabilities: { input: { image: true } } } };
-    const result = await createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    }).execute(
-      { url: 'https://example.com/photo', prefer_llms_txt: 'never' },
-      ctx,
-    );
-    expect(typeof result).toBe('object');
-    if (typeof result === 'string') throw new Error('expected inline image');
-    expect(result.attachments?.[0]?.mime).toBe('image/jpeg');
-    expect(result.attachments?.[0]?.url).toStartWith('data:image/jpeg;base64,');
-  });
-
-  test('v2-shaped or old contexts, auto routing and unsupported image bytes decline to inline', async () => {
-    globalThis.fetch = mock(
-      async (url: string | URL | Request) =>
-        new Response(
-          String(url).endsWith('/svg') ? '<svg></svg>' : Uint8Array.of(1, 2, 3),
-          {
-            headers: {
-              'content-type': String(url).endsWith('/svg')
-                ? 'image/svg+xml'
-                : 'image/png',
-            },
-          },
-        ),
-    ) as typeof fetch;
-    const direct = createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    });
-    const auto = createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'auto',
-    });
-    const ctx = createExecutionContext();
-    const args = {
-      url: 'https://example.com/invalid',
-      prefer_llms_txt: 'never' as const,
-    };
-    expect(await direct.execute(args, ctx)).toContain(
-      'inline_image_skipped: "model_capability_unknown"',
-    );
-    ctx.extra = { model: { capabilities: { input: { image: true } } } };
-    expect(await auto.execute(args, ctx)).toContain(
-      'inline_image_skipped: "image_routing_auto"',
-    );
-    expect(await direct.execute(args, ctx)).toContain(
-      'inline_image_skipped: "unsupported_image_format"',
-    );
-    expect(
-      await direct.execute({ ...args, url: 'https://example.com/svg' }, ctx),
-    ).toContain('inline_image_skipped: "unsupported_image_format"');
-  });
-
-  test('metadata-only oversized images explain the inline limit without writing to disk', async () => {
-    globalThis.fetch = mock(
-      async () =>
-        new Response(Uint8Array.of(137, 80, 78, 71), {
-          headers: { 'content-type': 'image/png', 'content-length': '3000000' },
-        }),
-    ) as typeof fetch;
-    const ctx = createExecutionContext();
-    ctx.extra = { model: { capabilities: { input: { image: true } } } };
-    const result = await createWebfetchTool({ client: {} } as any, {
-      imageRouting: () => 'direct',
-    }).execute(
-      { url: 'https://example.com/oversized.png', prefer_llms_txt: 'never' },
-      ctx,
-    );
-    expect(result).toContain('binary_metadata_only: true');
-    expect(result).toContain('inline_image_skipped: "exceeds_inline_limit"');
-    expect(result).toContain('Re-run with save_binary=true');
-  });
-
-  test('explicit save_binary takes precedence over inline images and keeps disk output', async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'smartfetch-inline-'));
-    const image = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10, 42]);
-    try {
-      globalThis.fetch = mock(
-        async () =>
-          new Response(image, { headers: { 'content-type': 'image/png' } }),
-      ) as typeof fetch;
-      const ctx = createExecutionContext();
-      ctx.extra = { model: { capabilities: { input: { image: true } } } };
-      const result = await createWebfetchTool({ client: {} } as any, {
-        imageRouting: () => 'direct',
-        binaryDir: directory,
-      }).execute(
-        {
-          url: 'https://example.com/image.png',
-          prefer_llms_txt: 'never',
-          save_binary: true,
-        },
-        ctx,
-      );
-      expect(typeof result).toBe('string');
-      expect(result).toContain('saved_path:');
-      expect(result).not.toContain('inline_image_skipped');
-      expect(await readFile(path.join(directory, 'image.png'))).toEqual(
-        Buffer.from(image),
-      );
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  test('returns a required llms.txt message when prefer_llms_txt is always and no llms.txt is available', async () => {
-    const fetchMock = mock(async (input: string | URL | Request) => {
-      const url = typeof input === 'string' ? input : input.toString();
-
-      if (
-        url === 'https://docs.example.com/llms-full.txt' ||
-        url === 'https://docs.example.com/llms.txt'
-      ) {
-        return new Response('not found', {
-          status: 404,
-          headers: { 'content-type': 'text/plain' },
-        });
-      }
-
-      throw new Error(`Unexpected fetch URL: ${url}`);
-    });
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    const webfetch = createWebfetchTool({ client: {} } as any);
-    const ctx = createExecutionContext();
-    const result = await webfetch.execute(
-      {
-        url: 'https://docs.example.com/page',
-        format: 'markdown',
-        extract_main: true,
-        prefer_llms_txt: 'always',
-        include_metadata: true,
-        save_binary: false,
-      },
-      ctx,
-    );
-
-    expect(result).toContain('Required llms.txt content was unavailable.');
-    expect(result).toContain('Original URL: https://docs.example.com/page');
-    expect(result).toContain('prefer_llms_txt: "always"');
-    expect(result).toContain('used_llms_txt: false');
-    expect(ctx.ask).toHaveBeenCalledTimes(1);
-    expect(ctx.metadata).not.toHaveBeenCalled();
   });
 
   test('same document with different fragments issues a single request', async () => {
@@ -988,46 +512,23 @@ describe('smartfetch/tool', () => {
 
     const webfetch = createWebfetchTool({ client: {} } as any);
 
-    const firstCtx = createExecutionContext();
     const firstResult = await webfetch.execute(
-      {
-        url: 'https://example.com/docs#sec1',
-        format: 'markdown',
-        extract_main: true,
-        prefer_llms_txt: 'auto',
-        include_metadata: true,
-        save_binary: false,
-      },
-      firstCtx,
+      { url: 'https://example.com/docs#sec1' },
+      createExecutionContext(),
     );
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(firstResult).toContain(
-      'requested_url: "https://example.com/docs#sec1"',
-    );
-    expect(firstResult).toContain('cache_hit: false');
+    expect(firstResult).toContain('document body');
 
-    const secondCtx = createExecutionContext();
     const secondResult = await webfetch.execute(
-      {
-        url: 'https://example.com/docs#sec2',
-        format: 'markdown',
-        extract_main: true,
-        prefer_llms_txt: 'auto',
-        include_metadata: true,
-        save_binary: false,
-      },
-      secondCtx,
+      { url: 'https://example.com/docs#sec2' },
+      createExecutionContext(),
     );
 
     // The fragment-stripped cache key collides with the first request, so
-    // the second fetch is served from cache without hitting the network,
-    // and the reported requested_url stays the URL of the current request.
+    // the second fetch is served from cache without hitting the network.
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(secondResult).toContain('cache_hit: true');
-    expect(secondResult).toContain(
-      'requested_url: "https://example.com/docs#sec2"',
-    );
+    expect(secondResult).toContain('document body');
   });
 
   test('fetches and cleans a 1 MiB U+2028 page in under one second', async () => {
@@ -1041,39 +542,27 @@ describe('smartfetch/tool', () => {
     const webfetch = createWebfetchTool({ client: {} } as any);
     const started = performance.now();
     const result = await webfetch.execute(
-      {
-        url: 'https://example.com/large',
-        format: 'markdown',
-        extract_main: false,
-        prefer_llms_txt: 'never',
-        include_metadata: false,
-        save_binary: false,
-      },
+      { url: 'https://example.com/large', format: 'text' },
       createExecutionContext(),
     );
-    expect(result).toBe('![');
+    // The tiny word count trips very_short_content, so the result carries
+    // the conditional status header ahead of the cleaned body.
+    expect(result.endsWith('![')).toBe(true);
     expect(performance.now() - started).toBeLessThan(1_000);
   });
 
-  test('a canonical URL does not share a credentialed response with another request', async () => {
+  test('a credentialed response never serves the cached body of another request', async () => {
     const fetchMock = mock(async (input: string | URL | Request) => {
       const url = String(input);
       return new Response(
-        `<html><head><link rel="canonical" href="https://example.com/private"></head><body>${url.includes('user:pass@') ? 'private account' : 'public page'}</body></html>`,
+        `<html><head><title>T</title></head><body>${url.includes('user:pass@') ? 'private account' : 'public page'}</body></html>`,
         { headers: { 'content-type': 'text/html' } },
       );
     });
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    const args = {
-      format: 'text' as const,
-      extract_main: false,
-      prefer_llms_txt: 'never' as const,
-      include_metadata: true,
-      save_binary: false,
-    };
     const fetchPage = (url: string) =>
-      webfetch.execute({ ...args, url }, createExecutionContext());
+      webfetch.execute({ url }, createExecutionContext());
     const privateResult = await fetchPage(
       'https://user:pass@example.com/private',
     );
@@ -1081,58 +570,6 @@ describe('smartfetch/tool', () => {
     expect(privateResult).toContain('private account');
     expect(publicResult).toContain('public page');
     expect(publicResult).not.toContain('private account');
-    expect(publicResult).toContain('cache_hit: false');
     expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  test('passes ctx.sessionID as parentID to the secondary-model session', async () => {
-    const fetchMock = mock(async () => {
-      return new Response(
-        'Article about smartfetch: it fetches pages, extracts the main ' +
-          'content, caches results, and summarizes them with a secondary ' +
-          'model whenever a prompt is provided by the tool caller.',
-        { status: 200, headers: { 'content-type': 'text/plain' } },
-      );
-    });
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    const session = {
-      create: mock(async () => ({ data: { id: 'secondary-session' } })),
-      prompt: mock(async () => ({
-        data: { parts: [{ type: 'text', text: 'Extracted answer' }] },
-      })),
-      delete: mock(async () => ({ data: true })),
-      abort: mock(async () => ({ data: true })),
-    };
-    const toolIds = { ids: mock(async () => ({ data: ['read'] })) };
-    mockV2Client = { session, tool: toolIds };
-
-    const webfetch = createWebfetchTool({ client: mockV2Client } as any, {
-      webfetchModels: [{ id: 'provider/small-model' }],
-    });
-    const ctx = createExecutionContext();
-    ctx.sessionID = 'main-session-id';
-    const result = await webfetch.execute(
-      {
-        url: 'https://example.com/article',
-        format: 'markdown',
-        extract_main: true,
-        prefer_llms_txt: 'auto',
-        include_metadata: false,
-        save_binary: false,
-        prompt: 'Extract the answer',
-      },
-      ctx,
-    );
-
-    expect(session.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        body: expect.objectContaining({
-          title: 'smartfetch-secondary',
-          parentID: 'main-session-id',
-        }),
-      }),
-    );
-    expect(result).toContain('Extracted answer');
   });
 });

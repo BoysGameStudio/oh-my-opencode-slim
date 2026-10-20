@@ -64,19 +64,13 @@ client.session.get({ path: { id: 'ses_x' }, query: { directory: '/d' } });
 // status (cancel-task getSessionStatus, orchestrator-wake)
 client.session.status({ query: { directory: '/d' } });
 
-// delete (cancel-task, secondary-model)
+// delete (cancel-task)
 client.session.delete({
   path: { id: 'ses_x' },
   query: { directory: '/d' },
 });
 
-// create (secondary-model)
-client.session.create({
-  query: { directory: '/d' },
-  body: { title: 'secondary' },
-});
-
-// prompt (secondary-model)
+// prompt (interview, v2 session-submit)
 client.session.prompt({
   path: { id: 'ses_x' },
   query: { directory: '/d' },
@@ -117,9 +111,6 @@ client.session.children({
   path: { id: 'ses_x' },
   query: { directory: '/d' },
 });
-
-// tool.ids (secondary-model)
-client.tool.ids({ query: { directory: '/d' } });
 
 // ---------------------------------------------------------------------------
 // Rejected: the v2-flat shapes the migration shipped. Each must be a type

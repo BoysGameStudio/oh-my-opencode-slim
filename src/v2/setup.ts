@@ -2090,33 +2090,6 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
 
     try {
       log('[v2] importing v1 factory...');
-      // Capability probe: v2 one-shot generation (`ctx.generate.text`),
-      // probed structurally since V2Context stays minimal by design.
-      // Powers the smartfetch secondary-model summaries without a temp
-      // session; hosts without the domain get no `experimental_v2` key
-      // at all.
-      const generateText = (
-        ctx as {
-          generate?: {
-            text?: (input: {
-              prompt: string;
-              model?: { id: string; providerID: string; variant?: string };
-            }) => Promise<{ text: string }>;
-          };
-        }
-      ).generate?.text;
-      const generateChannel =
-        typeof generateText === 'function'
-          ? {
-              generateText: (
-                prompt: string,
-                model?: { id: string; providerID: string; variant?: string },
-              ) => generateText({ prompt, ...(model ? { model } : {}) }),
-            }
-          : undefined;
-      log('[v2] ctx.generate.text', {
-        available: typeof generateText === 'function',
-      });
       // Capability probe: the v2 model registry (`ctx.model`) resolves the
       // catalog ⊕ config view the host itself uses for media gating. Powers
       // capability-aware image routing; hosts without the domain keep the
@@ -2126,7 +2099,6 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         : undefined;
       log('[v2] ctx.model', { available: Boolean(modelDomain) });
       const pluginInput = buildPluginInput(ctx, {
-        ...(generateChannel ?? {}),
         ...(modelDomain ? { modelDomain } : {}),
       });
       log('[v2] calling OhMyOpenCodeLite...');

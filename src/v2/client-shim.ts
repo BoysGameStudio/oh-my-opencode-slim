@@ -52,11 +52,6 @@ export interface ExperimentalV2 {
   queuedPromptIdentity?: true;
   /** Real host wait; not a snapshot, and not abortable by the 2.0.5 adapter. */
   waitForSessionIdle?: (sessionID: string) => Promise<void>;
-  /** One-shot generation (`ctx.generate.text`); no session involved. */
-  generateText?: (
-    prompt: string,
-    model?: V2GenerateModelRef,
-  ) => Promise<{ text: string }>;
   /** Live host model registry (`ctx.model`): `list()` resolves the full
    * catalog ⊕ config view with per-model capabilities. Absent on hosts
    * without the domain. */
@@ -868,16 +863,10 @@ export function buildPluginInput(
     worktree: directory,
     experimental_workspace: { register() {} },
     $: typeof Bun !== 'undefined' ? Bun.$ : undefined,
-    ...(extras?.generateText ||
-    extras?.modelDomain ||
-    wait ||
-    (s.prompt && s.context)
+    ...(extras?.modelDomain || wait || (s.prompt && s.context)
       ? {
           experimental_v2: {
             ...(s.prompt && s.context ? { queuedPromptIdentity: true } : {}),
-            ...(extras?.generateText
-              ? { generateText: extras.generateText }
-              : {}),
             ...(extras?.modelDomain ? { modelDomain: extras.modelDomain } : {}),
             ...(wait
               ? {

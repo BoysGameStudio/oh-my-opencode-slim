@@ -23,13 +23,13 @@ docs/static sites.
 
 | Tool | Description |
 |------|-------------|
-| `webfetch` | Fetch a URL, optionally prefer `llms.txt`, extract main content from HTML, include metadata, optionally save binary responses, and optionally run secondary-model extraction |
+| `webfetch` | Fetch a URL with `llms.txt` probing, main-content extraction from HTML, binary save support, and a minimal conditional status header |
 
 See the full [Webfetch documentation](webfetch.md) for parameters, output
-format, caching, llms.txt probing, redirect policy, secondary-model
-summarization, binary detection, and implementation details.
+format, caching, llms.txt probing, redirect policy, binary detection, and
+implementation details.
 
-`webfetch` blocks cross-origin redirects unless the requested URL or derived permission patterns explicitly allow them, and it can fall back to the raw fetched content when secondary-model summarization is unavailable.
+`webfetch` blocks cross-origin redirects unless the requested URL or derived permission patterns explicitly allow them.
 
 ---
 

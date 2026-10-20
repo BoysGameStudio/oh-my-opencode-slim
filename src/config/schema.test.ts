@@ -362,17 +362,14 @@ describe('PluginConfigSchema webfetch', () => {
     }
   });
 
-  it('accepts dedicated model fallback entries with variants', () => {
+  it('rejects the removed dedicated model key (strict schema)', () => {
     const result = PluginConfigSchema.safeParse({
       webfetch: {
-        model: [
-          'openai/gpt-4o-mini',
-          { id: 'anthropic/claude-3-haiku', variant: 'low-latency' },
-        ],
+        model: 'openai/gpt-4o-mini',
       },
     });
 
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
   });
 });
 
