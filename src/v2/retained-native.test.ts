@@ -11,7 +11,6 @@ import {
 import { handleToolExecuteBefore } from '../hooks/task-session-manager/tool-execute-hooks';
 import { BackgroundJobBoard } from '../utils/background-job-board';
 import { BackgroundJobBoard as FixtureBoard } from '../utils/background-job-fixture';
-import { classifyV2HistoricalRound } from '../utils/child-transcript';
 import { parseTaskIdFromTaskOutput } from '../utils/task';
 import { buildPluginInput } from './client-shim';
 import { createToolExecuteBridges } from './setup';
@@ -51,6 +50,7 @@ function round(text = 'LAB-MARKER') {
 
 function host(options?: {
   get?: () => unknown;
+  prompt?: (input: unknown) => Promise<unknown>;
   context?: (args: { sessionID: string }) => unknown;
   messages?: () => unknown;
 }) {
@@ -61,12 +61,14 @@ function host(options?: {
       id: CHILD,
       parentID: PARENT,
       agent: 'fixer',
-      time: { created: 9 },
+      outcome: 'succeeded',
+      time: { created: 9, idle: 13 },
     }));
   return buildPluginInput({
     directory: '/tmp/omo-implementation-repair',
     session: {
       get: async () => get(),
+      ...(options?.prompt ? { prompt: options.prompt } : {}),
       context: async (args: { sessionID: string }) => context(args),
       messages: options?.messages,
     },
@@ -114,51 +116,103 @@ describe('v2 historical context', () => {
     expect(assistant.info.agent).toBe('fixer');
   });
 
-  test('a newer synthetic blocks an older succeeded outcome', () => {
-    const round = classifyV2HistoricalRound({
-      data: [
-        {
-          info: {
-            id: 'msg_user',
-            role: 'user',
-            sourceType: 'user',
-            time: { created: 10 },
-          },
-          parts: [{ type: 'text', text: 'ask' }],
-        },
-        {
-          info: {
-            id: 'msg_assistant',
-            role: 'assistant',
-            sourceType: 'assistant',
-            parentID: 'msg_user',
-            time: { created: 11, completed: 12 },
-          },
-          parts: [{ type: 'text', text: 'OLD' }],
-        },
-        {
-          info: {
-            id: 'msg_idle',
-            role: 'system',
-            sourceType: 'idle',
-            outcome: 'succeeded',
-            time: { created: 13 },
-          },
-          parts: [],
-        },
-        {
-          info: {
-            id: 'msg_synthetic',
-            role: 'synthetic',
-            sourceType: 'synthetic',
-            time: { created: 14 },
-          },
-          parts: [{ type: 'text', text: 'new boundary' }],
-        },
-      ],
+  // The incident shape: the host recorded the terminal outcome, but the
+  // transcript carries no trailing idle marker (shutdown-interrupted write).
+  // Host-state triage must import completed, not stopped.
+  test('a host terminal outcome imports completed without a transcript idle marker', async () => {
+    const board = new BackgroundJobBoard();
+    const input = host({
+      context: (args) =>
+        args.sessionID === CHILD
+          ? [
+              {
+                id: 'msg_user',
+                type: 'user',
+                time: { created: 10 },
+                text: 'ask',
+              },
+              {
+                id: 'msg_assistant',
+                type: 'assistant',
+                agent: 'fixer',
+                parentID: 'msg_user',
+                time: { created: 11, completed: 12 },
+                finish: 'stop',
+                content: [{ type: 'text', text: 'LAB-MARKER' }],
+              },
+            ]
+          : round(),
     });
-    expect(round.verdict).toBe('incomplete');
-    expect(JSON.stringify(round)).not.toContain('OLD');
+    const result = await createSessionRecovery({
+      input: input as never,
+      backgroundJobBoard: board,
+      hostFlavor: 'v2',
+      stableStoppedMs: 0,
+    })({ parentSessionID: PARENT, requested: CHILD });
+    expect(result).toEqual({ kind: 'recovered', taskID: CHILD });
+    expect(board.get(CHILD)).toMatchObject({
+      state: 'completed',
+      resultSummary: 'LAB-MARKER',
+    });
+  });
+
+  test('a newer synthetic blocks an older succeeded outcome', async () => {
+    // Host-state triage: the succeeded outcome predates the newest input
+    // (the synthetic), so no terminal covers that round. Recovery reports
+    // pending instead of importing OLD or lying about a stopped round.
+    const input = host({
+      get: () => ({
+        id: CHILD,
+        parentID: PARENT,
+        agent: 'fixer',
+        outcome: 'succeeded',
+        time: { created: 9, idle: 13 },
+      }),
+      context: (args) =>
+        args.sessionID === CHILD
+          ? [
+              {
+                id: 'msg_user',
+                type: 'user',
+                time: { created: 10 },
+                text: 'ask',
+              },
+              {
+                id: 'msg_assistant',
+                type: 'assistant',
+                agent: 'fixer',
+                parentID: 'msg_user',
+                time: { created: 11, completed: 12 },
+                finish: 'stop',
+                content: [{ type: 'text', text: 'OLD' }],
+              },
+              {
+                id: 'msg_idle',
+                type: 'idle',
+                time: 13,
+                outcome: 'succeeded',
+              },
+              {
+                id: 'msg_synthetic',
+                type: 'synthetic',
+                time: { created: 14 },
+                text: 'new boundary',
+              },
+            ]
+          : round(),
+    });
+    const board = new BackgroundJobBoard();
+    const result = await createSessionRecovery({
+      input: input as never,
+      backgroundJobBoard: board,
+      hostFlavor: 'v2',
+      stableStoppedMs: 0,
+    })({ parentSessionID: PARENT, requested: CHILD });
+    expect(result.kind).toBe('refused');
+    if (result.kind === 'refused') {
+      expect(result.reason).toContain('no terminal outcome');
+    }
+    expect(board.get(CHILD)).toBeUndefined();
   });
 });
 
@@ -231,12 +285,17 @@ describe('v2 native resume through the setup bridge', () => {
       parentSessionID: PARENT,
     });
     expect(event.input.sessionID).toBe(CHILD);
+  });
 
-    const missing = new BackgroundJobBoard();
-    const missingEvent = {
+  test('a host-missing session refuses without creating a child', async () => {
+    const board = new BackgroundJobBoard();
+    const input = host({
+      get: () => ({ error: { message: 'NotFound' } }),
+    });
+    const event = {
       tool: 'subagent',
       sessionID: PARENT,
-      id: 'call_4',
+      id: 'call_missing',
       input: {
         agent: 'fixer',
         sessionID: CHILD,
@@ -244,47 +303,35 @@ describe('v2 native resume through the setup bridge', () => {
         description: 'next',
       },
     };
-    const missingBridges = createToolExecuteBridges(
-      (hookInput, output) =>
-        handleToolExecuteBefore(
-          hookInput,
-          output,
-          deps(
-            missing,
-            host({ get: () => ({ error: { message: 'NotFound' } }) }),
-          ),
-        ),
-      undefined,
-    );
-    await expect(missingBridges.beforeBridge(missingEvent)).rejects.toThrow(
-      /cannot resolve this sessionID/,
-    );
-    expect(missingEvent.input.sessionID).toBe(CHILD);
-    expect(missing.list(PARENT)).toEqual([]);
-
-    const wrong = new BackgroundJobBoard();
     await expect(
       createToolExecuteBridges(
         (hookInput, output) =>
-          handleToolExecuteBefore(
-            hookInput,
-            output,
-            deps(
-              wrong,
-              host({
-                get: () => ({
-                  id: CHILD,
-                  parentID: 'ses_other',
-                  agent: 'fixer',
-                }),
-              }),
-            ),
-          ),
+          handleToolExecuteBefore(hookInput, output, deps(board, input)),
+        undefined,
+      ).beforeBridge(event),
+    ).rejects.toThrow(/cannot resolve this sessionID/);
+    expect(event.input.sessionID).toBe(CHILD);
+    expect(board.list(PARENT)).toEqual([]);
+  });
+
+  test('a foreign-parent session refuses without importing', async () => {
+    const board = new BackgroundJobBoard();
+    const input = host({
+      get: () => ({
+        id: CHILD,
+        parentID: 'ses_other',
+        agent: 'fixer',
+      }),
+    });
+    await expect(
+      createToolExecuteBridges(
+        (hookInput, output) =>
+          handleToolExecuteBefore(hookInput, output, deps(board, input)),
         undefined,
       ).beforeBridge({
         tool: 'subagent',
         sessionID: PARENT,
-        id: 'call_5',
+        id: 'call_wrong',
         input: {
           agent: 'fixer',
           sessionID: CHILD,
@@ -293,8 +340,124 @@ describe('v2 native resume through the setup bridge', () => {
         },
       }),
     ).rejects.toThrow(/different parent/);
-    expect(wrong.get(CHILD)).toBeUndefined();
+    expect(board.get(CHILD)).toBeUndefined();
   });
+});
+
+test('host state that cannot be verified fails closed', async () => {
+  const board = new BackgroundJobBoard();
+  const input = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      outcome: 'succeeded',
+      time: { created: 9 },
+    }),
+  });
+  const result = await createSessionRecovery({
+    input: input as never,
+    backgroundJobBoard: board,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  expect(result.kind).toBe('refused');
+  if (result.kind === 'refused') {
+    expect(result.reason).toContain('host state could not be verified');
+  }
+  expect(board.get(CHILD)).toBeUndefined();
+});
+
+test('an unfinished (shutdown-interrupted) session is refused as pending and task_revive queues one continuation', async () => {
+  // Shutdown preserves the execution claim on purpose and the host may resume
+  // the round after a restart, so neither plain recovery nor the subagent
+  // continuation may import it or prompt it. Only the explicit queued revive
+  // adopts identity and lets the host admit the input at an idle boundary.
+  const board = new BackgroundJobBoard();
+  let promptCalls = 0;
+  const input = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      time: { created: 9 },
+    }),
+    prompt: async () => {
+      promptCalls += 1;
+      return { id: 'msg_host_1' };
+    },
+  });
+  const refused = await createSessionRecovery({
+    input: input as never,
+    backgroundJobBoard: board,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  expect(refused.kind).toBe('refused');
+  if (refused.kind === 'refused') {
+    expect(refused.reason).toContain('no terminal outcome');
+    expect(refused.reason).toContain('task_revive');
+  }
+  expect(board.get(CHILD)).toBeUndefined();
+
+  const event = {
+    tool: 'subagent',
+    sessionID: PARENT,
+    id: 'call_pending',
+    input: {
+      agent: 'fixer',
+      sessionID: CHILD,
+      prompt: 'again',
+      description: 'again',
+    },
+  };
+  await expect(
+    createToolExecuteBridges(
+      (hookInput, output) =>
+        handleToolExecuteBefore(hookInput, output, deps(board, input)),
+      undefined,
+    ).beforeBridge(event),
+  ).rejects.toThrow(/no terminal outcome/);
+  expect(board.get(CHILD)).toBeUndefined();
+
+  const { createRevivedRunTracker } = await import(
+    '../hooks/task-session-manager/revived-run-tracker'
+  );
+  const { createTaskReviveTool } = await import('../tools/task-revive');
+  const { createBackgroundJobTerminalGate } = await import(
+    '../utils/background-job-terminal-gate'
+  );
+  const gate = createBackgroundJobTerminalGate({
+    backgroundJobBoard: board,
+    input: input as never,
+  });
+  const tracker = createRevivedRunTracker({
+    input: input as never,
+    backgroundJobBoard: board,
+    terminalGate: gate,
+  });
+  const revive = createTaskReviveTool({
+    input: input as never,
+    backgroundJobBoard: board,
+    shouldManageSession: () => true,
+    terminalGate: gate,
+    revivedRunTracker: tracker,
+    recoverRetainedSession: createSessionRecovery({
+      input: input as never,
+      backgroundJobBoard: board,
+      hostFlavor: 'v2',
+      stableStoppedMs: 0,
+    }),
+    baselineTimeoutMs: 1_000,
+  }).task_revive;
+  const output = await revive.execute(
+    { sessionID: CHILD, prompt: 'continue' },
+    { sessionID: PARENT, agent: 'orchestrator' } as never,
+  );
+  expect(String(output)).toContain('status: started');
+  expect(promptCalls).toBe(1);
+  gate.dispose();
+  tracker.dispose();
 });
 
 test('real parent context pairs an alias through the shim', async () => {
@@ -378,7 +541,8 @@ test('real parent context pairs an alias through the shim', async () => {
           id: childID,
           parentID: PARENT,
           agent,
-          time: { created: 9 },
+          outcome: 'succeeded',
+          time: { created: 9, idle: 13 },
         };
       },
       context: async (args: { sessionID: string }) =>
@@ -408,129 +572,99 @@ test('real parent context pairs an alias through the shim', async () => {
   expect(description.length).toBeGreaterThan(0);
 });
 
-test('interrupted and failed idles do not require an assistant, and a later assistant is not closed by an older idle', () => {
-  const interrupted = classifyV2HistoricalRound({
-    data: [
-      {
-        info: {
-          id: 'msg_user',
-          role: 'user',
-          sourceType: 'user',
-          time: { created: 10 },
-        },
-        parts: [{ type: 'text', text: 'ask' }],
-      },
-      {
-        info: {
-          id: 'msg_idle',
-          role: 'system',
-          sourceType: 'idle',
-          outcome: 'interrupted',
-          time: { created: 11 },
-        },
-        parts: [],
-      },
-    ],
+test('host outcome triage: interrupted stops, failed errors, and a terminal outcome imports the newest assistant', async () => {
+  // Host-state triage imports the interrupted round without an assistant
+  // and, for a newer unclosed assistant, retains stopped rather than
+  // trusting an older idle.
+  const interruptedInput = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      outcome: 'interrupted',
+      time: { created: 9, idle: 11 },
+    }),
   });
-  expect(interrupted.verdict).toBe('interrupted');
+  const interruptedBoard = new BackgroundJobBoard();
+  await createSessionRecovery({
+    input: interruptedInput as never,
+    backgroundJobBoard: interruptedBoard,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  expect(interruptedBoard.get(CHILD)).toMatchObject({
+    state: 'stopped',
+  });
 
-  const failed = classifyV2HistoricalRound({
-    data: [
-      {
-        info: {
-          id: 'msg_user',
-          role: 'user',
-          sourceType: 'user',
-          time: { created: 10 },
-        },
-        parts: [{ type: 'text', text: 'ask' }],
-      },
-      {
-        info: {
-          id: 'msg_idle',
-          role: 'system',
-          sourceType: 'idle',
-          outcome: 'failed',
-          time: { created: 11 },
-        },
-        parts: [],
-      },
-    ],
+  const failedInput = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      outcome: 'failed',
+      time: { created: 9, idle: 11 },
+    }),
   });
-  expect(failed.verdict).toBe('error');
-  expect(failed.text).not.toContain('ask');
+  const failedBoard = new BackgroundJobBoard();
+  await createSessionRecovery({
+    input: failedInput as never,
+    backgroundJobBoard: failedBoard,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  expect(failedBoard.get(CHILD)).toMatchObject({ state: 'error' });
 
-  const succeededWithoutAssistant = classifyV2HistoricalRound({
-    data: [
-      {
-        info: {
-          id: 'msg_user',
-          role: 'user',
-          sourceType: 'user',
-          time: { created: 10 },
-        },
-        parts: [{ type: 'text', text: 'ask' }],
-      },
-      {
-        info: {
-          id: 'msg_idle',
-          role: 'system',
-          sourceType: 'idle',
-          outcome: 'succeeded',
-          time: { created: 11 },
-        },
-        parts: [],
-      },
-    ],
+  const newerAssistantInput = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      outcome: 'succeeded',
+      time: { created: 9, idle: 13 },
+    }),
+    context: (args) =>
+      args.sessionID === CHILD
+        ? [
+            {
+              id: 'msg_user',
+              type: 'user',
+              time: { created: 10 },
+              text: 'ask',
+            },
+            {
+              id: 'msg_a',
+              type: 'assistant',
+              agent: 'fixer',
+              parentID: 'msg_user',
+              time: { created: 11, completed: 12 },
+              finish: 'stop',
+              content: [{ type: 'text', text: 'ANSWER-A' }],
+            },
+            { id: 'msg_idle_a', type: 'idle', time: 13, outcome: 'succeeded' },
+            {
+              id: 'msg_b',
+              type: 'assistant',
+              agent: 'fixer',
+              parentID: 'msg_user',
+              time: { created: 14 },
+              content: [{ type: 'text', text: 'ANSWER-B' }],
+            },
+          ]
+        : round(),
   });
-  expect(succeededWithoutAssistant.verdict).toBe('incomplete');
-
-  const mismatch = classifyV2HistoricalRound({
-    data: [
-      {
-        info: {
-          id: 'msg_user',
-          role: 'user',
-          sourceType: 'user',
-          time: { created: 10 },
-        },
-        parts: [{ type: 'text', text: 'ask' }],
-      },
-      {
-        info: {
-          id: 'msg_a',
-          role: 'assistant',
-          sourceType: 'assistant',
-          parentID: 'msg_user',
-          time: { created: 11, completed: 12 },
-        },
-        parts: [{ type: 'text', text: 'ANSWER-A' }],
-      },
-      {
-        info: {
-          id: 'msg_idle_a',
-          role: 'system',
-          sourceType: 'idle',
-          outcome: 'succeeded',
-          time: { created: 13 },
-        },
-        parts: [],
-      },
-      {
-        info: {
-          id: 'msg_b',
-          role: 'assistant',
-          sourceType: 'assistant',
-          parentID: 'msg_user',
-          time: { created: 14 },
-        },
-        parts: [{ type: 'text', text: 'ANSWER-B' }],
-      },
-    ],
+  const newerBoard = new BackgroundJobBoard();
+  await createSessionRecovery({
+    input: newerAssistantInput as never,
+    backgroundJobBoard: newerBoard,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  // Host state is authoritative: the succeeded outcome after the latest
+  // input imports as completed, and the newest assistant text is the result.
+  expect(newerBoard.get(CHILD)).toMatchObject({
+    state: 'completed',
+    resultSummary: 'ANSWER-B',
   });
-  expect(mismatch.verdict).toBe('incomplete');
-  expect(JSON.stringify(mismatch)).not.toContain('ANSWER-B');
-  expect(JSON.stringify(mismatch)).not.toContain('ANSWER-A');
 });
 
 // A completed compaction cut the context (page.complete false): an older

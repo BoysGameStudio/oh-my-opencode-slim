@@ -135,9 +135,11 @@ new guidance remains deterministic and does not rewrite earlier messages.
 On v2 hosts with `session.prompt` and `session.context`, adoption queues the new
 instruction in the same session after shared recovery verifies parent ownership,
 agent evidence, and readable history. Host-proven aliases use the same path;
-unverified or ambiguous aliases remain refused. An incomplete historical round
-is permitted only for this explicit queued revive; ordinary recovery still
-requires a verified historical terminal. The host wakes an idle session or runs the input
+unverified or ambiguous aliases remain refused. Recovery uses the session's
+host outcome: a terminal round is imported, and a round without a terminal
+outcome (still running, or awaiting the host's restart resume) is refused
+except for an explicit queued revive. The host wakes an idle session or runs
+the input
 after the current execution; revival does not wait for idle or interrupt it.
 The plugin assigns a message ID before admission and only delivers the terminal
 answer after that exact input. An older execution's result, error, or idle event

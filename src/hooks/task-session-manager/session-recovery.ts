@@ -21,11 +21,12 @@ import {
 import { STOP_CONFIRMATION_GRACE_MS } from '../../utils/background-job-terminal-gate';
 import {
   classifyCurrentDeliveredRound,
-  classifyV2HistoricalRound,
   fetchChildTranscript,
+  latestInputAtOf,
   responseError,
   stringifyError,
   type TranscriptMessage,
+  terminalTextOf,
   transcriptOrderKey,
 } from '../../utils/child-transcript';
 import { isRecord } from '../../utils/guards';
@@ -33,7 +34,12 @@ import { getClient } from '../../utils/opencode-client';
 import { pendingSessionPrune } from '../../utils/pending-session-prunes';
 import { delay } from '../../utils/polling';
 import { SESSION_ID_PATTERN, withTimeout } from '../../utils/session';
-import { readLiveSession } from '../../utils/session-runtime-status';
+import {
+  composeHostRound,
+  hostRoundStateOf,
+  hostRoundVerdict,
+  readLiveSession,
+} from '../../utils/session-runtime-status';
 import {
   isNativeBackgroundLaunchOutput,
   parseTaskIdFromTaskOutput,
@@ -82,7 +88,8 @@ export interface RetainedRecoveryRequest {
   purpose?: 'revive';
   /** The upstream v1 exact-ID path, only when no transcript exists. */
   allowExactAdoption?: boolean;
-  /** Explicit revive with host support for identity-bound queued inputs. */
+  /** With a host-busy verdict, return verified identity for a queued
+   * continuation instead of refusing; every other verdict ignores this. */
   allowQueuedContinuation?: boolean;
 }
 
@@ -327,32 +334,64 @@ async function recoverRetainedSession(
       deletionEpoch,
     };
   }
-  if (childTranscript === undefined) {
+  if (childTranscript === undefined && options.hostFlavor !== 'v2') {
     return refuse(
       `Task ${sessionID} transcript could not be read (transcript source unavailable); no prompt was sent`,
     );
   }
-  const round =
-    options.hostFlavor === 'v2'
-      ? classifyV2HistoricalRound(childTranscript)
-      : classifyCurrentDeliveredRound(childTranscript);
-  if (round.verdict === 'unreadable') {
-    return refuse(
-      `Task ${sessionID} transcript could not be classified (${round.reason ?? 'unreadable'}); no prompt was sent`,
-    );
-  }
-  const queueContinuation =
-    options.hostFlavor === 'v2' &&
-    request.purpose === 'revive' &&
-    request.allowQueuedContinuation === true;
-  if (
-    options.hostFlavor === 'v2' &&
-    round.verdict === 'incomplete' &&
-    !queueContinuation
-  ) {
-    return refuse(
-      `Task ${sessionID} has no verified historical terminal after its latest input. The current round was not imported. No prompt was sent`,
-    );
+  let round: ReturnType<typeof classifyCurrentDeliveredRound>;
+  let queuedAdoption = false;
+  if (options.hostFlavor === 'v2') {
+    const latestInputAt = latestInputAtOf(childTranscript);
+    const hostState = hostRoundStateOf(hosted.hostInfo);
+    const verdict = hostRoundVerdict(hostState, latestInputAt);
+    if (verdict === 'unknown') {
+      const reason =
+        hostState.kind === 'unknown' ? hostState.reason : 'unknown';
+      return refuse(
+        `Task ${sessionID} host state could not be verified (${reason}); no prompt was sent`,
+      );
+    }
+    if (verdict === 'pending') {
+      queuedAdoption =
+        request.purpose === 'revive' &&
+        request.allowQueuedContinuation === true;
+      if (!queuedAdoption) {
+        // No terminal outcome covers the latest input. Shutdown preserves
+        // the execution claim on purpose and the host may resume the round
+        // after a restart, so a guessed stop import would lie.
+        return refuse(
+          `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or use task_revive with a new prompt. No prompt was sent`,
+        );
+      }
+      // Identity adoption still requires a decipherable latest input; the
+      // old classifier refused exactly this shape before queueing.
+      if (latestInputAt === undefined) {
+        return refuse(
+          `Task ${sessionID} transcript could not be classified (no delivered user round); no prompt was sent`,
+        );
+      }
+    }
+    round = composeHostRound(hostState, latestInputAt);
+    if (verdict === 'terminal') {
+      const text = terminalTextOf(childTranscript);
+      if (text !== undefined) round.text = text;
+    }
+    // With queuedAdoption the unreadable composition is the pending round;
+    // identity is returned below without an import. Every other unreadable
+    // shape refuses here.
+    if (round.verdict === 'unreadable' && !queuedAdoption) {
+      return refuse(
+        `Task ${sessionID} transcript could not be classified (${round.reason ?? 'unreadable'}); no prompt was sent`,
+      );
+    }
+  } else {
+    round = classifyCurrentDeliveredRound(childTranscript);
+    if (round.verdict === 'unreadable') {
+      return refuse(
+        `Task ${sessionID} transcript could not be classified (${round.reason ?? 'unreadable'}); no prompt was sent`,
+      );
+    }
   }
 
   let parentTranscript: unknown;
@@ -381,15 +420,15 @@ async function recoverRetainedSession(
     );
   }
 
-  if (queueContinuation) {
+  if (queuedAdoption) {
     if (options.isDisposed?.()) return refuse('Session recovery was disposed');
     if (ledger.deletionEpochs.get(sessionID) !== deletionEpoch) {
       return refuse(
         `Task ${sessionID} was deleted during recovery; no prompt was sent`,
       );
     }
-    // Historical terminals do not establish live idle. Return verified
-    // identity only; task_revive owns the lease and the new input generation.
+    // Busy or pending adoption returns verified identity only; task_revive
+    // owns the lease and the new input generation.
     return {
       kind: 'adoptable',
       taskID: sessionID,
@@ -452,10 +491,12 @@ async function recoverRetainedSession(
         ? { resultSummary: round.text }
         : state === 'cancelled'
           ? { resultSummary: 'cancelled' }
-          : {
-              resultSummary:
-                'Recovered retained session stopped before a terminal result.',
-            }),
+          : state === 'stopped'
+            ? {
+                resultSummary:
+                  'Recovered retained session stopped before a terminal result.',
+              }
+            : {}),
     ...(alias !== undefined ? { alias } : {}),
     ...(launchedAt !== undefined ? { launchedAt } : {}),
     ...(state === 'completed' && round.completedAt !== undefined
@@ -538,6 +579,8 @@ interface HostSession {
   agent?: string;
   createdAt?: number;
   title?: string;
+  /** Raw session info projection; round evidence is parsed from it. */
+  hostInfo: Record<string, unknown>;
 }
 
 async function readHostSession(
@@ -583,6 +626,7 @@ async function readHostSession(
     return {
       kind: 'ok',
       parentID,
+      hostInfo: data as Record<string, unknown>,
       ...(agent ? { agent } : {}),
       ...(createdAt !== undefined ? { createdAt } : {}),
       ...(typeof data?.title === 'string' && data.title

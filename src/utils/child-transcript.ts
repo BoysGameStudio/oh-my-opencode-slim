@@ -512,13 +512,6 @@ function sourceTypeOf(message: TranscriptMessage): string | undefined {
   return typeof source === 'string' ? source : undefined;
 }
 
-function outcomeOf(message: TranscriptMessage): string | undefined {
-  const outcome = message.info?.outcome;
-  return typeof outcome === 'string' && outcome.length > 0
-    ? outcome
-    : undefined;
-}
-
 function textOf(message: TranscriptMessage): string {
   const parts = Array.isArray(message.parts) ? message.parts : [];
   return parts
@@ -531,97 +524,39 @@ function textOf(message: TranscriptMessage): string {
     .join('\n');
 }
 
-/**
- * Historical v2 round. The latest user or synthetic message is the input
- * boundary. Only an idle/outcome after that boundary can confirm the round.
- * An older idle or Session-level outcome is not reused, and a missing time
- * is not treated as zero.
- */
-export function classifyV2HistoricalRound(
-  response: unknown,
-): CurrentRoundClassification {
-  if (response === undefined) {
-    return { verdict: 'unreadable', reason: 'transcript source unavailable' };
-  }
-  if (responseError(response) !== undefined) {
-    return { verdict: 'unreadable', reason: 'transcript read failed' };
-  }
-  if (!isRecord(response) || !Array.isArray(response.data)) {
-    return { verdict: 'unreadable', reason: 'malformed transcript response' };
-  }
-  const messages: TranscriptMessage[] = [];
-  for (const entry of response.data) {
-    if (!isRecord(entry) || !isRecord(entry.info)) {
-      return { verdict: 'unreadable', reason: 'malformed transcript entries' };
+/** Latest delivered user/synthetic input timestamp in a host transcript. */
+export function latestInputAtOf(transcript: unknown): number | undefined {
+  if (!isRecord(transcript) || !Array.isArray(transcript.data))
+    return undefined;
+  for (let index = transcript.data.length - 1; index >= 0; index -= 1) {
+    const entry = transcript.data[index];
+    if (!isRecord(entry) || !isRecord(entry.info)) continue;
+    const source = sourceTypeOf(entry);
+    if (source === 'user' || source === 'synthetic') {
+      return transcriptOrderKey(entry);
     }
-    messages.push(entry);
   }
+  return undefined;
+}
+
+/** Text of the latest assistant entry after the latest user/synthetic input. */
+export function terminalTextOf(transcript: unknown): string | undefined {
+  if (!isRecord(transcript) || !Array.isArray(transcript.data))
+    return undefined;
   let boundary = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const source = sourceTypeOf(messages[index] as TranscriptMessage);
+  for (let index = transcript.data.length - 1; index >= 0; index -= 1) {
+    const entry = transcript.data[index];
+    if (!isRecord(entry) || !isRecord(entry.info)) continue;
+    const source = sourceTypeOf(entry);
     if (source === 'user' || source === 'synthetic') {
       boundary = index;
       break;
     }
   }
-  if (boundary < 0) {
-    return { verdict: 'unreadable', reason: 'no delivered user round' };
+  for (let index = transcript.data.length - 1; index > boundary; index -= 1) {
+    const entry = transcript.data[index];
+    if (!isRecord(entry) || !isRecord(entry.info)) continue;
+    if (sourceTypeOf(entry) === 'assistant') return textOf(entry);
   }
-  const startedAt = transcriptOrderKey(messages[boundary] as TranscriptMessage);
-  // No user or synthetic entry follows the boundary.
-  let assistant = -1;
-  let closingIdle = -1;
-  for (let index = boundary + 1; index < messages.length; index += 1) {
-    const message = messages[index] as TranscriptMessage;
-    const source = sourceTypeOf(message);
-    if (source === 'assistant') {
-      assistant = index;
-      closingIdle = -1;
-      continue;
-    }
-    if (source === 'idle') closingIdle = index;
-  }
-  if (closingIdle < 0) return { verdict: 'incomplete', startedAt };
-  const idle = messages[closingIdle] as TranscriptMessage;
-  const idleOutcome = outcomeOf(idle);
-  const completedAt =
-    transcriptOrderKey(idle) ??
-    (assistant >= 0
-      ? assistantCompletedAt(messages[assistant] as TranscriptMessage)
-      : undefined);
-  if (idleOutcome === undefined) {
-    return { verdict: 'unreadable', reason: 'idle outcome is missing' };
-  }
-  if (idleOutcome === 'interrupted') {
-    return { verdict: 'interrupted', startedAt, completedAt };
-  }
-  if (idleOutcome === 'failed') {
-    const turn =
-      assistant >= 0 ? (messages[assistant] as TranscriptMessage) : undefined;
-    return {
-      verdict: 'error',
-      text:
-        (turn ? textOf(turn) : '') ||
-        'The historical round failed before an assistant result.',
-      startedAt,
-      completedAt,
-    };
-  }
-  if (idleOutcome !== 'succeeded') {
-    return {
-      verdict: 'unreadable',
-      reason: `unrecognized idle outcome ${idleOutcome}`,
-    };
-  }
-  if (assistant < 0) return { verdict: 'incomplete', startedAt };
-  const text = textOf(messages[assistant] as TranscriptMessage);
-  if (!text) return { verdict: 'incomplete', startedAt };
-  return {
-    verdict: 'completed',
-    text,
-    startedAt,
-    completedAt:
-      assistantCompletedAt(messages[assistant] as TranscriptMessage) ??
-      completedAt,
-  };
+  return undefined;
 }
