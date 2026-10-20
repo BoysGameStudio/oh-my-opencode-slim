@@ -197,6 +197,7 @@ function createSnapshot(overrides: Partial<TuiSnapshot> = {}): TuiSnapshot {
     updatedAt: 0,
     agentModels: {},
     agentVariants: {},
+    agentDisplayNames: {},
     activeSessions: {},
     activityPids: {},
     sessionParents: {},
@@ -1451,6 +1452,75 @@ describe('clickable sidebar sessions', () => {
     );
     expect(frame).toContain('exp-1 1/2');
     expect(frame).toContain('exp-2 2/2');
+  });
+
+  test('renders display names while canonical IDs keep models, activity and clicks', async () => {
+    const snapshot = createSnapshot({
+      agentModels: { arbiter: 'openai/gpt-6', paladin: 'openai/gpt-6' },
+      agentDisplayNames: { arbiter: 'reviewer', paladin: 'auditor' },
+      activeSessions: { rev_a: 'arbiter' },
+      sessionParents: { rev_a: 'conv-1' },
+      sessionDetails: { rev_a: { alias: 'rev-1', status: 'busy' } },
+    });
+    const navigated: string[] = [];
+    const interaction: Parameters<typeof renderSidebar>[7] = {
+      navigate: (id: string) => navigated.push(id),
+      isOpen: () => true,
+      toggleOpen: () => {},
+      expandedAgents: () => new Set<string>(),
+      toggleAgent: () => {},
+      syncScope: () => {},
+    };
+
+    const setup = await testRender(
+      () =>
+        renderSidebar(
+          snapshot,
+          'test',
+          attributionTheme,
+          false,
+          false,
+          () => 0,
+          'conv-1',
+          interaction,
+        ) as never,
+      { width: 60, height: 24 },
+    );
+    try {
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain('reviewer');
+      expect(frame).toContain('auditor');
+      expect(frame).not.toContain('arbiter');
+      expect(frame).not.toContain('paladin');
+
+      // Activity still resolves through the canonical ID, and a click on the
+      // display-labelled row targets the canonical agent's session.
+      expect(getActiveSidebarAgentNames(snapshot, 'conv-1')).toEqual(
+        new Set(['arbiter']),
+      );
+      const lines = frame.split('\n');
+      const row = lines.findIndex((line) => line.includes('reviewer'));
+      expect(row).toBeGreaterThan(-1);
+      await setup.mockMouse.click(
+        Math.max(lines[row].indexOf('reviewer'), 0) + 2,
+        row,
+      );
+      expect(navigated).toEqual(['rev_a']);
+    } finally {
+      setup.renderer.destroy();
+    }
+  });
+
+  test('falls back to the canonical ID when the label is missing or empty', async () => {
+    const snapshot = createSnapshot({
+      agentModels: { explorer: 'openai/gpt-6' },
+      agentDisplayNames: { explorer: '' },
+    });
+    const frame = await renderAttributionFrame(() =>
+      renderSidebar(snapshot, 'test', attributionTheme, false, false, () => 0),
+    );
+    expect(frame).toContain('explorer');
   });
 
   test('alias ordering is numeric (ora-2 before ora-10), unaliased last', () => {

@@ -796,6 +796,10 @@ Notes:
 - `@` prefixes and surrounding whitespace are normalized automatically
 - Display names must be unique
 - Display names cannot conflict with internal agent names like `oracle` or `explorer`
+- The TUI sidebar labels the agent with its display name, but models, activity,
+  row expansion, history and click targets stay keyed by the internal name.
+  Display names are frozen until a full reload, so renaming or removing one
+  changes the sidebar label only after the plugin reloads
 
 > **Rename continuity:** `librarian` was merged into `explorer`. Existing
 > `agents.librarian` config (model, variant, mcps, skills, prompt,

@@ -45,6 +45,10 @@ import { OhMyOpenCodeLite } from '../index';
 import { loadMergedOpenCodeConfig } from '../marketplace/preflight';
 import type { McpConfig } from '../mcp/types';
 import {
+  collectAgentDisplayNames,
+  recordTuiAgentDisplayNames,
+} from '../tui-state';
+import {
   configureBackgroundJobPersistence,
   loadInitialBackgroundJobPersistence,
 } from '../utils/background-job-persistence';
@@ -2297,6 +2301,13 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
             /* default() optional */
           }
         }
+        // v1 publishes this projection from its config hook; v2 never calls
+        // that hook, so finalization owns the startup sidebar identity
+        // snapshot. Refresh reads the same frozen registry identity table.
+        recordTuiAgentDisplayNames(
+          collectAgentDisplayNames(registry.identities),
+          directory,
+        );
         // Log inside finalization because the transform await only confirms
         // registration; the callback may not have run yet.
         log('[v2] agents registered', {

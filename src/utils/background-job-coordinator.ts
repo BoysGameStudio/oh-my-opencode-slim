@@ -205,6 +205,16 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     return this.board.abandonLaunch(launched, replaced);
   }
 
+  correctStartupRecoveredTerminal(input: {
+    taskID: string;
+    generation: number;
+    state: 'completed' | 'error' | 'cancelled' | 'stopped';
+    resultSummary?: string;
+    now?: number;
+  }): BackgroundJobRecord | undefined {
+    return this.board.correctStartupRecoveredTerminal(input);
+  }
+
   restoreRetainedSession(
     input: RestoreRetainedSessionInput,
   ): BackgroundJobRecord | undefined {

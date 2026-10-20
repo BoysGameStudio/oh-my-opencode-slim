@@ -164,6 +164,7 @@ describe('openPresetManager', () => {
       updatedAt: 0,
       agentModels: {},
       agentVariants: {},
+      agentDisplayNames: {},
       activeSessions: {},
       activityPids: {},
       sessionParents: {},

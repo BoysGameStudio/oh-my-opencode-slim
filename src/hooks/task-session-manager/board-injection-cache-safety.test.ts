@@ -642,6 +642,7 @@ describe('structural flavor split (v2 boardless)', () => {
       parentSessionID: SESSION,
       agent: 'explorer',
       description: 'map hooks',
+      now: BASE_TIME - 1_000,
     });
     board.updateStatus({
       taskID: 'child-done',
@@ -654,6 +655,7 @@ describe('structural flavor split (v2 boardless)', () => {
       parentSessionID: SESSION,
       agent: 'explorer',
       description: 'map hooks',
+      now: BASE_TIME - 1_000,
     });
     board.updateStatus({
       taskID: 'child-stopped',
@@ -696,7 +698,12 @@ describe('structural flavor split (v2 boardless)', () => {
       userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
       assistantMsg('msg_a_off_1', 'consumed the result', BASE_TIME + 1, 1, 10),
       {
-        info: { id: 'msg_native_1', sessionID: SESSION, role: 'user' },
+        info: {
+          id: 'msg_native_1',
+          sessionID: SESSION,
+          role: 'user',
+          time: { created: BASE_TIME + 60_005 },
+        },
         parts: [
           {
             type: 'text',
@@ -716,5 +723,47 @@ describe('structural flavor split (v2 boardless)', () => {
     expect(board.get('child-stopped')).toMatchObject({
       terminalUnreconciled: true,
     });
+  });
+
+  test('v2: an undated trusted delivery cannot retire a terminal job', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-undated',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-undated',
+      state: 'completed',
+      resultSummary: 'done',
+      now: BASE_TIME + 60_000,
+    });
+    const hook = createHook(board, 'v2');
+
+    await runTurn(hook, [
+      userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
+      {
+        info: {
+          id: 'msg_native_undated',
+          sessionID: SESSION,
+          role: 'user',
+        },
+        parts: [
+          {
+            type: 'text',
+            text: '<subagent sessionID="child-undated" state="completed" description="map hooks">\ndone\n</subagent>',
+            metadata: {
+              source: 'subagent',
+              childID: 'child-undated',
+              state: 'completed',
+            },
+          },
+        ],
+      },
+      userMsg('msg_u_off_2', 'next step', BASE_TIME + 2),
+    ]);
+
+    expect(board.getState('child-undated')).toBe('completed');
   });
 });

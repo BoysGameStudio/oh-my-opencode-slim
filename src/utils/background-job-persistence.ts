@@ -55,9 +55,12 @@ export interface BackgroundJobStorageBackend {
 const KEY_ROOT = 'omo/bgj/';
 const TOMBSTONE_PREFIX = `${KEY_ROOT}tombstone/`;
 const EPOCH_PREFIX = `${KEY_ROOT}epoch/`;
+const CHILD_PREFIX = `${KEY_ROOT}child/`;
 
 /** Persisted tombstone entries self-cap at this many most-recent items. */
 export const MAX_PERSISTED_TOMBSTONES = 500;
+/** Persisted owned-child identities self-cap at this many newest launches. */
+export const MAX_PERSISTED_CHILDREN = 500;
 
 /** Defensive bound on scan pagination (a corrupted cursor loop). */
 const MAX_SCAN_PAGES = 10_000;
@@ -73,9 +76,29 @@ export interface PersistedTombstoneEntry {
   resultSummary?: string;
 }
 
+/**
+ * Minimal plugin-owned child identity persisted across restarts. Carries
+ * exactly what startup recovery needs to re-adopt a background child when
+ * the host exposes no session listing: ownership, display fields, launch
+ * time, and whether the terminal outcome was already delivered.
+ */
+export interface PersistedBackgroundChild {
+  taskID: string;
+  parentSessionID: string;
+  agent: string;
+  description: string;
+  objective?: string;
+  launchedAt: number;
+  background: true;
+  /** Set after a terminal outcome was published to the parent. */
+  deliveredAt?: number;
+}
+
 export interface PersistedBackgroundJobState {
   /** taskID → persisted tombstone entry (currently suppressed runs). */
   tombstones: Map<string, PersistedTombstoneEntry>;
+  /** taskID → persisted plugin-owned background child identity. */
+  children: Map<string, PersistedBackgroundChild>;
   /** taskID → deletion epoch (survives clear-on-relaunch). */
   deletionEpochs: Map<string, number>;
   /** Highest deletion epoch seen; keeps future epochs monotonic. */
@@ -85,6 +108,7 @@ export interface PersistedBackgroundJobState {
 function emptyState(): PersistedBackgroundJobState {
   return {
     tombstones: new Map(),
+    children: new Map(),
     deletionEpochs: new Map(),
     nextEpoch: 0,
   };
@@ -95,6 +119,8 @@ let backend: BackgroundJobStorageBackend | undefined;
 let loaded = emptyState();
 /** Live tombstone bookkeeping for cap enforcement (loaded ∪ recorded). */
 const liveTombstones = new Map<string, PersistedTombstoneEntry>();
+/** Live owned-child identities for cap enforcement (loaded ∪ recorded). */
+const liveChildren = new Map<string, PersistedBackgroundChild>();
 /** Per-key serialized write queues (no concurrent RMW on one key). */
 const writeQueues = new Map<string, Promise<void>>();
 /**
@@ -151,6 +177,7 @@ export function configureBackgroundJobPersistence(
   backend = storage;
   loaded = emptyState();
   liveTombstones.clear();
+  liveChildren.clear();
   writeQueues.clear();
 }
 
@@ -160,6 +187,42 @@ function tombstoneKey(taskID: string): string {
 
 function epochKey(taskID: string): string {
   return `${EPOCH_PREFIX}${taskID}`;
+}
+
+function parsePersistedChild(
+  value: unknown,
+): PersistedBackgroundChild | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const record = value as Partial<PersistedBackgroundChild>;
+  if (
+    typeof record.taskID !== 'string' ||
+    !record.taskID ||
+    typeof record.parentSessionID !== 'string' ||
+    !record.parentSessionID ||
+    typeof record.agent !== 'string' ||
+    !record.agent ||
+    record.background !== true ||
+    typeof record.launchedAt !== 'number' ||
+    !Number.isFinite(record.launchedAt)
+  ) {
+    return undefined;
+  }
+  return {
+    taskID: record.taskID,
+    parentSessionID: record.parentSessionID,
+    agent: record.agent,
+    description:
+      typeof record.description === 'string' ? record.description : '',
+    ...(typeof record.objective === 'string'
+      ? { objective: record.objective }
+      : {}),
+    launchedAt: record.launchedAt,
+    background: true,
+    ...(typeof record.deliveredAt === 'number' &&
+    Number.isFinite(record.deliveredAt)
+      ? { deliveredAt: record.deliveredAt }
+      : {}),
+  };
 }
 
 /**
@@ -216,6 +279,9 @@ export async function loadInitialBackgroundJobPersistence(): Promise<PersistedBa
           state.tombstones.set(record.taskID, record);
           state.deletionEpochs.set(record.taskID, record.epoch);
         }
+      } else if (entry.key.startsWith(CHILD_PREFIX)) {
+        const child = parsePersistedChild(entry.value);
+        if (child) state.children.set(child.taskID, child);
       } else if (entry.key.startsWith(EPOCH_PREFIX)) {
         const taskID = entry.key.slice(EPOCH_PREFIX.length);
         if (typeof entry.value === 'number' && Number.isFinite(entry.value)) {
@@ -231,7 +297,11 @@ export async function loadInitialBackgroundJobPersistence(): Promise<PersistedBa
   for (const record of state.tombstones.values()) {
     liveTombstones.set(record.taskID, record);
   }
+  for (const child of state.children.values()) {
+    liveChildren.set(child.taskID, child);
+  }
   loaded = state;
+  enforceChildCap();
   return state;
 }
 
@@ -264,6 +334,7 @@ export function recordSuppression(
   };
   liveTombstones.set(taskID, record);
   enforceTombstoneCap();
+  removeChild(taskID);
 
   if (!backend) return;
   enqueueWrite(tombstoneKey(taskID), async () => {
@@ -304,6 +375,118 @@ export function getSuppressionTombstone(
   taskID: string,
 ): PersistedTombstoneEntry | undefined {
   return liveTombstones.get(taskID);
+}
+
+/** Seed snapshot of owned child identities (backend-loaded state only). */
+export function persistedBackgroundChildren(): ReadonlyMap<
+  string,
+  PersistedBackgroundChild
+> {
+  // Without a storage backend there is nothing durable to restore. Keep
+  // in-process launches out of startup scans so tests and plugin instances
+  // cannot inherit another board's live children.
+  return backend ? liveChildren : new Map();
+}
+
+/**
+ * Persist one plugin-owned background child identity (write-through from
+ * `BackgroundJobBoard.registerLaunch`). A new launch clears any previous
+ * delivery marker so the eventual terminal outcome is published once.
+ */
+export function recordPersistedBackgroundChild(
+  input: PersistedBackgroundChild,
+  options: { preserveDelivered?: boolean } = {},
+): void {
+  if (!backend) return;
+  const child: PersistedBackgroundChild = {
+    taskID: input.taskID,
+    parentSessionID: input.parentSessionID,
+    agent: input.agent,
+    description: input.description,
+    ...(input.objective !== undefined ? { objective: input.objective } : {}),
+    launchedAt: input.launchedAt,
+    background: true,
+  };
+  const previous = liveChildren.get(child.taskID);
+  if (options.preserveDelivered && previous?.deliveredAt !== undefined) {
+    child.deliveredAt = previous.deliveredAt;
+  }
+  if (
+    !child.taskID ||
+    !child.parentSessionID ||
+    !child.agent ||
+    !Number.isFinite(child.launchedAt)
+  ) {
+    return;
+  }
+  liveChildren.set(child.taskID, child);
+  enforceChildCap();
+  if (!backend) return;
+  enqueueWrite(childKey(child.taskID), async () => {
+    await backend?.set(childKey(child.taskID), { ...child });
+  });
+}
+
+/**
+ * Mark a persisted child's terminal outcome as delivered. When
+ * `expectedLaunchedAt` is supplied, the marker is applied only to that
+ * exact run: an acceptance that resolves after the same child relaunched
+ * cannot acknowledge the newer generation.
+ */
+export function markPersistedBackgroundChildDelivered(
+  taskID: string,
+  now = Date.now(),
+  expectedLaunchedAt?: number,
+): boolean {
+  const child = liveChildren.get(taskID);
+  if (!child) return false;
+  if (
+    expectedLaunchedAt !== undefined &&
+    child.launchedAt !== expectedLaunchedAt
+  ) {
+    return false;
+  }
+  const delivered: PersistedBackgroundChild = { ...child, deliveredAt: now };
+  liveChildren.set(taskID, delivered);
+  if (!backend) return true;
+  enqueueWrite(childKey(taskID), async () => {
+    await backend?.set(childKey(taskID), { ...delivered });
+  });
+  return true;
+}
+
+/** Remove a persisted child identity (e.g. after a deletion tombstone). */
+export function removePersistedBackgroundChild(taskID: string): void {
+  removeChild(taskID);
+}
+
+function removeChild(taskID: string): void {
+  if (!liveChildren.delete(taskID)) return;
+  if (!backend) return;
+  enqueueWrite(childKey(taskID), async () => {
+    await backend?.remove(childKey(taskID));
+  });
+}
+
+function childKey(taskID: string): string {
+  return `${CHILD_PREFIX}${taskID}`;
+}
+
+function enforceChildCap(): void {
+  if (liveChildren.size <= MAX_PERSISTED_CHILDREN) return;
+  const ordered = [...liveChildren.values()].sort(
+    (left, right) => left.launchedAt - right.launchedAt,
+  );
+  const evict = ordered.slice(0, liveChildren.size - MAX_PERSISTED_CHILDREN);
+  for (const child of evict) {
+    liveChildren.delete(child.taskID);
+  }
+  if (!backend) return;
+  for (const child of evict) {
+    enqueueWrite(childKey(child.taskID), async () => {
+      await backend?.remove(childKey(child.taskID));
+    });
+  }
 }
 
 function enforceTombstoneCap(): void {

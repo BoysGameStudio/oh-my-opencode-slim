@@ -39,6 +39,12 @@ import {
 } from '../cache-safe-injection';
 import type { MessagePart, MessageWithParts } from '../types';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
+import {
+  messageCreatedAt,
+  NATIVE_DELIVERY_STATES,
+  type NativeDelivery,
+  parseNativeDelivery,
+} from './native-delivery';
 import { extractTaskSummary, isLateCancelledTaskError } from './status-utils';
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -1319,16 +1325,10 @@ export function reconcileInjectedTerminalJobs(
 // v2 path. v1 is structurally board-on: its prompt-shape path owns
 // retirement, so this pass never runs there.
 
-type ObservedNativeDelivery = {
-  /** Child session ID from the delivery tag; the board taskID on v2. */
-  taskID: string;
-  state: 'completed' | 'error' | 'cancelled';
+type ObservedNativeDelivery = NativeDelivery & {
   /** Dedupe key: the delivery part's own message/part identity. */
   seenKey: string;
 };
-
-/** Delivery states the native notifier publishes (never `stopped`). */
-const NATIVE_DELIVERY_STATES = new Set(['completed', 'error', 'cancelled']);
 
 /**
  * Skew allowance for the current-publication check: the terminal event the
@@ -1367,68 +1367,6 @@ function nativeDeliverySeenKey(
   return messageID === undefined
     ? `anon:${textHash}`
     : `${messageID}:${partIndex}:${textHash}`;
-}
-
-/**
- * True only for the host's native v2 completion delivery. The host's
- * `sessions.synthetic` part opens with the
- * `<subagent sessionID="..." state="...">` tag AND carries
- * `metadata: { source: 'subagent', childID, state }`. Both are required:
- * header anchoring alone would let pasted user/assistant text masquerade as
- * a delivery (Greptile P1), so the metadata must exist and agree with the
- * tag. A result body merely quoting foreign task markup is nested, never at
- * the header, and cannot match either.
- */
-function parseNativeDelivery(
-  part: MessagePart,
-): Omit<ObservedNativeDelivery, 'seenKey'> | undefined {
-  const text = part.text;
-  if (typeof text !== 'string' || !/^\s*<subagent\b/i.test(text)) {
-    return undefined;
-  }
-  const taskID = parseTaskIdFromTaskOutput(text);
-  const state = parseTaskStateFromOutput(text);
-  if (!taskID || !state || !NATIVE_DELIVERY_STATES.has(state)) {
-    return undefined;
-  }
-  const meta = part.metadata;
-  if (
-    !isRecord(meta) ||
-    meta.source !== 'subagent' ||
-    meta.childID !== taskID ||
-    meta.state !== state
-  ) {
-    return undefined;
-  }
-  return { taskID, state: state as ObservedNativeDelivery['state'] };
-}
-
-function messageCreatedAt(message: MessageWithParts): number | undefined {
-  const info = message.info as { time?: unknown };
-  // The v2 host decodes `Session.Message.time` into Effect `DateTime.Utc`
-  // instances — structs carrying `epochMilliseconds`, NOT plain numbers —
-  // so `info.time.created` fails a naive `typeof value === 'number'` check
-  // and a numeric wire form (JSON round-trips, fixtures) fails
-  // `isRecord`. Accept every shape this clock actually arrives in.
-  const asMillis = (value: unknown): number | undefined => {
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-    if (typeof value !== 'object' || value === null) return undefined;
-    const millis = (value as { epochMilliseconds?: unknown }).epochMilliseconds;
-    if (typeof millis === 'number' && Number.isFinite(millis)) return millis;
-    return undefined;
-  };
-  if (!isRecord(info.time)) {
-    const direct = asMillis(info.time);
-    if (direct !== undefined) return direct;
-    return undefined;
-  }
-  // An assistant turn carries only `completed`; a user turn carries
-  // `created`. Both are the message's own clock, in the same unit.
-  for (const key of ['created', 'completed'] as const) {
-    const value = asMillis(info.time[key]);
-    if (value !== undefined) return value;
-  }
-  return undefined;
 }
 
 /**
@@ -1492,6 +1430,9 @@ function reconcileObservedNativeDeliveries(
       // so lastLiveBusyAt is unset). The current publication otherwise
       // retires via its own delivery or retireStaleTerminalRecords.
       const deliveryTime = messageCreatedAt(message);
+      // Trusted metadata proves who authored the delivery, not WHICH run it
+      // reports. Without a host timestamp no causal fence can be checked.
+      if (deliveryTime === undefined) return;
       if (!record.terminalUnreconciled) {
         if (
           record.state === 'running' &&

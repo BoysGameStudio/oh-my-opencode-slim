@@ -152,14 +152,18 @@ not an optional-degradation path.
    `noReply: true` maps to `delivery: "queue", resume: false` — or `delivery: "steer", resume: false` when the v1-shaped body carries an explicit `delivery: 'steer'` from `task_message`),
    `session.update`→
    `session.update` (`{sessionID, title}`), `session.delete`→`remove` (same
-   `DELETE /api/session/:id`), and `session.list` (v2 `Session.Info` page → the v1
-   `{data}` envelope with `directory` derived from `location` and `outcome`
-   mapped, used by the interview dashboard's session scan and the
-   orchestrator-wake children enumeration). Note that `remove` and `list`
-   are **not part of the stock v2 plugin session domain** — the
-   capability probes only succeed on hosts that extend it, and all v2.0.x
-   stable hosts take the degraded paths (see
-   [Not exposed to plugins: `session.list` / `session.remove`](#not-exposed-to-plugins-sessionlist-sessionremove)).
+   `DELETE /api/session/:id`), and `session.list` (v2 `Session.Info`
+   cursor page → a complete v1 `{data}` envelope: first-page filters
+   normalized and carried by the cursor, `cursor.next` drained within a
+   bounded budget, `directory` derived from `location`, and `outcome`
+   mapped; used by the interview dashboard's session scan and the
+   orchestrator-wake children enumeration). Note that `remove` is **not
+   part of the stock v2 plugin session domain**; `list` was not exposed
+   through v2.0.x either, but v2.1 exposes it natively as a cursor-paginated
+   route. The capability probes
+   still succeed only on hosts that extend the domain, and older hosts take
+   the degraded paths (see
+   [Plugin session domain](#plugin-session-domain-list-and-remove)).
    The shim marks the input `hostFlavor: 'v2'` and never fakes success
    shapes: methods the host lacks degrade with an honest log (or are
    omitted entirely, as with `session.get`, so capability probes see the
@@ -823,15 +827,37 @@ persists background-job lifecycle state through
 `src/utils/background-job-persistence.ts` (configured in `setup` before
 the v1 factory runs):
 
-- **Tombstones and deletion epochs** are write-through: every in-memory
-  ledger mutation queues a matching persisted update, so the persisted
-  state tracks the ledger (writes are fire-and-forget — a crash between
-  the in-memory mutation and the queue flush loses that persisted entry,
-  an accepted degradation to process-local behavior). Clearing a tombstone
-  on a legitimate relaunch is persisted too — a deleted-then-relaunched
-  task is *not* ghost-skipped after a restart, while its deletion epoch
-  survives for generation fencing (restored epochs keep the epoch counter
-  monotonic).
+- **Tombstones, deletion epochs, and owned child identities** are
+  write-through: every in-memory ledger mutation queues a matching
+  persisted update, so the persisted state tracks the ledger (writes are
+  fire-and-forget — a crash between the in-memory mutation and the queue
+  flush loses that persisted entry, an accepted degradation to
+  process-local behavior). A background launch persists the minimal child
+  identity (task ID, parent, original agent, description, objective,
+  launch time). A terminal outcome alone does not mark delivery: the
+  marker is persisted only after an accepted parent-visible wake, or
+  when a trusted current-run delivery is found in parent history.
+  Native notification ownership alone is not delivery evidence, and the
+  launch fence prevents an old delivery from acknowledging a newer run.
+  Busy, throttled, or failed publication retries retain the execution
+  until their accepted delivery covers it. One wake names at most 256
+  executions; the rest stay pending for a later accepted wake, and an
+  attempt whose entire batch was retired before sending is skipped and
+  releases its wake reservation.
+  Clearing a tombstone on a legitimate relaunch is persisted too —
+  a deleted-then-relaunched task is *not* ghost-skipped after a restart,
+  while its deletion epoch survives for generation fencing (restored
+  epochs keep the epoch counter monotonic).
+- **Owned child identities make startup recovery possible without
+  `session.list`.** The bounded startup scan unions those identities with
+  host child rows when list is available, reads each child's transcript,
+  verifies parent launch evidence for list-only candidates, and never
+  adopts a terminal child that has no persisted identity (historical
+  history is not replayed). The
+  delivery marker suppresses a second completion wake on a later restart.
+  Declined, skipped, throttled, or failed plugin wakes leave the identity
+  undelivered for retry. Because the marker write follows the accepted
+  wake, delivery is at-least-once across a crash, not crash-atomic.
 - **Aliases** are not persisted: only a parent created while the plugin
   runs gets numbered aliases, and an old alias resolves only through its
   marker in the parent's history. Once a compaction cuts that history, an
@@ -842,9 +868,10 @@ the v1 factory runs):
   behavior change, fresh boards and ledgers start exactly as
   process-local as before.
 - **Bounded and serialized.** Persisted tombstones (and their epoch
-  entries) self-cap at the 500 most recent by recorded time; writes for
-  one key are serialized in-process (no concurrent read-modify-write);
-  write failures log and degrade to process-local behavior.
+  entries) and owned child identities each self-cap at the 500 most recent
+  by recorded/launch time; writes for one key are serialized in-process
+  (no concurrent read-modify-write); write failures log and degrade to
+  process-local behavior.
 
 ### Diagnostics
 
@@ -909,41 +936,52 @@ environment; no extra setup is needed for panes. See
 [Secret handling](multiplexer-integration.md#known-limitations).
 See [Deployment Modes](multiplexer-integration.md#deployment-modes).
 
-### Not exposed to plugins: `session.list` / `session.remove`
+### Plugin session domain: list and remove
 
 The v2 plugin session domain (`packages/plugin/src/promise/session.ts`,
 `SessionDomain`, mirrored by the runtime object the promise adapter
 builds) exposes exactly `create`/`get`/`switchAgent`/`switchModel`/
 `prompt`/`generate`/`command`/`synthetic`/`interrupt`/`update`/`move`/
-`wait`/`context` — **`list` and `remove` are not handed to plugins**.
-Both endpoints exist on the host's HTTP API, but the
-plugin context never receives them. `session.status`, `session.todo`, and
+`wait`/`context` through v2.0.x — **`list` and `remove` are not handed to
+plugins there**. Both endpoints exist on the host's HTTP API, and v2.1
+exposes `session.list` natively to plugins as a cursor-paginated route
+(`{data, cursor:{previous?, next?}}`, default 50). Core emits
+`cursor.next` on every nonempty page — including the final data page —
+and an empty page is the terminal signal. The shim drains pages with its
+own bounded budget: at most 20 data pages of 50 (1000 sessions), one
+terminal empty probe, and four seconds total. A probe that reveals more
+data, repeated cursors, malformed pages, or an exhausted budget reject
+instead of returning a partial list. Root-only listing sends a real
+`null` (the legacy `"null"` string is normalized, because v2.1
+`Session.ID` rejects it), and the cursor carries the first page's
+filters. `session.status`, `session.todo`, and
 `session.children` are likewise not exposed to plugins — the wake
 scheduler's fallback enumeration, the delete no-op below, and the disabled
 runtime-status reconciliation (see
 [Upstream behaviors](#upstream-behaviors-to-know)) all follow from these
-gaps. The client shim capability-probes both at runtime
+gaps. The client shim capability-probes `list` and `remove` at runtime
 (`typeof s.list === 'function'`, `s.remove`), so a future host that
-extends the domain gets real delegation with no plugin change; on all
-v2.0.x stable hosts both probes fail and the shims degrade:
+extends the domain gets real delegation with no plugin change; on v2.0.x
+stable hosts both probes fail and the shims degrade:
 
-- **Children enumeration (orchestrator-wake).** The shim's
-  `client.session.list` returns the v1-parity empty page `{data: []}`,
-  so `session.list({parentID})`-based enumeration never yields children
-  and the scheduler always runs its **event-tracked fallback**
+- **Children enumeration (orchestrator-wake).** On hosts without `list`,
+  the shim's `client.session.list` returns the v1-parity empty page
+  `{data: []}`, so `session.list({parentID})`-based enumeration never
+  yields children and the scheduler runs its **event-tracked fallback**
   (adapter-synthesized `session.created` parentID links plus tracked
-  busy/idle statuses — the mode the doc's wake section describes as the
-  fallback is effectively the only path on v2). The gate still passes
-  because it probes the *shim's* `list` function, which always exists.
-  The interview dashboard's session scan likewise sees no sessions from
-  `list` on v2.
+  busy/idle statuses). On v2.1 the shim drains every cursor page, so the
+  list path is operative; a list failure or budget overrun still falls
+  back to the event-tracked path. The gate still passes because it probes
+  the *shim's* `list` function, which always exists. The interview
+  dashboard's session scan likewise sees every page on v2.1 and no
+  sessions where `list` is absent.
 - **Session delete.** `client.session.delete` is a **no-op**. No caller is
   affected: smartfetch summarizes through `generate.text` and never creates
   temp sessions on v2.
 
-Both degradations announce themselves in the plugin log with a single
-deterministic, **one-time-per-process** warning instead of degrading
-silently (`list`) or logging on every call (`remove`):
+Where those probes fail, both degradations announce themselves in the
+plugin log with a single deterministic, **one-time-per-process** warning
+instead of degrading silently (`list`) or logging on every call (`remove`):
 
 ```
 [v2][shim] session.list unavailable on this host build; children enumeration falls back to event tracking
@@ -968,7 +1006,8 @@ How it differs from the v1 path:
   (`session.get` is optional model enrichment). v1 keeps its exact
   historical probe set (`get`/`todo`/`children`/`status`/`promptAsync`).
 - **Children enumeration:** `session.list({ parentID })` through the shim
-  (v2 `Session.Info` → v1 envelope; `outcome` and `time.updated` mapped).
+  (v2.1 cursor pages drained to one complete v1 envelope; v2
+  `Session.Info` → v1 shape; `outcome` and `time.updated` mapped).
   When the listing is unavailable (missing/erroring/empty), an event-tracked
   fallback uses the adapter-synthesized `session.created` parentID links plus
   tracked busy/idle statuses — refreshed on every evaluation with the host's
@@ -976,11 +1015,12 @@ How it differs from the v1 path:
   child). A finished child is therefore terminal immediately instead of
   reading active for the whole staleness window, and a live child stays
   visible on its host evidence rather than dropping out on stale local
-  evidence. `session.list` is not exposed to plugins on any stable
-  host
+  evidence. `session.list` is not exposed to plugins on older stable
+  hosts
   (see
-  [Not exposed to plugins](#not-exposed-to-plugins-sessionlist-sessionremove)),
-  so the event-tracked fallback is the operative path. Results are scoped
+  [Plugin session domain](#plugin-session-domain-list-and-remove)),
+  and list errors or budget overruns fall back to the event-tracked path.
+  Results are scoped
   to the session's directory when the host reports one.
 - **Wake condition:** children with `outcome === undefined` (v2 records an
   outcome only on terminal transition: succeeded|failed|interrupted) that
