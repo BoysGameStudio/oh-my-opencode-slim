@@ -31,11 +31,11 @@ The generated `openai` preset assigns each specialist an OpenAI model:
 
 | Agent | Model |
 |-------|-------|
-| Orchestrator | `openai/gpt-6-sol` (`high`) |
-| Oracle | `openai/gpt-6-astra` (`high`) |
+| Orchestrator | `openai/gpt-6.1-sol` (`medium`) |
+| Oracle | `openai/gpt-6.1-sol` (`high`) |
 | Explorer | `openai/gpt-6-luna` (`low`) |
 | Designer | `openai/gpt-6-luna` (`medium`) |
-| Fixer | `openai/gpt-6-luna` (`high`) |
+| Fixer | `openai/gpt-6.1-sol` (`low`) |
 
 ## Generated Config Shape
 
@@ -48,12 +48,12 @@ setting the top-level `preset` field:
   "presets": {
     "openai": {
       "orchestrator": {
-        "model": "openai/gpt-6-sol",
-        "variant": "high",
+        "model": "openai/gpt-6.1-sol",
+        "variant": "medium",
         "skills": ["*"]
       },
       "oracle": {
-        "model": "openai/gpt-6-astra",
+        "model": "openai/gpt-6.1-sol",
         "variant": "high",
         "skills": ["simplify"]
       },
@@ -68,8 +68,8 @@ setting the top-level `preset` field:
         "skills": []
       },
       "fixer": {
-        "model": "openai/gpt-6-luna",
-        "variant": "high",
+        "model": "openai/gpt-6.1-sol",
+        "variant": "low",
         "skills": []
       }
     }

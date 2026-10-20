@@ -32,10 +32,10 @@ describe('providers', () => {
     );
     const agents = (config.presets as any).openai;
     expect(agents).toBeDefined();
-    expect(agents.orchestrator.model).toBe('openai/gpt-6-sol');
-    expect(agents.orchestrator.variant).toBe('high');
-    expect(agents.fixer.model).toBe('openai/gpt-6-luna');
-    expect(agents.fixer.variant).toBe('high');
+    expect(agents.orchestrator.model).toBe('openai/gpt-6.1-sol');
+    expect(agents.orchestrator.variant).toBe('medium');
+    expect(agents.fixer.model).toBe('openai/gpt-6.1-sol');
+    expect(agents.fixer.variant).toBe('low');
   });
 
   test('preserves exact OpenAI model and variant mappings', () => {
@@ -46,11 +46,11 @@ describe('providers', () => {
 
     const agents = (config.presets as any).openai;
     const expected = {
-      orchestrator: { model: 'openai/gpt-6-sol', variant: 'high' },
-      oracle: { model: 'openai/gpt-6-astra', variant: 'high' },
+      orchestrator: { model: 'openai/gpt-6.1-sol', variant: 'medium' },
+      oracle: { model: 'openai/gpt-6.1-sol', variant: 'high' },
       explorer: { model: 'openai/gpt-6-luna', variant: 'low' },
       designer: { model: 'openai/gpt-6-luna', variant: 'medium' },
-      fixer: { model: 'openai/gpt-6-luna', variant: 'high' },
+      fixer: { model: 'openai/gpt-6.1-sol', variant: 'low' },
     } as const;
 
     expect(MODEL_MAPPINGS.openai).toEqual(expected);
