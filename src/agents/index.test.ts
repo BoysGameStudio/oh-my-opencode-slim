@@ -1213,6 +1213,42 @@ describe('tool permissions', () => {
     }
   });
 
+  test('subagents are denied access to question by default', () => {
+    const agents = createAgents(runtimeFor());
+
+    // fixer/designer previously defaulted to allow; explorer/oracle lock the
+    // read-only matrix stance.
+    for (const name of ['fixer', 'designer', 'explorer', 'oracle']) {
+      const agent = agents.find((candidate) => candidate.name === name);
+      expect(
+        (agent as { config: { permission: Record<string, unknown> } }).config
+          .permission.question,
+      ).toBe('deny');
+    }
+  });
+
+  test('custom subagents follow the question deny default; explicit allow wins', () => {
+    const config: PluginConfig = {
+      agents: {
+        reviewer: { model: 'openai/gpt-5.5', prompt: 'You are a reviewer.' },
+        asker: {
+          model: 'openai/gpt-5.5',
+          prompt: 'You ask.',
+          permission: { question: 'allow' },
+        },
+      },
+    };
+    const agents = createAgents(runtimeFor(config));
+    const permissionOf = (name: string) =>
+      (
+        agents.find((a) => a.name === name) as {
+          config: { permission: Record<string, unknown> };
+        }
+      ).config.permission;
+    expect(permissionOf('reviewer').question).toBe('deny');
+    expect(permissionOf('asker').question).toBe('allow');
+  });
+
   test('council agent has synthesis-only (deny-all) permissions', () => {
     const agents = createAgents(
       runtimeFor({

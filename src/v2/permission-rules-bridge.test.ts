@@ -399,7 +399,7 @@ describe('built-in agent permission-rule derivation matrix', () => {
     expect(calls[0].permissions).toContainEqual({
       action: 'question',
       resource: '*',
-      effect: 'allow',
+      effect: 'deny',
     });
   });
 

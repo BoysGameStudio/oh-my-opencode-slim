@@ -646,11 +646,15 @@ function injectDisplayNames(
 
 /**
  * Apply default permissions to an agent.
- * Sets 'question' permission to 'allow' and includes skill permission presets.
- * If configuredSkills is provided, it honors that list instead of defaults.
+ * Includes skill permission presets. If configuredSkills is provided, it
+ * honors that list instead of defaults.
  *
- * Note: If the agent already explicitly sets question to 'deny', that is
- * respected (e.g. councillor should not ask questions).
+ * Question policy: subagents never block on the human. A background
+ * child's question parks with no tokens moving and no headless answerer
+ * (task_reply covers permissions on both hosts; v2 form questions need a
+ * host UI), so subagents default to 'deny' — same stance as `wait_for_user`
+ * and as v2's own built-in subagents. The orchestrator is the only ask
+ * channel. Explicit per-agent config always wins.
  */
 function applyDefaultPermissions(
   agent: AgentDefinition,
@@ -678,8 +682,12 @@ function applyDefaultPermissions(
     disabledSkills,
   );
 
-  // Respect explicit deny on question (councillor)
-  const questionPerm = existing.question === 'deny' ? 'deny' : 'allow';
+  // Subagents never ask the human: a parked child question has no
+  // headless answerer. Mirrors wait_for_user; explicit config wins.
+  const questionPerm =
+    agent.name === 'orchestrator'
+      ? (existing.question ?? 'allow')
+      : (existing.question ?? 'deny');
   const orchestratorDefaultPermissions = Object.fromEntries(
     ORCHESTRATOR_DEFAULT_TOOL_NAMES.map((toolName) => [
       toolName,
