@@ -144,6 +144,75 @@ describe('v2 profile refresh hook', () => {
     });
   });
 
+  test('projects display names from the registry and keeps them frozen across a refresh', async () => {
+    env.writeUserConfig({
+      agents: {
+        explorer: {
+          model: 'opencode-go/deepseek-v4.1-flash',
+          displayName: 'Scout',
+        },
+      },
+    });
+
+    await withFactory(async ({ refresh }) => {
+      // Startup projection carries the registry label, keyed canonically.
+      expect(sidebarModels().explorer).toBe('opencode-go/deepseek-v4.1-flash');
+      expect(readTuiSnapshot(env.projectDir).agentDisplayNames.explorer).toBe(
+        'Scout',
+      );
+
+      // `displayName` is frozen for the session: a refresh applies the new
+      // model but keeps the registry label until a full reload.
+      env.writeUserConfig({
+        agents: { explorer: { model: 'anthropic/claude-sonnet-4-5' } },
+      });
+      const refreshed = await refresh();
+      expect(refreshed.ok).toBe(true);
+      if (!refreshed.ok) throw new Error(refreshed.reason);
+      expect(sidebarModels().explorer).toBe('anthropic/claude-sonnet-4-5');
+      expect(readTuiSnapshot(env.projectDir).agentDisplayNames.explorer).toBe(
+        'Scout',
+      );
+    });
+  });
+
+  test('projects active-preset display names and keeps them frozen across a preset refresh', async () => {
+    env.writeUserConfig({
+      preset: 'cheap',
+      presets: {
+        cheap: {
+          explorer: {
+            model: 'opencode-go/deepseek-v4.1-flash',
+            displayName: 'Researcher',
+          },
+        },
+        strong: { explorer: { model: 'anthropic/claude-sonnet-4-5' } },
+      },
+    });
+
+    await withFactory(async ({ refresh }) => {
+      expect(readTuiSnapshot(env.projectDir).agentDisplayNames.explorer).toBe(
+        'Researcher',
+      );
+
+      // Switching presets updates the model; the frozen label stays.
+      env.writeUserConfig({
+        preset: 'strong',
+        presets: {
+          cheap: { explorer: { model: 'opencode-go/deepseek-v4.1-flash' } },
+          strong: { explorer: { model: 'anthropic/claude-sonnet-4-5' } },
+        },
+      });
+      const refreshed = await refresh();
+      expect(refreshed.ok).toBe(true);
+      if (!refreshed.ok) throw new Error(refreshed.reason);
+      expect(sidebarModels().explorer).toBe('anthropic/claude-sonnet-4-5');
+      expect(readTuiSnapshot(env.projectDir).agentDisplayNames.explorer).toBe(
+        'Researcher',
+      );
+    });
+  });
+
   test('resolves temperature and provider options for captured profiles', async () => {
     env.writeUserConfig({
       preset: 'cheap',
@@ -211,9 +280,17 @@ describe('v2 profile refresh hook', () => {
     try {
       // The host layer wins the shallow merge (same as at init).
       await hooks.config?.({
-        agent: { explorer: { model: 'anthropic/claude-sonnet-4-5' } },
+        agent: {
+          explorer: {
+            model: 'anthropic/claude-sonnet-4-5',
+            displayName: 'HostExplorer',
+          },
+        },
       } as never);
       expect(sidebarModels().explorer).toBe('anthropic/claude-sonnet-4-5');
+      expect(readTuiSnapshot(env.projectDir).agentDisplayNames.explorer).toBe(
+        'HostExplorer',
+      );
 
       const refresh = (
         hooks as unknown as { 'v2.refreshProfiles'?: ProfilesHook }
@@ -227,6 +304,10 @@ describe('v2 profile refresh hook', () => {
         id: 'claude-sonnet-4-5',
       });
       expect(sidebarModels().explorer).toBe('anthropic/claude-sonnet-4-5');
+      // Host-provided display names are part of the frozen registry identity.
+      expect(readTuiSnapshot(env.projectDir).agentDisplayNames.explorer).toBe(
+        'HostExplorer',
+      );
     } finally {
       await hooks.dispose?.();
     }
@@ -373,17 +454,32 @@ describe('v2 profile refresh hook', () => {
       env.writeUserConfig({
         preset: 'market',
         presets: { market: { marketplace: { agents: ['team/market'] } } },
+        agents: {
+          'market-agent': {
+            model: 'provider/package',
+            displayName: 'MarketVisible',
+          },
+        },
       });
 
       await withFactory(async ({ refresh }) => {
-        // Registry path wrote the full roster (core + marketplace).
+        // Registry path wrote the full roster (core + marketplace), including
+        // the marketplace agent's display label.
         expect(sidebarModels()['market-agent']).toBeDefined();
+        expect(
+          readTuiSnapshot(env.projectDir).agentDisplayNames['market-agent'],
+        ).toBe('MarketVisible');
 
         const refreshed = await refresh();
         expect(refreshed.ok).toBe(true);
 
-        // The refresh must not clobber the marketplace roster entry.
+        // The refresh must not clobber the marketplace roster entry or its
+        // label: `createAgents()` is marketplace-unaware, so labels come from
+        // the registry identity table, not the reloaded definitions.
         expect(sidebarModels()['market-agent']).toBeDefined();
+        expect(
+          readTuiSnapshot(env.projectDir).agentDisplayNames['market-agent'],
+        ).toBe('MarketVisible');
       });
     } finally {
       if (priorDataHome === undefined) delete process.env.XDG_DATA_HOME;

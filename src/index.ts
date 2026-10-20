@@ -268,6 +268,27 @@ function buildChainGeneration(
   return table;
 }
 
+/**
+ * Canonical agent ID → visible display name for the sidebar label.
+ *
+ * `identities` is the registry's authoritative canonical→display table
+ * (plugin config, active preset, host config, marketplace identities). It is
+ * the same table prompt routing uses, and `displayName` is documented as
+ * frozen for the session, so the label is projected from the registry only —
+ * never re-derived from a config reload. Only the rendered label uses these
+ * values: model lookup, activity, expansion and history keep their canonical
+ * keys.
+ */
+function collectAgentDisplayNames(
+  identities: Readonly<Record<string, string>> | undefined,
+): Record<string, string> {
+  const displayNames: Record<string, string> = {};
+  for (const [name, display] of Object.entries(identities ?? {})) {
+    if (display && display !== name) displayNames[name] = display;
+  }
+  return displayNames;
+}
+
 type DelegatedModelSelection = {
   agentName: string;
   entry: ModelChainEntry;
@@ -2026,6 +2047,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             ...(registry?.tuiAgentVariants ?? {}),
             ...projection.agentVariants,
           },
+          agentDisplayNames: collectAgentDisplayNames(registry?.identities),
         },
         ctx.directory,
       );
@@ -2245,6 +2267,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         {
           agentModels: registry.tuiAgentModels,
           agentVariants: registry.tuiAgentVariants,
+          agentDisplayNames: collectAgentDisplayNames(registry.identities),
         },
         ctx.directory,
       );

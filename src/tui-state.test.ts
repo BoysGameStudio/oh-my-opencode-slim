@@ -108,6 +108,31 @@ describe('tui-state persistence', () => {
     });
   });
 
+  test('persists canonical-to-display names and keeps them on model-only writes', () => {
+    recordTuiAgentModels(
+      {
+        agentModels: { arbiter: 'openai/gpt-6' },
+        agentDisplayNames: { arbiter: 'reviewer' },
+      },
+      tempDir,
+    );
+
+    expect(readTuiSnapshot(tempDir).agentDisplayNames).toEqual({
+      arbiter: 'reviewer',
+    });
+
+    // A writer that only carries models must not wipe the label map.
+    recordTuiAgentModels(
+      {
+        agentModels: { arbiter: 'openai/gpt-6', paladin: 'openai/gpt-6' },
+      },
+      tempDir,
+    );
+    expect(readTuiSnapshot(tempDir).agentDisplayNames).toEqual({
+      arbiter: 'reviewer',
+    });
+  });
+
   test('updates a single live agent model without dropping others', () => {
     recordTuiAgentModels(
       {
