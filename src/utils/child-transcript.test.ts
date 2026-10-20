@@ -3,7 +3,10 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import {
   classifyAssistantTurnEvidence,
   classifyTerminalEvidence,
+  classifyV2HistoricalRound,
   fetchChildTranscript,
+  hostTranscriptRoundOf,
+  latestInputAtOf,
   stringifyError,
 } from './child-transcript';
 
@@ -28,6 +31,253 @@ function message(overrides: {
     parts: overrides.parts ?? [{ type: 'text', text: 'the answer' }],
   };
 }
+
+describe('host transcript round helpers', () => {
+  const transcript = {
+    data: [
+      {
+        info: {
+          role: 'user',
+          sourceType: 'user',
+          time: { created: 10 },
+        },
+        parts: [],
+      },
+      {
+        info: {
+          role: 'assistant',
+          sourceType: 'assistant',
+          time: { completed: 11 },
+        },
+        parts: [{ type: 'text', text: 'older answer' }],
+      },
+      {
+        info: {
+          role: 'synthetic',
+          sourceType: 'synthetic',
+          time: { created: 12 },
+        },
+        parts: [],
+      },
+      {
+        info: {
+          role: 'assistant',
+          sourceType: 'assistant',
+          time: { completed: 13 },
+        },
+        parts: [
+          { type: 'text', text: ' latest ' },
+          { type: 'text', text: 'answer ' },
+        ],
+      },
+    ],
+  };
+
+  test('latestInputAtOf uses the newest user or synthetic boundary', () => {
+    expect(latestInputAtOf(transcript)).toBe(12);
+    expect(latestInputAtOf({ data: [] })).toBeUndefined();
+    expect(latestInputAtOf(undefined)).toBeUndefined();
+  });
+
+  test('hostTranscriptRoundOf returns only text bound to the host idle', () => {
+    expect(hostTranscriptRoundOf(transcript, 13)).toEqual({
+      kind: 'ok',
+      latestInputAt: 12,
+      text: 'latest\nanswer',
+    });
+    expect(hostTranscriptRoundOf(transcript, 12)).toEqual({
+      kind: 'newer-assistant',
+      at: 13,
+      latestInputAt: 12,
+    });
+    expect(
+      hostTranscriptRoundOf({
+        data: [transcript.data[0], transcript.data[1], transcript.data[2]],
+      }),
+    ).toEqual({ kind: 'ok', latestInputAt: 12, text: undefined });
+    expect(
+      hostTranscriptRoundOf({
+        data: [
+          transcript.data[2],
+          { info: { role: 'assistant', sourceType: 'assistant' }, parts: [] },
+        ],
+      }),
+    ).toEqual({ kind: 'unreadable', reason: 'assistant time is missing' });
+  });
+
+  test('malformed entries and malformed transcripts fail closed', () => {
+    expect(
+      hostTranscriptRoundOf(
+        {
+          data: [transcript.data[0], { info: null }, transcript.data[2]],
+        },
+        13,
+      ),
+    ).toEqual({ kind: 'unreadable', reason: 'malformed transcript entries' });
+    expect(hostTranscriptRoundOf({ data: 'nope' }, 13)).toEqual({
+      kind: 'unreadable',
+      reason: 'malformed transcript response',
+    });
+    expect(hostTranscriptRoundOf(undefined, 13)).toEqual({
+      kind: 'unreadable',
+      reason: 'transcript source unavailable',
+    });
+  });
+
+  test('textless assistant evidence is preserved as empty text', () => {
+    expect(
+      hostTranscriptRoundOf(
+        {
+          data: [
+            transcript.data[0],
+            {
+              info: {
+                role: 'assistant',
+                sourceType: 'assistant',
+                time: { created: 13 },
+              },
+              parts: [{ type: 'text', text: '   ' }],
+            },
+          ],
+        },
+        13,
+      ),
+    ).toEqual({ kind: 'ok', latestInputAt: 10, text: '' });
+  });
+});
+
+describe('classifyV2HistoricalRound (startup path)', () => {
+  function v2Message(overrides: {
+    id: string;
+    sourceType: string;
+    time?: Record<string, number>;
+    outcome?: string;
+    text?: string;
+  }) {
+    return {
+      info: {
+        id: overrides.id,
+        role: overrides.sourceType === 'idle' ? 'system' : overrides.sourceType,
+        sourceType: overrides.sourceType,
+        ...(overrides.time !== undefined ? { time: overrides.time } : {}),
+        ...(overrides.outcome !== undefined
+          ? { outcome: overrides.outcome }
+          : {}),
+      },
+      parts:
+        overrides.text !== undefined
+          ? [{ type: 'text', text: overrides.text }]
+          : [],
+    };
+  }
+
+  test('interrupted idle is interrupted without an assistant', () => {
+    expect(
+      classifyV2HistoricalRound({
+        data: [
+          v2Message({ id: 'u', sourceType: 'user', time: { created: 10 } }),
+          v2Message({
+            id: 'i',
+            sourceType: 'idle',
+            time: { created: 11 },
+            outcome: 'interrupted',
+          }),
+        ],
+      }),
+    ).toMatchObject({ verdict: 'interrupted', startedAt: 10 });
+  });
+
+  test('failed idle keeps the fallback when no assistant text exists', () => {
+    const round = classifyV2HistoricalRound({
+      data: [
+        v2Message({ id: 'u', sourceType: 'user', time: { created: 10 } }),
+        v2Message({
+          id: 'i',
+          sourceType: 'idle',
+          time: { created: 11 },
+          outcome: 'failed',
+        }),
+      ],
+    });
+    expect(round).toMatchObject({
+      verdict: 'error',
+      text: 'The historical round failed before an assistant result.',
+    });
+    expect(round.text).not.toContain('ask');
+  });
+
+  test('succeeded idle without an assistant stays incomplete', () => {
+    expect(
+      classifyV2HistoricalRound({
+        data: [
+          v2Message({ id: 'u', sourceType: 'user', time: { created: 10 } }),
+          v2Message({
+            id: 'i',
+            sourceType: 'idle',
+            time: { created: 11 },
+            outcome: 'succeeded',
+          }),
+        ],
+      }),
+    ).toMatchObject({ verdict: 'incomplete', startedAt: 10 });
+  });
+
+  test('a newer assistant after the closing idle is rejected', () => {
+    const round = classifyV2HistoricalRound({
+      data: [
+        v2Message({ id: 'u', sourceType: 'user', time: { created: 10 } }),
+        v2Message({
+          id: 'a',
+          sourceType: 'assistant',
+          time: { created: 11, completed: 12 },
+          text: 'ANSWER-A',
+        }),
+        v2Message({
+          id: 'ia',
+          sourceType: 'idle',
+          time: { created: 13 },
+          outcome: 'succeeded',
+        }),
+        v2Message({
+          id: 'b',
+          sourceType: 'assistant',
+          time: { created: 14 },
+          text: 'ANSWER-B',
+        }),
+      ],
+    });
+    expect(round.verdict).toBe('incomplete');
+    expect(JSON.stringify(round)).not.toContain('ANSWER-A');
+    expect(JSON.stringify(round)).not.toContain('ANSWER-B');
+  });
+
+  test('a newer synthetic blocks an older succeeded outcome', () => {
+    const round = classifyV2HistoricalRound({
+      data: [
+        v2Message({ id: 'u', sourceType: 'user', time: { created: 10 } }),
+        v2Message({
+          id: 'a',
+          sourceType: 'assistant',
+          time: { created: 11, completed: 12 },
+          text: 'OLD',
+        }),
+        v2Message({
+          id: 'i',
+          sourceType: 'idle',
+          time: { created: 13 },
+          outcome: 'succeeded',
+        }),
+        v2Message({
+          id: 's',
+          sourceType: 'synthetic',
+          time: { created: 14 },
+        }),
+      ],
+    });
+    expect(round.verdict).toBe('incomplete');
+    expect(JSON.stringify(round)).not.toContain('OLD');
+  });
+});
 
 test('stringifyError never throws on unserializable empty-message errors', () => {
   const error = Object.assign(new Error(''), { name: 'E', self: {} });

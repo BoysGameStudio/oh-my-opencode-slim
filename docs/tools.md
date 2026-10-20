@@ -177,8 +177,13 @@ launch; use `task_status` to inspect the current generation.
 V2 untracked adoption uses a different result boundary: it queues a caller-ID
 input after verifying parent ownership, agent evidence, and readable history,
 without requiring status/idle APIs. Host-proven aliases retain the upstream
-ambiguity and ownership checks. Only explicit queued revival may continue an
-incomplete historical round; ordinary recovery keeps its terminal requirement.
+ambiguity and ownership checks. On-demand recovery consults the session's host
+outcome: terminal rounds are imported, work without a terminal outcome (still
+running, or awaiting restart resume) is refused except for explicit queued
+continuation, and partial or unverifiable state fails closed. An assistant
+created after the host idle keeps the round pending. Startup recovery is
+unchanged. Queued revival cannot prove a previous round's idle; its adoption
+is never terminal evidence.
 The new generation is registered before the write and is not replaced by late
 acknowledgement. Only that input's completed answer is delivered to the parent;
 old execution outcomes are ignored. Transport uncertainty retains exclusion and

@@ -531,6 +531,85 @@ function textOf(message: TranscriptMessage): string {
     .join('\n');
 }
 
+/** Evidence for the round after the latest input, bound to a host terminal
+ *  `time.idle`. `newer-assistant` means a reply was created after the host
+ *  idle, so the host terminal does not cover the newest transcript activity. */
+export type HostTranscriptRoundEvidence =
+  | {
+      kind: 'ok';
+      latestInputAt: number | undefined;
+      text: string | undefined;
+    }
+  | { kind: 'no-input' }
+  | {
+      kind: 'newer-assistant';
+      at: number;
+      latestInputAt: number | undefined;
+    }
+  | { kind: 'unreadable'; reason: string };
+
+/**
+ * Validate and read the host transcript round up to `terminalIdleAt`.
+ * Malformed entries fail closed, exactly like the retained v2 classifier;
+ * they are never skipped. A missing assistant timestamp cannot be bound to
+ * the host idle, so it also fails closed.
+ */
+export function hostTranscriptRoundOf(
+  transcript: unknown,
+  terminalIdleAt?: number,
+): HostTranscriptRoundEvidence {
+  if (transcript === undefined) {
+    return { kind: 'unreadable', reason: 'transcript source unavailable' };
+  }
+  if (responseError(transcript) !== undefined) {
+    return { kind: 'unreadable', reason: 'transcript read failed' };
+  }
+  if (!isRecord(transcript) || !Array.isArray(transcript.data)) {
+    return { kind: 'unreadable', reason: 'malformed transcript response' };
+  }
+  const messages: TranscriptMessage[] = [];
+  for (const entry of transcript.data) {
+    if (!isRecord(entry) || !isRecord(entry.info)) {
+      return { kind: 'unreadable', reason: 'malformed transcript entries' };
+    }
+    messages.push(entry);
+  }
+  let boundary = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const source = sourceTypeOf(messages[index] as TranscriptMessage);
+    if (source === 'user' || source === 'synthetic') {
+      boundary = index;
+      break;
+    }
+  }
+  if (boundary < 0) return { kind: 'no-input' };
+  const latestInputAt = transcriptOrderKey(
+    messages[boundary] as TranscriptMessage,
+  );
+  let text: string | undefined;
+  for (let index = boundary + 1; index < messages.length; index += 1) {
+    const message = messages[index] as TranscriptMessage;
+    if (sourceTypeOf(message) !== 'assistant') continue;
+    const at = transcriptOrderKey(message);
+    if (at === undefined) {
+      return { kind: 'unreadable', reason: 'assistant time is missing' };
+    }
+    if (terminalIdleAt !== undefined && at > terminalIdleAt) {
+      return { kind: 'newer-assistant', at, latestInputAt };
+    }
+    text = textOf(message);
+  }
+  return { kind: 'ok', latestInputAt, text };
+}
+
+/** Latest delivered user/synthetic input timestamp in a host transcript.
+ *  Malformed transcripts fail closed as undefined, matching the round
+ *  evidence reader. */
+export function latestInputAtOf(transcript: unknown): number | undefined {
+  const evidence = hostTranscriptRoundOf(transcript);
+  return evidence.kind === 'ok' ? evidence.latestInputAt : undefined;
+}
+
 /**
  * Historical v2 round. The latest user or synthetic message is the input
  * boundary. Only an idle/outcome after that boundary can confirm the round.

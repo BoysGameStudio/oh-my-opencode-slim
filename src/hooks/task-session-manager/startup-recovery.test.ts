@@ -868,6 +868,261 @@ describe('startup subagent recovery', () => {
     });
   });
 
+  test('does not correct a relaunch registered while startup reads are pending', async () => {
+    await seedPersistence(memoryStorage(), [
+      persistedChild(RUNNING, { launchedAt: 6 }),
+    ]);
+    const concurrency = new BackgroundTaskConcurrency({
+      defaultConcurrency: 1,
+      providerConcurrency: {},
+      modelConcurrency: {},
+    });
+    const release = spyOn(concurrency, 'releaseTask');
+    const board = new BackgroundJobBoard();
+    const original = board.registerLaunch({
+      taskID: RUNNING,
+      parentSessionID: PARENT,
+      agent: 'explorer',
+      description: 'original run',
+      background: true,
+      adopted: true,
+      now: 6,
+    });
+    const wakes: string[] = [];
+    let relaunched = false;
+    const raceClient = {
+      session: {
+        list: async () => ({
+          data: [
+            { id: PARENT, agent: 'orchestrator' },
+            { id: RUNNING, parentID: PARENT, agent: 'explorer' },
+          ],
+        }),
+        get: async ({ path }: { path: { id: string } }) => ({
+          data:
+            path.id === PARENT
+              ? { id: PARENT, agent: 'orchestrator' }
+              : {
+                  id: path.id,
+                  parentID: PARENT,
+                  agent: 'explorer',
+                  outcome: 'succeeded',
+                },
+        }),
+        messages: async ({ path }: { path: { id: string } }) => {
+          if (path.id === PARENT) return { data: [] };
+          if (!relaunched) {
+            relaunched = true;
+            board.registerLaunch({
+              taskID: RUNNING,
+              parentSessionID: PARENT,
+              agent: 'explorer',
+              description: 'relaunched while reading',
+              background: true,
+              now: 30,
+            });
+          }
+          return completedChildTranscript('Done');
+        },
+      },
+    };
+
+    const result = await recoverSubagentSessionsAtStartup({
+      input: {
+        client: raceClient as never,
+        directory: '/tmp',
+        worktree: '/tmp',
+      },
+      backgroundJobBoard: board,
+      hostFlavor: 'v2',
+      shouldManageSession: () => false,
+      backgroundTaskConcurrency: concurrency,
+      onRecoveredTerminal: (parentSessionID, taskID) => {
+        wakes.push(`${parentSessionID}:${taskID}`);
+        return true;
+      },
+    });
+
+    expect(result).toEqual([]);
+    expect(board.get(RUNNING)).toMatchObject({
+      state: 'running',
+      description: 'relaunched while reading',
+      runStartedAt: 30,
+    });
+    expect(board.get(RUNNING)?.generation).toBeGreaterThan(original.generation);
+    expect(board.get(RUNNING)?.recoveredAtStartup).toBeUndefined();
+    expect(release).not.toHaveBeenCalled();
+    expect(wakes).toEqual([]);
+    expect(
+      persistedBackgroundChildren().get(RUNNING)?.deliveredAt,
+    ).toBeUndefined();
+    concurrency.dispose();
+  });
+
+  test('does not correct a same-generation reopen registered while startup reads are pending', async () => {
+    await seedPersistence(memoryStorage(), [
+      persistedChild(RUNNING, { launchedAt: 6 }),
+    ]);
+    const concurrency = new BackgroundTaskConcurrency({
+      defaultConcurrency: 1,
+      providerConcurrency: {},
+      modelConcurrency: {},
+    });
+    const release = spyOn(concurrency, 'releaseTask');
+    const board = new BackgroundJobBoard();
+    const restored = board.restoreRetainedSession({
+      taskID: RUNNING,
+      parentSessionID: PARENT,
+      agent: 'explorer',
+      description: 'finished before restart',
+      state: 'completed',
+      resultSummary: 'Old result',
+      background: true,
+      launchedAt: 6,
+    });
+    expect(restored?.generation).toBeDefined();
+    const wakes: string[] = [];
+    let reopened = false;
+    const raceClient = {
+      session: {
+        list: async () => ({
+          data: [
+            { id: PARENT, agent: 'orchestrator' },
+            { id: RUNNING, parentID: PARENT, agent: 'explorer' },
+          ],
+        }),
+        get: async ({ path }: { path: { id: string } }) => ({
+          data:
+            path.id === PARENT
+              ? { id: PARENT, agent: 'orchestrator' }
+              : {
+                  id: path.id,
+                  parentID: PARENT,
+                  agent: 'explorer',
+                  outcome: 'succeeded',
+                },
+        }),
+        messages: async ({ path }: { path: { id: string } }) => {
+          if (path.id === PARENT) return { data: [] };
+          if (!reopened) {
+            reopened = true;
+            board.markRunningFromLiveSession(RUNNING, 30);
+          }
+          return completedChildTranscript('Done');
+        },
+      },
+    };
+
+    const result = await recoverSubagentSessionsAtStartup({
+      input: {
+        client: raceClient as never,
+        directory: '/tmp',
+        worktree: '/tmp',
+      },
+      backgroundJobBoard: board,
+      hostFlavor: 'v2',
+      shouldManageSession: () => false,
+      backgroundTaskConcurrency: concurrency,
+      onRecoveredTerminal: (parentSessionID, taskID) => {
+        wakes.push(`${parentSessionID}:${taskID}`);
+        return true;
+      },
+    });
+
+    expect(result).toEqual([]);
+    expect(board.get(RUNNING)).toMatchObject({
+      state: 'running',
+      runStartedAt: 30,
+    });
+    expect(board.get(RUNNING)?.generation).toBe(restored?.generation);
+    expect(release).not.toHaveBeenCalled();
+    expect(wakes).toEqual([]);
+    expect(
+      persistedBackgroundChildren().get(RUNNING)?.deliveredAt,
+    ).toBeUndefined();
+    concurrency.dispose();
+  });
+
+  test('corrects a same-run adoption registered while startup reads are pending', async () => {
+    await seedPersistence(memoryStorage(), [
+      persistedChild(RUNNING, { launchedAt: 6 }),
+    ]);
+    const concurrency = new BackgroundTaskConcurrency({
+      defaultConcurrency: 1,
+      providerConcurrency: {},
+      modelConcurrency: {},
+    });
+    const release = spyOn(concurrency, 'releaseTask');
+    const board = new BackgroundJobBoard();
+    const wakes: string[] = [];
+    let adopted = false;
+    const raceClient = {
+      session: {
+        list: async () => ({
+          data: [
+            { id: PARENT, agent: 'orchestrator' },
+            { id: RUNNING, parentID: PARENT, agent: 'explorer' },
+          ],
+        }),
+        get: async ({ path }: { path: { id: string } }) => ({
+          data:
+            path.id === PARENT
+              ? { id: PARENT, agent: 'orchestrator' }
+              : {
+                  id: path.id,
+                  parentID: PARENT,
+                  agent: 'explorer',
+                  outcome: 'succeeded',
+                },
+        }),
+        messages: async ({ path }: { path: { id: string } }) => {
+          if (path.id === PARENT) return { data: [] };
+          if (!adopted) {
+            adopted = true;
+            board.registerLaunch({
+              taskID: RUNNING,
+              parentSessionID: PARENT,
+              agent: 'explorer',
+              description: 'adopted while reading',
+              background: true,
+              adopted: true,
+              now: 6,
+            });
+          }
+          return completedChildTranscript('Done');
+        },
+      },
+    };
+
+    const result = await recoverSubagentSessionsAtStartup({
+      input: {
+        client: raceClient as never,
+        directory: '/tmp',
+        worktree: '/tmp',
+      },
+      backgroundJobBoard: board,
+      hostFlavor: 'v2',
+      shouldManageSession: () => false,
+      backgroundTaskConcurrency: concurrency,
+      onRecoveredTerminal: (parentSessionID, taskID) => {
+        wakes.push(`${parentSessionID}:${taskID}`);
+        return true;
+      },
+    });
+
+    expect(result).toEqual([RUNNING]);
+    expect(board.get(RUNNING)).toMatchObject({
+      state: 'completed',
+      resultSummary: 'Done',
+    });
+    expect(release).toHaveBeenCalledWith(RUNNING);
+    expect(wakes).toEqual([`${PARENT}:${RUNNING}`]);
+    expect(
+      persistedBackgroundChildren().get(RUNNING)?.deliveredAt,
+    ).toBeDefined();
+    concurrency.dispose();
+  });
+
   test('adopts a delivered terminal child after it resumes as a live run', async () => {
     const storage = memoryStorage();
     await seedPersistence(storage, [

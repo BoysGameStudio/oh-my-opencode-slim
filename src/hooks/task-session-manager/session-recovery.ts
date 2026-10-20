@@ -1,9 +1,11 @@
 /**
- * On-demand v1 recovery of a host child the local board no longer knows.
+ * On-demand recovery of a host child the local board no longer knows.
  *
  * Reads the host session, verifies parent and agent, classifies only the
- * latest delivered round, then imports a terminal cache row. It does not
- * scan at startup, send a prompt, or keep a recovery claim.
+ * latest delivered round, then imports a terminal cache row. On v2 the host
+ * outcome/idle owns terminality and transcript text is bound to that idle;
+ * the startup recovery path below keeps its transcript-idle classifier.
+ * It does not scan at startup, send a prompt, or keep a recovery claim.
  */
 import type { PluginInput } from '@opencode-ai/plugin';
 import {
@@ -29,6 +31,7 @@ import {
   classifyCurrentDeliveredRound,
   classifyV2HistoricalRound,
   fetchChildTranscript,
+  latestInputAtOf,
   responseError,
   stringifyError,
   type TranscriptMessage,
@@ -40,7 +43,10 @@ import { getClient } from '../../utils/opencode-client';
 import { pendingSessionPrune } from '../../utils/pending-session-prunes';
 import { delay } from '../../utils/polling';
 import { SESSION_ID_PATTERN, withTimeout } from '../../utils/session';
-import { readLiveSession } from '../../utils/session-runtime-status';
+import {
+  attributeHostRound,
+  readLiveSession,
+} from '../../utils/session-runtime-status';
 import {
   isNativeBackgroundLaunchOutput,
   parseTaskIdFromTaskOutput,
@@ -341,32 +347,47 @@ async function recoverRetainedSession(
       deletionEpoch,
     };
   }
-  if (childTranscript === undefined) {
+  if (childTranscript === undefined && options.hostFlavor !== 'v2') {
     return refuse(
       `Task ${sessionID} transcript could not be read (transcript source unavailable); no prompt was sent`,
     );
   }
-  const round =
-    options.hostFlavor === 'v2'
-      ? classifyV2HistoricalRound(childTranscript)
-      : classifyCurrentDeliveredRound(childTranscript);
-  if (round.verdict === 'unreadable') {
-    return refuse(
-      `Task ${sessionID} transcript could not be classified (${round.reason ?? 'unreadable'}); no prompt was sent`,
-    );
-  }
-  const queueContinuation =
-    options.hostFlavor === 'v2' &&
-    request.purpose === 'revive' &&
-    request.allowQueuedContinuation === true;
-  if (
-    options.hostFlavor === 'v2' &&
-    round.verdict === 'incomplete' &&
-    !queueContinuation
-  ) {
-    return refuse(
-      `Task ${sessionID} has no verified historical terminal after its latest input. The current round was not imported. No prompt was sent`,
-    );
+  let round: ReturnType<typeof classifyCurrentDeliveredRound>;
+  let queuedAdoption = false;
+  if (options.hostFlavor === 'v2') {
+    round = attributeHostRound(hosted.hostInfo, childTranscript);
+    if (round.verdict === 'unreadable') {
+      return refuse(
+        `Task ${sessionID} host state could not be verified (${round.reason ?? 'unreadable'}); no prompt was sent`,
+      );
+    }
+    if (round.verdict === 'incomplete') {
+      queuedAdoption =
+        request.purpose === 'revive' &&
+        request.allowQueuedContinuation === true;
+      if (!queuedAdoption) {
+        // No terminal outcome covers the latest input. Shutdown preserves
+        // the execution claim on purpose and the host may resume the round
+        // after a restart, so a guessed stop import would lie.
+        return refuse(
+          `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or use task_revive with a new prompt. No prompt was sent`,
+        );
+      }
+      // Identity adoption still requires a decipherable latest input; the
+      // old classifier refused exactly this shape before queueing.
+      if (latestInputAtOf(childTranscript) === undefined) {
+        return refuse(
+          `Task ${sessionID} transcript could not be classified (no delivered user round); no prompt was sent`,
+        );
+      }
+    }
+  } else {
+    round = classifyCurrentDeliveredRound(childTranscript);
+    if (round.verdict === 'unreadable') {
+      return refuse(
+        `Task ${sessionID} transcript could not be classified (${round.reason ?? 'unreadable'}); no prompt was sent`,
+      );
+    }
   }
 
   let parentTranscript: unknown;
@@ -395,15 +416,15 @@ async function recoverRetainedSession(
     );
   }
 
-  if (queueContinuation) {
+  if (queuedAdoption) {
     if (options.isDisposed?.()) return refuse('Session recovery was disposed');
     if (ledger.deletionEpochs.get(sessionID) !== deletionEpoch) {
       return refuse(
         `Task ${sessionID} was deleted during recovery; no prompt was sent`,
       );
     }
-    // Historical terminals do not establish live idle. Return verified
-    // identity only; task_revive owns the lease and the new input generation.
+    // Busy or pending adoption returns verified identity only; task_revive
+    // owns the lease and the new input generation.
     return {
       kind: 'adoptable',
       taskID: sessionID,
@@ -466,10 +487,12 @@ async function recoverRetainedSession(
         ? { resultSummary: round.text }
         : state === 'cancelled'
           ? { resultSummary: 'cancelled' }
-          : {
-              resultSummary:
-                'Recovered retained session stopped before a terminal result.',
-            }),
+          : state === 'stopped'
+            ? {
+                resultSummary:
+                  'Recovered retained session stopped before a terminal result.',
+              }
+            : {}),
     ...(alias !== undefined ? { alias } : {}),
     ...(launchedAt !== undefined ? { launchedAt } : {}),
     ...(state === 'completed' && round.completedAt !== undefined
@@ -652,6 +675,17 @@ export async function recoverSubagentSessionsAtStartup(
     const taskID = candidate.id;
     if (!SESSION_ID_PATTERN.test(taskID)) continue;
     if (ledger.tombstones.has(taskID)) continue;
+    // Capture the run identity before any asynchronous read below. A relaunch
+    // or same-generation reopen registered while this scan is reading is a
+    // newer run; stale history must not correct or re-own it.
+    const scanStartRow = board.get(taskID);
+    const scanStartRun: StartupRunIdentity | undefined = scanStartRow
+      ? {
+          generation: scanStartRow.generation,
+          runStartedAt: scanStartRow.runStartedAt,
+          terminalRevision: scanStartRow.terminalRevision,
+        }
+      : undefined;
     const epoch = ledger.deletionEpochs.get(taskID);
     let parentSessionID = candidate.parentID;
     let hostOutcome = candidate.outcome;
@@ -722,6 +756,11 @@ export async function recoverSubagentSessionsAtStartup(
       delegation?.at,
       state.startedAt,
     );
+    const rowKeepsObservedRun = startupRowKeepsObservedRun({
+      scanStartRun,
+      row: boardRow,
+      observedRunStartedAt: runStartedAt,
+    });
 
     // A persisted delivery marker only covers the run it acknowledged. A
     // newer child round that began while this process was down does not
@@ -731,7 +770,11 @@ export async function recoverSubagentSessionsAtStartup(
       persistedDeliveredAt !== undefined &&
       (runStartedAt === undefined || persistedDeliveredAt >= runStartedAt);
     if (persistedDeliveryCoversRun) {
-      if (boardRow?.state === 'running' && state.kind === 'terminal') {
+      if (
+        rowKeepsObservedRun &&
+        boardRow?.state === 'running' &&
+        state.kind === 'terminal'
+      ) {
         correctStartupTerminal(options, board, boardRow, state);
       }
       continue;
@@ -752,7 +795,11 @@ export async function recoverSubagentSessionsAtStartup(
         : true
       : false;
     if (deliveryIsCurrent) {
-      if (boardRow?.state === 'running' && state.kind === 'terminal') {
+      if (
+        rowKeepsObservedRun &&
+        boardRow?.state === 'running' &&
+        state.kind === 'terminal'
+      ) {
         correctStartupTerminal(options, board, boardRow, state);
       }
       if (candidate.persisted && delivered) {
@@ -769,8 +816,11 @@ export async function recoverSubagentSessionsAtStartup(
       if (boardRow) {
         // A parent transform may have adopted this running row while the
         // startup scan was in flight. Mark it startup-owned so its eventual
-        // revision-1 terminal outcome publishes a wake.
-        boardRow.recoveredAtStartup = true;
+        // revision-1 terminal outcome publishes a wake — but only while the
+        // row still belongs to the run observed at scan start.
+        if (rowKeepsObservedRun && boardRow.state === 'running') {
+          boardRow.recoveredAtStartup = true;
+        }
         continue;
       }
       // No run fence means no way to keep a stale delivery from stranding
@@ -815,6 +865,7 @@ export async function recoverSubagentSessionsAtStartup(
 
     if (boardRow) {
       if (boardRow.state !== 'running') continue;
+      if (!rowKeepsObservedRun) continue;
       if (correctStartupTerminal(options, board, boardRow, state)) {
         await deliverStartupTerminal(
           options,
@@ -859,6 +910,52 @@ export async function recoverSubagentSessionsAtStartup(
 }
 
 const RECOVERED_STARTUP_AGENT_FALLBACK = 'unknown';
+
+/** Run identity captured before a candidate's asynchronous reads. */
+interface StartupRunIdentity {
+  generation: number;
+  runStartedAt: number;
+  terminalRevision: number;
+}
+
+/**
+ * Decide whether the board row observed after the asynchronous reads still
+ * belongs to the run this scan classified.
+ *
+ * A row present at scan start must keep its exact identity: a relaunch
+ * replaces the generation, and a same-generation reopen (terminal publish
+ * followed by live activity) advances the run fence and the terminal
+ * revision. Either way the history read before that transition is stale.
+ *
+ * A row absent at scan start may have been adopted concurrently for the same
+ * old run. Its own fence then has to be no newer than the evidence this scan
+ * collected (persisted launch, delegation call, child round start); a
+ * relaunch registered at its own clock would carry a newer fence and is
+ * rejected instead of applying stale terminal history.
+ */
+function startupRowKeepsObservedRun(input: {
+  scanStartRun: StartupRunIdentity | undefined;
+  row:
+    | {
+        generation: number;
+        runStartedAt: number;
+        terminalRevision: number;
+      }
+    | undefined;
+  observedRunStartedAt: number | undefined;
+}): boolean {
+  const { scanStartRun, row, observedRunStartedAt } = input;
+  if (!row) return false;
+  if (scanStartRun) {
+    return (
+      row.generation === scanStartRun.generation &&
+      row.runStartedAt === scanStartRun.runStartedAt &&
+      row.terminalRevision === scanStartRun.terminalRevision
+    );
+  }
+  if (observedRunStartedAt === undefined) return false;
+  return row.runStartedAt <= observedRunStartedAt;
+}
 
 /**
  * Apply a startup running→terminal correction and free the admission slot
@@ -1109,6 +1206,8 @@ interface HostSession {
   outcome?: string;
   createdAt?: number;
   title?: string;
+  /** Raw session info projection; round evidence is parsed from it. */
+  hostInfo: Record<string, unknown>;
 }
 
 async function readHostSession(
@@ -1154,6 +1253,7 @@ async function readHostSession(
     return {
       kind: 'ok',
       parentID,
+      hostInfo: data as Record<string, unknown>,
       ...(agent ? { agent } : {}),
       ...(typeof data?.outcome === 'string' ? { outcome: data.outcome } : {}),
       ...(createdAt !== undefined ? { createdAt } : {}),

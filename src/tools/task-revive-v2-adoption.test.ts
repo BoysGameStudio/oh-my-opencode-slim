@@ -31,7 +31,7 @@ function assistant(id: string, text: string) {
   return {
     id,
     type: 'assistant',
-    time: { completed: Date.now() },
+    time: { created: 1, completed: 1 },
     content: [{ type: 'text', text }],
   };
 }
@@ -73,8 +73,9 @@ function harness(
         id: childID,
         parentID: options.foreign ? 'foreign' : parentID,
         agent: 'explorer',
-        outcome: 'completed',
-        time: { idle: Date.now() },
+        ...(options.busy
+          ? { time: { created: 1 } }
+          : { outcome: 'succeeded', time: { created: 1, idle: 2 } }),
       }),
       context: async ({ sessionID }: { sessionID: string }) =>
         sessionID === parentID ? (options.parentTranscript ?? []) : transcript,

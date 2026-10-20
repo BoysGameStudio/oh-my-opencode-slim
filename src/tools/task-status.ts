@@ -307,6 +307,7 @@ async function readTaskResult(
 
   const token = current ? gate.capture(current) : undefined;
   const client = getClient(options.input);
+  let hostInfo: Record<string, unknown> | undefined;
   if (typeof client.session.get === 'function') {
     const response = await client.session.get({
       path: { id: taskID },
@@ -314,6 +315,7 @@ async function readTaskResult(
     });
     if (response.data?.parentID !== parentSessionID)
       throw new Error(`Task ${requested} does not belong to this session`);
+    hostInfo = response.data as Record<string, unknown> | undefined;
   } else if (!current)
     throw new Error(
       `Task ${requested} is not tracked by this session and cannot be verified`,
@@ -364,6 +366,7 @@ async function readTaskResult(
   const read = await readUntrackedEvidence(
     { input: options.input, readTimeoutMs: options.readTimeoutMs },
     taskID,
+    hostInfo,
   );
   if (read.live.status === 'busy' || read.live.status === 'retry')
     return runningResultRefusal(
@@ -433,7 +436,11 @@ async function reportUntrackedTaskStatus(
     'board: untracked',
   ];
 
-  const evidence = await readUntrackedEvidence(options, identity);
+  const evidence = await readUntrackedEvidence(
+    options,
+    identity,
+    ownership.hostInfo,
+  );
   // v1's live status map is real evidence of execution; v2 has no
   // equivalent (the shim omits `status`), so this probe is v1 only.
   if (evidence.live.status === 'busy' || evidence.live.status === 'retry') {
@@ -448,7 +455,10 @@ async function reportUntrackedTaskStatus(
   if (evidence.live.status === 'unknown') {
     evidenceLine = `state: unknown (uncertain; live status could not be read: ${evidence.live.reason})`;
   } else if (evidence.round) {
-    evidenceLine = describeUntrackedEvidence(evidence.round);
+    evidenceLine = describeUntrackedEvidence(
+      evidence.round,
+      evidence.live.status === 'v2' ? 'host state' : 'history',
+    );
   } else {
     evidenceLine = `state: ${UNTRACKED_STATE} (uncertain; transcript could not be read)`;
   }
@@ -464,21 +474,27 @@ async function reportUntrackedTaskStatus(
 }
 
 /** Observed-state line for one transcript classification verdict. */
-function describeUntrackedEvidence(round: {
-  verdict: string;
-  reason?: string;
-}): string {
+function describeUntrackedEvidence(
+  round: {
+    verdict: string;
+    reason?: string;
+  },
+  source: 'history' | 'host state',
+): string {
   if (round.verdict === 'completed') {
-    return 'state: completed (verified from history)';
+    return `state: completed (verified from ${source})`;
   }
   if (round.verdict === 'error') {
-    return 'state: error (verified from history)';
+    return `state: error (verified from ${source})`;
   }
   if (round.verdict === 'interrupted') {
-    return 'state: stopped (interrupted, verified from history)';
+    return `state: stopped (interrupted, verified from ${source})`;
   }
   if (round.verdict === 'unreadable' || round.verdict === 'retry') {
-    return `state: ${UNTRACKED_STATE} (uncertain; transcript ${round.verdict}${round.reason ? `: ${round.reason}` : ''})`;
+    return `state: ${UNTRACKED_STATE} (uncertain; ${source} ${round.verdict}${round.reason ? `: ${round.reason}` : ''})`;
+  }
+  if (source === 'host state') {
+    return `state: ${UNTRACKED_STATE} (uncertain; no terminal host outcome covers the latest input)`;
   }
   // incomplete / absent: no verified terminal round after the latest
   // input. The session may be running or merely unfinished — do not

@@ -22,10 +22,10 @@ Centralized utilities and shared abstractions used across the oh-my-opencode-sli
 - **BackgroundJobCoordinator** (`background-job-coordinator.ts`): Lifecycle policy layer between board and consumers with terminal-state subscriptions, deferred-close policy, and metadata shaping
 - **BackgroundJobSupervisor** (`background-job-supervisor.ts`): One-shot wall-clock deadline supervision with timer/generation/abort mechanics
 - **BackgroundTaskConcurrency** (`background-task-concurrency.ts`): Process-local admission scheduler for native background task launches with model/provider capacity tracking
-- **Runtime Session Status** (`session-runtime-status.ts`): Reads and validates the in-process OpenCode session-status map with absent/unknown distinction
+- **Runtime Session Status** (`session-runtime-status.ts`): Reads and validates the in-process OpenCode session-status map with absent/unknown distinction; also reduces the on-demand `session.get` outcome/idleAt projection to terminal/pending/unknown verdicts and binds transcript text to that host idle (startup recovery keeps its transcript-idle classifier)
 - **Session Metadata** (`session-metadata.ts`): Bounded session → agent/directory map with LRU eviction and active orchestrator protection
 - **Session Selection** (`session-selection.ts`): Session selection resolution with provenance tracking (host-persisted, observed-external, unknown)
-- **Child Transcript** (`child-transcript.ts`): Child session transcript evidence extraction and terminal evidence classification
+- **Child Transcript** (`child-transcript.ts`): Child session transcript evidence extraction and terminal evidence classification; on-demand v2 recovery binds latest input and assistant text to the host idle, while startup keeps the transcript-idle classifier
 - **BackgroundJobTerminalGate** (`background-job-terminal-gate.ts`): Terminal evidence verification with host outcome attribution, evidence deadlines, and reading leases
 - **BackgroundJobPersistence** (`background-job-persistence.ts`): Persistence layer for lifecycle state with tombstone and epoch tracking across host restarts
 - **BackgroundJobFixture** (`background-job-fixture.ts`): Test-only board fixtures for adapter/state-machine tests (not for production)
@@ -164,9 +164,9 @@ Session metadata, the opencode client accessor, and the type-only call-shape con
 | `tui-reusable-projection.ts` | Board → tui-state projection for sidebar reusable dots |
 | `session.ts` | Session timeout, abort, and model-reference utilities |
 | `session-metadata.ts` | Bounded session → agent/directory store |
-| `session-runtime-status.ts` | Bounded live session-status map reads |
+| `session-runtime-status.ts` | Bounded live session-status map reads; on-demand host round-state verdicts from the session info projection, with transcript text bound to the host idle |
 | `session-selection.ts` | Session selection resolution with provenance |
-| `child-transcript.ts` | Child session transcript evidence extraction |
+| `child-transcript.ts` | Child session transcript evidence extraction; v1/startup idle classification, on-demand v2 binding of latest input and assistant text to the host idle (malformed entries fail closed) |
 | `jsdom.ts` | JSDOM runtime detection without prerequisite |
 | `redact.ts` | Shape-based secret redaction for logging |
 | `logger.ts` | Process-wide file logging (pid-suffixed) |

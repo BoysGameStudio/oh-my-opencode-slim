@@ -360,6 +360,98 @@ describe('mapV2EventToV1 session.execution.* lifecycle synthesis', () => {
     ]);
   });
 
+  test.each([
+    ['succeeded', ['session.status', 'session.idle']],
+    ['interrupted', ['session.status', 'session.idle']],
+    ['failed', ['session.error', 'session.status', 'session.idle']],
+  ] as const)(
+    'execution.%s stamps every synthesized terminal event with envelope `created` in exact order',
+    (subtype, expectedTypes) => {
+      const created = 1_788_961_638_000;
+      const ev = deepFreeze({
+        id: `evt_terminal_${subtype}`,
+        created,
+        type: `session.execution.${subtype}`,
+        data: { sessionID: 'ses_exec' },
+      });
+      const out = mapV2EventToV1(ev);
+      expect(out.map((mapped) => mapped.type)).toEqual([
+        `session.execution.${subtype}`,
+        ...expectedTypes,
+      ]);
+      expect(out[0]).toBe(ev);
+      expect(out[out.length - 2]).toEqual({
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_exec',
+          status: { type: 'idle' },
+          activityAt: created,
+        },
+      });
+      // Every synthesized event from the terminal envelope carries the
+      // same host activity boundary. A companion without it would fall
+      // back to local receipt time and could act on a newer run.
+      for (const synthesized of out.slice(1)) {
+        expect(
+          (synthesized as { properties: Record<string, unknown> }).properties,
+        ).toMatchObject({ activityAt: created });
+      }
+      expect(out[out.length - 1]).toEqual({
+        type: 'session.idle',
+        properties: { sessionID: 'ses_exec', activityAt: created },
+      });
+    },
+  );
+
+  test.each([
+    ['succeeded', ['session.status', 'session.idle']],
+    ['interrupted', ['session.status', 'session.idle']],
+    ['failed', ['session.error', 'session.status', 'session.idle']],
+  ] as const)(
+    'execution.%s without a usable envelope `created` omits activityAt in exact order',
+    (subtype, expectedTypes) => {
+      const missing = Symbol('missing');
+      for (const created of [
+        missing,
+        undefined,
+        null,
+        'nope',
+        -1,
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+      ]) {
+        const ev: Record<string, unknown> = {
+          id: `evt_terminal_${subtype}`,
+          type: `session.execution.${subtype}`,
+          data: { sessionID: 'ses_exec' },
+        };
+        if (created !== missing) ev.created = created;
+        const out = mapV2EventToV1(ev);
+        expect(out.map((mapped) => mapped.type)).toEqual([
+          `session.execution.${subtype}`,
+          ...expectedTypes,
+        ]);
+        for (const synthesized of out.slice(1)) {
+          expect(
+            Object.hasOwn(
+              (synthesized as { properties: Record<string, unknown> })
+                .properties,
+              'activityAt',
+            ),
+          ).toBe(false);
+        }
+        const status = out[out.length - 2];
+        expect(status).toEqual({
+          type: 'session.status',
+          properties: {
+            sessionID: 'ses_exec',
+            status: { type: 'idle' },
+          },
+        });
+      }
+    },
+  );
+
   test('execution.failed emits v1 session.error (host error verbatim) before the idle pair', () => {
     const ev = deepFreeze({
       type: 'session.execution.failed',
@@ -495,9 +587,19 @@ describe('mapV2EventToV1 live wire shape (payload under `data`)', () => {
     expect(out.slice(1)).toEqual([
       {
         type: 'session.status',
-        properties: { sessionID: 'ses_live', status: { type: 'idle' } },
+        properties: {
+          sessionID: 'ses_live',
+          status: { type: 'idle' },
+          activityAt: 1_788_961_637_000,
+        },
       },
-      { type: 'session.idle', properties: { sessionID: 'ses_live' } },
+      {
+        type: 'session.idle',
+        properties: {
+          sessionID: 'ses_live',
+          activityAt: 1_788_961_637_000,
+        },
+      },
     ]);
   });
 
