@@ -169,11 +169,11 @@ bun run build
   "preset": "openai",
   "presets": {
     "openai": {
-      "orchestrator": { "model": "openai/gpt-6-sol", "variant": "high", "skills": ["*"] },
-      "oracle": { "model": "openai/gpt-6-astra", "variant": "high", "skills": ["simplify"] },
+      "orchestrator": { "model": "openai/gpt-6.1-sol", "variant": "medium", "skills": ["*"] },
+      "oracle": { "model": "openai/gpt-6.1-sol", "variant": "high", "skills": ["simplify"] },
       "explorer": { "model": "openai/gpt-6-luna", "variant": "low", "skills": [] },
       "designer": { "model": "openai/gpt-6-luna", "variant": "medium", "skills": [] },
-      "fixer": { "model": "openai/gpt-6-luna", "variant": "high", "skills": [] }
+      "fixer": { "model": "openai/gpt-6.1-sol", "variant": "low", "skills": [] }
     }
   }
 }
@@ -248,7 +248,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2" dir="rtl" align="right">
-      <b>مدل پیش‌فرض:</b> <code>openai/gpt-6-sol (medium)</code>
+      <b>مدل پیش‌فرض:</b> <code>openai/gpt-6.1-sol (medium)</code>
     </td>
   </tr>
   <tr>
@@ -332,7 +332,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2" dir="rtl" align="right">
-      <b>مدل پیش‌فرض:</b> <code>openai/gpt-6-astra (high)</code>
+      <b>مدل پیش‌فرض:</b> <code>openai/gpt-6.1-sol (high)</code>
     </td>
   </tr>
   <tr>
@@ -465,7 +465,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2" dir="rtl" align="right">
-      <b>مدل پیش‌فرض:</b> <code>openai/gpt-6-luna</code>
+      <b>مدل پیش‌فرض:</b> <code>openai/gpt-6.1-sol (low)</code>
     </td>
   </tr>
   <tr>
@@ -634,7 +634,7 @@ auto-updateهای Plugin آن‌ها را به‌روز نگه می‌دارد؛
 مقدار پیش‌فرض `no` است. برای automation، آن را صریحاً با این دستور فعال کنید:
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
 
 برای تنظیمات، موقعیت‌ها، اندازه‌ها و جزئیات نصب، **[Companion](docs/companion.md)** را

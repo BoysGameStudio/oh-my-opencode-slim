@@ -151,11 +151,11 @@ bun run build
   "preset": "openai",
   "presets": {
     "openai": {
-      "orchestrator": { "model": "openai/gpt-6-sol", "variant": "high", "skills": ["*"] },
-      "oracle": { "model": "openai/gpt-6-astra", "variant": "high", "skills": ["simplify"] },
+      "orchestrator": { "model": "openai/gpt-6.1-sol", "variant": "medium", "skills": ["*"] },
+      "oracle": { "model": "openai/gpt-6.1-sol", "variant": "high", "skills": ["simplify"] },
       "explorer": { "model": "openai/gpt-6-luna", "variant": "low", "skills": [] },
       "designer": { "model": "openai/gpt-6-luna", "variant": "medium", "skills": [] },
-      "fixer": { "model": "openai/gpt-6-luna", "variant": "high", "skills": [] }
+      "fixer": { "model": "openai/gpt-6.1-sol", "variant": "low", "skills": [] }
     },
     "opencode-go": {
       "orchestrator": { "model": "opencode-go/minimax-m3", "variant": "thinking" },
@@ -231,7 +231,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-6-sol (medium)</code>
+      <b>默认模型：</b> <code>openai/gpt-6.1-sol (medium)</code>
     </td>
   </tr>
   <tr>
@@ -313,7 +313,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-6-astra (high)</code>
+      <b>默认模型：</b> <code>openai/gpt-6.1-sol (high)</code>
     </td>
   </tr>
   <tr>
@@ -444,7 +444,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>默认模型：</b> <code>openai/gpt-6-luna (medium)</code>
+      <b>默认模型：</b> <code>openai/gpt-6.1-sol (low)</code>
     </td>
   </tr>
   <tr>
@@ -543,7 +543,7 @@ Skill 分配即权限授予——智能体只能激活被授予的 Skill。请�
 交互式安装期间，安装器会询问是否启用 Companion，并默认选择 `no`。自动化安装可显式启用：
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
 
 配置、位置、尺寸和安装详情见 **[Companion](docs/companion.md)**。

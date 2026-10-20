@@ -32,10 +32,10 @@ describe('providers', () => {
     );
     const agents = (config.presets as any).openai;
     expect(agents).toBeDefined();
-    expect(agents.orchestrator.model).toBe('openai/gpt-6-sol');
-    expect(agents.orchestrator.variant).toBe('high');
-    expect(agents.fixer.model).toBe('openai/gpt-6-luna');
-    expect(agents.fixer.variant).toBe('high');
+    expect(agents.orchestrator.model).toBe('openai/gpt-6.1-sol');
+    expect(agents.orchestrator.variant).toBe('medium');
+    expect(agents.fixer.model).toBe('openai/gpt-6.1-sol');
+    expect(agents.fixer.variant).toBe('low');
   });
 
   test('preserves exact OpenAI model and variant mappings', () => {
@@ -46,11 +46,11 @@ describe('providers', () => {
 
     const agents = (config.presets as any).openai;
     const expected = {
-      orchestrator: { model: 'openai/gpt-6-sol', variant: 'high' },
-      oracle: { model: 'openai/gpt-6-astra', variant: 'high' },
+      orchestrator: { model: 'openai/gpt-6.1-sol', variant: 'medium' },
+      oracle: { model: 'openai/gpt-6.1-sol', variant: 'high' },
       explorer: { model: 'openai/gpt-6-luna', variant: 'low' },
       designer: { model: 'openai/gpt-6-luna', variant: 'medium' },
-      fixer: { model: 'openai/gpt-6-luna', variant: 'high' },
+      fixer: { model: 'openai/gpt-6.1-sol', variant: 'low' },
     } as const;
 
     expect(MODEL_MAPPINGS.openai).toEqual(expected);
@@ -115,32 +115,12 @@ describe('providers', () => {
     ).toThrow('Unsupported preset "toString"');
   });
 
-  test('generateLiteConfig companion: yes', () => {
+  test('generateLiteConfig omits companion config', () => {
     const config = generateLiteConfig({
       backgroundSubagents: 'no',
       reset: false,
-      companion: 'yes',
     });
-
-    expect(config.companion).toBeDefined();
-    expect((config.companion as any).enabled).toBe(true);
-    expect((config.companion as any).position).toBe('bottom-right');
-    expect((config.companion as any).size).toBe('medium');
-  });
-
-  test('generateLiteConfig companion: no or omitted', () => {
-    const configYes = generateLiteConfig({
-      backgroundSubagents: 'no',
-      reset: false,
-      companion: 'no',
-    });
-    expect(configYes.companion).toBeUndefined();
-
-    const configOmitted = generateLiteConfig({
-      backgroundSubagents: 'no',
-      reset: false,
-    });
-    expect(configOmitted.companion).toBeUndefined();
+    expect(config.companion).toBeUndefined();
   });
 
   test('generateLiteConfig includes default skills', () => {
