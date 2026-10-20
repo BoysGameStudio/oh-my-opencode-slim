@@ -12,6 +12,7 @@ The directory follows a **Facade + Strategy** pattern where `index.ts` acts as t
   Historical-task recovery and injected completions admit already-managed parents
   regardless of agent name; stale Orchestrator mapping repair stays specific to
   Orchestrator turns and does not promote unmanaged Build/custom parents.
+- **session-recovery.ts**: On-demand recovery of untracked host children: verifies parent/agent, triages v2 rounds by the `session.get` outcome/idleAt projection (terminal rounds import their true state, rounds without a terminal outcome are refused unless an explicit queued continuation adopts identity, partial or unverifiable evidence fails closed, and no round is imported as stopped on a guess), and imports terminal rows into the board.
 - **revived-run-tracker.ts**: Logs terminal notification transport acceptance and failure with the captured transport-attempt number (including late acceptance after a timeout), lease deferral, and once-only ownership release to the fallback publication wake.
 - **../../utils/background-job-terminal-gate.ts**: Shared execution/observation gate for every terminal publication. Runtime quiescence and attributable result evidence authorize one board commit; busy withdraws terminal publications. Grace, bounded retries and single-open reads are shared across adapters.
 - **input-wait-tracker.ts**: Provides the single `hasInputWait()` seam used by idle reconciliation and continuation evaluation. It combines local question/permission waits with the process-global explicit user-wait latch.

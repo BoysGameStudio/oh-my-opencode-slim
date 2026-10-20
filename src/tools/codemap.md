@@ -31,6 +31,7 @@ Each tool is implemented as a factory function that returns a `ToolDefinition` r
 |------------|---------|----------------|
 | **Task Management** | Background task communication, cancellation, status, results, revival, and HITL continuation control | `task-message.ts`, `cancel-task.ts`, `task-status.ts`, `task-revive.ts`, `wait-for-user.ts` |
 | **Task Policy & Activity** | Shared live-status policy and activity tracking consumed by `task_status` and event wiring | `task-policy.ts` (`summarizeTaskStatus`), `task-activity.ts` (`TaskActivityTracker`) |
+| **Retained Adoption** | Shared resolve-or-adopt seam for untracked host sessions, consumed by `task_revive` and the v2 subagent continuation bridge | `retained-adoption.ts` (`resolveOrAdoptUntrackedTask`) |
 | **ACP Integration** | External agent protocol execution with live progress streaming to the parent TUI (`ctx.metadata`) | `acp-run.ts`, ACP client implementation |
 | **Code Intelligence** | AST-based code manipulation | `ast-grep/` directory, `tools.ts` |
 | **Web Fetching** | Intelligent web content retrieval | `smartfetch/` directory, `tool.ts` |
