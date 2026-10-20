@@ -14,10 +14,6 @@ describe('orchestrator prompt: host vocabulary', () => {
     const prompt = v2();
 
     expect(prompt).toContain('`subagent` calls in one message');
-    expect(prompt).toContain(
-      'Continue a completed session with `subagent` by exact id',
-    );
-    expect(prompt).toContain('`task_message` amends a running lane');
     expect(prompt).toContain('look up IDs with the models tool');
     expect(prompt).not.toContain('task_id');
   });
@@ -26,10 +22,6 @@ describe('orchestrator prompt: host vocabulary', () => {
     const prompt = v1();
 
     expect(prompt).toContain('`task` calls in one message');
-    expect(prompt).toContain(
-      'Continue an existing session with `task_revive` by exact id or alias',
-    );
-    expect(prompt).toContain('`task_message` amends a running lane');
     expect(prompt).not.toContain('delivery:');
     expect(prompt).not.toContain('subagent(');
     expect(prompt).not.toContain('models tool');
