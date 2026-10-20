@@ -634,7 +634,7 @@ auto-updateهای Plugin آن‌ها را به‌روز نگه می‌دارد؛
 مقدار پیش‌فرض `no` است. برای automation، آن را صریحاً با این دستور فعال کنید:
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
 
 برای تنظیمات، موقعیت‌ها، اندازه‌ها و جزئیات نصب، **[Companion](docs/companion.md)** را

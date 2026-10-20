@@ -148,14 +148,16 @@ describe('parseArgs background subagents', () => {
 });
 
 describe('parseArgs companion', () => {
-  test('defaults companion install to ask', () => {
-    expect(parseArgs([]).companion).toBe('ask');
-  });
-
-  test('parses companion mode override', () => {
-    expect(parseArgs(['--companion=yes']).companion).toBe('yes');
-    expect(parseArgs(['--companion=no']).companion).toBe('no');
-    expect(parseArgs(['--companion=ask']).companion).toBe('ask');
+  test('ignores the removed --companion install option', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(parseArgs(['--companion=yes'])).not.toHaveProperty('companion');
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('companion install'),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

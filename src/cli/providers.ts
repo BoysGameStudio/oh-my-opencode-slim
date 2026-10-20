@@ -120,17 +120,5 @@ export function generateLiteConfig(
     presets[presetName] = buildPreset(presetName);
   }
 
-  if (installConfig.companion === 'yes') {
-    config.companion = {
-      enabled: true,
-      position: 'bottom-right',
-      size: 'medium',
-      gifPack: 'default',
-      loopStyle: 'classic',
-      speed: 1,
-      debug: false,
-    };
-  }
-
   return config;
 }

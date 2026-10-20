@@ -548,7 +548,7 @@ ping all agents
 対話式インストールでは、インストーラーが Companion を有効にするか尋ね、デフォルトは `no` です。自動化では明示的に有効化できます:
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
 
 設定、位置、サイズ、インストール詳細は **[Companion](docs/companion.md)** を参照してください。

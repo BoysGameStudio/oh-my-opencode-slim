@@ -189,26 +189,23 @@ The in-memory position remains authoritative while a delayed write is retried.
 
 ---
 
-## Installer Flag
+## Installing
 
-During interactive installation, the installer asks whether to download and
-enable the native Companion binary. The prompt defaults to `no`, so pressing
-Enter skips it.
-
-On niri, Companion can install normally when enabled now that the native binary
-is fixed.
-
-Companion installation is best-effort. If the binary cannot be downloaded or
-installed, the installer prints a warning and continues installing the core
-plugin without Companion enabled.
-
-For automation, pass `--companion=yes` to install without prompting:
+Companion is installed separately from the plugin. Run the regular installer
+first, then:
 
 ```bash
-bunx oh-my-opencode-slim install --companion=yes
+bunx oh-my-opencode-slim companion install
 ```
 
-Pass `--companion=no` to skip the native binary and omit the config block.
+The command downloads the native binary for the current OS/architecture and
+sets `"companion": { "enabled": true }` in the existing
+`oh-my-opencode-slim.json(c)`, keeping any other companion settings and
+comments. It exits with an error if no plugin config exists yet. Pass
+`--dry-run` to print the target, archive URL, and paths without writing
+anything. Restart OpenCode to launch Companion.
+
+On niri, Companion installs normally now that the native binary is fixed.
 
 ## niri support status
 
@@ -301,8 +298,8 @@ plan:
    `companion-v0.1.3` GitHub release.
 2. **Separate Companion Versioning**: the companion uses its own version so the
    plugin can ship beta updates without rebuilding native binaries every time.
-3. **OS/Arch Detection**: `--companion=yes` selects the archive for the current
-   target.
+3. **OS/Arch Detection**: `companion install` selects the archive for the
+   current target.
 4. **Manifest + Checksums**: the plugin ships
    `src/companion/companion-manifest.json`, which names the companion release
    and SHA256 checksum for each supported archive.
@@ -403,18 +400,18 @@ The runtime updater has a matching manifest constant in
 `src/companion/updater.ts`; tests assert the JSON manifest and runtime constant
 stay in sync.
 
-### 4. Install with the plugin installer
+### 4. Install with the companion command
 
 Once the release assets exist, users can run:
 
 ```bash
-bunx oh-my-opencode-slim@beta install --companion=yes
+bunx oh-my-opencode-slim@beta companion install
 ```
 
-The installer detects the user's OS/architecture, downloads the matching archive
-from `companion-v0.1.3`, installs it to the runtime binary path, and writes the
-companion config block. If the companion install fails, the core plugin install
-continues without enabling Companion.
+The command detects the user's OS/architecture, downloads the matching archive
+from `companion-v0.1.3`, installs it to the runtime binary path, and enables
+companion in the existing plugin config. A failed download leaves the config
+unchanged.
 
 ### Cost controls
 

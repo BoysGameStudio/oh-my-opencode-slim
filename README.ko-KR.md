@@ -602,7 +602,7 @@ Companion은 선택적으로 사용하는 데스크톱 플로팅 상태 창입�
 자동 설치에서는 다음 옵션으로 활성화하세요.
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
 
 설정, 위치, 크기, 설치에 관한 자세한 내용은 **[Companion 문서](docs/companion.md)**를 참고하세요.

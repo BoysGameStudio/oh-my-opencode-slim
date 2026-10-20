@@ -33,7 +33,6 @@ The installer supports the following options:
 
 | Option | Description |
 |--------|-------------|
-| `--companion=ask\|yes\|no` | Install and enable the desktop Companion (`ask` by default; prompt defaults to no) |
 | `--preset=<name>` | Active generated config preset: `openai` or `opencode-go` (default: `openai`) |
 | `--background-subagents=ask\|yes\|no` | Configure the required background-subagents and Exa websearch environment exports (`ask` by default; prompt defaults to yes) |
 | `--background-subagents-target=<path>` | Write the background-subagents and websearch exports to a specific shell/profile file |

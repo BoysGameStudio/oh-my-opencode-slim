@@ -543,7 +543,7 @@ Skill 分配即权限授予——智能体只能激活被授予的 Skill。请�
 交互式安装期间，安装器会询问是否启用 Companion，并默认选择 `no`。自动化安装可显式启用：
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
 
 配置、位置、尺寸和安装详情见 **[Companion](docs/companion.md)**。

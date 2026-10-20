@@ -115,32 +115,12 @@ describe('providers', () => {
     ).toThrow('Unsupported preset "toString"');
   });
 
-  test('generateLiteConfig companion: yes', () => {
+  test('generateLiteConfig omits companion config', () => {
     const config = generateLiteConfig({
       backgroundSubagents: 'no',
       reset: false,
-      companion: 'yes',
     });
-
-    expect(config.companion).toBeDefined();
-    expect((config.companion as any).enabled).toBe(true);
-    expect((config.companion as any).position).toBe('bottom-right');
-    expect((config.companion as any).size).toBe('medium');
-  });
-
-  test('generateLiteConfig companion: no or omitted', () => {
-    const configYes = generateLiteConfig({
-      backgroundSubagents: 'no',
-      reset: false,
-      companion: 'no',
-    });
-    expect(configYes.companion).toBeUndefined();
-
-    const configOmitted = generateLiteConfig({
-      backgroundSubagents: 'no',
-      reset: false,
-    });
-    expect(configOmitted.companion).toBeUndefined();
+    expect(config.companion).toBeUndefined();
   });
 
   test('generateLiteConfig includes default skills', () => {
