@@ -1146,7 +1146,7 @@ The field accepts either:
 | `lsp` | string or object | Language server protocol operations |
 | `skill` | string or object | Skill execution |
 | `todowrite` | string only | Todo list writing |
-| `question` | string only | Asking the user questions |
+| `question` | string only | Asking the user questions (subagents default to `deny`; explicit `allow`/`ask`/`deny` per agent is honored; only the orchestrator asks by default) |
 | `webfetch` | string only | Web content fetching |
 | `websearch` | string only | Web search |
 | `codesearch` | string only | Code search |
