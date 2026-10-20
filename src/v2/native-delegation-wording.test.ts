@@ -93,7 +93,7 @@ describe('buildOrchestratorPrompt delegation vocabulary', () => {
     expect(prompt).not.toContain('task_id');
   });
 
-  test('v1 (no hostFlavor) emits task / task_revive wording', () => {
+  test('v1 (no hostFlavor) emits task wording', () => {
     const prompt = buildOrchestratorPrompt();
 
     expect(prompt).toContain('`task` calls in one message');
@@ -172,10 +172,11 @@ describe('createAgents council seat pointer vocabulary', () => {
     expect(v1).not.toContain('dispatch via subagent()');
   });
 
-  test('v2 keeps native resume guidance and does not adopt the v1 task_revive-first rule', () => {
+  test('v2 does not adopt the v1 task_revive-first rule', () => {
     const v2 = orchestratorPromptFor('v2');
 
     expect(v2).not.toContain('task_result');
+    expect(v2).not.toContain('task_revive');
     expect(v2).not.toContain(
       'Only sessions listed under Reusable Sessions may be resumed with `subagent()`.',
     );
