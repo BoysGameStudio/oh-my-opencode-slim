@@ -1244,6 +1244,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "giannisCKS",
+      "name": "Giannis Papakostas",
+      "avatar_url": "https://avatars.githubusercontent.com/u/6207534?v=4",
+      "profile": "https://gianniscks.github.io/",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"
