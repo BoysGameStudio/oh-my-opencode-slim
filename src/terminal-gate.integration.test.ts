@@ -351,7 +351,14 @@ for (const state of ['completed', 'error'] as const) {
 
 async function fallbackAssembly(hostFlavor?: string, delayMs = 2000) {
   jest.useFakeTimers();
-  cleanups.push(async () => jest.useRealTimers());
+  let fakeTimers = true;
+  const restoreTimers = async () => {
+    if (!fakeTimers) return;
+    fakeTimers = false;
+    jest.useRealTimers();
+  };
+  // Covers a throw inside assembly() before its disposal cleanup is pushed.
+  cleanups.push(restoreTimers);
   const h = await assembly(undefined, {
     hostFlavor,
     rootConfigOverrides: {
@@ -361,6 +368,10 @@ async function fallbackAssembly(hostFlavor?: string, delayMs = 2000) {
       fallback: { initialRetryDelayMs: delayMs },
     },
   });
+  // Cleanups run in reverse, so this restores real timers before plugin
+  // disposal. Disposing under fake timers can wait on a timer that never
+  // fires, time out afterEach, and flip the next test's timers mid-run.
+  cleanups.push(restoreTimers);
   await h.begin();
   await h.after('running');
   await h.hooks['chat.message']?.(
