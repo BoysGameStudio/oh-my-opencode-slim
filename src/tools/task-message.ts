@@ -18,6 +18,7 @@ import {
   type CanonicalTaskResolver,
   idParamFor,
   readTaskRef,
+  recentTaskHandles,
   resolveTaskRecord,
   taskRefArgs,
   unknownTaskRefError,
@@ -103,7 +104,11 @@ export function createTaskMessageTool(options: {
         throw new Error(`Unknown task ID or alias: ${identity}`);
       }
       if (!job) {
-        throw unknownTaskRefError(identity, delegation.resumeParam);
+        throw unknownTaskRefError(
+          identity,
+          delegation.resumeParam,
+          recentTaskHandles(options.backgroundJobBoard, parentSessionID),
+        );
       }
 
       const currentJob = getCurrentTaskMessageJob(

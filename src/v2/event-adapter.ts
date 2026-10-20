@@ -27,9 +27,12 @@
  * `session.execution.started/succeeded/failed/interrupted` events; the
  * stream carries neither `session.idle` nor busy/idle `session.status`.
  * The execution events are synthesized into the v1 lifecycle shapes below.
- * A terminal execution event synthesizes both a `session.status` idle and
- * a `session.idle`, so a consumer watching both must tolerate duplicate
- * idle delivery (the documented double-idle invariant).
+ * Every synthesized lifecycle status preserves the host envelope `created`
+ * as `activityAt` (busy AND terminal idle), so terminal evidence keeps its
+ * host-clock attribution. A terminal execution event synthesizes both a
+ * `session.status` idle and a `session.idle`, so a consumer watching both
+ * must tolerate duplicate idle delivery (the documented double-idle
+ * invariant).
  *
  * The synthesized shapes are pinned to what the v1 consumers actually read:
  * - `session.created` early registration (task-session-manager
@@ -313,18 +316,21 @@ export function mapV2EventToV1(
     // rather than guessing a lifecycle meaning.
     if (typeof props.sessionID === 'string') {
       const sessionID = props.sessionID;
+      // The host envelope timestamps every event with `created`
+      // (Clock.currentTimeMillis). Preserve it as the activity boundary on
+      // EVERY synthesized lifecycle status — busy and terminal idle alike:
+      // the router forwards it as observedAt, so a delayed delivery keeps
+      // the host time instead of degenerating into a local receipt time,
+      // which cannot prove activity after a recorded host idle (and, for a
+      // terminal event, is what lets the terminal gate attribute the idle
+      // to this run at all).
+      const activityAt =
+        typeof event.created === 'number' &&
+        Number.isFinite(event.created) &&
+        event.created >= 0
+          ? event.created
+          : undefined;
       if (type === 'session.execution.started') {
-        // The host envelope timestamps every event with `created`
-        // (Clock.currentTimeMillis). Preserve it as the activity boundary:
-        // the router forwards it as observedAt, so a delayed delivery keeps
-        // the host time instead of degenerating into a local receipt time,
-        // which cannot prove activity after a recorded host idle.
-        const activityAt =
-          typeof event.created === 'number' &&
-          Number.isFinite(event.created) &&
-          event.created >= 0
-            ? event.created
-            : undefined;
         out.push({
           type: 'session.status',
           properties: {
@@ -360,7 +366,11 @@ export function mapV2EventToV1(
         // double-idle invariant.
         out.push({
           type: 'session.status',
-          properties: { sessionID, status: { type: 'idle' } },
+          properties: {
+            sessionID,
+            status: { type: 'idle' },
+            ...(activityAt !== undefined ? { activityAt } : {}),
+          },
         });
         out.push({
           type: 'session.idle',
