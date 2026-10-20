@@ -1216,9 +1216,11 @@ describe('tool permissions', () => {
   test('subagents are denied access to question by default', () => {
     const agents = createAgents(runtimeFor());
 
-    // fixer/designer previously defaulted to allow; explorer/oracle lock the
-    // read-only matrix stance.
-    for (const name of ['fixer', 'designer', 'explorer', 'oracle']) {
+    // Every role-builtin previously defaulted to allow: factory maps
+    // carry only the task stance; the read-only matrix belongs to
+    // councillors/council, not explorer/oracle. Observer shares this but
+    // is disabled in the default runtime (vision-gated).
+    for (const name of ['fixer', 'designer', 'explorer', 'oracle'] as const) {
       const agent = agents.find((candidate) => candidate.name === name);
       expect(
         (agent as { config: { permission: Record<string, unknown> } }).config
