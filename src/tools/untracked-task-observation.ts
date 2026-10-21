@@ -167,7 +167,8 @@ async function readTranscript(
     if (state.kind === 'terminal') {
       const text = terminalTextOf(transcript);
       if (text) round.text = text;
-      else round.reason = 'answer text is not readable yet';
+      else if (state.outcome === 'succeeded')
+        round.reason = 'answer text is not readable yet';
     }
     return { live, round };
   } catch (error) {

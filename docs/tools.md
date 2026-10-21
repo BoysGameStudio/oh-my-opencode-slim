@@ -178,7 +178,8 @@ V2 untracked adoption uses a different result boundary: it queues a caller-ID
 input after verifying parent ownership, agent evidence, and readable history,
 without requiring status/idle APIs. Host-proven aliases retain the upstream
 ambiguity and ownership checks. Recovery consults the session's host outcome:
-terminal rounds are imported, work without a terminal outcome (still running,
+successful rounds require nonempty answer text; textless failed or interrupted
+rounds retain their proven error or stopped state. Work without a terminal outcome (still running,
 or awaiting restart resume) is refused except for explicit queued
 continuation, and partial or unverifiable state fails closed.
 The new generation is registered before the write and is not replaced by late
