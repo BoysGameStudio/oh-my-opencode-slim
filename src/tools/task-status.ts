@@ -166,7 +166,7 @@ export function createTaskStatusTool(options: {
   const z = tool.schema;
   const task_status = tool({
     description:
-      "Inspect a tracked child task without resuming, prompting, or changing it. It accepts its task ID or parent-scoped alias. Pass result: true for a completed task's final text; refuses other terminals. For an untracked session (e.g. after a restart), reports a read-only observed state.",
+      "Inspect a tracked child task without resuming, prompting, or changing it. It accepts its task ID or parent-scoped alias. Pass result: true for a completed task's final text; refuses other terminals. For an untracked session (e.g. after a restart), reports a read-only observed state. An unknown or placeholder task_id enumerates the session's recent task handles, including recently finished sessions.",
     args: {
       ...taskRefArgs(idParam),
       result: z

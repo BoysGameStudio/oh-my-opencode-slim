@@ -1362,6 +1362,14 @@ describe('task_status unknown-handle enumeration', () => {
     );
   });
 
+  test('the tool description documents the handle enumeration for a placeholder id', () => {
+    const { task_status } = makeTool({ board: new BackgroundJobBoard() });
+    const description = task_status.description ?? '';
+    expect(description).toContain('unknown or placeholder task_id');
+    expect(description).toContain('recent task handles');
+    expect(description).toContain('recently finished sessions');
+  });
+
   test('task_status keeps the bare unknown error with an empty board', async () => {
     client = { session: {} };
     const { task_status } = makeTool({ board: new BackgroundJobBoard() });
