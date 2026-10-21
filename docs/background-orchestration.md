@@ -370,8 +370,18 @@ pending even if the session retains an older terminal outcome. A succeeded
 round without readable answer text also stays pending. Terminal history that
 predates the current persisted or board run fence cannot settle that run.
 On v2, a session outcome without a readable terminal boundary cannot settle
-a persisted run either. An unreadable transcript is skipped rather than
-adopted. When
+a persisted run either. Persisted idles pass the same assistant attribution
+as on-demand recovery: an assistant completed after an idle makes that idle
+stale, never extends its timestamp. A delayed parent notification (or stored
+delivery marker) cannot acknowledge an explicitly unfinished latest round;
+delivery must correlate with that round's proven terminal boundary.
+
+Startup listing, session-info, and parent/child transcript waits each have a
+5-second deadline. A stalled list falls back to persisted identities, and a
+stalled candidate cannot block subsequent children. Timeouts remain unknown,
+never completion; timing out a shared session-info waiter does not release or
+reissue its still-open host read. An unreadable transcript is skipped rather
+than adopted. When
 the host client exposes `session.get`, each newly recovered task is also probed
 for existence: a session deleted while the plugin was down is tombstoned and
 torn down instead of resurrecting as a forever-running ghost, and a session

@@ -347,6 +347,60 @@ describe('classifyV2HistoricalRound (startup path)', () => {
     expect(JSON.stringify(round)).not.toContain('ANSWER-B');
   });
 
+  test.each([
+    ['succeeded', 'completed'],
+    ['failed', 'error'],
+    ['interrupted', 'interrupted'],
+  ] as const)(
+    'startup %s uses the idle boundary and rejects a later assistant completion',
+    (outcome, verdict) => {
+      const answer = v2Message({
+        id: 'a',
+        sourceType: 'assistant',
+        time: { created: 13, completed: 14 },
+        text: 'ANSWER',
+      });
+      const history = {
+        data: [
+          v2Message({ id: 'u', sourceType: 'user', time: { created: 12 } }),
+          answer,
+          v2Message({
+            id: 'idle',
+            sourceType: 'idle',
+            time: { created: 14 },
+            outcome,
+          }),
+        ],
+      };
+      expect(classifyV2HistoricalRound(history)).toMatchObject({
+        verdict,
+        completedAt: 14,
+      });
+      answer.info.time = { created: 13, completed: 16 };
+      expect(classifyV2HistoricalRound(history)).toEqual({
+        verdict: 'incomplete',
+        startedAt: 12,
+      });
+    },
+  );
+
+  test('an idle without a timestamp never borrows assistant completion', () => {
+    expect(
+      classifyV2HistoricalRound({
+        data: [
+          v2Message({ id: 'u', sourceType: 'user', time: { created: 12 } }),
+          v2Message({
+            id: 'a',
+            sourceType: 'assistant',
+            time: { created: 13, completed: 16 },
+            text: 'ANSWER',
+          }),
+          v2Message({ id: 'idle', sourceType: 'idle', outcome: 'succeeded' }),
+        ],
+      }).verdict,
+    ).toBe('unreadable');
+  });
+
   test('a newer synthetic blocks an older succeeded outcome', () => {
     const round = classifyV2HistoricalRound({
       data: [

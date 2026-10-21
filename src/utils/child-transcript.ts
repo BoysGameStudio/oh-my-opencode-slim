@@ -23,7 +23,11 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 
 import { isRecord } from './guards';
-import type { HostRoundState } from './session-runtime-status';
+import {
+  composeHostRound,
+  type HostRoundState,
+  hostRoundStateOf,
+} from './session-runtime-status';
 
 export type ChildTerminalEvidence =
   | { kind: 'ready'; text: string }
@@ -607,21 +611,9 @@ export function terminalTextOf(transcript: unknown): string | undefined {
 export function classifyV2HistoricalRound(
   response: unknown,
 ): CurrentRoundClassification {
-  if (response === undefined) {
-    return { verdict: 'unreadable', reason: 'transcript source unavailable' };
-  }
-  if (responseError(response) !== undefined) {
-    return { verdict: 'unreadable', reason: 'transcript read failed' };
-  }
-  if (!isRecord(response) || !Array.isArray(response.data)) {
-    return { verdict: 'unreadable', reason: 'malformed transcript response' };
-  }
-  const messages: TranscriptMessage[] = [];
-  for (const entry of response.data) {
-    if (!isRecord(entry) || !isRecord(entry.info)) {
-      return { verdict: 'unreadable', reason: 'malformed transcript entries' };
-    }
-    messages.push(entry);
+  const messages = transcriptEntries(response);
+  if (!Array.isArray(messages)) {
+    return { verdict: 'unreadable', reason: messages.reason };
   }
   let boundary = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -636,13 +628,11 @@ export function classifyV2HistoricalRound(
   }
   const startedAt = transcriptOrderKey(messages[boundary] as TranscriptMessage);
   // No user or synthetic entry follows the boundary.
-  let assistant = -1;
   let closingIdle = -1;
   for (let index = boundary + 1; index < messages.length; index += 1) {
     const message = messages[index] as TranscriptMessage;
     const source = sourceTypeOf(message);
     if (source === 'assistant') {
-      assistant = index;
       closingIdle = -1;
       continue;
     }
@@ -650,45 +640,23 @@ export function classifyV2HistoricalRound(
   }
   if (closingIdle < 0) return { verdict: 'incomplete', startedAt };
   const idle = messages[closingIdle] as TranscriptMessage;
-  const idleOutcome = outcomeOf(idle);
-  const completedAt =
-    transcriptOrderKey(idle) ??
-    (assistant >= 0
-      ? assistantCompletedAt(messages[assistant] as TranscriptMessage)
-      : undefined);
-  if (idleOutcome === undefined) {
-    return { verdict: 'unreadable', reason: 'idle outcome is missing' };
+  // A persisted idle supplies the host terminal boundary, never the
+  // assistant's completion time. Apply the same attribution as on-demand
+  // recovery so newer assistant activity cannot stretch an older idle.
+  const state = attributeHostRoundToTranscript(
+    hostRoundStateOf({
+      outcome: outcomeOf(idle),
+      time: { idle: transcriptOrderKey(idle) },
+    }),
+    response,
+  );
+  const round = composeHostRound(state, startedAt);
+  if (round.verdict === 'completed' || round.verdict === 'error') {
+    const text = terminalTextOf(response);
+    if (text) round.text = text;
+    else if (round.verdict === 'completed') {
+      return { verdict: 'incomplete', startedAt };
+    }
   }
-  if (idleOutcome === 'interrupted') {
-    return { verdict: 'interrupted', startedAt, completedAt };
-  }
-  if (idleOutcome === 'failed') {
-    const turn =
-      assistant >= 0 ? (messages[assistant] as TranscriptMessage) : undefined;
-    return {
-      verdict: 'error',
-      text:
-        (turn ? textOf(turn) : '') ||
-        'The historical round failed before an assistant result.',
-      startedAt,
-      completedAt,
-    };
-  }
-  if (idleOutcome !== 'succeeded') {
-    return {
-      verdict: 'unreadable',
-      reason: `unrecognized idle outcome ${idleOutcome}`,
-    };
-  }
-  if (assistant < 0) return { verdict: 'incomplete', startedAt };
-  const text = textOf(messages[assistant] as TranscriptMessage);
-  if (!text) return { verdict: 'incomplete', startedAt };
-  return {
-    verdict: 'completed',
-    text,
-    startedAt,
-    completedAt:
-      assistantCompletedAt(messages[assistant] as TranscriptMessage) ??
-      completedAt,
-  };
+  return round;
 }

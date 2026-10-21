@@ -46,6 +46,10 @@ import { pendingSessionPrune } from '../../utils/pending-session-prunes';
 import { delay } from '../../utils/polling';
 import { SESSION_ID_PATTERN, withTimeout } from '../../utils/session';
 import {
+  raceEvidenceDeadline,
+  readHostSessionInfo,
+} from '../../utils/session-info-read';
+import {
   composeHostRound,
   hostRoundStateOf,
   hostRoundVerdict,
@@ -548,6 +552,9 @@ export interface StartupSubagentRecoveryOptions {
   shouldManageSession: (sessionID: string) => boolean;
   hostFlavor?: string;
   isDisposed?: () => boolean;
+  /** Per-read startup deadline, independent of transcript observation time. */
+  readTimeoutMs?: number;
+  timers?: Parameters<typeof raceEvidenceDeadline>[2];
   /** Re-establish parent ownership metadata after a process restart. */
   registerParentSession?: (sessionID: string) => void;
   /** Resolves true only after the parent-visible wake was accepted. */
@@ -591,11 +598,10 @@ type StartupChildState =
 /**
  * Trusted, current-run native delivery present in the parent's history.
  * The header/metadata/child/parent checks live in `parseNativeDelivery`;
- * this adds the two requirements the restart path needs: the delivery
- * carries a host timestamp, and that timestamp is at or after the run's
- * start fence. A completion paired to a newer round may bear its completion
- * timestamp, so no pre-start allowance is applied. A missing timestamp is
- * forged or incomplete evidence and never acknowledges a persisted run.
+ * callers must first prove that the latest child round is terminal. This
+ * then requires a delivery timestamp at or after both that terminal boundary
+ * and the run's start fence. A notification's creation time is not execution
+ * evidence: a delayed old result cannot acknowledge an incomplete new round.
  */
 function nativeDeliveryForRun(
   transcript: unknown,
@@ -655,6 +661,12 @@ export async function recoverSubagentSessionsAtStartup(
   options: StartupSubagentRecoveryOptions,
 ): Promise<string[]> {
   if (options.isDisposed?.()) return [];
+  const readTimeoutMs = options.readTimeoutMs ?? TRANSCRIPT_READ_TIMEOUT_MS;
+  if (!Number.isFinite(readTimeoutMs) || readTimeoutMs <= 0) {
+    throw new Error(
+      'Startup recovery read timeout must be positive and finite',
+    );
+  }
   const rows = await listStartupSessions(options);
   const persisted = persistedBackgroundChildren();
   if ((rows.length === 0 && persisted.size === 0) || options.isDisposed?.()) {
@@ -697,6 +709,8 @@ export async function recoverSubagentSessionsAtStartup(
       directory,
       parentSessionID,
       options.hostFlavor,
+      readTimeoutMs,
+      options.timers,
     ).catch(() => undefined);
     transcripts.set(parentSessionID, read);
     return read;
@@ -723,7 +737,22 @@ export async function recoverSubagentSessionsAtStartup(
     let parentSessionID = candidate.parentID;
     let hostOutcome = candidate.outcome;
     if (!parentSessionID || hostOutcome === undefined) {
-      const hosted = await readHostSession(client, directory, taskID);
+      const response = await raceEvidenceDeadline(
+        readHostSessionInfo(options.input, {
+          taskID,
+          identity: [
+            'startup',
+            epoch ?? '',
+            candidate.persisted?.launchedAt ?? '',
+            scanStartRun?.generation ?? '',
+            scanStartRun?.runStartedAt ?? '',
+            scanStartRun?.terminalRevision ?? '',
+          ].join(':'),
+        }),
+        readTimeoutMs,
+        options.timers,
+      );
+      const hosted = hostSessionFromResponse(response, taskID);
       if (hosted.kind === 'ok') {
         if (parentSessionID && hosted.parentID !== parentSessionID) continue;
         parentSessionID ??= hosted.parentID;
@@ -766,13 +795,7 @@ export async function recoverSubagentSessionsAtStartup(
     }
     options.registerParentSession?.(parentSessionID);
 
-    const state = await classifyStartupChild(
-      client,
-      directory,
-      taskID,
-      hostOutcome,
-      options.hostFlavor,
-    );
+    const state = await classifyStartupChild(options, taskID, hostOutcome);
     if (state.kind === 'unknown') continue;
     // A run can already have relaunched before this scan starts, while the
     // host transcript still exposes the previous terminal round. Matching
@@ -814,13 +837,15 @@ export async function recoverSubagentSessionsAtStartup(
       observedRunStartedAt: runStartedAt,
     });
 
-    // A persisted delivery marker only covers the run it acknowledged. A
-    // newer child round that began while this process was down does not
-    // inherit it.
+    // Delivery timestamps never override explicit unfinished child evidence.
+    // Even a stored marker must cover this round's own terminal boundary.
     const persistedDeliveredAt = candidate.persisted?.deliveredAt;
     const persistedDeliveryCoversRun =
+      state.kind === 'terminal' &&
       persistedDeliveredAt !== undefined &&
-      (runStartedAt === undefined || persistedDeliveredAt >= runStartedAt);
+      (runStartedAt === undefined || persistedDeliveredAt >= runStartedAt) &&
+      (state.completedAt === undefined ||
+        persistedDeliveredAt >= state.completedAt);
     if (persistedDeliveryCoversRun) {
       if (
         rowKeepsObservedRun &&
@@ -835,18 +860,16 @@ export async function recoverSubagentSessionsAtStartup(
     // A trusted current-run delivery already in the parent's history means
     // the outcome reached the parent before this process existed. Never
     // adopt, re-probe, or replay it; just fence the persisted identity.
-    const delivered = nativeDeliveryForRun(
-      transcript,
-      parentSessionID,
-      taskID,
-      runStartedAt,
-    );
-    const deliveryIsCurrent = delivered
-      ? state.kind === 'terminal'
-        ? delivered.state === state.state
-        : true
-      : false;
-    if (deliveryIsCurrent) {
+    const delivered =
+      state.kind === 'terminal'
+        ? nativeDeliveryForRun(
+            transcript,
+            parentSessionID,
+            taskID,
+            latestFence(runStartedAt, state.completedAt),
+          )
+        : undefined;
+    if (state.kind === 'terminal' && delivered?.state === state.state) {
       if (
         rowKeepsObservedRun &&
         boardRow?.state === 'running' &&
@@ -1059,22 +1082,29 @@ async function deliverStartupTerminal(
 }
 
 async function classifyStartupChild(
-  client: PluginInput['client'],
-  directory: string,
+  options: StartupSubagentRecoveryOptions,
   taskID: string,
   outcome: string | undefined,
-  hostFlavor: string | undefined,
 ): Promise<StartupChildState> {
   const terminalFromOutcome = startupTerminalState(outcome);
   let round: ReturnType<typeof classifyCurrentDeliveredRound> | undefined;
   try {
-    const transcript = await fetchChildTranscript(client, taskID, directory);
+    const transcript = await raceEvidenceDeadline(
+      fetchChildTranscript(
+        getClient(options.input),
+        taskID,
+        options.input.directory,
+      ),
+      options.readTimeoutMs ?? TRANSCRIPT_READ_TIMEOUT_MS,
+      options.timers,
+    );
+    if (transcript === undefined) return { kind: 'unknown' };
     round =
-      hostFlavor === 'v2'
+      options.hostFlavor === 'v2'
         ? classifyV2HistoricalRound(transcript)
         : classifyCurrentDeliveredRound(transcript);
   } catch {
-    round = undefined;
+    return { kind: 'unknown' };
   }
   if (round) {
     if (round.verdict === 'completed') {
@@ -1161,9 +1191,13 @@ async function listStartupSessions(
   ).list;
   if (typeof list !== 'function') return [];
   try {
-    const response = await list.call(client.session, {
-      query: { directory: options.input.directory },
-    });
+    const response = await raceEvidenceDeadline(
+      list.call(client.session, {
+        query: { directory: options.input.directory },
+      }),
+      options.readTimeoutMs ?? TRANSCRIPT_READ_TIMEOUT_MS,
+      options.timers,
+    );
     const data = Array.isArray(response)
       ? response
       : isRecord(response) && Array.isArray(response.data)
@@ -1281,44 +1315,49 @@ async function readHostSession(
       path: { id: sessionID },
       query: { directory },
     });
-    const error = responseError(response);
-    if (error !== undefined) return sessionReadRefusal(sessionID, error);
-    const rawData = isRecord(response) ? response.data : undefined;
-    const data = isRecord(rawData)
-      ? (rawData as Record<string, unknown>)
-      : undefined;
-    const parentID =
-      typeof data?.parentID === 'string' ? data.parentID : undefined;
-    if (data?.id !== undefined && data.id !== sessionID) {
-      return refuse(
-        `Task ${sessionID} could not be read (session ID mismatch); no prompt was sent`,
-      );
-    }
-    if (!parentID) {
-      return refuse(
-        `Task ${sessionID} could not be read (missing parent); no prompt was sent`,
-      );
-    }
-    const agent =
-      typeof data?.agent === 'string' ? data.agent.trim() : undefined;
-    const createdAt =
-      isRecord(data?.time) && typeof data.time.created === 'number'
-        ? data.time.created
-        : undefined;
-    return {
-      kind: 'ok',
-      parentID,
-      hostInfo: data as Record<string, unknown>,
-      ...(agent ? { agent } : {}),
-      ...(typeof data?.outcome === 'string' ? { outcome: data.outcome } : {}),
-      ...(createdAt !== undefined ? { createdAt } : {}),
-      ...(typeof data?.title === 'string' && data.title
-        ? { title: data.title }
-        : {}),
-    };
+    return hostSessionFromResponse(response, sessionID);
   } catch (error) {
     return sessionReadRefusal(sessionID, error);
   }
+}
+
+/** Shared ownership/identity parsing for direct and bounded startup reads. */
+function hostSessionFromResponse(
+  response: unknown,
+  sessionID: string,
+): HostSession | RetainedRecoveryResult {
+  const error = responseError(response);
+  if (error !== undefined) return sessionReadRefusal(sessionID, error);
+  const data =
+    isRecord(response) && isRecord(response.data) ? response.data : undefined;
+  const parentID =
+    typeof data?.parentID === 'string' ? data.parentID : undefined;
+  if (data?.id !== undefined && data.id !== sessionID) {
+    return refuse(
+      `Task ${sessionID} could not be read (session ID mismatch); no prompt was sent`,
+    );
+  }
+  if (!parentID) {
+    return refuse(
+      `Task ${sessionID} could not be read (missing parent); no prompt was sent`,
+    );
+  }
+  const agent = typeof data?.agent === 'string' ? data.agent.trim() : undefined;
+  const createdAt =
+    isRecord(data?.time) && typeof data.time.created === 'number'
+      ? data.time.created
+      : undefined;
+  return {
+    kind: 'ok',
+    parentID,
+    hostInfo: data as Record<string, unknown>,
+    ...(agent ? { agent } : {}),
+    ...(typeof data?.outcome === 'string' ? { outcome: data.outcome } : {}),
+    ...(createdAt !== undefined ? { createdAt } : {}),
+    ...(typeof data?.title === 'string' && data.title
+      ? { title: data.title }
+      : {}),
+  };
 }
 
 /** A not-found/404 is positive evidence the host session is gone
@@ -1347,16 +1386,19 @@ async function readParentTranscript(
   parentSessionID: string,
   hostFlavor: string | undefined,
   timeoutMs = TRANSCRIPT_READ_TIMEOUT_MS,
+  timers?: Parameters<typeof raceEvidenceDeadline>[2],
 ): Promise<unknown> {
   // A failed read is no evidence; a held one rejects at the deadline.
   const limit = hostFlavor === 'v2' ? undefined : PARENT_READ_WINDOW + 1;
-  const transcript = await withTimeout(
-    fetchChildTranscript(client, parentSessionID, directory, limit).catch(
-      () => undefined,
-    ),
+  const result = await raceEvidenceDeadline(
+    fetchChildTranscript(client, parentSessionID, directory, limit)
+      .catch(() => undefined)
+      .then((value) => ({ value })),
     timeoutMs,
-    'parent transcript read timed out',
+    timers,
   );
+  if (result === undefined) throw new Error('parent transcript read timed out');
+  const transcript = result.value;
   return limit !== undefined &&
     isRecord(transcript) &&
     Array.isArray(transcript.data) &&
