@@ -72,7 +72,7 @@ Two adjacent findings caution against it, without directly testing
 cross-member council review:
 
 - In [the repeated-review study](https://arxiv.org/abs/2603.16244),
-  repeated rounds in the same session increased recall, but those gains
+  multi-turn review increased recall, but those gains
   were outweighed by precision and F1 degradation as false positives grew.
 - In [the multi-stage pipeline pilot](https://arxiv.org/abs/2603.21454v2),
   allowing later stages to see earlier stages' conclusions produced
