@@ -1127,8 +1127,8 @@ The **terminal-publication wake** closes that gap on both host flavors:
   (`terminalRevision` 1) is suppressed with `reason:
   "first-publication-native-owned"` — the native notifier armed by that
   generation's `subagent` tool call already delivers it to an idle
-  parent; if that native delivery is ever lost host-side, the job falls
-  back to board injection on the parent's next activity. Exception: a
+  parent; if that native delivery is ever lost host-side, the job stays
+  pullable with `task_status` on the parent's next activity. Exception: a
   revived run whose tracker-owned `<task>` notification exhausts its
   whole retry budget releases ownership and re-emits the publication
   wake directly through the scheduler (a revived lineage has no native
@@ -1155,9 +1155,17 @@ per-parent throttle window; a burst of publications collapses into one
 wake).
 
 Related: when a job whose terminal report the parent already consumed
-(reconciled) reopens to running, the board injection appends exactly one
-corrective trailing notice ("previously reported terminal, now running
-again; the earlier report is superseded") in the cache-safe tail zone.
+(reconciled) reopens to running, the plugin appends exactly one corrective
+trailing notice ("previously reported terminal, now running again; the earlier
+report is superseded") in the cache-safe tail zone, pointing at `task_status`.
+
+On v1 hosts the same first-publication rule holds (the native task-tool
+notifier delivers it), and a LATER publication of the same run — which has no
+native notifier on either host — is delivered by the plugin itself: on v1 as
+one self-contained `<completed-job>` delta through the bounded delta queue
+(so it survives a busy parent and the per-parent publication throttle), on v2
+as the bare publication wake below with the result pulled through
+`task_status`.
 
 ### Host outcome quirks the terminal gate defends against
 
