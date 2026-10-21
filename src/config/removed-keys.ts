@@ -23,6 +23,7 @@ export const REMOVED_CONFIG_KEYS = [
   'backgroundJobs.readContextMaxFiles',
   'backgroundJobs.strategy',
   'backgroundJobs.maxRetainedSnapshots',
+  'backgroundJobs.boardInjection',
   'fallback.timeoutMs',
   'fallback.retry_on_empty',
   'fallback.runtimeOverride',

@@ -526,6 +526,12 @@ export const BackgroundJobsConfigStrictSchema = z.object({
         'backgroundJobs.maxRetainedSnapshots was removed; the frozen-replay map is session-bounded',
     })
     .optional(),
+  boardInjection: z
+    .never({
+      error:
+        'backgroundJobs.boardInjection was removed; the job board is never rendered — terminal results arrive as one-shot pushes and task_status is the pull channel',
+    })
+    .optional(),
   orchestratorWake: z
     .object({
       enabled: z
@@ -618,13 +624,6 @@ export const BackgroundJobsConfigStrictSchema = z.object({
     .default(true)
     .describe(
       'When true, intercept wait_for_user calls made while background tasks are still running and the orchestrator wake scheduler is enabled, returning guidance to end the turn instead of blocking on manual input. Default enabled.',
-    ),
-  // Preserved for V1 compatibility. Structurally ignored in V2.
-  boardInjection: z
-    .boolean()
-    .default(true)
-    .describe(
-      'When false on v1 hosts, the Background Job Board is never injected into prompts — tracking, wake, and task_status keep working, and terminal retirement runs through prompt-shape consumption (covering cancelled, which has no native delivery). Default enabled. On v2 hosts the key is ignored with a warning: the native background notifier and inbox delivery replace the passive board.',
     ),
   childInputWake: z
     .boolean()

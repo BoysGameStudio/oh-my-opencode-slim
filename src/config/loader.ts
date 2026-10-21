@@ -802,11 +802,6 @@ export function loadPluginConfig(
     }
   }
 
-  // boardInjection is v1-only: force-disabled at the RuntimeConfig layer on
-  // v2 (native notifier + inbox delivery replace the passive board). An
-  // explicit true warns here — pre-parse, on the merged explicit-only
-  // config — because the loader is the layer that sees user intent, and
-  // Object.hasOwn distinguishes an explicit key from an applied default.
   // periodicWakeEnabled needs no derivation here: v2 disables the periodic
   // evaluation structurally where the wake scheduler is wired (src/index.ts).
   // An explicit true warns the same way, so the override is never silent.
@@ -815,14 +810,6 @@ export function loadPluginConfig(
       string,
       unknown
     >;
-    if (
-      Object.hasOwn(backgroundJobs, 'boardInjection') &&
-      backgroundJobs.boardInjection === true
-    ) {
-      console.warn(
-        '[oh-my-opencode-slim] backgroundJobs.boardInjection is ignored on OpenCode v2 hosts: the native background notifier and inbox delivery replace the passive board. Run oh-my-opencode-slim doctor for details.',
-      );
-    }
     const orchestratorWake = backgroundJobs.orchestratorWake;
     if (
       orchestratorWake !== null &&

@@ -3,7 +3,6 @@ import type {
   BackgroundJobBoard,
   BackgroundJobLaunchInput,
   BackgroundJobLease,
-  BackgroundJobPromptMetadata,
   BackgroundJobRecord,
   BackgroundJobStatusInput,
   BackgroundJobTerminalInput,
@@ -471,20 +470,6 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
 
   hasConvergenceSignals(taskID: string, threshold = 3): boolean {
     return this.board.hasConvergenceSignals(taskID, threshold);
-  }
-
-  formatForPrompt(
-    parentSessionID: string,
-    now = Date.now(),
-  ): string | undefined {
-    return this.board.formatForPrompt(parentSessionID, now);
-  }
-
-  formatForPromptWithMetadata(
-    parentSessionID: string,
-    now = Date.now(),
-  ): BackgroundJobPromptMetadata | undefined {
-    return this.board.formatForPromptWithMetadata(parentSessionID, now);
   }
 
   clearParent(parentSessionID: string): void {

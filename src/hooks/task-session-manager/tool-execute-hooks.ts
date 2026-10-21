@@ -69,7 +69,7 @@ function normalizeObjectiveKey(value: string): string {
 
 /** Trigger line the orchestrator emits on a council synthesis call: the
  * session IDs / board aliases the seat dispatches returned, which the
- * harness resolves host-side from its own Background Job Board, so the
+ * harness resolves host-side from its own job board, so the
  * orchestrator never re-emits seat text as output tokens (Mixture-of-Agents
  * assembly with an independent judge). No /g flag: lastIndex state would
  * skip matches across the findIndex/exec passes. */

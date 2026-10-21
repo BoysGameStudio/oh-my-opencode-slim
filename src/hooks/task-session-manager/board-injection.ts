@@ -1,8 +1,10 @@
 /**
- * Board injection subsystem for task session manager.
+ * Terminal-observation subsystem for the task session manager.
  *
- * Handles injecting Background Job Board state into the message stream
- * and processing synthetic injected completions.
+ * The Background Job Board is never rendered (issue #1647): this module
+ * observes delivery facts already present in the parent's history (host
+ * native completions, the plugin's own tagged `<completed-job>` pushes) and
+ * retires the terminal runs they report.
  *
  * All injection logic must go through the cache-safe helpers in
  * ../cache-safe-injection.ts to ensure prompt cache safety.
@@ -96,29 +98,12 @@ function reportedRunKey(taskID: string, generation: number): string {
   return `${taskID}:${generation}`;
 }
 
-/** Corrective notice text for a reconciled job that reopened to running.
- * Matches the board's system-reminder tone; carries the job identity and
- * the supersession verdict inline. */
-export function formatReopenCorrectionText(
-  correction: ReopenCorrection,
-): string {
-  return formatSystemReminder(
-    [
-      '### Background Job Board — Reopened Job',
-      'A background job that previously reported a terminal result is running again; the earlier report is superseded.',
-      `- ${correction.alias} / ${correction.taskID} / run ${correction.generation} / previously ${correction.priorTerminalState}, now running`,
-      'Consult the Background Job Board for the current state before acting on the earlier result.',
-    ].join('\n'),
-  );
-}
-
-/** Board-injection-off variant of the reopen correction: same facts, but
- * the pointer goes to the pull channel (the board is not injected in this
- * mode, so pointing at it would reference a panel the model cannot see).
- * The correction itself is a staleness notice, not board status — the
- * native notifier covers terminal publications, not the reopen-to-running
+/** Corrective notice for a reconciled job that reopened to running: same
+ * facts, with the pointer at the pull channel (`task_status`). The
+ * correction itself is a staleness notice, not board status — the native
+ * notifier covers terminal publications, not the reopen-to-running
  * transition (#1314's anti-narration scope is board status lines). */
-export function formatReopenCorrectionTextNoBoard(
+export function formatReopenCorrectionText(
   correction: ReopenCorrection,
 ): string {
   return formatSystemReminder(
@@ -194,7 +179,7 @@ function deliverReopenCorrections(
         id: `${baseInfo.id ?? 'board'}-reopen-correction:${key}`,
       },
       {
-        text: formatReopenCorrectionTextNoBoard(correction),
+        text: formatReopenCorrectionText(correction),
         metadataKey: state.metadataKey,
         extraMetadata: { reopenCorrection: true },
       },
