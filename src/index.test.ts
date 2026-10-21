@@ -2102,6 +2102,126 @@ describe('plugin reload generation cleanup', () => {
     },
   );
 
+  // ── Terminal publication push (issue #1647) ─────────────────────────────
+  //
+  // rev-1 completed/error is delivered natively by the host (both hosts), so
+  // OMOS publishes NOTHING for it. A later publication (rev>1) has no native
+  // notifier: v1 pushes ONE self-contained `<completed-job>` delta through
+  // the bounded delta queue (never the drop-prone publication wake), and v2
+  // keeps the bare publication wake.
+
+  async function emitTerminalPublication(record: {
+    pluginConfig?: Record<string, unknown>;
+    /** Terminal revision of the published record (1 = native-owned). */
+    terminalRevision?: number;
+    state?: 'completed' | 'error' | 'cancelled';
+  }) {
+    const completedPush = mock(() => {});
+    const publicationWake = mock(() => {});
+    const createScheduler = wakeHooks.createOrchestratorWakeScheduler;
+    const scheduler = spyOn(
+      wakeHooks,
+      'createOrchestratorWakeScheduler',
+    ).mockImplementation((...args: Parameters<typeof createScheduler>) => ({
+      ...createScheduler(...args),
+      triggerCompletedJobPublication: completedPush,
+      triggerTerminalPublicationWake: publicationWake,
+    }));
+    const subscriptions = spyOn(
+      BackgroundJobCoordinator.prototype,
+      'addTerminalOutcomeListener',
+    );
+    let hooks: Awaited<ReturnType<typeof plugin>> | undefined;
+    try {
+      hooks = await createHooks(record.pluginConfig ?? {});
+      const board = new BackgroundJobBoard();
+      const launch = {
+        taskID: 'child-terminal',
+        parentSessionID: 'parent-1',
+        agent: 'fixer',
+        description: 'terminal publication probe',
+        now: 100,
+      };
+      board.registerLaunch(launch);
+      const state = record.state ?? 'completed';
+      const published = board.updateStatus({
+        taskID: launch.taskID,
+        state,
+        resultSummary: 'the result',
+        now: 200,
+      });
+      if (!published) throw new Error('missing published record');
+      if ((record.terminalRevision ?? 1) > 1) {
+        // A later publication of the same generation: the record runs again
+        // and terminates once more.
+        board.markRunningFromLiveSession(launch.taskID, 300);
+        board.updateStatus({
+          taskID: launch.taskID,
+          state,
+          resultSummary: 'the later result',
+          now: 400,
+        });
+      }
+      const terminal = board.get(launch.taskID);
+      if (!terminal) throw new Error('missing terminal record');
+      for (const [listener] of subscriptions.mock.calls) listener(terminal);
+      return {
+        completedPush,
+        publicationWake,
+        terminal,
+      };
+    } finally {
+      await hooks?.dispose?.();
+      scheduler.mockRestore();
+      subscriptions.mockRestore();
+    }
+  }
+
+  test('rev-1 completed stays native: no plugin push, no wake', async () => {
+    const { completedPush, publicationWake } = await emitTerminalPublication({
+      terminalRevision: 1,
+    });
+    expect(completedPush).not.toHaveBeenCalled();
+    expect(publicationWake).not.toHaveBeenCalled();
+  });
+
+  test('rev>1 completed pushes one self-contained completed-job delta (v1)', async () => {
+    const { completedPush, publicationWake, terminal } =
+      await emitTerminalPublication({
+        terminalRevision: 2,
+      });
+    expect(completedPush).toHaveBeenCalledTimes(1);
+    expect(publicationWake).not.toHaveBeenCalled();
+    const [sessionID, delta, dedupeKey, fence] = completedPush.mock.calls[0] as [
+      string,
+      string,
+      string,
+      { taskID: string; generation: number; terminalRevision: number },
+    ];
+    expect(sessionID).toBe('parent-1');
+    expect(delta).toContain('<completed-job>');
+    expect(delta).toContain('task: child-terminal');
+    expect(delta).toContain('state: completed');
+    expect(delta).toContain('result: the later result');
+    expect(dedupeKey).toBe('child-terminal:1');
+    expect(fence).toMatchObject({
+      taskID: 'child-terminal',
+      generation: 1,
+      terminalRevision: terminal.terminalRevision,
+      state: 'completed',
+    });
+    expect(terminal.terminalRevision).toBeGreaterThan(1);
+  });
+
+  test('a cancelled publication pushes nothing (the stop path owns it)', async () => {
+    const { completedPush, publicationWake } = await emitTerminalPublication({
+      terminalRevision: 2,
+      state: 'cancelled',
+    });
+    expect(completedPush).not.toHaveBeenCalled();
+    expect(publicationWake).not.toHaveBeenCalled();
+  });
+
   // ── C3 host-attributed double-delivery gate ─────────────────────────────
   // A stop the host itself reported (`Host reported outcome:
   // interrupted|cancelled.`) is delivered to the parent by the host's
