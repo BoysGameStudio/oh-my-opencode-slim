@@ -589,6 +589,8 @@ ping all agents
 
 ## 🖥️ Companion
 
+네이티브 소스와 릴리스는 **[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion)** 저장소로 분리되었습니다. 설치, 업데이트, 상태 연동은 플러그인에 남으며 기존 명령과 설정은 변경되지 않습니다.
+
 Companion은 선택적으로 사용하는 데스크톱 플로팅 상태 창입니다.
 현재 세션 상태와 작업 중인 에이전트를 실시간으로 표시하므로,
 백그라운드 작업을 한눈에 파악할 수 있습니다.

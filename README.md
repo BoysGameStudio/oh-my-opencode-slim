@@ -671,6 +671,10 @@ illustrated overview at
 
 ## 🖥️ Companion
 
+Native source and releases: **[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion)**.
+The plugin keeps the installer, updater, and state integration; existing commands
+and configuration are unchanged.
+
 The optional Companion is a floating desktop status window for live agent
 activity. It shows the current session state and which agents are active, so
 background work is easier to follow at a glance.

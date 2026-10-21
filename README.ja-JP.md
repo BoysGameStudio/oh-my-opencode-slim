@@ -538,6 +538,8 @@ ping all agents
 
 ## 🖥️ Companion
 
+ネイティブのソースとリリースは **[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion)** に移りました。インストーラー、更新、状態連携はプラグインに残り、既存のコマンドと設定は変わりません。
+
 任意の Companion は、ライブのエージェント活動を表示するフローティングデスクトップステータスウィンドウです。現在のセッション状態と稼働中のエージェントを表示するため、バックグラウンド作業を一目で追いやすくなります。
 
 <div align="center">

@@ -72,7 +72,9 @@ run by default). The v1 code path is unchanged.
     `wakeRepeatMarker`; child-input wakes exempt, delta-bearing wakes keep
     the full template) and logs `duplicate wake body suppressed`.
     Retries follow the interval timer; failed publication/recovery retains its
-    reason until delivery or a generation change. v2 children mode passes
+     reason until delivery or a generation change. Parent busy transitions
+     retain an SDK-failed publication reason for the next idle, even when
+     periodic wakes are disabled; deletion still discards it. v2 children mode passes
     `delivery: 'queue'` (v1 call shape unchanged).
   - A delivered publication consumes the per-parent throttle inside
     `evaluate`, whether delivered directly, by timer or by one-flight

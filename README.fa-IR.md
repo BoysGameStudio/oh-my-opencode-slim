@@ -621,6 +621,8 @@ auto-updateهای Plugin آن‌ها را به‌روز نگه می‌دارد؛
 
 <h2 dir="rtl" align="right">🖥️ Companion (همراهِ میزکار)</h2>
 
+کد و انتشارهای بومی به **[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion)** منتقل شده‌اند. نصب‌کننده، به‌روزرسانی و ارتباط وضعیت در افزونه باقی می‌مانند؛ دستورها و تنظیمات قبلی تغییر نکرده‌اند.
+
 این پنجره شناور (Companion) اختیاری است، status زنده فعالیت Agentها را روی Desktop
 نمایش می‌دهد. state فعلی session و Agentهای فعال را نشان می‌دهد تا
 پیگیری کارهای پس‌زمینه در یک نگاه ساده‌تر باشد.

@@ -30,7 +30,6 @@
     "AGENTS.md": "8279b6a2e478926e9aa238af7d2986e5",
     "README.md": "c5a57ad9e54d96af16b9c4440249effa",
     "biome.json": "357ddb478c583fdc59e0ab7c912bf2d0",
-    "companion/VIDEOS/README.md": "41de84c6847095524429525e3cb7aac6",
     "package.json": "b0de78a44144766be047a223aa837d04",
     "scripts/benchmark-opencode-cache.ts": "7b35c826831a94b76331d873a20870b9",
     "scripts/cache-smoke.ts": "0b23b2ac2ce45d9fcca9d8744a20a65c",
@@ -260,8 +259,6 @@
   },
   "folder_hashes": {
     ".": "474ddd9ce36e173bb2e5d822ac999bb1",
-    "companion": "f6b91fec8d234cd0226fb33980da3a64",
-    "companion/VIDEOS": "f6b91fec8d234cd0226fb33980da3a64",
     "scripts": "c6688ad9d8f2b3538d68c7dd9a30fed2",
     "src": "d0c58fd2ca1e2ad97766efff83498390",
     "src/agents": "dd7c1abeee4464f6b900e822d36da9e8",
