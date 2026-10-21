@@ -13,7 +13,11 @@ import {
 import { isRecord } from './guards';
 import { log } from './logger';
 import { getClient } from './opencode-client';
-import { raceEvidenceDeadline, readHostSessionInfo } from './session-info-read';
+import {
+  pendingForeignRead,
+  raceEvidenceDeadline,
+  readHostSessionInfo,
+} from './session-info-read';
 import {
   getRuntimeSessionStatusSnapshot,
   type RuntimeSessionStatusSnapshot,
@@ -745,6 +749,18 @@ export function createBackgroundJobTerminalGate(options: {
     if (entry && entry.identity !== identity)
       return { kind: 'blocked', retryAfter: entry.settled };
     if (!entry) {
+      // Outcome reads go through the cross-component registry: a plain
+      // probe may occupy the raw read under a different identity. Defer
+      // before the deadline race — the registry serializes and re-issues
+      // under our identity once the occupant settles, so no attempt is
+      // burned on a chained wait (greptile P1 4339476556).
+      if (key.startsWith('outcome:') && options.input) {
+        const wait = pendingForeignRead(options.input, {
+          taskID: token.taskID,
+          identity,
+        });
+        if (wait) return { kind: 'blocked', retryAfter: wait };
+      }
       const underlying = Promise.resolve().then(operation);
       const release = () => {
         if (openReads.get(key)?.underlying === underlying)

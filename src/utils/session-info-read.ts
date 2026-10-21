@@ -36,15 +36,33 @@ export function raceEvidenceDeadline<T>(
  *  concurrent consumers share the one underlying host read. */
 const sessionInfoReads = new WeakMap<
   object,
-  Map<string, { identity: string; promise: Promise<unknown> }>
+  Map<
+    string,
+    { identity: string; promise: Promise<unknown>; settled: Promise<void> }
+  >
 >();
+
+/** The settle signal of an occupant whose identity differs from the
+ *  caller's, or undefined when the slot is idle or held by the same
+ *  identity. Resolves (never rejects) only after the slot is released, and
+ *  carries no evidence — callers re-enter {@link readHostSessionInfo} to
+ *  read under their own identity. */
+export function pendingForeignRead(
+  input: PluginInput,
+  key: { taskID: string; identity: string },
+): Promise<void> | undefined {
+  const session = getClient(input)?.session;
+  const entry = sessionInfoReads.get(session)?.get(key.taskID);
+  return entry && entry.identity !== key.identity ? entry.settled : undefined;
+}
 
 /** Share the raw, still-open host `session.get` across consumers of one
  *  task. A consumer deadline must not release this slot or authorize a new
  *  read; the entry clears only when the underlying read settles. A caller
- *  holding a different identity (e.g. a newer generation) is refused rather
- *  than handed the older read. Hosts without `session.get` resolve
- *  undefined (capability absence, not evidence). */
+ *  holding a different identity never receives the occupant's evidence:
+ *  it waits for the occupant to settle and re-issues its own fresh read
+ *  under its own identity (serialized, never concurrent). Hosts without
+ *  `session.get` resolve undefined (capability absence, not evidence). */
 export function readHostSessionInfo(
   input: PluginInput,
   key: { taskID: string; identity: string },
@@ -58,22 +76,27 @@ export function readHostSessionInfo(
     sessionInfoReads.set(session, reads);
   }
   const existing = reads.get(key.taskID);
-  if (existing)
-    return existing.identity === key.identity
-      ? existing.promise
-      : Promise.reject(
-          new Error('An earlier session-info observation is still in flight.'),
-        );
+  if (existing) {
+    if (existing.identity === key.identity) return existing.promise;
+    // Serialize, never share: the re-issue happens through the public
+    // reader after the occupant settles, so a same-identity join, slot
+    // release, or a newer foreign read is re-evaluated against current
+    // state at every hop.
+    const settled = existing.settled;
+    return settled.then(() => readHostSessionInfo(input, key));
+  }
   const promise = Promise.resolve().then(() =>
     session.get({
       path: { id: key.taskID },
       query: { directory: input.directory },
     }),
   );
-  reads.set(key.taskID, { identity: key.identity, promise });
+  // Release first, then resolve: foreign waiters and the gate's deferred
+  // retries must never see the slot as occupied behind a settled read.
   const release = () => {
     if (reads.get(key.taskID)?.promise === promise) reads.delete(key.taskID);
   };
-  void promise.then(release, release);
+  const settled = promise.then(release, release);
+  reads.set(key.taskID, { identity: key.identity, promise, settled });
   return promise;
 }
