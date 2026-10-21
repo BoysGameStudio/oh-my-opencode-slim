@@ -10,6 +10,10 @@ v2 loads `default.setup(ctx)` (v1 loads `default.server`). `setup` wraps the v1
 factory to reuse all build logic, then translates the returned v1 `Hooks` into
 v2 registrations. v1 behavior is unchanged.
 
+`client-shim.ts` treats a named `session.prompt` agent as an owning-identity
+assertion against the persisted session agent, not a selection override;
+unverified identity and model/variant overrides fail before prompt admission.
+
 ## Entry Points
 
 | Path | Role |

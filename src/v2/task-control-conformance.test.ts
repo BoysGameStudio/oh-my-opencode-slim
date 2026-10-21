@@ -47,7 +47,7 @@ function harness(
   const host = {
     get: mock(async () => ({
       outcome: 'interrupted',
-      agent: 'persisted-agent',
+      agent: 'explorer',
       model: { id: 'persisted-model', providerID: 'provider', variant: 'high' },
     })),
     context: mock(async () => []),
@@ -137,6 +137,52 @@ function harness(
 }
 
 describe('task controls through the real v2 client shim', () => {
+  test.each([
+    { agent: 'other-agent' },
+    {},
+    { error: 'lookup failed' },
+    undefined,
+  ])(
+    'refuses an unverified owning agent before writing: %j',
+    async (record) => {
+      const h = harness({
+        session: { get: mock(async () => record) as never },
+      });
+      await expect(
+        h.input.client.session.prompt({
+          path: { id: 'ses_child' },
+          body: {
+            agent: 'explorer',
+            noReply: true,
+            parts: [{ type: 'text', text: 'Update' }],
+          },
+        }),
+      ).rejects.toThrow('agent must match');
+      expect(h.host.prompt).not.toHaveBeenCalled();
+      expect(h.host.switchAgent).not.toHaveBeenCalled();
+      expect(h.host.switchModel).not.toHaveBeenCalled();
+    },
+  );
+
+  test('does not write if owning-agent lookup rejects or is unavailable', async () => {
+    for (const get of [
+      undefined,
+      mock(async () => {
+        throw new Error('lookup failed');
+      }),
+    ]) {
+      const h = harness({ session: { get } });
+      await expect(
+        h.input.client.session.prompt({
+          path: { id: 'ses_child' },
+          body: { agent: 'explorer', noReply: true, parts: [] },
+        }),
+      ).rejects.toThrow();
+      expect(h.host.prompt).not.toHaveBeenCalled();
+      expect(h.host.switchAgent).not.toHaveBeenCalled();
+    }
+  });
+
   test.each(
     ['v2', 'v1-idle', 'v1-absent'].flatMap((route) =>
       [
@@ -327,9 +373,10 @@ describe('task controls through the real v2 client shim', () => {
           }),
         );
       } else {
-        expect(h.host.get).not.toHaveBeenCalled();
+        expect(h.host.get).toHaveBeenCalledWith({ sessionID: 'ses_child' });
         expect(h.host.context).not.toHaveBeenCalled();
         expect(shimPrompt.mock.calls[0]?.[0].body).toEqual({
+          agent: 'explorer',
           noReply: true,
           parts: [{ type: 'text', text: 'Update' }],
         });
@@ -693,7 +740,7 @@ describe('task controls through the real v2 client shim', () => {
     expect(h.host.switchModel).not.toHaveBeenCalled();
     expect(h.host.synthetic).not.toHaveBeenCalled();
     expect(h.host.wait).not.toHaveBeenCalled();
-    expect(h.host.get).not.toHaveBeenCalled();
+    expect(h.host.get).toHaveBeenCalledWith({ sessionID: 'ses_child' });
     expect(h.host.context).not.toHaveBeenCalled();
     expect(output).toMatch(/steer/i);
     expect(output).not.toMatch(/read|applied|acknowledged/i);

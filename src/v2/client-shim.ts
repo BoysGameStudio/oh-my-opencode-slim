@@ -583,14 +583,32 @@ export function buildPluginInput(
       prompt: s.prompt
         ? async (args: Record<string, unknown>) => {
             const body = isRecord(args.body) ? args.body : {};
-            if (
-              ['agent', 'model', 'variant'].some(
-                (key) => body[key] !== undefined,
-              )
-            ) {
+            if (['model', 'variant'].some((key) => body[key] !== undefined)) {
               throw new Error(
                 '[v2] session.prompt cannot represent selection overrides (agent/model/variant); inherit the persisted session selection',
               );
+            }
+            // v1 callers must name the owning agent. On v2 this is an
+            // identity assertion, not a request to switch selection: the flat
+            // prompt API always inherits the persisted session agent.
+            if (body.agent !== undefined) {
+              const session = s.get
+                ? await withTimeout(
+                    s.get({ sessionID: sessionIDOf(args) }),
+                    5_000,
+                    '[v2] session.prompt agent identity lookup timed out',
+                  )
+                : undefined;
+              if (
+                typeof body.agent !== 'string' ||
+                !body.agent ||
+                !isRecord(session) ||
+                session.agent !== body.agent
+              ) {
+                throw new Error(
+                  '[v2] session.prompt cannot represent selection overrides: agent must match the persisted session agent',
+                );
+              }
             }
             const files = filesFromBody(args);
             // `delivery` decides the inbox consumption boundary

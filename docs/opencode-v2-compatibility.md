@@ -339,8 +339,11 @@ child bridge degrades with a one-time warning.
 The v1-facing `session.prompt` shim preserves text and file attachments. A
 `noReply: true` write is a real, non-synthetic prompt with `queue` + `resume: false` (or `steer` + `resume: false` when `task_message` passes an explicit v2-only `delivery: "steer"`);
 queue alone would not preserve the no-resume intent. Unsupported per-call
-agent/model/variant overrides are rejected before writing, never silently dropped
-or implemented by non-atomic `switchAgent`/`switchModel` calls. `task_message`
+model/variant overrides and agent changes are rejected before writing, never
+silently dropped or implemented by non-atomic `switchAgent`/`switchModel` calls.
+A named owning agent is an identity assertion: the shim verifies it matches
+`session.get().agent` before admitting the prompt. Missing, mismatched, or
+unreadable identity fails closed without a write or selection switch. `task_message`
 explicitly inherits persisted selection on v2; other noReply callers, including
 interview notifications, retain the same no-resume semantics.
 

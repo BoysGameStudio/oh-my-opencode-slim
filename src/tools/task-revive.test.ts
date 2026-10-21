@@ -32,6 +32,7 @@ import { createCancelTaskTool } from './cancel-task';
 import { createTaskReviveTool } from './task-revive';
 
 const gates: BackgroundJobTerminalGate[] = [];
+const trackers: RevivedRunTracker[] = [];
 
 function createTool(overrides?: {
   abort?: () => Promise<unknown>;
@@ -84,6 +85,7 @@ function createTool(overrides?: {
     }),
     overrides?.revivedRunTracker,
   );
+  trackers.push(revivedRunTracker);
   const onLaunch = mock(overrides?.onLaunch ?? (() => {}));
   const tools = createTaskReviveTool({
     input,
@@ -136,6 +138,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const tracker of trackers.splice(0)) tracker.dispose();
   for (const gate of gates.splice(0)) gate.dispose();
   jest.useRealTimers();
   mock.restore();

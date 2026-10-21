@@ -76,6 +76,7 @@ async function loadPlugin(
   const cleanup = async () => {
     if (cleaned) return;
     cleaned = true;
+    await hooks.dispose?.();
     for (const [key, value] of previousValues) {
       if (value === undefined) {
         delete process.env[key];
