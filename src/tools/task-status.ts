@@ -16,8 +16,13 @@ import {
   type GateResult,
   runtimeObservationFromSnapshot,
 } from '../utils/background-job-terminal-gate';
+import { isRecord } from '../utils/guards';
 import { getClient } from '../utils/opencode-client';
 import { SESSION_ID_PATTERN } from '../utils/session';
+import {
+  raceEvidenceDeadline,
+  readHostSessionInfo,
+} from '../utils/session-info-read';
 import {
   classifyLiveSession,
   getRuntimeSessionStatusSnapshot,
@@ -42,6 +47,9 @@ import {
 
 const ACTIVE_STATES = new Set(['busy', 'running', 'retry']);
 const UNTRACKED_STATE = 'running-or-incomplete';
+
+/** Bound for the shared host session-info read (matches the probe's own). */
+const DEFAULT_HOST_INFO_TIMEOUT_MS = 1_500;
 
 /**
  * The running-branch `[guidance]` block, shared byte-for-byte by the tracked
@@ -186,7 +194,13 @@ export function createTaskStatusTool(options: {
       const canonical = options.resolveCanonicalTaskRef
         ? await options.resolveCanonicalTaskRef(parentSessionID, requested)
         : undefined;
-      if (canonical?.kind === 'refused') throw new Error(canonical.reason);
+      if (canonical?.kind === 'refused')
+        throw new Error(
+          withRecentTaskHandles(
+            canonical.reason,
+            recentTaskHandles(options.backgroundJobBoard, parentSessionID),
+          ),
+        );
       const identity = canonical?.taskID ?? requested;
       const job = canonical
         ? options.backgroundJobBoard.get(identity)
@@ -389,7 +403,13 @@ async function readTaskResult(
     requested,
   );
   if (resolution.kind === 'disposed') throw new Error(pluginDisposedMessage());
-  if (resolution.kind === 'refused') throw new Error(resolution.reason);
+  if (resolution.kind === 'refused')
+    throw new Error(
+      withRecentTaskHandles(
+        resolution.reason,
+        recentTaskHandles(options.board, parentSessionID),
+      ),
+    );
   const { identity, canonical, job: tracked } = resolution;
   if (tracked && tracked.parentSessionID !== parentSessionID) {
     throw new Error(`Task ${identity} does not belong to this session`);
@@ -444,21 +464,55 @@ async function readTaskResult(
   const client = getClient(options.input);
   let hostInfo: Record<string, unknown> | undefined;
   let hostInfoRead = false;
-  // One host session-info read per query: the terminal probe classifies from
-  // it and the ownership gate below reuses it instead of re-reading.
+  let hostInfoError: unknown;
+  // One host session-info read per query, sharing the terminal gate's raw
+  // in-flight read: the probe classifies from it and the ownership gate
+  // below reuses it instead of re-reading. A deadline or failed read
+  // degrades the probe to its bounded path (unknown, never a hang) and the
+  // ownership gate below fails closed for untracked ids.
+  const readIdentity =
+    current === undefined
+      ? `untracked:${parentSessionID}:${taskID}`
+      : `tracked:${current.generation}`;
+  const readHostInfoOnce = async (): Promise<void> => {
+    if (hostInfoRead) return;
+    hostInfoRead = true;
+    if (typeof client.session.get !== 'function') return;
+    try {
+      const tagged = readHostSessionInfo(options.input, {
+        taskID,
+        identity: readIdentity,
+      }).then(
+        (value) => ({ value, failed: false as const }),
+        (error) => ({ error, failed: true as const }),
+      );
+      const raced = await raceEvidenceDeadline(
+        tagged,
+        options.readTimeoutMs ?? DEFAULT_HOST_INFO_TIMEOUT_MS,
+      );
+      if (raced === undefined) {
+        hostInfoError = new Error('session info read timed out');
+        return;
+      }
+      if (raced.failed) {
+        hostInfoError = raced.error;
+        return;
+      }
+      const response = raced.value;
+      hostInfo =
+        isRecord(response) && isRecord(response.data)
+          ? response.data
+          : isRecord(response)
+            ? response
+            : undefined;
+    } catch (error) {
+      hostInfoError = error;
+    }
+  };
   const loadHostInfo = async (): Promise<
     Record<string, unknown> | undefined
   > => {
-    if (hostInfoRead) return hostInfo;
-    hostInfoRead = true;
-    if (typeof client.session.get !== 'function') return undefined;
-    const response = await client.session.get({
-      path: { id: taskID },
-      query: { directory: options.input.directory },
-    });
-    if (response.data?.parentID !== parentSessionID)
-      throw new Error(`Task ${requested} does not belong to this session`);
-    hostInfo = response.data as Record<string, unknown> | undefined;
+    await readHostInfoOnce();
     return hostInfo;
   };
   if (current?.state === 'running') {
@@ -490,11 +544,21 @@ async function readTaskResult(
   }
 
   const token = current ? gate.capture(current) : undefined;
-  await loadHostInfo();
+  await readHostInfoOnce();
   if (typeof client.session.get !== 'function' && !current)
     throw new Error(
       `Task ${requested} is not tracked by this session and cannot be verified`,
     );
+  if (hostInfoError !== undefined) {
+    if (!current)
+      throw new Error(
+        `Task ${requested} is not tracked by this session and cannot be verified`,
+      );
+  } else if (typeof client.session.get === 'function') {
+    // Ownership gate: a readable projection must name this parent.
+    if (hostInfo?.parentID !== parentSessionID)
+      throw new Error(`Task ${requested} does not belong to this session`);
+  }
 
   if (current) {
     const latest = board.get(taskID);

@@ -933,6 +933,7 @@ describe('task_status v2 terminal-outcome probe', () => {
       outcome?: string;
       idle?: number;
       resultFirstRead?: boolean;
+      getFails?: boolean;
     } = {},
   ) {
     const board = new BackgroundJobBoard();
@@ -945,6 +946,7 @@ describe('task_status v2 terminal-outcome probe', () => {
     });
     let getCalls = 0;
     const get = mock(async () => {
+      if (options.getFails) throw new Error('host read failed');
       const idle =
         options.resultFirstRead && getCalls++ === 0 ? 0 : (options.idle ?? 5);
       return {
@@ -983,6 +985,49 @@ describe('task_status v2 terminal-outcome probe', () => {
   }
 
   const context = { sessionID: 'parent-1' } as never;
+
+  test('a failing host-info read degrades to the unconfirmed reply instead of throwing', async () => {
+    const h = makeProbeTool({ getFails: true });
+    const output = await h.tool.task_status.execute(
+      { task_id: 'exp-1' },
+      context,
+    );
+    expect(String(output)).toContain('state: running (unconfirmed)');
+    expect(String(output)).toContain('status_uncertain: true');
+    const refusal = await h.tool.task_status.execute(
+      { task_id: 'exp-1', result: true },
+      context,
+    );
+    expect(String(refusal)).toContain('state: running (unconfirmed)');
+  });
+
+  test('a refused alias enumerates recent handles in both modes', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'ses_child1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'probe',
+      now: 1,
+    });
+    const { task_status } = makeTool({
+      board,
+      resolveCanonicalTaskRef: async () => ({
+        kind: 'refused',
+        reason: 'Unknown task ID or alias: fix-9',
+      }),
+    });
+    for (const args of [
+      { task_id: 'fix-9' },
+      { task_id: 'fix-9', result: true },
+    ]) {
+      const error = (await task_status
+        .execute(args, { sessionID: 'parent-1' } as never)
+        .catch((e: Error) => e)) as Error;
+      expect(error.message).toContain('Unknown task ID or alias: fix-9');
+      expect(error.message).toContain('recent:');
+    }
+  });
 
   test('plain query publishes the terminal state from an attributable outcome', async () => {
     const h = makeProbeTool({ outcome: 'succeeded', idle: 5 });

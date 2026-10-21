@@ -22,6 +22,7 @@ import {
   resolveTaskRecord,
   taskRefArgs,
   unknownTaskRefError,
+  withRecentTaskHandles,
 } from './task-ref';
 
 const z = tool.schema;
@@ -91,7 +92,13 @@ export function createTaskMessageTool(options: {
       if (!requested) throw new Error(`task_message requires ${idParam}`);
       const ref = await resolveTaskRecord(options, parentSessionID, requested);
       if (ref.kind === 'disposed') throw new Error(pluginDisposedMessage());
-      if (ref.kind === 'refused') throw new Error(ref.reason);
+      if (ref.kind === 'refused')
+        throw new Error(
+          withRecentTaskHandles(
+            ref.reason,
+            recentTaskHandles(options.backgroundJobBoard, parentSessionID),
+          ),
+        );
       // The await above resumes in a later microtask; a disposal queued in
       // that gap must still stop the send path (the helper's disposed
       // check ran before the gap).

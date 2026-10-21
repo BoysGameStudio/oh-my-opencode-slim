@@ -2,6 +2,7 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import type { CurrentRoundClassification } from './child-transcript';
 import { isRecord } from './guards';
 import { getClient } from './opencode-client';
+import { raceEvidenceDeadline, readHostSessionInfo } from './session-info-read';
 
 export type RuntimeSessionStatus = 'busy' | 'retry' | 'idle';
 export const DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS = 5_000;
@@ -252,24 +253,32 @@ export async function classifyLiveSession(
       reason: 'session-status and session-get unavailable on this host',
     };
   }
-  let response: unknown;
-  try {
-    response = await withTimeout(
-      Promise.resolve().then(() =>
-        client.session.get({
-          path: { id: sessionID },
-          query: { directory: input.directory },
-        }),
-      ),
-      timeoutMs,
-      options.timers,
-    );
-  } catch (error) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return { kind: 'unknown', reason: 'Session status lookup timed out' };
+  }
+  // One shared raw read per client+session; the deadline releases only this
+  // waiter, so a stalled host read is never re-issued behind itself.
+  const tagged = readHostSessionInfo(input, {
+    taskID: sessionID,
+    identity: `standalone:${sessionID}`,
+  }).then(
+    (value) => ({ value, failed: false as const }),
+    (error) => ({ error, failed: true as const }),
+  );
+  const raced = await raceEvidenceDeadline(tagged, timeoutMs, options.timers);
+  if (raced === undefined) {
+    return { kind: 'unknown', reason: 'Session status lookup timed out' };
+  }
+  if (raced.failed) {
     return {
       kind: 'unknown',
-      reason: error instanceof Error ? error.message : String(error),
+      reason:
+        raced.error instanceof Error
+          ? raced.error.message
+          : String(raced.error),
     };
   }
+  const response = raced.value;
   if (
     !isRecord(response) ||
     (response.error !== undefined && response.error !== null)

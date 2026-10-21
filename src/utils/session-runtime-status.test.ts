@@ -206,6 +206,44 @@ describe('getRuntimeSessionStatusSnapshot capability probe', () => {
 });
 
 describe('classifyLiveSession', () => {
+  test('concurrent probes share one in-flight host-info read', async () => {
+    let resolveRead: (value: unknown) => void = () => {};
+    const pending = new Promise<unknown>((resolve) => {
+      resolveRead = resolve;
+    });
+    const get = mock(() => pending);
+    const input = pluginInputWithClient({ session: { get } } as never);
+    const first = classifyLiveSession(input, 'ses_shared');
+    const second = classifyLiveSession(input, 'ses_shared');
+    await Promise.resolve();
+    expect(get).toHaveBeenCalledTimes(1);
+    resolveRead({ data: { outcome: 'succeeded', time: { idle: 4 } } });
+    expect(await first).toEqual({
+      kind: 'outcome',
+      outcome: 'succeeded',
+      idleAt: 4,
+    });
+    expect(await second).toEqual({
+      kind: 'outcome',
+      outcome: 'succeeded',
+      idleAt: 4,
+    });
+  });
+
+  test('a rejected host-info read classifies unknown instead of throwing', async () => {
+    const get = mock(async () => {
+      throw new Error('host read failed');
+    });
+    const result = await classifyLiveSession(
+      pluginInputWithClient({ session: { get } } as never),
+      'ses_1',
+    );
+    expect(result.kind).toBe('unknown');
+    if (result.kind === 'unknown') {
+      expect(result.reason).toContain('host read failed');
+    }
+  });
+
   test.each([
     [{ type: 'busy' }, 'running'],
     [{ type: 'retry' }, 'running'],
