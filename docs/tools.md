@@ -45,6 +45,15 @@ Fast, structural code search and refactoring - more powerful than plain text gre
 
 `ast_grep` understands code structure, so it can find patterns like "all arrow functions that return a JSX element" rather than relying on exact text matching.
 
+If the ast-grep CLI is missing or cannot execute, the tools attempt automatic
+recovery once, then return an error rather than retrying indefinitely. Missing
+paths are rediscovered locally before downloading, so an installed CLI can be
+used offline. Only an unusable plugin-cached binary is removed; package and
+system binaries are never deleted. Downloaded Linux binaries require glibc.
+On Alpine/musl, build a compatible binary locally
+(`cargo install ast-grep --locked`), copy it to the plugin cache path shown in
+the error, and restart OpenCode.
+
 `ast_grep_replace` previews changes by default. Set `dryRun: false` to write
 the replacements. Report-size limits do not limit which matching rewrites
 are applied. Write failures and timeouts return errors instead of a successful
