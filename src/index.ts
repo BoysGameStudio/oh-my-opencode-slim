@@ -62,6 +62,7 @@ import {
   createToolLoopGuardHook,
   ForegroundFallbackManager,
   formatChildInputWaitDelta,
+  formatCompletedJobDelta,
   formatStoppedJobDelta,
   GOAL_POINTER_METADATA_KEY,
   HOST_ATTRIBUTED_STOP_OUTCOME,
@@ -1154,9 +1155,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       terminalGate,
       // Flip mechanism half reads the per-instance box declared above.
       isBackgroundDefaultFlipArmed: backgroundDefaultFlip.isArmed,
+      // Host flavor marker; v1 hosts are structurally boardless (issue
+      // #1647): the machine board is never rendered.
       hostFlavor,
-      // v1-only honoured switch (forced false on v2 at RuntimeConfig).
-      boardInjection: runtime.backgroundJobs.boardInjection,
       maxSessionsPerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
       backgroundJobBoard: backgroundJobCoordinator,
       backgroundJobSupervisor,
@@ -1229,11 +1230,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             : (runtime.backgroundJobs.orchestratorWake.periodicWakeEnabled ??
               true),
       },
-      // Honoured switch: wake annotations follow the board the parent
-      // actually sees — rendered on v1 unless boardInjection is false;
-      // RuntimeConfig forces it false on v2 (structural boardless, see
-      // injectBackgroundJobBoard).
-      boardInjectionEnabled: runtime.backgroundJobs.boardInjection,
+      // The machine board is never rendered, so wake annotations always point
+      // at the pull channel (`task_status`).
       childInputWakeKinds: runtime.backgroundJobs.childInputWakeKinds,
       shouldManageSession: (sessionID) =>
         sessionMetadata.getAgent(sessionID) === 'orchestrator',
@@ -1254,6 +1252,17 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           record?.generation === generation &&
           record.state === 'stopped' &&
           record.terminalUnreconciled
+        );
+      },
+      // A queued completed-job result stays actionable only while the record
+      // is still the SAME run's terminal publication: a reopened record (or
+      // one that published again) must not be reported from a stale delta.
+      isCompletedJobCurrent: (taskID, generation) => {
+        const record = backgroundJobCoordinator.get(taskID);
+        return (
+          record?.generation === generation &&
+          record.terminalUnreconciled === true &&
+          (record.state === 'completed' || record.state === 'error')
         );
       },
       isChildInputWaitCurrent: (taskID, requestID) => {
@@ -1449,7 +1458,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
       // First-publication ownership (live-verified on a 2.0.8 host): the
       // native notifier delivers a run's FIRST terminal publication to
-      // the parent even while it sits idle, so a plugin wake beside it
+      // the parent even while it sits idle, so a plugin push beside it
       // would double-notify. On v2 EVERY plugin task launch AND relaunch
       // is a host `subagent` tool call that arms the host's native
       // background notifier — a relaunch re-arms it with a fresh
@@ -1461,9 +1470,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // native notifier and remain the plugin's to deliver (v1 behaves
       // the same: the native task tool arms notifyBackgroundResult per
       // background call). Edge: if a native delivery is ever lost
-      // host-side, the job falls back to the passive display channel on
-      // the parent's next activity — board injection when enabled, or
-      // nothing until the next task_status pull otherwise.
+      // host-side, the job falls back to the stale-terminal display on
+      // the parent's next activity, or stays silent until the next
+      // task_status pull.
       // A startup-adopted row was launched before this plugin instance
       // existed, so no native observer survives to deliver its first
       // publication. The plugin owns that wake.
@@ -1472,6 +1481,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         // is not proof of delivery, so nothing is acknowledged here: the
         // next restart's history scan either finds a trusted current-run
         // delivery or re-owns this terminal outcome.
+
         log('[orchestrator-wake] terminal publication wake skipped', {
           sessionID: record.parentSessionID,
           taskID: record.taskID,
@@ -1480,6 +1490,45 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           verdict: 'skipped',
           reason: 'first-publication-native-owned',
         });
+        return;
+      }
+      if (hostFlavor !== 'v2') {
+        // v1 is structurally boardless: the board no longer carries later
+        // terminal results. Push ONE self-contained `<completed-job>` delta
+        // through the bounded delta queue (durable across a busy parent and
+        // the publication throttle) instead of the drop-prone publication
+        // wake. The fence in the part metadata retires exactly this
+        // publication when the parent observes it.
+        if (
+          runtime.backgroundJobs.orchestratorWake.wakeOnTerminalPublication ===
+          false
+        ) {
+          return;
+        }
+        const state =
+          record.terminalState === 'completed' ||
+          record.terminalState === 'error'
+            ? record.terminalState
+            : record.state === 'completed' || record.state === 'error'
+              ? record.state
+              : undefined;
+        if (!state) return;
+        orchestratorWakeScheduler?.triggerCompletedJobPublication(
+          record.parentSessionID,
+          formatCompletedJobDelta({
+            alias: record.alias,
+            taskID: record.taskID,
+            state,
+            resultSummary: record.resultSummary ?? state,
+          }),
+          `${record.taskID}:${record.generation}`,
+          {
+            taskID: record.taskID,
+            generation: record.generation,
+            terminalRevision: record.terminalRevision,
+            state,
+          },
+        );
         return;
       }
       void (async () => {

@@ -24,6 +24,7 @@ import { DEFAULT_CHILD_INPUT_WAKE_KINDS } from '../../config/constants';
 import {
   createInternalAgentTextPart,
   isInternalInitiatorPart,
+  TERMINAL_DELTA_METADATA_KEY,
 } from '../../utils';
 import { stringifyError } from '../../utils/child-transcript';
 import { isRecord as isObjectRecord } from '../../utils/guards';
@@ -63,11 +64,6 @@ export const ORCHESTRATOR_WAKE_TEXT =
   '<system-reminder>\nFinish any incomplete TODOs. Await running agents; if one appears stuck, assess it and cancel/respawn only when justified. Do not respond to this reminder.\n</system-reminder>';
 
 export const ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT =
-  '<system-reminder>\nA background job stopped without a terminal result. Consult the Background Job Board, recover or reroute the work as needed, and do not wait for that job as if it were still running. Do not respond to this reminder.\n</system-reminder>';
-
-/** Board-injection-off variant: the board never appears in prompts, so the
- * wake points at the pull channel that carries the same facts. */
-export const ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD =
   '<system-reminder>\nA background job stopped without a terminal result. Check `task_status` for the stopped task, recover or reroute the work as needed, and do not wait for that job as if it were still running. Do not respond to this reminder.\n</system-reminder>';
 
 /**
@@ -163,6 +159,19 @@ export function formatStoppedJobDelta(record: {
   reason: string;
 }): string {
   return `<stopped-job>\nalias: ${record.alias}\ntask: ${record.taskID}\nstate: ${record.state}\nreason: ${record.reason}\n</stopped-job>`;
+}
+
+/** Self-contained result for a later terminal publication not covered by the
+ * host's native first-publication notifier. The result text is carried
+ * verbatim; the generation/revision fence travels in part metadata, never in
+ * the prompt-visible body. */
+export function formatCompletedJobDelta(record: {
+  alias: string;
+  taskID: string;
+  state: 'completed' | 'error';
+  resultSummary: string;
+}): string {
+  return `<completed-job>\nalias: ${record.alias}\ntask: ${record.taskID}\nstate: ${record.state}\nresult: ${record.resultSummary}\n</completed-job>`;
 }
 
 /** Host-attributed stop outcome (shared with the stopped-recovery wake
@@ -263,10 +272,6 @@ export const WAKE_REPEAT_CORES: ReadonlyMap<string, string> = new Map([
   ],
   [
     ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT,
-    'A background job stopped without a terminal result; consult the Background Job Board and recover or reroute the work as needed.',
-  ],
-  [
-    ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD,
     'A background job stopped without a terminal result; check task_status for the stopped task and recover or reroute the work as needed.',
   ],
   [
@@ -316,29 +321,38 @@ export const STOPPED_RECOVERY_QUEUE_CAP = 32;
 export const STOPPED_RECOVERY_WAKE_CHUNK = 8;
 
 /** Recovery facts that overflow the bounded detail queue still produce a
- * durable, actionable signal. The parent can consult the board for the facts
- * whose inline details were coalesced. */
+ * durable, actionable signal. The retained overflowed task identifiers are
+ * appended by the caller; `task_status` resolves each one. */
 export const STOPPED_RECOVERY_OVERFLOW_TEXT =
-  '<stopped-job-overflow>\nAdditional stopped-job recovery facts were queued beyond the inline detail limit. Consult the Background Job Board for all unreconciled stopped jobs.\n</stopped-job-overflow>';
+  '<stopped-job-overflow>\nAdditional stopped-job recovery facts were queued beyond the inline detail limit. Check task_status for the listed task IDs.\n</stopped-job-overflow>';
 
-/** Board-injection-off variant: overflow facts are pulled, not displayed.
- * The retained overflowed task identifiers are appended by the caller —
- * this notice alone cannot make the stops discoverable. */
-export const STOPPED_RECOVERY_OVERFLOW_TEXT_NO_BOARD =
-  '<stopped-job-overflow>\nAdditional stopped-job recovery facts were queued beyond the inline detail limit. The retained overflowed stopped task IDs are listed below; check `task_status` for each to see its facts.\n</stopped-job-overflow>';
+/** Completed results that overflow the bounded detail queue keep a durable
+ * pointer to the on-demand pull channel. */
+export const COMPLETED_JOB_OVERFLOW_TEXT =
+  '<completed-job-overflow>\nAdditional completed-job results were queued beyond the inline detail limit. Check task_status for the listed task IDs.\n</completed-job-overflow>';
 
-/** Upper bound on task identifiers inlined in the board-less overflow
- * notice: keeps the wake prompt bounded under pathological stop floods;
- * evictions beyond the cap are reported as a count, not listed. */
+/** Max completed-job results queued per parent. Same bounding policy as the
+ * stopped-job recovery queue: oldest entries are dropped with an overflow
+ * bump, so a busy parent cannot grow an unbounded push. */
+export const COMPLETED_JOB_QUEUE_CAP = 32;
+
+/** Max completed-job results appended to one push. Remaining entries stay
+ * queued for the next wake. */
+export const COMPLETED_JOB_WAKE_CHUNK = 8;
+
+/** Upper bound on task identifiers inlined in the overflow notice: keeps the
+ * wake prompt bounded under pathological stop floods; evictions beyond the
+ * cap are reported as a count, not listed. */
 export const STOPPED_RECOVERY_OVERFLOW_ID_CAP = 64;
 
-/** Bounded overflow IDs shared by both queues; unretained entries stay honest. */
+/** Bounded overflow IDs shared by all queues; unretained entries stay honest. */
 function overflowedTaskIDs(
   keys: string[],
   totalOverflowCount: number,
-  kind: 'stopped-job' | 'child-input-wait',
+  kind: 'stopped-job' | 'completed-job' | 'child-input-wait',
 ): string {
-  const parse = kind === 'stopped-job' ? parseRecoveryKey : parseChildInputKey;
+  const parse =
+    kind === 'child-input-wait' ? parseChildInputKey : parseRecoveryKey;
   const ids = [
     ...new Set(
       keys
@@ -456,6 +470,10 @@ export type OrchestratorWakeOptions = {
    * The callback must check both the task generation and that the current
    * record is still stopped and terminal-unreconciled. */
   isStoppedJobRecoveryCurrent?: (taskID: string, generation: number) => boolean;
+  /** Revalidate a queued completed-job result immediately before delivering
+   * its push. The callback must check both the task generation and that the
+   * current record is still terminal-unreconciled in the same state. */
+  isCompletedJobCurrent?: (taskID: string, generation: number) => boolean;
   /** Revalidate a queued child input wait immediately before delivering its
    * wake. The callback must check the ask is still open for the current run
    * of the child task. */
@@ -479,11 +497,6 @@ export type OrchestratorWakeOptions = {
   clearTimeout?: WakeSchedulerTimers['clearTimeout'];
   /** Observation clock for publication spacing; independent of scheduling. */
   now?: () => number;
-  /** Whether the Background Job Board is injected into orchestrator
-   * prompts. Stopped-recovery and overflow wake texts reference the board
-   * only when it is actually visible to the model; otherwise they point at
-   * `task_status` instead. Absent means enabled (v1 parity). */
-  boardInjectionEnabled?: boolean;
   /** C2 writer-lane verdict for a queued child task: the caller derives it
    * from the child agent's role write permissions. Return false only for a
    * task whose agent is known to lack write capability; unknown tasks and
@@ -829,9 +842,25 @@ function isInputWaitAskEvent(type: string): boolean {
   return type === 'permission.asked' || type === 'question.asked';
 }
 
+/** Exact terminal run a queued completed-job result reports. The identifier
+ * and the fence ride the delivered part's metadata (never the prompt-visible
+ * body), so retirement can be generation-fenced without extra prompt bytes. */
+export type CompletedJobFence = {
+  taskID: string;
+  generation: number;
+  terminalRevision: number;
+  state: 'completed' | 'error';
+};
+
+/** One queued delta: its prompt body plus an optional retirement fence. */
+type DeltaEntry = {
+  text: string;
+  fence?: CompletedJobFence;
+};
+
 /** One wake kind's queued deltas for one parent session. */
 type DeltaBatch = {
-  deltas: Map<string, string>;
+  deltas: Map<string, DeltaEntry>;
   /** Number of detail entries coalesced beyond the bounded queue. */
   overflowCount: number;
   /** Keys of entries dropped by the cap, newest-first-drop order. The
@@ -845,14 +874,22 @@ type DeltaQueuePolicy = {
   /** Max deltas per parent; the oldest is dropped with an overflow bump. */
   cap: number;
   /** scheduleBlocker trigger name used when this queue's wake is blocked. */
-  blockerTrigger: 'stopped-job-recovery' | 'child-input';
+  blockerTrigger:
+    | 'stopped-job-recovery'
+    | 'terminal-publication'
+    | 'child-input';
   /** Whether a queued delta is still actionable (unparseable keys are not). */
   isCurrent?: (key: string) => boolean;
 };
 
 type DeltaQueue = DeltaQueuePolicy & {
   batches: Map<string, DeltaBatch>;
-  add: (sessionID: string, delta: string, dedupeKey?: string) => void;
+  add: (
+    sessionID: string,
+    delta: string,
+    dedupeKey?: string,
+    fence?: CompletedJobFence,
+  ) => void;
   prune: (batch: DeltaBatch | undefined) => boolean;
 };
 
@@ -866,7 +903,12 @@ function makeDeltaQueue(policy: DeltaQueuePolicy): DeltaQueue {
   const batches = new Map<string, DeltaBatch>();
 
   /** Queue a delta for the session's next wake of this kind. */
-  const add = (sessionID: string, delta: string, dedupeKey?: string): void => {
+  const add = (
+    sessionID: string,
+    delta: string,
+    dedupeKey?: string,
+    fence?: CompletedJobFence,
+  ): void => {
     let batch = batches.get(sessionID);
     if (!batch) {
       batch = { deltas: new Map(), overflowCount: 0, overflowedKeys: [] };
@@ -874,7 +916,7 @@ function makeDeltaQueue(policy: DeltaQueuePolicy): DeltaQueue {
     }
     const key = dedupeKey ?? delta;
     if (batch.deltas.has(key)) {
-      batch.deltas.set(key, delta);
+      batch.deltas.set(key, { text: delta, fence });
       return;
     }
     while (batch.deltas.size >= policy.cap) {
@@ -889,7 +931,7 @@ function makeDeltaQueue(policy: DeltaQueuePolicy): DeltaQueue {
         batch.overflowedKeys.push(oldest);
       }
     }
-    batch.deltas.set(key, delta);
+    batch.deltas.set(key, { text: delta, fence });
   };
 
   /** Drop stale details and retained overflow keys before delivery. Counts
@@ -979,7 +1021,6 @@ export function createOrchestratorWakeScheduler(
   const now = options.now ?? Date.now;
   const enabled = options.config.enabled === true;
   const periodicWakeEnabled = options.config.periodicWakeEnabled ?? true;
-  const boardInjectionEnabled = options.boardInjectionEnabled ?? true;
   const wakeOnTerminalPublication =
     options.config.wakeOnTerminalPublication ?? true;
   const publicationWakeMinIntervalMs =
@@ -1045,6 +1086,29 @@ export function createOrchestratorWakeScheduler(
       : undefined,
   });
   const pendingStoppedRecoveries = stoppedRecoveryQueue.batches;
+
+  const completedCurrent = options.isCompletedJobCurrent;
+  /** Later terminal results (rev>1 completed/error) the host's native
+   * first-publication notifier does not cover, carrying one self-contained
+   * `<completed-job>` delta each (see `formatCompletedJobDelta`). Deduplicated
+   * per execution by `${taskID}:${generation}`; bounded per parent
+   * (`COMPLETED_JOB_QUEUE_CAP`) with at most `COMPLETED_JOB_WAKE_CHUNK`
+   * entries per wake and an overflow pointer to `task_status`. Deltas that
+   * arrive while a wake is in flight survive its confirmation: only the keys
+   * actually sent are retired on delivery. */
+  const completedJobQueue = makeDeltaQueue({
+    cap: COMPLETED_JOB_QUEUE_CAP,
+    blockerTrigger: 'terminal-publication',
+    isCurrent: completedCurrent
+      ? (key) => {
+          const parsed = parseRecoveryKey(key);
+          return parsed
+            ? completedCurrent(parsed.taskID, parsed.generation)
+            : false;
+        }
+      : undefined,
+  });
+  const pendingCompletedJobs = completedJobQueue.batches;
 
   /** Last delivered publication wake per parent (epoch ms), for the
    * `publicationWakeMinIntervalMs` throttle. Direct, timer and waiter
@@ -1268,6 +1332,7 @@ export function createOrchestratorWakeScheduler(
     clearLocalSession(sessionID);
     clearWakeSession(sessionID);
     pendingStoppedRecoveries.delete(sessionID);
+    pendingCompletedJobs.delete(sessionID);
     lastPublicationWakeAt.delete(sessionID);
     pendingPublications.delete(sessionID);
     pendingChildInputWakes.delete(sessionID);
@@ -1367,7 +1432,7 @@ export function createOrchestratorWakeScheduler(
   function reportScheduleBlocker(
     sessionID: string,
     reason: string,
-    trigger?: 'stopped-job-recovery' | 'child-input',
+    trigger?: 'stopped-job-recovery' | 'terminal-publication' | 'child-input',
   ): void {
     let reasons = reportedScheduleBlockers.get(sessionID);
     if (!reasons) {
@@ -1911,7 +1976,8 @@ export function createOrchestratorWakeScheduler(
     if (
       recoveryWake &&
       childInputTimers.has(sessionID) &&
-      !pendingStoppedRecoveries.has(sessionID)
+      !pendingStoppedRecoveries.has(sessionID) &&
+      !pendingCompletedJobs.has(sessionID)
     ) {
       return false;
     }
@@ -2090,8 +2156,11 @@ export function createOrchestratorWakeScheduler(
         return false;
       }
 
-      const recoveryBatch = recoveryWake
+      let recoveryBatch = recoveryWake
         ? pendingStoppedRecoveries.get(sessionID)
+        : undefined;
+      let completedBatch = recoveryWake
+        ? pendingCompletedJobs.get(sessionID)
         : undefined;
       // A resolved ask must not cause an input-wait wake by itself: prune
       // queued ask deltas even when no stopped-job batch is present. When
@@ -2104,14 +2173,22 @@ export function createOrchestratorWakeScheduler(
         prunedToEmpty(childInputQueue, childInputDeltas)
       ) {
         pendingChildInputWakes.delete(sessionID);
-        if (!recoveryBatch) return false;
+        if (!recoveryBatch && !completedBatch) return false;
       }
       // A stale, revived, or already-reconciled detail must not cause a
       // recovery wake by itself. An overflow marker remains actionable even
       // when all retained details have since gone stale.
       if (recoveryBatch && prunedToEmpty(stoppedRecoveryQueue, recoveryBatch)) {
         pendingStoppedRecoveries.delete(sessionID);
-        return false;
+        recoveryBatch = undefined;
+        if (!completedBatch) return false;
+      }
+      // A completed result whose record reopened, left the parent, or was
+      // already consumed must not wake the parent on its own.
+      if (completedBatch && prunedToEmpty(completedJobQueue, completedBatch)) {
+        pendingCompletedJobs.delete(sessionID);
+        completedBatch = undefined;
+        if (!recoveryBatch) return false;
       }
 
       const modelSelection =
@@ -2150,16 +2227,22 @@ export function createOrchestratorWakeScheduler(
       }
       // Re-prune stop facts after the selection await: a child can leave
       // stopped/unreconciled while parent generation stays put (#1079 r2).
-      // Same for asks answered while queued.
+      // Same for asks answered while queued and for consumed results.
       if (recoveryBatch && prunedToEmpty(stoppedRecoveryQueue, recoveryBatch)) {
         pendingStoppedRecoveries.delete(sessionID);
-        return false;
+        recoveryBatch = undefined;
+        if (!completedBatch) return false;
+      }
+      if (completedBatch && prunedToEmpty(completedJobQueue, completedBatch)) {
+        pendingCompletedJobs.delete(sessionID);
+        completedBatch = undefined;
       }
       const liveChildInputDeltas = pendingChildInputWakes.get(sessionID);
       if (
         liveChildInputDeltas &&
         prunedToEmpty(childInputQueue, liveChildInputDeltas) &&
-        !recoveryBatch
+        !recoveryBatch &&
+        !completedBatch
       ) {
         pendingChildInputWakes.delete(sessionID);
         return false;
@@ -2178,6 +2261,7 @@ export function createOrchestratorWakeScheduler(
       if (
         recoveryWake &&
         !recoveryBatch &&
+        !completedBatch &&
         (childInputTimers.has(sessionID) || !liveChildInputDeltas)
       ) {
         return false;
@@ -2222,19 +2306,22 @@ export function createOrchestratorWakeScheduler(
         ...(sendInputDeltas?.overflowedKeys ?? []),
       ];
       const inputDelta = sendInputKeys
-        .map((key) => sendInputDeltas?.deltas.get(key))
+        .map((key) => sendInputDeltas?.deltas.get(key)?.text)
         .filter((text): text is string => typeof text === 'string')
         .join('\n');
       const wakeText =
         // Overflow-only asks are input waits too; never report them as stops.
         // Request-specific reply guidance travels in each detail.
         (sendInputKeys.length > 0 || sentInputOverflowCount > 0) &&
-        !recoveryBatch
+        !recoveryBatch &&
+        !completedBatch
           ? ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT
           : recoveryWake
-            ? boardInjectionEnabled
+            ? recoveryBatch
               ? ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT
-              : ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD
+              : // A completed-job result carries its own facts; the wake is a
+                // bare resume pointer instead of standing prose.
+                ORCHESTRATOR_PUBLICATION_WAKE_TEXT
             : reason === 'publication' && capabilities.flavor === 'v2'
               ? // rev>1 terminal publication: no native notifier exists on
                 // either host, so this static pointer is the parent's only
@@ -2279,22 +2366,46 @@ export function createOrchestratorWakeScheduler(
       const sentOverflowCount = recoveryBatch?.overflowCount ?? 0;
       const sentOverflowKeys = [...(recoveryBatch?.overflowedKeys ?? [])];
       const recoveryDelta = sentKeys
-        .map((key) => recoveryBatch?.deltas.get(key))
+        .map((key) => recoveryBatch?.deltas.get(key)?.text)
         .filter((text): text is string => typeof text === 'string')
         .join('\n');
       const overflowDelta =
         recoveryBatch && recoveryBatch.overflowCount > 0
-          ? boardInjectionEnabled
-            ? STOPPED_RECOVERY_OVERFLOW_TEXT
-            : // Board-less overflow has no passive display fallback and
-              // `task_status` needs a known id, so the notice carries the
-              // retained overflowed task identifiers itself instead of
-              // pointing at a channel that cannot list them.
-              `${STOPPED_RECOVERY_OVERFLOW_TEXT_NO_BOARD}\n${overflowedTaskIDs(
-                recoveryBatch.overflowedKeys,
-                recoveryBatch.overflowCount,
-                'stopped-job',
-              )}`
+          ? // The overflowed facts are pulled, not displayed: the retained
+            // task identifiers travel with the notice so `task_status` can
+            // resolve each one.
+            `${STOPPED_RECOVERY_OVERFLOW_TEXT}\n${overflowedTaskIDs(
+              recoveryBatch.overflowedKeys,
+              recoveryBatch.overflowCount,
+              'stopped-job',
+            )}`
+          : '';
+      // Later terminal results (rev>1 completed/error): one self-contained
+      // `<completed-job>` delta each. Same send-time snapshot discipline as
+      // the stopped batch: only the keys actually sent are retired, and the
+      // generation/revision fence rides in the part metadata so retirement
+      // can be observed from parent history without extra prompt bytes.
+      const sentCompletedKeys = completedBatch
+        ? [...completedBatch.deltas.keys()].slice(0, COMPLETED_JOB_WAKE_CHUNK)
+        : [];
+      const sentCompletedOverflowCount = completedBatch?.overflowCount ?? 0;
+      const sentCompletedOverflowKeys = [
+        ...(completedBatch?.overflowedKeys ?? []),
+      ];
+      const completedDelta = sentCompletedKeys
+        .map((key) => completedBatch?.deltas.get(key)?.text)
+        .filter((text): text is string => typeof text === 'string')
+        .join('\n');
+      const completedFences = sentCompletedKeys
+        .map((key) => completedBatch?.deltas.get(key)?.fence)
+        .filter((fence): fence is CompletedJobFence => fence !== undefined);
+      const completedOverflowDelta =
+        completedBatch && completedBatch.overflowCount > 0
+          ? `${COMPLETED_JOB_OVERFLOW_TEXT}\n${overflowedTaskIDs(
+              completedBatch.overflowedKeys,
+              completedBatch.overflowCount,
+              'completed-job',
+            )}`
           : '';
       const inputOverflowDelta =
         sendInputDeltas && sentInputOverflowCount > 0
@@ -2334,6 +2445,8 @@ export function createOrchestratorWakeScheduler(
         publicationSummary,
         overflowDelta,
         recoveryDelta,
+        completedOverflowDelta,
+        completedDelta,
         inputOverflowDelta,
         inputDelta,
         writerLaneDetail,
@@ -2395,7 +2508,15 @@ export function createOrchestratorWakeScheduler(
       if (capabilities.flavor === 'v2') {
         bodyText = `${bodyText}\n${WAKE_ANTI_FORGERY_TEXT}`;
       }
-      const internalPart = createInternalAgentTextPart(bodyText);
+      const internalPart = createInternalAgentTextPart(
+        bodyText,
+        // Completed-job pushes carry their exact run fence in part metadata
+        // (never in the body): parent-history observation retires only the
+        // publication this part actually reported.
+        completedFences.length > 0
+          ? { [TERMINAL_DELTA_METADATA_KEY]: completedFences }
+          : undefined,
+      );
       // promptAsync appends one NEW user message; it does not transform
       // history. Build that volatile trailing message through the shared
       // helper, preserving the internal-initiator tag on its sole part.
@@ -2468,6 +2589,13 @@ export function createOrchestratorWakeScheduler(
             sentKeys,
             sentOverflowKeys,
             sentOverflowCount,
+          ],
+          [
+            completedJobQueue,
+            completedBatch,
+            sentCompletedKeys,
+            sentCompletedOverflowKeys,
+            sentCompletedOverflowCount,
           ],
           [
             childInputQueue,
@@ -2652,6 +2780,7 @@ export function createOrchestratorWakeScheduler(
     delta?: string,
     dedupeKey?: string,
     settleDelayMs = 0,
+    fence?: CompletedJobFence,
   ): void {
     if (
       disposed ||
@@ -2663,7 +2792,7 @@ export function createOrchestratorWakeScheduler(
     }
     noteGateSession(sessionID);
     if (delta) {
-      queue.add(sessionID, delta, dedupeKey);
+      queue.add(sessionID, delta, dedupeKey, fence);
     } else if (!queue.batches.has(sessionID)) {
       queue.batches.set(sessionID, {
         deltas: new Map(),
@@ -2711,6 +2840,37 @@ export function createOrchestratorWakeScheduler(
     dedupeKey?: string,
   ): void {
     triggerDeltaWake(stoppedRecoveryQueue, sessionID, delta, dedupeKey);
+  }
+
+  /**
+   * Queue ONE self-contained result for a terminal publication the host's
+   * native first-publication notifier does not cover (rev>1 completed/error)
+   * and wake the parent through the same bounded delta machinery as
+   * stopped-job recovery.
+   *
+   * Deliberately NOT the terminal-publication wake: that path drops on a busy
+   * parent and on the per-parent throttle, which would silently lose the
+   * result. Here the delta is durable in the per-parent queue (cap
+   * `COMPLETED_JOB_QUEUE_CAP`, `COMPLETED_JOB_WAKE_CHUNK` per wake) until a
+   * wake actually delivers it; overflow becomes a `task_status` pointer.
+   * Revalidated by `isCompletedJobCurrent` immediately before delivery so a
+   * reopened, re-published, or already-consumed record is never reported
+   * twice.
+   */
+  function triggerCompletedJobPublication(
+    sessionID: string,
+    delta: string,
+    dedupeKey: string,
+    fence: CompletedJobFence,
+  ): void {
+    triggerDeltaWake(
+      completedJobQueue,
+      sessionID,
+      delta,
+      dedupeKey,
+      0,
+      fence,
+    );
   }
 
   /**
@@ -2936,6 +3096,7 @@ export function createOrchestratorWakeScheduler(
         clearChildInputTimer(parentID);
       }
       pendingStoppedRecoveries.clear();
+      pendingCompletedJobs.clear();
       lastPublicationWakeAt.clear();
       pendingPublications.clear();
       pendingChildInputWakes.clear();
@@ -3042,6 +3203,14 @@ export function createOrchestratorWakeScheduler(
           }
           return;
         }
+        if (pendingCompletedJobs.has(sessionID)) {
+          if (localSessions.get(sessionID)?.archived) {
+            beginContinuousIdle(sessionID);
+          } else {
+            triggerDeltaWake(completedJobQueue, sessionID);
+          }
+          return;
+        }
         if (pendingChildInputWakes.has(sessionID)) {
           if (localSessions.get(sessionID)?.archived) {
             beginContinuousIdle(sessionID);
@@ -3092,6 +3261,7 @@ export function createOrchestratorWakeScheduler(
     event,
     observeChatMessage,
     triggerStoppedJobRecovery,
+    triggerCompletedJobPublication,
     triggerTerminalPublicationWake,
     triggerChildInputWaitWake,
     /** Clear timers when wait_for_user or fallback begins. */
