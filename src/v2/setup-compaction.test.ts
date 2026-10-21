@@ -161,7 +161,11 @@ describe('createSessionCompactionBridge', () => {
     expect(Object.hasOwn(event, 'result')).toBe(false);
 
     // A host-provided result is read-only for the plugin too.
-    const presetResult = { summary: 'host result' };
+    const presetResult = {
+      summary: 'host result',
+      native: { messages: [{ role: 'user', content: 'replacement window' }] },
+      metadata: { keepID: 'msg_kept' },
+    };
     const message2 = {
       id: 'msg_1',
       role: 'user',
@@ -172,6 +176,11 @@ describe('createSessionCompactionBridge', () => {
     await createSessionCompactionBridge()(event2);
 
     expect(event2.result).toBe(presetResult);
+    expect(event2.result).toEqual({
+      summary: 'host result',
+      native: { messages: [{ role: 'user', content: 'replacement window' }] },
+      metadata: { keepID: 'msg_kept' },
+    });
   });
 
   test('plain messages without tags pass through unchanged', async () => {

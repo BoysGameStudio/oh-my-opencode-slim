@@ -960,7 +960,7 @@ describe('v2 client shim delegation', () => {
         };
       }
     ).session.list({ query: {} });
-    expect(calls).toEqual([{}]);
+    expect(calls).toEqual([{ limit: 50 }]);
     // v1-shape mapping the interview dashboard reads: directory (from v2
     // location.ref) + time.updated for the scan cutoff; identity fields
     // pass through, nothing fabricated.
@@ -1023,7 +1023,7 @@ describe('v2 client shim delegation', () => {
     ]);
   });
 
-  test('list passes through directory and parentID filters (null → "null")', async () => {
+  test('list normalizes root filters to real null', async () => {
     const calls: unknown[] = [];
     const input = buildPluginInput(
       makeCtx({
@@ -1043,11 +1043,158 @@ describe('v2 client shim delegation', () => {
     await list({ query: { parentID: null } });
     await list({ query: { parentID: 'null' } });
     expect(calls).toEqual([
-      { directory: '/w' },
-      { parentID: 'ses_parent' },
-      { parentID: 'null' }, // root-only sentinel on the wire
-      { parentID: 'null' },
+      { directory: '/w', limit: 50 },
+      { parentID: 'ses_parent', limit: 50 },
+      { parentID: null, limit: 50 },
+      { parentID: null, limit: 50 },
     ]);
+  });
+
+  test('list drains cursors and sends root filters only on the first page', async () => {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        list: async (args: { cursor?: string }) => {
+          calls.push(args);
+          if (!args.cursor) {
+            return { data: [{ id: 'ses_first' }], cursor: { next: 'page-2' } };
+          }
+          if (args.cursor === 'page-2') {
+            return { data: [{ id: 'ses_last' }], cursor: { next: 'end' } };
+          }
+          return { data: [], cursor: {} };
+        },
+      } as never),
+    );
+    const list = (
+      input.client as {
+        session: { list: (args: unknown) => Promise<{ data: unknown[] }> };
+      }
+    ).session.list;
+    expect(
+      await list({ query: { directory: '/project', parentID: null } }),
+    ).toEqual({ data: [{ id: 'ses_first' }, { id: 'ses_last' }] });
+    expect(calls).toEqual([
+      { directory: '/project', parentID: null, limit: 50 },
+      { cursor: 'page-2', limit: 50 },
+      { cursor: 'end', limit: 50 },
+    ]);
+  });
+
+  test.each([
+    ['invalid response', undefined],
+    ['invalid entry', { data: [null] }],
+    ['invalid cursor', { data: [], cursor: { next: 1 } }],
+    ['empty continuation', { data: [], cursor: { next: 'more' } }],
+  ])(
+    'list refuses %s instead of returning partial success',
+    async (_, page) => {
+      const input = buildPluginInput(
+        makeCtx({ list: async () => page } as never),
+      );
+      await expect(
+        (
+          input.client as {
+            session: { list: (args: unknown) => Promise<unknown> };
+          }
+        ).session.list({ query: {} }),
+      ).rejects.toThrow(/session.list/);
+    },
+  );
+
+  test('list accepts the official 2.1 nullable terminal cursor', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        list: async () => ({
+          data: [{ id: 'ses_terminal' }],
+          cursor: { previous: null, next: null },
+        }),
+      } as never),
+    );
+    expect(
+      await (
+        input.client as {
+          session: { list: (args: unknown) => Promise<unknown> };
+        }
+      ).session.list({ query: {} }),
+    ).toEqual({ data: [{ id: 'ses_terminal' }] });
+  });
+
+  test('list rejects a repeated cursor', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        list: async () => ({
+          data: [{ id: 'ses_repeat' }],
+          cursor: { next: 'same' },
+        }),
+      } as never),
+    );
+    await expect(
+      (
+        input.client as {
+          session: { list: (args: unknown) => Promise<unknown> };
+        }
+      ).session.list({ query: {} }),
+    ).rejects.toThrow(/repeated.*cursor/);
+  });
+
+  test.each([0, 51, 1000, 1001])(
+    'list bounds complete enumeration of %i sessions',
+    async (count) => {
+      let calls = 0;
+      const input = buildPluginInput(
+        makeCtx({
+          list: async ({ cursor }: { cursor?: string }) => {
+            calls++;
+            const start = Number(cursor ?? 0);
+            const data = Array.from(
+              { length: Math.max(0, Math.min(50, count - start)) },
+              (_, index) => ({ id: `ses_${start + index}` }),
+            );
+            return {
+              data,
+              cursor: data.length ? { next: String(start + data.length) } : {},
+            };
+          },
+        } as never),
+      );
+      const result = (
+        input.client as {
+          session: { list: (args: unknown) => Promise<{ data: unknown[] }> };
+        }
+      ).session.list({ query: {} });
+      if (count > 1000) {
+        await expect(result).rejects.toThrow(/capacity/);
+        expect(calls).toBe(21);
+      } else {
+        expect((await result).data).toHaveLength(count);
+        expect(calls).toBe(Math.ceil(count / 50) + 1);
+      }
+    },
+  );
+
+  test('list refuses enumeration after its total time budget', async () => {
+    let now = 0;
+    const clock = spyOn(performance, 'now').mockImplementation(() => now);
+    try {
+      const input = buildPluginInput(
+        makeCtx({
+          list: async () => {
+            now = 4_001;
+            return { data: [{ id: 'ses_late' }], cursor: {} };
+          },
+        } as never),
+      );
+      await expect(
+        (
+          input.client as {
+            session: { list: (args: unknown) => Promise<unknown> };
+          }
+        ).session.list({ query: {} }),
+      ).rejects.toThrow(/budget/);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test('list without session.list keeps the v1-parity empty page', async () => {
