@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import * as path from 'node:path';
+import { MarketplaceStore } from '../marketplace/store';
 import { readTuiSnapshot } from '../tui-state';
 import { createV2Setup } from './setup';
 import { makeTestEnv, type TestEnv } from './test-fixtures';
@@ -76,6 +77,41 @@ interface Harness {
 
 /** Live sidebar model projection for the fixture project dir. */
 const sidebarModels = () => readTuiSnapshot(env.projectDir).agentModels;
+
+/** Live sidebar identity projection for the fixture project dir. */
+const sidebarDisplayNames = () =>
+  readTuiSnapshot(env.projectDir).agentDisplayNames;
+
+/**
+ * Install one marketplace agent into the isolated data home so the real v2
+ * setup can finalize it. `agentName` stays the canonical runtime ID.
+ */
+function installMarketplaceAgent(agentName: string): void {
+  new MarketplaceStore({ pluginVersion: '3.2.0' }).install({
+    manifest: {
+      schemaVersion: 2,
+      id: `team/${agentName}`,
+      version: '1.0.0',
+      displayName: 'Marketplace agent',
+      description: 'Sidebar identity fixture',
+      agentName,
+      prompt: 'Marketplace identity fixture prompt',
+      skills: [],
+      mcps: [],
+      tools: ['read'],
+      author: { name: 'Test' },
+      tags: [],
+      license: 'MIT',
+      compatibility: { plugin: '>=1.0.0' },
+      model: { source: 'explicit', candidates: ['provider/package'] },
+      routing: {
+        description: 'Marketplace identity lane',
+        when: 'Testing marketplace identity projection.',
+        keywords: ['identity'],
+      },
+    } as never,
+  });
+}
 
 async function bootHarness(deferAgentTransform = false): Promise<Harness> {
   const reg = () => ({ dispose() {} });
@@ -495,6 +531,64 @@ describe('v2 session-frozen hot refresh', () => {
         (call) => call.sessionID === secondChild,
       );
       expect(secondSwitch?.model.id).toBe('claude-sonnet-4-5');
+    });
+  }, 20_000);
+
+  test('projects marketplace display names into the v2 startup sidebar', async () => {
+    installMarketplaceAgent('arbiter');
+    env.writeUserConfig({
+      marketplace: { agents_add: ['team/arbiter'] },
+      agents: {
+        arbiter: {
+          model: 'openai/gpt-5-mini',
+          displayName: 'reviewer',
+        },
+      },
+    });
+
+    // Reproduce the startup race: the profiles hook can run before the
+    // deferred agent transform finalizes the registry. Finalization itself
+    // must publish the identity projection.
+    const harness = await bootHarness(true);
+    try {
+      expect(sidebarDisplayNames().arbiter).toBeUndefined();
+      harness.flushAgentTransform();
+      expect(sidebarModels().arbiter).toBe('openai/gpt-5-mini');
+      expect(sidebarDisplayNames().arbiter).toBe('reviewer');
+    } finally {
+      await harness.cleanup();
+    }
+  }, 20_000);
+
+  test('keeps marketplace display names frozen across refresh alias change and removal', async () => {
+    installMarketplaceAgent('arbiter');
+    const config = (model: string, displayName?: string) => ({
+      marketplace: { agents_add: ['team/arbiter'] },
+      agents: {
+        arbiter: {
+          model,
+          ...(displayName === undefined ? {} : { displayName }),
+        },
+      },
+    });
+    env.writeUserConfig(config('openai/gpt-5-mini', 'reviewer'));
+
+    await withHarness(async () => {
+      expect(sidebarDisplayNames().arbiter).toBe('reviewer');
+
+      // Alias change: the session-frozen label must not follow the reload.
+      env.writeUserConfig(config('anthropic/claude-sonnet-4-5', 'reviewer2'));
+      await waitFor(
+        () => sidebarModels().arbiter === 'anthropic/claude-sonnet-4-5',
+      );
+      expect(sidebarDisplayNames().arbiter).toBe('reviewer');
+
+      // Alias removal: the last-known label stays keyed to the canonical ID.
+      env.writeUserConfig(config('openai/gpt-5.4-mini'));
+      await waitFor(() => sidebarModels().arbiter === 'openai/gpt-5.4-mini');
+      expect(sidebarDisplayNames().arbiter).toBe('reviewer');
+      // The canonical roster key survives too (no visible-alias rename).
+      expect(sidebarModels().arbiter).toBe('openai/gpt-5.4-mini');
     });
   }, 20_000);
 });

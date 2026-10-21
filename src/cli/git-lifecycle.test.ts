@@ -1,13 +1,14 @@
 import { expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { restoreAfterEvals, stashChanges } from './git-lifecycle';
 
 function withRepo(
   run: (cwd: string, git: (...args: string[]) => string) => void,
 ) {
-  const cwd = mkdtempSync('/tmp/opencode/eval-git-');
+  const cwd = mkdtempSync(join(tmpdir(), 'eval-git-'));
   const git = (...args: string[]) =>
     execFileSync('git', args, { cwd, encoding: 'utf-8' }).trim();
   try {

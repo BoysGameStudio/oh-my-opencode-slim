@@ -23,7 +23,11 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 
 import { isRecord } from './guards';
-import type { HostRoundState } from './session-runtime-status';
+import {
+  composeHostRound,
+  type HostRoundState,
+  hostRoundStateOf,
+} from './session-runtime-status';
 
 export type ChildTerminalEvidence =
   | { kind: 'ready'; text: string }
@@ -513,6 +517,13 @@ function sourceTypeOf(message: TranscriptMessage): string | undefined {
   return typeof source === 'string' ? source : undefined;
 }
 
+function outcomeOf(message: TranscriptMessage): string | undefined {
+  const outcome = message.info?.outcome;
+  return typeof outcome === 'string' && outcome.length > 0
+    ? outcome
+    : undefined;
+}
+
 function textOf(message: TranscriptMessage): string {
   const parts = Array.isArray(message.parts) ? message.parts : [];
   return parts
@@ -559,11 +570,10 @@ export function attributeHostRoundToTranscript(
 
 /** Latest delivered user/synthetic input timestamp in a host transcript. */
 export function latestInputAtOf(transcript: unknown): number | undefined {
-  if (!isRecord(transcript) || !Array.isArray(transcript.data))
-    return undefined;
-  for (let index = transcript.data.length - 1; index >= 0; index -= 1) {
-    const entry = transcript.data[index];
-    if (!isRecord(entry) || !isRecord(entry.info)) continue;
+  const entries = transcriptEntries(transcript);
+  if (!Array.isArray(entries)) return undefined;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index] as TranscriptMessage;
     const source = sourceTypeOf(entry);
     if (source === 'user' || source === 'synthetic') {
       return transcriptOrderKey(entry);
@@ -574,22 +584,79 @@ export function latestInputAtOf(transcript: unknown): number | undefined {
 
 /** Text of the latest assistant entry after the latest user/synthetic input. */
 export function terminalTextOf(transcript: unknown): string | undefined {
-  if (!isRecord(transcript) || !Array.isArray(transcript.data))
-    return undefined;
+  const entries = transcriptEntries(transcript);
+  if (!Array.isArray(entries)) return undefined;
   let boundary = -1;
-  for (let index = transcript.data.length - 1; index >= 0; index -= 1) {
-    const entry = transcript.data[index];
-    if (!isRecord(entry) || !isRecord(entry.info)) continue;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index] as TranscriptMessage;
     const source = sourceTypeOf(entry);
     if (source === 'user' || source === 'synthetic') {
       boundary = index;
       break;
     }
   }
-  for (let index = transcript.data.length - 1; index > boundary; index -= 1) {
-    const entry = transcript.data[index];
-    if (!isRecord(entry) || !isRecord(entry.info)) continue;
+  for (let index = entries.length - 1; index > boundary; index -= 1) {
+    const entry = entries[index] as TranscriptMessage;
     if (sourceTypeOf(entry) === 'assistant') return textOf(entry);
   }
   return undefined;
+}
+
+/**
+ * Historical v2 round. The latest user or synthetic message is the input
+ * boundary. Only an idle/outcome after that boundary can confirm the round.
+ * An older idle or Session-level outcome is not reused, and a missing time
+ * is not treated as zero.
+ */
+export function classifyV2HistoricalRound(
+  response: unknown,
+): CurrentRoundClassification {
+  const messages = transcriptEntries(response);
+  if (!Array.isArray(messages)) {
+    return { verdict: 'unreadable', reason: messages.reason };
+  }
+  let boundary = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const source = sourceTypeOf(messages[index] as TranscriptMessage);
+    if (source === 'user' || source === 'synthetic') {
+      boundary = index;
+      break;
+    }
+  }
+  if (boundary < 0) {
+    return { verdict: 'unreadable', reason: 'no delivered user round' };
+  }
+  const startedAt = transcriptOrderKey(messages[boundary] as TranscriptMessage);
+  // No user or synthetic entry follows the boundary.
+  let closingIdle = -1;
+  for (let index = boundary + 1; index < messages.length; index += 1) {
+    const message = messages[index] as TranscriptMessage;
+    const source = sourceTypeOf(message);
+    if (source === 'assistant') {
+      closingIdle = -1;
+      continue;
+    }
+    if (source === 'idle') closingIdle = index;
+  }
+  if (closingIdle < 0) return { verdict: 'incomplete', startedAt };
+  const idle = messages[closingIdle] as TranscriptMessage;
+  // A persisted idle supplies the host terminal boundary, never the
+  // assistant's completion time. Apply the same attribution as on-demand
+  // recovery so newer assistant activity cannot stretch an older idle.
+  const state = attributeHostRoundToTranscript(
+    hostRoundStateOf({
+      outcome: outcomeOf(idle),
+      time: { idle: transcriptOrderKey(idle) },
+    }),
+    response,
+  );
+  const round = composeHostRound(state, startedAt);
+  if (round.verdict === 'completed' || round.verdict === 'error') {
+    const text = terminalTextOf(response);
+    if (text) round.text = text;
+    else if (round.verdict === 'completed') {
+      return { verdict: 'incomplete', startedAt };
+    }
+  }
+  return round;
 }

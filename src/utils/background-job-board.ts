@@ -4,6 +4,12 @@ import {
   formatSystemReminder,
 } from '../config/constants';
 import { escapeRegExp } from './agent-variant';
+import {
+  getPersistedBackgroundChild,
+  type PersistedBackgroundChild,
+  recordPersistedBackgroundChild,
+  restorePersistedBackgroundChild,
+} from './background-job-persistence';
 import type { BackgroundJobStore } from './background-job-store';
 import {
   clearBackgroundJobSuppression,
@@ -108,6 +114,8 @@ export interface BackgroundJobRecord {
   verifiedRetainedRound?: true;
   /** Recovery has not sent a prompt; importing a row does not own host work. */
   recoveredWithoutPrompt?: true;
+  /** In-memory only: adopted by the startup scan from persisted host state. */
+  recoveredAtStartup?: true;
   /**
    * In-memory provenance: this plugin's own tracked native task call launched
    * this record as a fresh background child. Never set for adopted, restored,
@@ -319,6 +327,11 @@ function aliasPrefixForAgent(agent: string): string {
 export class BackgroundJobBoard implements BackgroundJobStore {
   private terminalGate?: BackgroundJobTerminalGate;
   private readonly jobs = new Map<string, BackgroundJobRecord>();
+  /** Persisted identity overwritten by a launch that may still be refused. */
+  private readonly launchPersistenceSnapshots = new WeakMap<
+    BackgroundJobRecord,
+    PersistedBackgroundChild | undefined
+  >();
   /** One live operation/relaunch owner per native session ID. */
   private readonly liveLeases = new Map<string, BackgroundJobLease>();
   private readonly counters = new Map<string, number>();
@@ -478,6 +491,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
             : {}),
         } satisfies BackgroundJobRecord;
         this.setJob(observed);
+        this.persistBackgroundChild(observed, { preserveDelivered: true });
         return observed;
       }
 
@@ -517,12 +531,42 @@ export class BackgroundJobBoard implements BackgroundJobStore {
         timeoutCount: existing.timeoutCount ?? 0,
       } satisfies BackgroundJobRecord;
       this.setJob(updated);
+      this.persistBackgroundChild(updated, {});
       return updated;
     }
 
     const record = this.createLaunchRecord(input, now, generation);
     this.setJob(record);
+    this.persistBackgroundChild(record, {});
     return record;
+  }
+
+  private persistBackgroundChild(
+    record: BackgroundJobRecord,
+    options: { preserveDelivered?: boolean },
+  ): void {
+    if (!record.background || record.state !== 'running') return;
+    // Capture what this write replaces. A refused relaunch restores it,
+    // including its delivered marker, instead of leaving the rejected
+    // launch as a phantom persisted run.
+    this.launchPersistenceSnapshots.set(
+      record,
+      getPersistedBackgroundChild(record.taskID),
+    );
+    recordPersistedBackgroundChild(
+      {
+        taskID: record.taskID,
+        parentSessionID: record.parentSessionID,
+        agent: record.agent,
+        description: record.description,
+        ...(record.objective !== undefined
+          ? { objective: record.objective }
+          : {}),
+        launchedAt: record.runStartedAt,
+        background: true,
+      },
+      { preserveDelivered: options.preserveDelivered === true },
+    );
   }
 
   abandonLaunch(
@@ -536,6 +580,13 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       return false;
     }
     this.setJob(replaced);
+    if (this.launchPersistenceSnapshots.has(launched)) {
+      restorePersistedBackgroundChild(
+        launched.taskID,
+        this.launchPersistenceSnapshots.get(launched),
+      );
+      this.launchPersistenceSnapshots.delete(launched);
+    }
     return true;
   }
 
@@ -787,6 +838,11 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       ...existing,
       state: 'running',
       updatedAt: now,
+      launchedAt: existing.state === 'running' ? existing.launchedAt : now,
+      // A terminal/reconciled row observed live again is a genuinely new
+      // execution: the per-run fence must move with it. Repeated busy
+      // observations of an in-flight run keep the existing fence.
+      runStartedAt: existing.state === 'running' ? existing.runStartedAt : now,
       lastLiveBusyAt: now,
       activityRevision: existing.activityRevision + 1,
       stopConfirmationStartedAt: undefined,
@@ -806,6 +862,12 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     };
 
     this.setJob(updated);
+    if (existing.state !== 'running') {
+      // A self-continued or directly prompted child starts a new live run.
+      // Clear the prior terminal delivery marker; passive observations must
+      // keep it so a completed child cannot replay a wake after restart.
+      this.persistBackgroundChild(updated, {});
+    }
     return updated;
   }
 
@@ -1743,6 +1805,54 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     const context = formatContextFiles(job.contextFiles);
     if (context) lines.push(`  Context read by ${job.alias}: ${context}`);
     return lines.join('\n');
+  }
+
+  /**
+   * Correct a running row that startup recovery had adopted before the
+   * child was verified terminal. The caller owns publication; this method
+   * deliberately fires no terminal listener so a restart cannot double
+   * wake the parent.
+   */
+  correctStartupRecoveredTerminal(input: {
+    taskID: string;
+    generation: number;
+    state: 'completed' | 'error' | 'cancelled' | 'stopped';
+    resultSummary?: string;
+    now?: number;
+  }): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(input.taskID);
+    if (
+      existing?.state !== 'running' ||
+      existing.generation !== input.generation ||
+      existing.externalOrigin !== true
+    ) {
+      return existing;
+    }
+    const now = input.now ?? Date.now();
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      state: input.state,
+      terminalUnreconciled: true,
+      terminalRevision:
+        input.state === 'stopped'
+          ? existing.terminalRevision
+          : existing.terminalRevision + 1,
+      updatedAt: now,
+      completedAt: existing.completedAt ?? now,
+      terminalState: input.state === 'stopped' ? undefined : input.state,
+      ...(input.resultSummary !== undefined
+        ? { resultSummary: input.resultSummary }
+        : {}),
+      statusUncertain: false,
+      statusUncertainSince: undefined,
+      lastStatusError: undefined,
+      verifiedRetainedRound: true,
+      recoveredAtStartup: true,
+    };
+    // Startup delivery marks the identity after its wake callback so a
+    // failed callback can be retried on the next restart.
+    this.setJob(updated);
+    return updated;
   }
 
   /**

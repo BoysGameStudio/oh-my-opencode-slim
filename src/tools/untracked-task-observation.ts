@@ -80,6 +80,10 @@ export async function verifyUntrackedOwnership(
   if (!data || typeof data.parentID !== 'string' || !data.parentID) {
     return { kind: 'unreadable' };
   }
+  // Mirror recovery: a payload for a different session proves nothing.
+  if (data.id !== undefined && data.id !== identity) {
+    return { kind: 'unreadable' };
+  }
   if (data.parentID !== parentSessionID) return { kind: 'foreign-parent' };
 
   const agent =
@@ -172,7 +176,10 @@ async function readTranscript(
       const text = terminalTextOf(transcript);
       if (text) round.text = text;
       else if (state.outcome === 'succeeded')
-        round.reason = 'answer text is not readable yet';
+        return {
+          live,
+          round: { verdict: 'incomplete', startedAt: latestInputAt },
+        };
     }
     return { live, round };
   } catch (error) {

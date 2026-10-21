@@ -432,17 +432,12 @@ describe('v2 native resume through the setup bridge', () => {
       parentSessionID: PARENT,
     });
     expect(event.input.sessionID).toBe(CHILD);
-  });
 
-  test('a host-missing session refuses without creating a child', async () => {
-    const board = new BackgroundJobBoard();
-    const input = host({
-      get: () => ({ error: { message: 'NotFound' } }),
-    });
-    const event = {
+    const missing = new BackgroundJobBoard();
+    const missingEvent = {
       tool: 'subagent',
       sessionID: PARENT,
-      id: 'call_missing',
+      id: 'call_4',
       input: {
         agent: 'fixer',
         sessionID: CHILD,
@@ -450,35 +445,47 @@ describe('v2 native resume through the setup bridge', () => {
         description: 'next',
       },
     };
-    await expect(
-      createToolExecuteBridges(
-        (hookInput, output) =>
-          handleToolExecuteBefore(hookInput, output, deps(board, input)),
-        undefined,
-      ).beforeBridge(event),
-    ).rejects.toThrow(/cannot resolve this sessionID/);
-    expect(event.input.sessionID).toBe(CHILD);
-    expect(board.list(PARENT)).toEqual([]);
-  });
+    const missingBridges = createToolExecuteBridges(
+      (hookInput, output) =>
+        handleToolExecuteBefore(
+          hookInput,
+          output,
+          deps(
+            missing,
+            host({ get: () => ({ error: { message: 'NotFound' } }) }),
+          ),
+        ),
+      undefined,
+    );
+    await expect(missingBridges.beforeBridge(missingEvent)).rejects.toThrow(
+      /cannot resolve this sessionID/,
+    );
+    expect(missingEvent.input.sessionID).toBe(CHILD);
+    expect(missing.list(PARENT)).toEqual([]);
 
-  test('a foreign-parent session refuses without importing', async () => {
-    const board = new BackgroundJobBoard();
-    const input = host({
-      get: () => ({
-        id: CHILD,
-        parentID: 'ses_other',
-        agent: 'fixer',
-      }),
-    });
+    const wrong = new BackgroundJobBoard();
     await expect(
       createToolExecuteBridges(
         (hookInput, output) =>
-          handleToolExecuteBefore(hookInput, output, deps(board, input)),
+          handleToolExecuteBefore(
+            hookInput,
+            output,
+            deps(
+              wrong,
+              host({
+                get: () => ({
+                  id: CHILD,
+                  parentID: 'ses_other',
+                  agent: 'fixer',
+                }),
+              }),
+            ),
+          ),
         undefined,
       ).beforeBridge({
         tool: 'subagent',
         sessionID: PARENT,
-        id: 'call_wrong',
+        id: 'call_5',
         input: {
           agent: 'fixer',
           sessionID: CHILD,
@@ -487,7 +494,7 @@ describe('v2 native resume through the setup bridge', () => {
         },
       }),
     ).rejects.toThrow(/cannot resolve this sessionID/);
-    expect(board.get(CHILD)).toBeUndefined();
+    expect(wrong.get(CHILD)).toBeUndefined();
   });
 
   test('an untracked incomplete session is adopted instead of refused', async () => {
@@ -533,6 +540,282 @@ describe('v2 native resume through the setup bridge', () => {
     // One row only: adoption never spawns a second child.
     expect(board.list(PARENT)).toHaveLength(1);
   });
+});
+
+test('real parent context pairs an alias through the shim', async () => {
+  // Desensitized OpenCode 2.0.19 session.context tool part
+  // (bounds-20260930T062758 round1 parent context): name, state.content,
+  // and created/ran/completed. Identifiers and body text are replaced.
+  const messages: Array<Record<string, unknown>> = [
+    {
+      id: 'msg_parent_user',
+      type: 'user',
+      time: { created: 1000 },
+      text: 'ask',
+    },
+    {
+      id: 'msg_parent_turn',
+      type: 'assistant',
+      agent: 'orchestrator',
+      time: { created: 1001, completed: 1100 },
+      content: [
+        {
+          type: 'tool',
+          name: 'subagent',
+          id: 'call_child',
+          time: { created: 1002, ran: 1003, completed: 1090 },
+          state: {
+            input: {
+              agent: 'fixer',
+              description: 'Run one check',
+              prompt: 'ask',
+              background: false,
+            },
+            content: [
+              {
+                type: 'text',
+                text: '<subagent sessionID="ses_childshape" state="completed">\nMARKER\n</subagent>',
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ];
+  let childID = '';
+  let agent = '';
+  let description = '';
+  for (const message of messages) {
+    const content = message.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (!part || typeof part !== 'object') continue;
+      const tool = part as Record<string, unknown>;
+      if (tool.name !== 'subagent') continue;
+      const state = tool.state as Record<string, unknown>;
+      const input = state.input as Record<string, unknown>;
+      agent = String(input.agent);
+      description = String(input.description);
+      const blocks = state.content as Array<Record<string, unknown>>;
+      const text = String(blocks[0]?.text ?? '');
+      const outer = /sessionID="([^"]+)"/.exec(text)?.[1] ?? '';
+      childID = outer;
+      blocks[0] = {
+        ...blocks[0],
+        text: appendChildRefSuffix(text, {
+          parentSessionID: PARENT,
+          agent,
+          alias: 'fix-4',
+          sessionID: outer,
+        }),
+      };
+    }
+  }
+  expect(childID).toMatch(/^ses_/);
+  const directory = '/tmp/omo-implementation-repair';
+  const input = buildPluginInput({
+    directory,
+    session: {
+      get: async (args: { sessionID: string }) => {
+        if (args.sessionID !== childID)
+          return { error: { message: 'NotFound' } };
+        return {
+          id: childID,
+          parentID: PARENT,
+          agent,
+          outcome: 'succeeded',
+          time: { created: 9, idle: 13 },
+        };
+      },
+      context: async (args: { sessionID: string }) =>
+        args.sessionID === PARENT ? messages : round('FROM-CHILD'),
+    },
+  } as never);
+  const board = new BackgroundJobBoard();
+  const canonical = await createAliasAuthority({
+    input: input as never,
+    board,
+  }).resolveCanonical(PARENT, 'fix-4');
+  expect(canonical).toEqual({ kind: 'exact', taskID: childID });
+  const result = await createSessionRecovery({
+    input: input as never,
+    backgroundJobBoard: board,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: childID, agent });
+  expect(result).toEqual({ kind: 'recovered', taskID: childID });
+  expect(board.get(childID)).toMatchObject({
+    alias: 'fix-4',
+    agent,
+    state: 'completed',
+    parentSessionID: PARENT,
+  });
+  expect(board.get(childID)?.description.length).toBeGreaterThan(0);
+  expect(description.length).toBeGreaterThan(0);
+});
+
+test('host outcome triage: interrupted stops, failed errors, and a newer assistant exceeds the host idle', async () => {
+  // Host-state triage imports the interrupted round without an assistant.
+  // An assistant created after the terminal idle is newer activity the host
+  // terminal does not cover, so it must stay pending rather than complete.
+  const interruptedInput = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      outcome: 'interrupted',
+      time: { created: 9, idle: 11 },
+    }),
+    context: (args) =>
+      args.sessionID === CHILD ? round().slice(0, 1) : round(),
+  });
+  const interruptedBoard = new BackgroundJobBoard();
+  await createSessionRecovery({
+    input: interruptedInput as never,
+    backgroundJobBoard: interruptedBoard,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  expect(interruptedBoard.get(CHILD)).toMatchObject({
+    state: 'stopped',
+  });
+
+  const failedInput = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      outcome: 'failed',
+      time: { created: 9, idle: 11 },
+    }),
+    context: (args) =>
+      args.sessionID === CHILD ? round().slice(0, 1) : round(),
+  });
+  const failedBoard = new BackgroundJobBoard();
+  await createSessionRecovery({
+    input: failedInput as never,
+    backgroundJobBoard: failedBoard,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  expect(failedBoard.get(CHILD)).toMatchObject({ state: 'error' });
+
+  const newerAssistantInput = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      outcome: 'succeeded',
+      time: { created: 9, idle: 13 },
+    }),
+    context: (args) =>
+      args.sessionID === CHILD
+        ? [
+            {
+              id: 'msg_user',
+              type: 'user',
+              time: { created: 10 },
+              text: 'ask',
+            },
+            {
+              id: 'msg_a',
+              type: 'assistant',
+              agent: 'fixer',
+              parentID: 'msg_user',
+              time: { created: 11, completed: 12 },
+              finish: 'stop',
+              content: [{ type: 'text', text: 'ANSWER-A' }],
+            },
+            { id: 'msg_idle_a', type: 'idle', time: 13, outcome: 'succeeded' },
+            {
+              id: 'msg_b',
+              type: 'assistant',
+              agent: 'fixer',
+              parentID: 'msg_user',
+              time: { created: 14 },
+              content: [{ type: 'text', text: 'ANSWER-B' }],
+            },
+          ]
+        : round(),
+  });
+  const newerBoard = new BackgroundJobBoard();
+  const newerResult = await createSessionRecovery({
+    input: newerAssistantInput as never,
+    backgroundJobBoard: newerBoard,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  // The host succeeded at idle 13, but the newest assistant was created at
+  // 14. That reply is not covered by the terminal boundary.
+  expect(newerResult.kind).toBe('refused');
+  if (newerResult.kind === 'refused') {
+    expect(newerResult.reason).toContain('no terminal outcome');
+  }
+  expect(newerBoard.get(CHILD)).toBeUndefined();
+});
+
+test('malformed transcript entries fail closed during v2 recovery', async () => {
+  const board = new BackgroundJobBoard();
+  const input = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      outcome: 'succeeded',
+      time: { created: 9, idle: 13 },
+    }),
+  });
+  (input.client.session as { messages: unknown }).messages = async () => ({
+    data: [{ info: null }],
+  });
+  const result = await createSessionRecovery({
+    input: input as never,
+    backgroundJobBoard: board,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  expect(result.kind).toBe('refused');
+  if (result.kind === 'refused') {
+    expect(result.reason).toContain('malformed transcript entries');
+  }
+  expect(board.get(CHILD)).toBeUndefined();
+});
+
+test('a host terminal outcome without a transcript input boundary is pending, not completed', async () => {
+  const board = new BackgroundJobBoard();
+  const input = host({
+    get: () => ({
+      id: CHILD,
+      parentID: PARENT,
+      agent: 'fixer',
+      outcome: 'succeeded',
+      time: { created: 9, idle: 13 },
+    }),
+    context: (args) =>
+      args.sessionID === CHILD
+        ? [
+            {
+              id: 'msg_assistant',
+              type: 'assistant',
+              agent: 'fixer',
+              time: { created: 11, completed: 12 },
+              finish: 'stop',
+              content: [{ type: 'text', text: 'ORPHAN' }],
+            },
+          ]
+        : round(),
+  });
+  const result = await createSessionRecovery({
+    input: input as never,
+    backgroundJobBoard: board,
+    hostFlavor: 'v2',
+    stableStoppedMs: 0,
+  })({ parentSessionID: PARENT, requested: CHILD });
+  expect(result.kind).toBe('refused');
+  if (result.kind === 'refused') {
+    expect(result.reason).toContain('no terminal outcome');
+  }
+  expect(board.get(CHILD)).toBeUndefined();
 });
 
 test('host state that cannot be verified fails closed', async () => {

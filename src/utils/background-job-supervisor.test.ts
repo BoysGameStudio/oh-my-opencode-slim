@@ -83,6 +83,30 @@ describe('BackgroundJobSupervisor', () => {
     expect(abort).toHaveBeenCalledWith('ses_1');
   });
 
+  test('a reopened live run arms a fresh deadline from its new fence', async () => {
+    const { board, coordinator, supervisor, timers, abort } =
+      createSupervisor();
+    const job = launch(board, true);
+    supervisor.onLaunch(job);
+    const completed = boardFixture.updateStatus(coordinator, {
+      taskID: job.taskID,
+      state: 'completed',
+      now: 50,
+    });
+    if (completed) supervisor.onTerminal(completed);
+
+    const reopened = coordinator.markRunningFromLiveSession(job.taskID, 60);
+    expect(reopened).toMatchObject({ state: 'running', runStartedAt: 60 });
+    if (reopened) supervisor.onLaunch(reopened);
+
+    // The original deadline was 100. The reopened execution started at 60,
+    // so its one-shot deadline is 160.
+    await timers.advanceTo(159);
+    expect(abort).not.toHaveBeenCalled();
+    await timers.advanceTo(160);
+    expect(abort).toHaveBeenCalledTimes(1);
+  });
+
   test('terminal state wins before the deadline and clears timers', async () => {
     const { board, coordinator, supervisor, timers, abort } =
       createSupervisor();

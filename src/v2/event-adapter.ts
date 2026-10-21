@@ -82,6 +82,19 @@ function payloadOf(event: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
+ * Host activity boundary from the event envelope's `created`
+ * (Clock.currentTimeMillis). Only a valid finite nonnegative timestamp
+ * survives; anything else yields no field at all, so consumers fall back
+ * to their local receipt time.
+ */
+function hostActivityAt(event: Record<string, unknown>): number | undefined {
+  const created = event.created;
+  return typeof created === 'number' && Number.isFinite(created) && created >= 0
+    ? created
+    : undefined;
+}
+
+/**
  * v2 usage telemetry (`session.usage.updated` / `session.step.ended`)
  * → v1 completed-assistant `message.updated`.
  *
@@ -268,6 +281,10 @@ function permissionAskedToV1(
  * first and never mutated. Synthesis:
  * - `session.execution.*` → the v1 lifecycle
  *   shapes: `started` → `session.status` `{status:{type:'busy'}}`;
+ *   terminal subtypes carry the envelope `created` as `activityAt` on every
+ *   synthesized lifecycle event (`session.error`, idle `session.status`,
+ *   and `session.idle`) so a delayed terminal envelope cannot terminalize
+ *   or reconcile a newer run;
  *   `succeeded`/`interrupted` → `session.status` idle + `session.idle`;
  *   `failed` → a v1 `session.error` (host error payload passed through
  *   best-effort) followed by the same idle pair — error-before-idle
@@ -322,18 +339,11 @@ export function mapV2EventToV1(
       const sessionID = props.sessionID;
       // The host envelope timestamps every event with `created`
       // (Clock.currentTimeMillis). Preserve it as the activity boundary on
-      // EVERY synthesized lifecycle status — busy and terminal idle alike:
-      // the router forwards it as observedAt, so a delayed delivery keeps
-      // the host time instead of degenerating into a local receipt time,
-      // which cannot prove activity after a recorded host idle (and, for a
-      // terminal event, is what lets the terminal gate attribute the idle
-      // to this run at all).
-      const activityAt =
-        typeof event.created === 'number' &&
-        Number.isFinite(event.created) &&
-        event.created >= 0
-          ? event.created
-          : undefined;
+      // both lifecycle edges: the router forwards it as observedAt, so a
+      // delayed delivery keeps the host time instead of degenerating into
+      // a local receipt time, which cannot prove activity after a recorded
+      // host idle.
+      const activityAt = hostActivityAt(event);
       if (type === 'session.execution.started') {
         out.push({
           type: 'session.status',
@@ -360,6 +370,7 @@ export function mapV2EventToV1(
                 props.error !== undefined
                   ? props.error
                   : { message: 'v2 session execution failed' },
+              ...(activityAt !== undefined ? { activityAt } : {}),
             },
           });
         }
@@ -378,7 +389,10 @@ export function mapV2EventToV1(
         });
         out.push({
           type: 'session.idle',
-          properties: { sessionID },
+          properties: {
+            sessionID,
+            ...(activityAt !== undefined ? { activityAt } : {}),
+          },
         });
       }
     }

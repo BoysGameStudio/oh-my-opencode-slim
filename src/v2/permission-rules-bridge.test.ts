@@ -585,6 +585,138 @@ describe('createPermissionRulesBridge', () => {
     await bridge.dispose();
   });
 
+  test('admits a known foreign root from the created event without a session lookup', async () => {
+    let lookupCount = 0;
+    const bridge = makeBridge({
+      session: {
+        get: async () => {
+          lookupCount += 1;
+          throw new Error('session lookup must not run');
+        },
+        update: async () => ({}),
+      } as unknown as V2Session,
+      requireKnownIdentity: () => true,
+      marketplaceAgentNames: () => new Set(['package-agent']),
+    });
+    await bridge.observeEvent({
+      type: 'session.created',
+      data: {
+        sessionID: 'ses_permission_reviewer',
+        agent: 'permission-reviewer',
+      },
+    });
+
+    await expect(
+      bridge.ensurePromptPermission('ses_permission_reviewer'),
+    ).resolves.toBeUndefined();
+    expect(lookupCount).toBe(0);
+    await bridge.dispose();
+  });
+
+  test('admits a known foreign root when the first prompt races ahead of session.created', async () => {
+    let lookupCount = 0;
+    let resolveLookup!: (value: {
+      data: { sessionID: string; agent: string };
+    }) => void;
+    const bridge = makeBridge({
+      session: {
+        get: () => {
+          lookupCount += 1;
+          return new Promise((resolve) => {
+            resolveLookup = resolve;
+          });
+        },
+        update: async () => ({}),
+      } as unknown as V2Session,
+      requireKnownIdentity: () => true,
+      marketplaceAgentNames: () => new Set(['package-agent']),
+    });
+
+    // The prompt hook runs before the asynchronous event pump has observed
+    // session.created. It must await the deterministic lookup before it
+    // admits the prompt; there is no sleep or retry.
+    let settled = false;
+    const pending = bridge
+      .ensurePromptPermission('ses_permission_reviewer_race')
+      .then(() => {
+        settled = true;
+      });
+    await Promise.resolve();
+    expect(lookupCount).toBe(1);
+    expect(settled).toBe(false);
+
+    resolveLookup({
+      data: {
+        sessionID: 'ses_permission_reviewer_race',
+        agent: 'permission-reviewer',
+      },
+    });
+    await expect(pending).resolves.toBeUndefined();
+    expect(settled).toBe(true);
+
+    // A late created event must reuse the cached identity, not re-query.
+    await bridge.observeEvent({
+      type: 'session.created',
+      data: {
+        sessionID: 'ses_permission_reviewer_race',
+        agent: 'permission-reviewer',
+      },
+    });
+    await expect(
+      bridge.ensurePromptPermission('ses_permission_reviewer_race'),
+    ).resolves.toBeUndefined();
+    expect(lookupCount).toBe(1);
+    await bridge.dispose();
+  });
+
+  test('uses the created event when it arrives during the first-prompt lookup', async () => {
+    let lookupCount = 0;
+    let resolveLookup!: (value: {
+      data: { sessionID: string; agent: string };
+    }) => void;
+    const bridge = makeBridge({
+      session: {
+        get: () => {
+          lookupCount += 1;
+          return new Promise((resolve) => {
+            resolveLookup = resolve;
+          });
+        },
+        update: async () => ({}),
+      } as unknown as V2Session,
+      requireKnownIdentity: () => true,
+      marketplaceAgentNames: () => new Set(['package-agent']),
+    });
+
+    const pending = bridge.ensurePromptPermission(
+      'ses_permission_reviewer_overlap',
+    );
+    await Promise.resolve();
+    expect(lookupCount).toBe(1);
+
+    await bridge.observeEvent({
+      type: 'session.created',
+      data: {
+        sessionID: 'ses_permission_reviewer_overlap',
+        agent: 'permission-reviewer',
+      },
+    });
+    resolveLookup({
+      data: {
+        sessionID: 'ses_permission_reviewer_overlap',
+        agent: 'permission-reviewer',
+      },
+    });
+    await expect(pending).resolves.toBeUndefined();
+    expect(lookupCount).toBe(1);
+
+    await expect(
+      bridge.ensurePromptPermission('ses_permission_reviewer_overlap'),
+    ).resolves.toBeUndefined();
+    expect(lookupCount).toBe(1);
+    await bridge.dispose();
+  });
+
   test('fails closed for a root without an agent when session lookup is unavailable', async () => {
     const bridge = makeBridge({
       session: makeSession(),

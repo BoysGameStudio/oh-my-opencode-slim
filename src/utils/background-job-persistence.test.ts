@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { BackgroundJobBoard as FixtureBoard } from './background-job-fixture';
 import {
   type BackgroundJobStorageBackend,
   clearSuppression,
   configureBackgroundJobPersistence,
   getSuppressionTombstone,
   loadInitialBackgroundJobPersistence,
+  MAX_PERSISTED_CHILDREN,
   MAX_PERSISTED_TOMBSTONES,
+  markPersistedBackgroundChildDelivered,
+  persistedBackgroundChildren,
+  recordPersistedBackgroundChild,
   recordSuppression,
 } from './background-job-persistence';
 import {
@@ -300,5 +305,276 @@ describe('background-job persistence', () => {
     const snapshot = await loadInitialBackgroundJobPersistence();
     expect(snapshot.tombstones.size).toBe(7);
     expect(snapshot.nextEpoch).toBe(7);
+  });
+
+  test('an oldest incoming child is evicted in memory and backend, not resurrected', async () => {
+    const { backend, map } = createMemoryBackend();
+    configureBackgroundJobPersistence(backend);
+    await loadInitialBackgroundJobPersistence();
+
+    const child = (taskID: string, launchedAt: number) => ({
+      taskID,
+      parentSessionID: 'parent-cap',
+      agent: 'explorer',
+      description: taskID,
+      launchedAt,
+      background: true as const,
+    });
+
+    for (let i = 0; i < MAX_PERSISTED_CHILDREN; i += 1) {
+      recordPersistedBackgroundChild(
+        child(`ses_child_${String(i).padStart(4, '0')}`, 1_000 + i),
+      );
+    }
+    await flushWrites();
+    expect(persistedBackgroundChildren().size).toBe(MAX_PERSISTED_CHILDREN);
+
+    // The incoming identity is older than every retained child, so the cap
+    // evicts it immediately. Its queued delete must win over its own set.
+    recordPersistedBackgroundChild(child('ses_child_ancient', 1));
+    await flushWrites();
+
+    expect(persistedBackgroundChildren().has('ses_child_ancient')).toBe(false);
+    const backendChildKeys = [...map.keys()].filter((key) =>
+      key.includes('child/'),
+    );
+    expect(backendChildKeys.length).toBe(MAX_PERSISTED_CHILDREN);
+    expect(
+      backendChildKeys.some((key) => key.includes('ses_child_ancient')),
+    ).toBe(false);
+
+    // A reload sees the same capped set — the evicted identity cannot
+    // reappear from the backend after the restart.
+    configureBackgroundJobPersistence(backend);
+    const snapshot = await loadInitialBackgroundJobPersistence();
+    expect(snapshot.children.size).toBe(MAX_PERSISTED_CHILDREN);
+    expect(snapshot.children.has('ses_child_ancient')).toBe(false);
+  });
+
+  test('a delayed old-run delivery acknowledgement cannot fence a relaunched run', async () => {
+    const { backend } = createMemoryBackend();
+    configureBackgroundJobPersistence(backend);
+    await loadInitialBackgroundJobPersistence();
+
+    const board = new BackgroundJobBoard();
+    const first = board.registerLaunch({
+      taskID: 'ses_relaunch_fence',
+      parentSessionID: 'parent-fence',
+      agent: 'fixer',
+      description: 'first run',
+      background: true,
+      now: 100,
+    });
+    await flushWrites();
+    expect(
+      persistedBackgroundChildren().get('ses_relaunch_fence'),
+    ).toMatchObject({ launchedAt: 100 });
+
+    const relaunched = board.registerLaunch({
+      taskID: 'ses_relaunch_fence',
+      parentSessionID: 'parent-fence',
+      agent: 'fixer',
+      description: 'second run',
+      background: true,
+      now: 300,
+    });
+    await flushWrites();
+
+    // The board keeps the historical first launch; the persisted identity
+    // carries the current run's fence.
+    expect(relaunched).toMatchObject({
+      launchedAt: 100,
+      lastLaunchedAt: 300,
+      runStartedAt: 300,
+    });
+    expect(
+      persistedBackgroundChildren().get('ses_relaunch_fence'),
+    ).toMatchObject({ launchedAt: 300 });
+
+    // The old run's acknowledgement arrives late: it must not mark the
+    // relaunched run delivered.
+    expect(
+      markPersistedBackgroundChildDelivered(
+        'ses_relaunch_fence',
+        400,
+        first.runStartedAt,
+      ),
+    ).toBe(false);
+    expect(
+      persistedBackgroundChildren().get('ses_relaunch_fence')?.deliveredAt,
+    ).toBeUndefined();
+
+    // The current run's acknowledgement succeeds and survives a restart.
+    expect(
+      markPersistedBackgroundChildDelivered(
+        'ses_relaunch_fence',
+        500,
+        relaunched.runStartedAt,
+      ),
+    ).toBe(true);
+    await flushWrites();
+
+    configureBackgroundJobPersistence(backend);
+    const snapshot = await loadInitialBackgroundJobPersistence();
+    expect(snapshot.children.get('ses_relaunch_fence')).toMatchObject({
+      launchedAt: 300,
+      deliveredAt: 500,
+    });
+  });
+
+  test('a refused relaunch restores the replaced persisted fence and delivery marker', async () => {
+    const { backend } = createMemoryBackend();
+    configureBackgroundJobPersistence(backend);
+    await loadInitialBackgroundJobPersistence();
+
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'ses_refused_relaunch',
+      parentSessionID: 'parent-refused',
+      agent: 'fixer',
+      description: 'settled run',
+      background: true,
+      now: 100,
+    });
+    const replaced = board.get('ses_refused_relaunch');
+    if (!replaced) throw new Error('missing replaced record');
+    expect(
+      markPersistedBackgroundChildDelivered(
+        'ses_refused_relaunch',
+        150,
+        replaced.runStartedAt,
+      ),
+    ).toBe(true);
+    await flushWrites();
+
+    const relaunched = board.registerLaunch({
+      taskID: 'ses_refused_relaunch',
+      parentSessionID: 'parent-refused',
+      agent: 'fixer',
+      description: 'refused run',
+      background: true,
+      now: 300,
+    });
+    await flushWrites();
+    expect(
+      persistedBackgroundChildren().get('ses_refused_relaunch'),
+    ).toMatchObject({ launchedAt: 300 });
+    expect(
+      persistedBackgroundChildren().get('ses_refused_relaunch')?.deliveredAt,
+    ).toBeUndefined();
+
+    // The host refused the queued admission: memory and persistence both
+    // return to the replaced run, including the marker that acknowledged it.
+    expect(board.abandonLaunch(relaunched, replaced)).toBe(true);
+    await flushWrites();
+    expect(board.get('ses_refused_relaunch')).toEqual(replaced);
+    expect(
+      persistedBackgroundChildren().get('ses_refused_relaunch'),
+    ).toMatchObject({ launchedAt: 100, deliveredAt: 150 });
+
+    // A later accepted relaunch advances the fence. The old run's marker is
+    // rejected; the current run's marker succeeds.
+    const current = board.registerLaunch({
+      taskID: 'ses_refused_relaunch',
+      parentSessionID: 'parent-refused',
+      agent: 'fixer',
+      description: 'accepted run',
+      background: true,
+      now: 500,
+    });
+    await flushWrites();
+    expect(
+      markPersistedBackgroundChildDelivered(
+        'ses_refused_relaunch',
+        600,
+        replaced.runStartedAt,
+      ),
+    ).toBe(false);
+    expect(
+      markPersistedBackgroundChildDelivered(
+        'ses_refused_relaunch',
+        700,
+        current.runStartedAt,
+      ),
+    ).toBe(true);
+    expect(
+      persistedBackgroundChildren().get('ses_refused_relaunch'),
+    ).toMatchObject({ launchedAt: 500, deliveredAt: 700 });
+  });
+
+  test('a reopened live run advances the persisted fence and rejects the old delivery', async () => {
+    const { backend } = createMemoryBackend();
+    configureBackgroundJobPersistence(backend);
+    await loadInitialBackgroundJobPersistence();
+
+    const board = new FixtureBoard();
+    const first = board.registerLaunch({
+      taskID: 'ses_reopened_fence',
+      parentSessionID: 'parent-reopened',
+      agent: 'fixer',
+      description: 'first run',
+      background: true,
+      now: 100,
+    });
+    expect(
+      markPersistedBackgroundChildDelivered(
+        'ses_reopened_fence',
+        150,
+        first.runStartedAt,
+      ),
+    ).toBe(true);
+    await flushWrites();
+
+    board.updateStatus({
+      taskID: 'ses_reopened_fence',
+      state: 'completed',
+      resultSummary: 'first result',
+      now: 200,
+    });
+    board.markReconciled('ses_reopened_fence', 250);
+
+    // A live busy observation reopens the terminal/reconciled row as a new
+    // execution. The persisted fence must move with the run.
+    const reopened = board.markRunningFromLiveSession(
+      'ses_reopened_fence',
+      300,
+    );
+    expect(reopened).toMatchObject({
+      state: 'running',
+      launchedAt: 300,
+      runStartedAt: 300,
+    });
+    await flushWrites();
+    expect(
+      persistedBackgroundChildren().get('ses_reopened_fence'),
+    ).toMatchObject({ launchedAt: 300 });
+    expect(
+      persistedBackgroundChildren().get('ses_reopened_fence')?.deliveredAt,
+    ).toBeUndefined();
+
+    // Repeated in-flight busy observations do not move the fence again.
+    const stillBusy = board.markRunningFromLiveSession(
+      'ses_reopened_fence',
+      350,
+    );
+    expect(stillBusy?.runStartedAt).toBe(300);
+
+    expect(
+      markPersistedBackgroundChildDelivered(
+        'ses_reopened_fence',
+        400,
+        first.runStartedAt,
+      ),
+    ).toBe(false);
+    expect(
+      markPersistedBackgroundChildDelivered(
+        'ses_reopened_fence',
+        500,
+        reopened.runStartedAt,
+      ),
+    ).toBe(true);
+    expect(
+      persistedBackgroundChildren().get('ses_reopened_fence'),
+    ).toMatchObject({ launchedAt: 300, deliveredAt: 500 });
   });
 });

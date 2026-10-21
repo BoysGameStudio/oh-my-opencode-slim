@@ -85,6 +85,7 @@ import { createRevivedRunTracker } from './hooks/task-session-manager/revived-ru
 import {
   createAliasAuthority,
   createSessionRecovery,
+  recoverSubagentSessionsAtStartup,
 } from './hooks/task-session-manager/session-recovery';
 import type { ToolLoopGuardHook } from './hooks/tool-loop-guard/hook';
 import {
@@ -122,6 +123,7 @@ import {
 import {
   clearTuiAgentActivities,
   clearTuiSessionAlias,
+  collectAgentDisplayNames,
   readTuiSnapshot,
   recordTuiAgentActivity,
   recordTuiAgentModel,
@@ -136,6 +138,7 @@ import {
   BackgroundJobSupervisor,
   type BackgroundTaskConcurrency,
   createDisplayNameMentionRewriter,
+  markPersistedBackgroundChildDelivered,
   normalizeAgentName,
   resolveRuntimeAgentName,
 } from './utils';
@@ -264,27 +267,6 @@ function buildChainGeneration(
     }
   }
   return table;
-}
-
-/**
- * Canonical agent ID → visible display name for the sidebar label.
- *
- * `identities` is the registry's authoritative canonical→display table
- * (plugin config, active preset, host config, marketplace identities). It is
- * the same table prompt routing uses, and `displayName` is documented as
- * frozen for the session, so the label is projected from the registry only —
- * never re-derived from a config reload. Only the rendered label uses these
- * values: model lookup, activity, expansion and history keep their canonical
- * keys.
- */
-function collectAgentDisplayNames(
-  identities: Readonly<Record<string, string>> | undefined,
-): Record<string, string> {
-  const displayNames: Record<string, string> = {};
-  for (const [name, display] of Object.entries(identities ?? {})) {
-    if (display && display !== name) displayNames[name] = display;
-  }
-  return displayNames;
 }
 
 type DelegatedModelSelection = {
@@ -1022,6 +1004,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       onSettled: (taskID) => markRevivedRunSettled(taskID),
       contextFilesForPrompt: (taskID) => getRevivedContextFiles(taskID),
       pruneContext: () => pruneRevivedContext(),
+      onNotificationAccepted: (taskID, runStartedAt) => {
+        markPersistedBackgroundChildDelivered(
+          taskID,
+          Date.now(),
+          runStartedAt ?? backgroundJobCoordinator.get(taskID)?.runStartedAt,
+        );
+      },
       // Degraded-fallback wiring (revived-lineage strand): when every
       // tracker notification attempt has failed, the publication this
       // tracker suppressed in the terminal-outcome listener would
@@ -1032,10 +1021,29 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // must not apply to this fallback. The scheduler's own guards
       // (canSchedule, one-flight wake gate, publication throttle) still
       // apply, correctly.
-      onOwnershipReleased: (parentSessionID, taskID, generation) => {
-        void orchestratorWakeScheduler
-          ?.triggerTerminalPublicationWake(parentSessionID, taskID, generation)
-          ?.catch(() => undefined);
+      onOwnershipReleased: (
+        parentSessionID,
+        taskID,
+        generation,
+        runStartedAt,
+      ) => {
+        void (async () => {
+          const record = backgroundJobCoordinator.get(taskID);
+          const delivered =
+            await orchestratorWakeScheduler?.triggerTerminalPublicationWake(
+              parentSessionID,
+              taskID,
+              generation,
+              record?.terminalRevision,
+            );
+          if (delivered === true) {
+            markPersistedBackgroundChildDelivered(
+              taskID,
+              Date.now(),
+              runStartedAt ?? record?.runStartedAt,
+            );
+          }
+        })().catch(() => undefined);
       },
     });
     backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
@@ -1258,7 +1266,73 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       hasPendingDelegatedWork: (sessionID) =>
         backgroundJobCoordinator.hasRunning(sessionID) ||
         backgroundJobCoordinator.hasTerminalUnreconciled(sessionID),
+      isPublicationCurrent: (publication) => {
+        const record = backgroundJobCoordinator.get(publication.taskID);
+        return (
+          record !== undefined &&
+          record.state !== 'running' &&
+          record.terminalUnreconciled === true &&
+          record.generation === publication.generation &&
+          (publication.terminalRevision === undefined ||
+            record.terminalRevision === publication.terminalRevision)
+        );
+      },
+      onPublicationAccepted: (publication) => {
+        const record = backgroundJobCoordinator.get(publication.taskID);
+        markPersistedBackgroundChildDelivered(
+          publication.taskID,
+          Date.now(),
+          record?.runStartedAt,
+        );
+      },
       coordinator: sessionLifecycle,
+    });
+    // A restarted plugin starts with an empty board. If the parent stays idle
+    // it never transforms history, so restore owned children here from host
+    // state instead of waiting for the next parent request. Verification is
+    // in the scanner: parent launch evidence is required before adoption.
+    void recoverSubagentSessionsAtStartup({
+      input: ctx,
+      backgroundJobBoard: backgroundJobCoordinator,
+      shouldManageSession: (sessionID) =>
+        sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
+        sessionMetadata.isTaskManaged(sessionID),
+      hostFlavor,
+      isDisposed: () => instanceDisposed,
+      registerParentSession: (sessionID) => {
+        // Membership in task management, matching the transform path.
+        sessionMetadata.markTaskManaged(sessionID);
+      },
+      backgroundTaskConcurrency,
+      getModelForAgent: (agentType: string, parentSessionID?: string) => {
+        const delegated = resolveDelegatedModelForParent(
+          agentType,
+          parentSessionID,
+        );
+        if (delegated) return delegated.entry.id;
+        return (
+          resolvePrimaryModelFromFinalHostConfig(agentType) ??
+          (parentSessionID
+            ? sessionMetadata.getModel(parentSessionID)
+            : undefined)
+        );
+      },
+      onRecoveredTerminal: async (parentSessionID, taskID) => {
+        const record = backgroundJobCoordinator.get(taskID);
+        if (!record) return false;
+        return (
+          (await orchestratorWakeScheduler?.triggerTerminalPublicationWake(
+            parentSessionID,
+            taskID,
+            record.generation,
+            record.terminalRevision,
+          )) === true
+        );
+      },
+    }).catch((error: unknown) => {
+      log('[task-session-manager] startup subagent recovery failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     });
     backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
       // A placeholder is not delegated work; its stop is not recoverable
@@ -1314,6 +1388,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // parent gets. Skipping there would lose the stop entirely.
       if (
         record.terminalRevision === 1 &&
+        record.recoveredAtStartup !== true &&
         HOST_ATTRIBUTED_STOP_OUTCOME.test(record.resultSummary ?? '') &&
         !revivedRunTracker.willNotifyParent(record.taskID, record.generation)
       ) {
@@ -1389,7 +1464,14 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // host-side, the job falls back to the passive display channel on
       // the parent's next activity — board injection when enabled, or
       // nothing until the next task_status pull otherwise.
-      if (record.terminalRevision === 1) {
+      // A startup-adopted row was launched before this plugin instance
+      // existed, so no native observer survives to deliver its first
+      // publication. The plugin owns that wake.
+      if (record.terminalRevision === 1 && record.recoveredAtStartup !== true) {
+        // The native notifier owns this publication. Native ownership alone
+        // is not proof of delivery, so nothing is acknowledged here: the
+        // next restart's history scan either finds a trusted current-run
+        // delivery or re-owns this terminal outcome.
         log('[orchestrator-wake] terminal publication wake skipped', {
           sessionID: record.parentSessionID,
           taskID: record.taskID,
@@ -1400,13 +1482,14 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         });
         return;
       }
-      void orchestratorWakeScheduler
-        ?.triggerTerminalPublicationWake(
+      void (async () => {
+        await orchestratorWakeScheduler?.triggerTerminalPublicationWake(
           record.parentSessionID,
           record.taskID,
           record.generation,
-        )
-        ?.catch(() => undefined);
+          record.terminalRevision,
+        );
+      })().catch(() => undefined);
     });
 
     // Initialize hooks and wrapPostToolHook helper for error isolation

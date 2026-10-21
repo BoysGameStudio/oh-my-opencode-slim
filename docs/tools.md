@@ -179,6 +179,9 @@ incomplete round without importing the older outcome or partial answer.
 Work without a terminal outcome (still running,
 or awaiting restart resume) is refused except for explicit queued
 continuation, and partial or unverifiable state fails closed.
+Startup tracking recovery remains separately run-fenced: a historical idle
+cannot settle a newer persisted execution, and queued adoption never serves
+as terminal evidence for the previous round.
 The new generation is registered before the write and is not replaced by late
 acknowledgement. Only that input's completed answer is delivered to the parent;
 old execution outcomes are ignored. Transport uncertainty retains exclusion and

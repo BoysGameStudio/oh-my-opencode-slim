@@ -325,7 +325,7 @@ export function hostRoundStateOf(
   if (
     !outcomePresent ||
     typeof idleAt !== 'number' ||
-    !Number.isFinite(idleAt) ||
+    !Number.isSafeInteger(idleAt) ||
     idleAt < 0 ||
     (outcome !== 'succeeded' &&
       outcome !== 'failed' &&

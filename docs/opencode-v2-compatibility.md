@@ -773,8 +773,34 @@ keep steering; this is not foreground fallback.
 
 ## Background job state: rehydrate probe and persistence
 
-Two mechanisms keep the in-memory background job board honest against the
+Several mechanisms keep the in-memory background job board honest against the
 host across process and plugin restarts:
+
+### Tracking recovery is not execution recovery
+
+Restoring a board row does not resume interrupted execution. OpenCode owns
+automatic restart continuation. In the inspected
+[v2.0.32 host source](https://github.com/anomalyco/opencode/blob/v2.0.32/packages/core/src/session/context.ts),
+`SessionContext.select` flushes MCP tools, then selects the persisted agent
+without an explicit plugin-activation barrier in that method. The runner
+already waits for activation once when a drain begins, but does not repeat
+that wait before every later context selection. Local server logs contain
+`Session.AgentNotFoundError: Agent not found: "designer"` during restart drains;
+the same failure also affects other plugin agents.
+The related upstream [OpenCode issue #54172](https://github.com/anomalyco/opencode/issues/54172)
+also reports existing agents disappearing during plugin/config reloads.
+The proposed [host fix #51133](https://github.com/anomalyco/opencode/pull/51133)
+adds per-selection waits; it remains unmerged at the time of investigation.
+That fix does not establish whether activation readiness covers this plugin's
+deferred agent projection and asynchronous rebuild during cold startup.
+
+If native recovery reaches agent selection before registration completes,
+board adoption cannot repair that failed execution. A prompt-admission hook
+cannot protect selection that already failed. The host needs a readiness
+boundary covering plugin activation and committed agent-registry rebuilds.
+Do not interpret a restored task row as proof that execution resumed, and do
+not blindly resend continuation prompts after uncertain admission. This plugin
+does not add placeholder agents or automatically relaunch work to mask the race.
 
 ### Rehydrate existence probe (`session.get`)
 
@@ -846,15 +872,37 @@ persists background-job lifecycle state through
 `src/utils/background-job-persistence.ts` (configured in `setup` before
 the v1 factory runs):
 
-- **Tombstones and deletion epochs** are write-through: every in-memory
-  ledger mutation queues a matching persisted update, so the persisted
-  state tracks the ledger (writes are fire-and-forget — a crash between
-  the in-memory mutation and the queue flush loses that persisted entry,
-  an accepted degradation to process-local behavior). Clearing a tombstone
-  on a legitimate relaunch is persisted too — a deleted-then-relaunched
-  task is *not* ghost-skipped after a restart, while its deletion epoch
-  survives for generation fencing (restored epochs keep the epoch counter
-  monotonic).
+- **Tombstones, deletion epochs, and owned child identities** are
+  write-through: every in-memory ledger mutation queues a matching
+  persisted update, so the persisted state tracks the ledger (writes are
+  fire-and-forget — a crash between the in-memory mutation and the queue
+  flush loses that persisted entry, an accepted degradation to
+  process-local behavior). A background launch persists the minimal child
+  identity (task ID, parent, original agent, description, objective,
+  launch time). A terminal outcome alone does not mark delivery: the
+  marker is persisted only after an accepted parent-visible wake, or
+  when a trusted current-run delivery is found in parent history.
+  Native notification ownership alone is not delivery evidence, and the
+  launch fence prevents an old delivery from acknowledging a newer run.
+  Busy, throttled, or failed publication retries retain the execution
+  until their accepted delivery covers it. One wake names at most 256
+  executions; the rest stay pending for a later accepted wake, and an
+  attempt whose entire batch was retired before sending is skipped and
+  releases its wake reservation.
+  Clearing a tombstone on a legitimate relaunch is persisted too —
+  a deleted-then-relaunched task is *not* ghost-skipped after a restart,
+  while its deletion epoch survives for generation fencing (restored
+  epochs keep the epoch counter monotonic).
+- **Owned child identities make startup recovery possible without
+  `session.list`.** The bounded startup scan unions those identities with
+  host child rows when list is available, reads each child's transcript,
+  verifies parent launch evidence for list-only candidates, and never
+  adopts a terminal child that has no persisted identity (historical
+  history is not replayed). The
+  delivery marker suppresses a second completion wake on a later restart.
+  Declined, skipped, throttled, or failed plugin wakes leave the identity
+  undelivered for retry. Because the marker write follows the accepted
+  wake, delivery is at-least-once across a crash, not crash-atomic.
 - **Aliases** are not persisted: only a parent created while the plugin
   runs gets numbered aliases, and an old alias resolves only through its
   marker in the parent's history. Once a compaction cuts that history, an
@@ -865,9 +913,10 @@ the v1 factory runs):
   behavior change, fresh boards and ledgers start exactly as
   process-local as before.
 - **Bounded and serialized.** Persisted tombstones (and their epoch
-  entries) self-cap at the 500 most recent by recorded time; writes for
-  one key are serialized in-process (no concurrent read-modify-write);
-  write failures log and degrade to process-local behavior.
+  entries) and owned child identities each self-cap at the 500 most recent
+  by recorded/launch time; writes for one key are serialized in-process
+  (no concurrent read-modify-write); write failures log and degrade to
+  process-local behavior.
 
 ### Diagnostics
 

@@ -155,6 +155,10 @@ export function createRevivedRunTracker(options: {
   onSettled?: (taskID: string) => void;
   contextFilesForPrompt?: (taskID: string) => ContextFile[];
   pruneContext?: () => void;
+  /** Fired when the parent prompt transport accepts a terminal
+   * notification. Persisted startup identities use this as their
+   * delivered acknowledgement, fenced to the run that produced it. */
+  onNotificationAccepted?: (taskID: string, runStartedAt?: number) => void;
   /** Resolve the parent session's CURRENT agent/model selection at send
    * time (#1079): a terminal notification must continue the parent in
    * the mode the session uses now, never a hardcoded `orchestrator`.
@@ -171,6 +175,7 @@ export function createRevivedRunTracker(options: {
     parentSessionID: string,
     taskID: string,
     generation: number,
+    runStartedAt?: number,
   ) => void;
 }): RevivedRunTracker {
   const runs = new Map<string, RevivedRun>();
@@ -497,6 +502,7 @@ export function createRevivedRunTracker(options: {
             });
           }
           notification.sent = true;
+          options.onNotificationAccepted?.(run.taskID, record.runStartedAt);
           if (notification.retryTimer) {
             clearTimeout(notification.retryTimer);
             notification.retryTimer = undefined;
@@ -550,6 +556,7 @@ export function createRevivedRunTracker(options: {
         run.parentSessionID,
         run.taskID,
         run.generation,
+        record.runStartedAt,
       );
       return;
     }

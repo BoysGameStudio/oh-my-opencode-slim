@@ -33,6 +33,9 @@ describe('host round state', () => {
       { time: { idle: 12 } },
       { outcome: 'completed', time: { idle: 12 } },
       { outcome: 'succeeded', time: { idle: Number.NaN } },
+      { outcome: 'succeeded', time: { idle: -1 } },
+      { outcome: 'succeeded', time: { idle: 1.5 } },
+      { outcome: 'succeeded', time: { idle: Number.MAX_SAFE_INTEGER + 1 } },
     ]) {
       expect(hostRoundStateOf(info).kind).toBe('unknown');
     }

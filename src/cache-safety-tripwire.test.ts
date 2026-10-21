@@ -76,6 +76,10 @@ const ALLOWLIST = new Map<string, string>([
     'Date.now() defaults the askedAt ordering key for pending child asks; timestamps are internal bookkeeping — the wake delta carries the ask content, never the timestamp.',
   ],
   [
+    'hooks/task-session-manager/session-recovery.ts',
+    'Date.now() stamps the persisted delivery marker and bounds v1 stop-confirmation polling; neither value is rendered into prompt content. Restored board timestamps come from host/transcript evidence, not this clock.',
+  ],
+  [
     'hooks/auto-update-checker/cache.ts',
     'Date.now() and process.pid name an on-disk quarantine directory during the atomic publish transaction; the path is filesystem bookkeeping, never serialized into prompt content.',
   ],

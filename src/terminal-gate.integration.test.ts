@@ -12,6 +12,12 @@ import * as runtimeFactories from './hooks/task-session-manager/runtime-status-r
 import { OhMyOpenCodeLite as plugin } from './index';
 import type { BackgroundJobRecord } from './utils/background-job-board';
 import type { BackgroundJobCoordinator } from './utils/background-job-coordinator';
+import {
+  configureBackgroundJobPersistence,
+  loadInitialBackgroundJobPersistence,
+  markPersistedBackgroundChildDelivered,
+  recordPersistedBackgroundChild,
+} from './utils/background-job-persistence';
 import * as gateFactories from './utils/background-job-terminal-gate';
 import { BackgroundTaskConcurrency } from './utils/background-task-concurrency';
 import { createEventDirectoryScope } from './utils/event-directory-scope';
@@ -27,6 +33,7 @@ import { mapV2EventToV1 } from './v2/event-adapter';
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  configureBackgroundJobPersistence(undefined);
 });
 const flush = async () => {
   for (let i = 0; i < 80; i++) await Promise.resolve();
@@ -1111,6 +1118,8 @@ interface V2HostProbe {
 
 function v2ShimClient(options: {
   outcome: string;
+  /** Parent ID reported by `session.get` for the child (default 'parent'). */
+  parentID?: string;
   /** Transcript source: a host that exposes `session.messages`.
    * Omitted by default — honest method absence on the session. */
   transcript?: () => unknown;
@@ -1145,11 +1154,11 @@ function v2ShimClient(options: {
     return {
       data: visible
         ? {
-            parentID: 'parent',
+            parentID: options.parentID ?? 'parent',
             outcome: host.outcome,
             time: { idle: host.idleAt },
           }
-        : { parentID: 'parent' },
+        : { parentID: options.parentID ?? 'parent' },
     };
   });
   const messages = options.transcript
@@ -3844,3 +3853,114 @@ driftTest(
     }
   },
 );
+
+test('startup recovers a running native child and wakes the idle parent on completion', async () => {
+  resetOrchestratorWakeGateForTests();
+  const promptAsync = mock(async () => ({}));
+  const runningChildHistory = {
+    data: [
+      {
+        info: { id: 'u', role: 'user', time: { created: 12 } },
+        parts: [{ type: 'text', text: 'go' }],
+      },
+    ],
+  };
+  const childHistory = {
+    data: [
+      {
+        info: { id: 'u', role: 'user', time: { created: 12 } },
+        parts: [{ type: 'text', text: 'go' }],
+      },
+      {
+        info: {
+          id: 'a',
+          role: 'assistant',
+          time: { created: 13, completed: 14 },
+          finish: 'stop',
+        },
+        parts: [{ type: 'text', text: 'Done' }],
+      },
+    ],
+  };
+  let transcript: unknown = runningChildHistory;
+  const hostChildren: Array<Record<string, unknown>> = [
+    { id: 'ses_parent', agent: 'orchestrator' },
+    { id: 'ses_child', parentID: 'ses_parent', agent: 'explorer' },
+  ];
+  const values = new Map<string, unknown>();
+  configureBackgroundJobPersistence({
+    get: (key: string) => values.get(key),
+    set: (key: string, value: unknown) => {
+      values.set(key, value);
+    },
+    remove: (key: string) => {
+      values.delete(key);
+    },
+    scan: ({ prefix }: { prefix: string }) => ({
+      entries: [...values.entries()]
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([key, value]) => ({ key, value })),
+    }),
+  });
+  recordPersistedBackgroundChild({
+    taskID: 'ses_child',
+    parentSessionID: 'ses_parent',
+    agent: 'explorer',
+    description: 'map auth',
+    launchedAt: 10,
+    background: true,
+  });
+  // The previous run completed one second before this run started. Its
+  // delivery marker must not hide the resumed run.
+  markPersistedBackgroundChildDelivered('ses_child', 11);
+  await Bun.sleep(10);
+  await loadInitialBackgroundJobPersistence();
+  const probe = v2ShimClient({
+    outcome: 'succeeded',
+    parentID: 'ses_parent',
+    transcript: () => transcript,
+    wakeSurface: { listChildren: () => hostChildren, promptAsync },
+  });
+  const { h, pump, awaitPublication } = await openV2Lifecycle(probe, {
+    hostFlavor: 'v2',
+  });
+
+  // No parent transform and no parent prompt: startup alone must restore the
+  // running child from host session state plus persisted launch evidence.
+  let adopted: BackgroundJobRecord | undefined;
+  for (let i = 0; i < 100; i += 1) {
+    adopted = h.board.get('ses_child');
+    if (adopted?.state === 'running' && adopted.externalOrigin === true) break;
+    await Bun.sleep(5);
+  }
+  expect(adopted).toMatchObject({
+    parentSessionID: 'ses_parent',
+    agent: 'explorer',
+    state: 'running',
+    background: true,
+    externalOrigin: true,
+    recoveredAtStartup: true,
+  });
+  expect(adopted?.pluginLaunched).toBeUndefined();
+  expect(promptAsync).not.toHaveBeenCalled();
+
+  transcript = childHistory;
+  await pump({
+    type: 'session.execution.succeeded',
+    data: { sessionID: 'ses_child' },
+  });
+  await awaitPublication('ses_child', 0);
+  await flush();
+  await Bun.sleep(30);
+  expect(promptAsync).toHaveBeenCalledTimes(1);
+
+  // A duplicate completion observation must not send a second publication
+  // for a terminal execution that was already acknowledged.
+  await pump({
+    type: 'session.execution.succeeded',
+    data: { sessionID: 'ses_child' },
+  });
+  await flush();
+  await Bun.sleep(30);
+  expect(promptAsync).toHaveBeenCalledTimes(1);
+});

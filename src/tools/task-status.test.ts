@@ -420,7 +420,8 @@ describe('task_status untracked read-only fallback', () => {
     transcript?: 'completed' | 'incomplete' | 'textless';
     liveStatus?: Record<string, { type: string }>;
     omitGet?: boolean;
-    outcome?: 'succeeded';
+    outcome?: string;
+    idle?: number;
   }) {
     return {
       session: {
@@ -435,7 +436,7 @@ describe('task_status untracked read-only fallback', () => {
                   ...(options?.outcome
                     ? {
                         outcome: options.outcome,
-                        time: { created: 9, idle: 13 },
+                        time: { created: 100, idle: options.idle ?? 200 },
                       }
                     : { time: { created: 100, updated: 200 } }),
                 },
@@ -474,6 +475,76 @@ describe('task_status untracked read-only fallback', () => {
     } as any);
     expect(output).toContain('state: running-or-incomplete (uncertain');
     expect(output).not.toContain('The task is still running.');
+  });
+
+  test('v2 status classifies from the ownership read without an extra get', async () => {
+    client = hostClient({
+      transcript: 'incomplete',
+      outcome: 'succeeded',
+      idle: 20,
+    });
+    const { task_status } = makeTool({
+      board: new BackgroundJobBoard(),
+      hostFlavor: 'v2',
+    });
+    const output = await task_status.execute({ task_id: KID }, {
+      sessionID: 'parent-1',
+    } as any);
+    expect(output).toContain('state: completed (verified from host state)');
+    expect(client.session.get).toHaveBeenCalledTimes(1);
+  });
+
+  test('v2 keeps a newer assistant after the host idle pending', async () => {
+    client = hostClient({
+      transcript: 'incomplete',
+      outcome: 'succeeded',
+      idle: 12,
+    });
+    client.session.messages = mock(async () => ({
+      data: [
+        {
+          info: { id: 'msg_user', role: 'user', time: { created: 10 } },
+          parts: [],
+        },
+        {
+          info: {
+            id: 'msg_newer',
+            role: 'assistant',
+            time: { created: 13 },
+          },
+          parts: [{ type: 'text', text: 'NEWER' }],
+        },
+      ],
+    }));
+    const { task_status } = makeTool({
+      board: new BackgroundJobBoard(),
+      hostFlavor: 'v2',
+    });
+    const output = await task_status.execute({ task_id: KID }, {
+      sessionID: 'parent-1',
+    } as any);
+    expect(output).toContain('state: running-or-incomplete (uncertain');
+    expect(output).toContain(
+      'no terminal host outcome covers the latest input',
+    );
+    expect(output).not.toContain('NEWER');
+    expect(client.session.get).toHaveBeenCalledTimes(1);
+  });
+
+  test('a returned id for another session refuses untracked ownership', async () => {
+    client = hostClient();
+    client.session.get = mock(async () => ({
+      data: {
+        id: 'ses_other',
+        parentID: 'parent-1',
+        agent: 'fixer',
+        time: { created: 100 },
+      },
+    }));
+    const { task_status } = makeTool({ board: new BackgroundJobBoard() });
+    await expect(
+      task_status.execute({ task_id: KID }, { sessionID: 'parent-1' } as any),
+    ).rejects.toThrow('Unknown task ID or alias');
   });
 
   test('a v1 live busy map reports live running without board adoption', async () => {
@@ -582,7 +653,7 @@ describe('task_status untracked read-only fallback', () => {
     expect(board.get(KID)).toBeUndefined();
   });
 
-  test('a v2 host outcome without readable answer text reports the caveat, not verified completion', async () => {
+  test('a v2 host outcome without readable answer text reports pending, not verified completion', async () => {
     // Incident 1115 companion: the status fallback must not render a
     // textless succeeded host outcome as plain verified completion.
     client = hostClient({ transcript: 'textless', outcome: 'succeeded' });
@@ -595,13 +666,12 @@ describe('task_status untracked read-only fallback', () => {
       sessionID: 'parent-1',
     } as any);
     expect(output).toContain(
-      'state: completed (host outcome; answer text is not readable yet)',
+      'uncertain; no terminal host outcome covers the latest input',
     );
-    await expect(
-      task_status.execute({ task_id: KID, result: true }, {
-        sessionID: 'parent-1',
-      } as any),
-    ).rejects.toThrow(/no terminal evidence of completion/);
+    const result = await task_status.execute({ task_id: KID, result: true }, {
+      sessionID: 'parent-1',
+    } as any);
+    expect(result).toContain('state: running (unconfirmed)');
   });
 
   test('a failed v1 live status read reports unknown, not history completion', async () => {
