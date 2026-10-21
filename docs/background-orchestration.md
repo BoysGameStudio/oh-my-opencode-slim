@@ -578,8 +578,16 @@ terminal publications of the same run (for example a child that
 self-continued), and child-input asks still wake an idle parent, and their
 SDK-error retries still use the idle timer. A failed publication retry survives
 parent busy/idle transitions, including when periodic wakes are disabled.
-Deletion clears the retry. This does not add restart persistence or retry
-publications skipped by the throttle. On v2, terminal retirement is
+Deletion clears the retry. On v2, later-result wakes carry explicit
+`task_status { sessionID: "<child>", result: true }` pointers for every queued
+publishing child, rather than asking the parent to guess from delegation
+history. Failed sends and throttled bursts retain those identities; only the
+occurrences accepted by transport are retired, so a child publishing during
+the send survives for a later wake. The pointers live in a newly appended,
+tagged volatile message through the cache-safe injection helper; historical
+messages, frozen prompts, and tool definitions are not rewritten. The shared
+input-wait, parent-busy, and no-progress gates still apply. This does not add
+restart persistence; v1's throttle behavior is unchanged. On v2, terminal retirement is
 observation-based: the plugin watches the host's native `<subagent>`
 deliveries in the parent's transcript and retires the matching record, with a
 timestamp fallback for a missed observation. On v1, `boardInjection: false`
