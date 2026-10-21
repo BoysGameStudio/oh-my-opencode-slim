@@ -132,6 +132,32 @@ const HOST_TERMINAL_OUTCOMES: readonly string[] = [
   'interrupted',
 ];
 
+/** Reduce a session-info payload to the probe verdict. Parsing is shared
+ *  with recovery triage through `hostRoundStateOf`; the reason strings are
+ *  the classifier's own (they are rendered by task_status). */
+function classifySessionInfo(
+  info: Record<string, unknown>,
+): LiveSessionClassification {
+  const state = hostRoundStateOf(info);
+  if (state.kind === 'terminal') {
+    return { kind: 'outcome', outcome: state.outcome, idleAt: state.idleAt };
+  }
+  if (state.kind === 'pending') {
+    return { kind: 'unknown', reason: 'no host terminal outcome' };
+  }
+  const outcome = info.idleOutcome ?? info.idle_outcome ?? info.outcome;
+  if (outcome === undefined || outcome === null) {
+    return { kind: 'unknown', reason: 'no host terminal outcome' };
+  }
+  return {
+    kind: 'unknown',
+    reason:
+      typeof outcome === 'string' && !HOST_TERMINAL_OUTCOMES.includes(outcome)
+        ? `unrecognized host outcome: ${outcome}`
+        : 'host outcome has no valid idle time',
+  };
+}
+
 /**
  * One bounded classification of a live child session, reduced to what a
  * task-status probe can act on. Pure: no tool text, no board writes.
@@ -180,11 +206,12 @@ export async function readLiveSession(
  * Classify one child session ONCE for a task-status probe.
  *
  * Reuses the live session-status map where the host exposes it (v1). On
- * hosts without that map (v2) the map read is not evidence, so one bounded
- * host `session.get` read surfaces the terminal outcome
- * (`succeeded|failed|interrupted`) together with `time.idle` — the same
- * host-clock timestamp the terminal gate attributes against. Anything
- * unreadable or unrecognized stays `unknown`, never a fabricated state.
+ * hosts without that map (v2) one bounded host `session.get` read surfaces
+ * the terminal outcome (`succeeded|failed|interrupted`) together with
+ * `time.idle` — the same host-clock timestamp the terminal gate attributes
+ * against. Anything unreadable or unrecognized stays `unknown`, never a
+ * fabricated state. Callers that already read the session info pass it as
+ * `hostInfo` so the probe never issues a duplicate read.
  */
 export async function classifyLiveSession(
   input: PluginInput,
@@ -194,6 +221,8 @@ export async function classifyLiveSession(
     timers?: RuntimeStatusTimers;
     /** Reuse a status-map read already performed for this query. */
     snapshot?: RuntimeSessionStatusSnapshot;
+    /** Reuse a session-info read already performed for this query. */
+    hostInfo?: Record<string, unknown>;
   } = {},
 ): Promise<LiveSessionClassification> {
   const timeoutMs =
@@ -213,6 +242,9 @@ export async function classifyLiveSession(
     return live.kind === 'busy' || live.kind === 'retry'
       ? { kind: 'running' }
       : { kind: 'idle' };
+  }
+  if (options.hostInfo !== undefined) {
+    return classifySessionInfo(options.hostInfo);
   }
   if (typeof client?.session?.get !== 'function') {
     return {
@@ -244,32 +276,9 @@ export async function classifyLiveSession(
   ) {
     return { kind: 'unknown', reason: 'invalid session info response' };
   }
-  const info = isRecord(response.data) ? response.data : response;
-  const outcome = info.idleOutcome ?? info.idle_outcome ?? info.outcome;
-  const rawIdleAt = isRecord(info.time) ? info.time.idle : undefined;
-  const idleAt =
-    typeof rawIdleAt === 'number' &&
-    Number.isFinite(rawIdleAt) &&
-    rawIdleAt >= 0
-      ? rawIdleAt
-      : undefined;
-  if (typeof outcome === 'string' && HOST_TERMINAL_OUTCOMES.includes(outcome)) {
-    if (idleAt === undefined) {
-      return { kind: 'unknown', reason: 'host outcome has no valid idle time' };
-    }
-    return {
-      kind: 'outcome',
-      outcome: outcome as HostTerminalOutcome,
-      idleAt,
-    };
-  }
-  return {
-    kind: 'unknown',
-    reason:
-      typeof outcome === 'string'
-        ? `unrecognized host outcome: ${outcome}`
-        : 'no host terminal outcome',
-  };
+  return classifySessionInfo(
+    isRecord(response.data) ? response.data : response,
+  );
 }
 
 export function runtimeSessionStatus(
@@ -299,7 +308,7 @@ export type HostRoundState =
 export function hostRoundStateOf(
   info: Record<string, unknown> | undefined,
 ): HostRoundState {
-  const outcome = info?.outcome;
+  const outcome = info?.idleOutcome ?? info?.idle_outcome ?? info?.outcome;
   const time = isRecord(info?.time) ? info.time : undefined;
   const idleAt = time?.idle;
   const outcomePresent = outcome !== undefined && outcome !== null;
@@ -308,6 +317,7 @@ export function hostRoundStateOf(
     !outcomePresent ||
     typeof idleAt !== 'number' ||
     !Number.isFinite(idleAt) ||
+    idleAt < 0 ||
     (outcome !== 'succeeded' &&
       outcome !== 'failed' &&
       outcome !== 'interrupted')

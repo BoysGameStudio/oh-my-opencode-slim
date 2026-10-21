@@ -87,9 +87,12 @@ async function probeTerminalOutcome(
   },
   run: { taskID: string; generation: number },
   snapshot?: RuntimeSessionStatusSnapshot,
+  loadHostInfo?: () => Promise<Record<string, unknown> | undefined>,
 ): Promise<TerminalProbeResult> {
+  const hostInfo = loadHostInfo ? await loadHostInfo() : undefined;
   const classification = await classifyLiveSession(options.input, run.taskID, {
     ...(snapshot ? { snapshot } : {}),
+    ...(hostInfo !== undefined ? { hostInfo } : {}),
   });
   let gateResult: GateResult | undefined;
   if (classification.kind === 'outcome') {
@@ -438,11 +441,32 @@ async function readTaskResult(
     );
   }
   let terminalProbe: TerminalProbeResult | undefined;
+  const client = getClient(options.input);
+  let hostInfo: Record<string, unknown> | undefined;
+  let hostInfoRead = false;
+  // One host session-info read per query: the terminal probe classifies from
+  // it and the ownership gate below reuses it instead of re-reading.
+  const loadHostInfo = async (): Promise<
+    Record<string, unknown> | undefined
+  > => {
+    if (hostInfoRead) return hostInfo;
+    hostInfoRead = true;
+    if (typeof client.session.get !== 'function') return undefined;
+    const response = await client.session.get({
+      path: { id: taskID },
+      query: { directory: options.input.directory },
+    });
+    if (response.data?.parentID !== parentSessionID)
+      throw new Error(`Task ${requested} does not belong to this session`);
+    hostInfo = response.data as Record<string, unknown> | undefined;
+    return hostInfo;
+  };
   if (current?.state === 'running') {
     terminalProbe = await probeTerminalOutcome(
       { input: options.input, gate, board },
       { taskID, generation: current.generation },
       snapshot,
+      loadHostInfo,
     );
     if (
       terminalProbe.record &&
@@ -466,17 +490,8 @@ async function readTaskResult(
   }
 
   const token = current ? gate.capture(current) : undefined;
-  const client = getClient(options.input);
-  let hostInfo: Record<string, unknown> | undefined;
-  if (typeof client.session.get === 'function') {
-    const response = await client.session.get({
-      path: { id: taskID },
-      query: { directory: options.input.directory },
-    });
-    if (response.data?.parentID !== parentSessionID)
-      throw new Error(`Task ${requested} does not belong to this session`);
-    hostInfo = response.data as Record<string, unknown> | undefined;
-  } else if (!current)
+  await loadHostInfo();
+  if (typeof client.session.get !== 'function' && !current)
     throw new Error(
       `Task ${requested} is not tracked by this session and cannot be verified`,
     );
@@ -509,6 +524,7 @@ async function readTaskResult(
           { input: options.input, gate, board },
           { taskID, generation: current.generation },
           snapshot,
+          loadHostInfo,
         );
         if (terminalProbe.record?.generation !== current.generation) {
           throw new Error(

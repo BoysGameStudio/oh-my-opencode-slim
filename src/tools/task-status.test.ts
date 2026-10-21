@@ -1014,9 +1014,9 @@ describe('task_status v2 terminal-outcome probe', () => {
     );
     expect(output).toBe('Host reported outcome: succeeded.');
     expect(h.board.get('ses_child1')?.state).toBe('completed');
-    // Initial gate probe (stale idle), classifier read, gate attribution read,
-    // and result ownership check; exactly one is the classifier.
-    expect(h.get).toHaveBeenCalledTimes(4);
+    // Initial gate probe (stale idle), the classifier's read (reused by the
+    // result ownership check), and the gate attribution read.
+    expect(h.get).toHaveBeenCalledTimes(3);
   });
 
   test('interrupted publishes stopped and never becomes completed', async () => {
