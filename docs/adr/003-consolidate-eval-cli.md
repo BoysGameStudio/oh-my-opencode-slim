@@ -82,6 +82,8 @@ Consolidate to **one file, flag-based dispatch** (Option 1).
 The current implementation keeps one flag-based CLI entry point, but extracts
 `eval-server.ts` for independently testable URL/ownership behavior. Explicit
 `OPENCODE_URL` targets are connect-only; no unowned listener is terminated.
+Live commands require a compatible v1 endpoint or `OPENCODE_V1_EXECUTABLE`;
+the unqualified system `opencode` is never auto-selected because it may be v2.
 `suite-runner.ts` owns validation, collection/scoring, and worktree restoration;
 `results.ts` owns result lookup. The historical file counts and private
 `startServe`/`stopServe` descriptions below describe the original consolidation,

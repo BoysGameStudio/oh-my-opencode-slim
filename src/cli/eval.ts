@@ -232,7 +232,10 @@ try {
 // Scoring saved outputs is offline unless an advisory judge is requested.
 const server =
   !values['outputs-file'] || values.judge
-    ? await startEvalServer(process.env.OPENCODE_URL)
+    ? await startEvalServer({
+        url: process.env.OPENCODE_URL,
+        executable: process.env.OPENCODE_V1_EXECUTABLE,
+      })
     : null;
 
 const judgeResults = new Map<string, string>();

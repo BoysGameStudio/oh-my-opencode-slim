@@ -27,7 +27,10 @@ export interface EvalSessionClient {
         agent: string;
       };
       query: { directory: string };
-    }) => Promise<unknown>;
+    }) => Promise<{
+      error?: unknown;
+      response?: Pick<Response, 'ok' | 'status'>;
+    }>;
     messages: (opts: {
       path: { id: string };
       query: { directory: string };

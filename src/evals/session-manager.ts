@@ -1,4 +1,4 @@
-import { sessionAbortFailure, withTimeout } from '../utils/session';
+import { withTimeout } from '../utils/session';
 import type { EvalSessionClient } from './eval-client';
 import { pollSession } from './polling-session';
 import type { Transcript } from './schema';
@@ -64,7 +64,8 @@ export async function runWithSession(
     console.log(`${tsFn()} ${attemptLabel} still running (${secs}s)`);
   }, 30_000);
   let sid: string | undefined;
-  let dispatchSettled = true;
+  let dispatchAttempted = false;
+  let dispatchAcknowledged = false;
   let result: EvalSessionResult;
 
   try {
@@ -106,27 +107,24 @@ export async function runWithSession(
       };
     }
 
-    dispatchSettled = false;
-    const dispatch = client.session
-      .promptAsync({
-        path: { id: sid },
-        body: {
-          parts: promptBody.parts,
-          agent: promptBody.agent,
-        },
-        query: { directory },
-      })
-      .finally(() => {
-        dispatchSettled = true;
-      });
+    dispatchAttempted = true;
+    const dispatch = client.session.promptAsync({
+      path: { id: sid },
+      body: {
+        parts: promptBody.parts,
+        agent: promptBody.agent,
+      },
+      query: { directory },
+    });
     const dispatched = await deps.withTimeout(
       dispatch,
       timeoutMs,
       'Session prompt timed out',
     );
-    const dispatchFailure = sessionAbortFailure(dispatched);
-    if (dispatchFailure)
-      throw new Error(`Prompt dispatch failed: ${dispatchFailure}`);
+    if (dispatched.error != null || dispatched.response?.ok !== true) {
+      throw new Error('Session prompt was not positively acknowledged');
+    }
+    dispatchAcknowledged = true;
 
     result = await deps.pollSession(
       {
@@ -162,14 +160,14 @@ export async function runWithSession(
     clearInterval(heartbeat);
   }
   if (sid) {
-    const dispatchWasPending = !dispatchSettled;
     await deps.stopEvalSessionTree(client, sid, directory);
-    // A still-pending submission could start work after an abort. Do not
-    // claim quiescence or restore user work in that ambiguous case.
-    if (dispatchWasPending) {
+    // Promise rejection/settlement does not prove the host discarded a prompt.
+    // Without a positive HTTP acknowledgement, admission may still happen
+    // after these aborts and idle scans. Keep user work stashed in that case.
+    if (dispatchAttempted && !dispatchAcknowledged) {
       throw new EvalQuiescenceError(
         [sid],
-        'Prompt submission was still pending when shutdown began',
+        'Prompt dispatch was not positively acknowledged; late admission remains possible',
       );
     }
   }

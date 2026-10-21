@@ -5,9 +5,13 @@ import type { pollSession } from '../polling-session';
 import { runWithSession } from '../session-manager';
 import { EvalQuiescenceError } from '../session-quiescence';
 
+type PromptResponse = Awaited<
+  ReturnType<EvalSessionClient['session']['promptAsync']>
+>;
+
 function fixture() {
   const promptAsync = mock<EvalSessionClient['session']['promptAsync']>(
-    async () => ({}),
+    async () => ({ response: new Response(null, { status: 204 }) }),
   );
   const client = {
     session: {
@@ -146,7 +150,7 @@ test('shutdown failure is fatal instead of an ordinary failed trial eligible for
 
 test('a timed-out pending prompt submission cannot be declared safe after abort', async () => {
   const { promptAsync, deps, run } = fixture();
-  const dispatch = Promise.withResolvers<unknown>();
+  const dispatch = Promise.withResolvers<PromptResponse>();
   promptAsync.mockReturnValue(dispatch.promise);
   deps.withTimeout = async <T>(
     promise: Promise<T>,
@@ -157,14 +161,14 @@ test('a timed-out pending prompt submission cannot be declared safe after abort'
       throw new Error('dispatch timed out');
     return promise;
   };
-  await expect(run()).rejects.toThrow('Prompt submission was still pending');
+  await expect(run()).rejects.toThrow('not positively acknowledged');
   expect(deps.stopEvalSessionTree).toHaveBeenCalledTimes(1);
   dispatch.resolve({});
 });
 
 test('a prompt settling during shutdown does not bypass the fail-closed fence', async () => {
   const { promptAsync, deps, run } = fixture();
-  const dispatch = Promise.withResolvers<unknown>();
+  const dispatch = Promise.withResolvers<PromptResponse>();
   promptAsync.mockReturnValue(dispatch.promise);
   deps.withTimeout = async <T>(
     promise: Promise<T>,
@@ -176,15 +180,42 @@ test('a prompt settling during shutdown does not bypass the fail-closed fence', 
     return promise;
   };
   deps.stopEvalSessionTree.mockImplementation(async () => {
-    dispatch.resolve({});
+    dispatch.resolve({ response: new Response(null, { status: 204 }) });
     await tick();
   });
-  await expect(run()).rejects.toThrow('Prompt submission was still pending');
+  await expect(run()).rejects.toThrow('not positively acknowledged');
 });
 
 test('SDK prompt errors still stop the created session', async () => {
   const { promptAsync, deps, run } = fixture();
   promptAsync.mockResolvedValue({ error: 'rejected' });
-  expect((await run()).success).toBe(false);
+  await expect(run()).rejects.toBeInstanceOf(EvalQuiescenceError);
   expect(deps.stopEvalSessionTree).toHaveBeenCalledTimes(1);
+});
+
+test('transport rejection remains unsafe when the host admits the prompt after idle scans', async () => {
+  const { promptAsync, deps, run } = fixture();
+  const admit = Promise.withResolvers<void>();
+  let hostAdmitted = false;
+  const admitted = admit.promise.then(() => {
+    hostAdmitted = true;
+  });
+  promptAsync.mockRejectedValue(
+    new Error('connection reset after request write'),
+  );
+  // The shutdown barrier succeeds before the server's delayed admission.
+  deps.stopEvalSessionTree.mockResolvedValue();
+  await expect(run()).rejects.toThrow('late admission remains possible');
+  expect(deps.stopEvalSessionTree).toHaveBeenCalledTimes(1);
+  expect(deps.pollSession).not.toHaveBeenCalled();
+  expect(hostAdmitted).toBe(false);
+  admit.resolve();
+  await admitted;
+  expect(hostAdmitted).toBe(true);
+});
+
+test('a fulfilled SDK promise without a positive HTTP acknowledgement remains unsafe', async () => {
+  const { promptAsync, run } = fixture();
+  promptAsync.mockResolvedValue({});
+  await expect(run()).rejects.toBeInstanceOf(EvalQuiescenceError);
 });

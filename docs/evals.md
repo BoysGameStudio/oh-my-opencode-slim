@@ -23,6 +23,19 @@ of historical filesystem state. Missing outputs fail the command.
 
 ## Live commands (spend model tokens)
 
+Live collection and `--judge` require a **compatible OpenCode 1.x runtime**.
+The installed/default `opencode` may be v2 (for example 2.0.28); this harness
+does not implement its API and never auto-selects that executable. Supply either
+`OPENCODE_URL` for an existing v1 endpoint or `OPENCODE_V1_EXECUTABLE` for an
+explicit v1 binary. The harness does not install a runtime or change your normal
+OpenCode setup. Offline commands above need neither.
+
+Compatibility is checked before stashing or creating any eval session: explicit
+binaries must report a 1.x `--version`; endpoints must report a healthy 1.x
+`/global/health` response and expose the v1 `/session` array API. A missing,
+unverifiable, or v2 runtime fails immediately rather than starting a token-costing
+run. These checks establish the API baseline, not a live-model benchmark.
+
 Use a **disposable checkout**, not a worktree with concurrent editors or active
 agent sessions. Eval prompts can edit files. Collection stashes tracked and
 untracked work, resets/cleans between passes, and restores staged and unstaged
@@ -38,8 +51,12 @@ server's status map are ignored. All concurrent workers finish shutdown before
 between-pass cleanup or final restoration.
 
 Shutdown is bounded to 10 seconds with bounded individual requests. If abort,
-child enumeration, or status checks fail, or prompt submission was still pending
-when shutdown began, the command fails **without reset, clean, or stash restore**.
+child enumeration, or status checks fail, or prompt submission did not receive a
+positive HTTP acknowledgement, the command fails **without reset, clean, or
+stash restore**. This includes transport rejection: a rejected client promise
+does not prove the host discarded the request, and it may admit the prompt after
+idle scans. A late success after client timeout is likewise not an acknowledgement
+observed by the trial.
 It prints the checkout and preserved stash commit. This deliberately prefers
 recoverable stashed work to restoring it underneath a possible active writer.
 Stop only the reported eval sessions and their descendants using the selected
@@ -49,10 +66,12 @@ unrelated production sessions or blindly pop another stash. Abrupt process
 termination likewise requires checking the eval sessions before recovery.
 
 ```bash
-bun run eval --suite orchestrator-natural-routing
-bun run eval --smoke --suite orchestrator-direct-execution
-bun run eval --suite orchestrator-natural-routing --exclude case-id,other-case
+# Connect only to an already running compatible v1 server:
 OPENCODE_URL=http://127.0.0.1:8765 bun run eval --suite orchestrator-natural-routing
+
+# Or explicitly select an installed v1 executable to manage a local server:
+OPENCODE_V1_EXECUTABLE=/path/to/opencode-v1 bun run eval --smoke --suite orchestrator-direct-execution
+OPENCODE_V1_EXECUTABLE=/path/to/opencode-v1 bun run eval --suite orchestrator-natural-routing --exclude case-id,other-case
 ```
 
 Omitting `--suite` runs every discovered suite. Full collection uses three
@@ -60,9 +79,10 @@ trials per case; smoke runs only tagged cases once. `EVAL_CONCURRENCY` sets a
 positive integer worker count (default 3).
 
 With `OPENCODE_URL`, the harness only connects to that URL: it never starts or
-stops a local server on its behalf. Without it, the target is
-`http://127.0.0.1:4096`: reuse a healthy server, otherwise attempt to start an
-owned `opencode serve` child. No existing listener is killed, even when unhealthy.
+stops a local server on its behalf, even if `OPENCODE_V1_EXECUTABLE` is also set.
+With only `OPENCODE_V1_EXECUTABLE`, the target is `http://127.0.0.1:4096`: reuse a
+compatible healthy v1 server, otherwise attempt to start an owned child using
+that exact executable. No existing listener is killed, even when unhealthy.
 Startup failure cleans up only that child. Saved-output scoring does not contact
 a server unless `--judge` is also requested.
 

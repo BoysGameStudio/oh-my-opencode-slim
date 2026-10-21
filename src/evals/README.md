@@ -27,7 +27,8 @@ are advisory and never determine the exit code.
 - `eval-client.ts`: the OpenCode v1 SDK client subset.
 - `../cli/eval.ts`: consolidated command entry point.
 - `../cli/auto-collect.ts`: automated collection and between-pass cleanup.
-- `../cli/eval-server.ts`: connect-only URL overrides and owned-child lifecycle.
+- `../cli/eval-server.ts`: explicit v1 URL/executable selection, fail-fast runtime
+  compatibility checks, and owned-child lifecycle.
 - `../cli/git-lifecycle.ts`: tracked/untracked stash capture and restoration.
 
 Results are ignored under `src/evals/results/`. Do not commit file changes made
@@ -37,8 +38,9 @@ Collection drains all workers before propagating errors. Every created root is
 stopped on success as well as failure, including discovered descendants; abort
 acknowledgements and two stable idle scans are required. Shutdown uncertainty
 throws `EvalQuiescenceError`, which prevents reset/clean/stash restoration and
-prints recovery context. A pending prompt dispatch is never treated as stopped
-just because an earlier abort returned successfully. See the recovery policy in
+prints recovery context. An unacknowledged prompt dispatch (including a transport
+rejection) is never treated as stopped just because an earlier abort returned
+successfully. See the recovery policy in
 the command documentation.
 
 ## Adding cases
