@@ -476,7 +476,9 @@ function describeUntrackedEvidence(round: {
   reason?: string;
 }): string {
   if (round.verdict === 'completed') {
-    return 'state: completed (verified from history)';
+    return round.reason
+      ? `state: completed (host outcome; ${round.reason})`
+      : 'state: completed (verified from history)';
   }
   if (round.verdict === 'error') {
     return 'state: error (verified from history)';

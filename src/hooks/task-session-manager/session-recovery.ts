@@ -344,7 +344,14 @@ async function recoverRetainedSession(
   if (options.hostFlavor === 'v2') {
     const latestInputAt = latestInputAtOf(childTranscript);
     const hostState = hostRoundStateOf(hosted.hostInfo);
-    const verdict = hostRoundVerdict(hostState, latestInputAt);
+    let verdict = hostRoundVerdict(hostState, latestInputAt);
+    // Incident 1115: a succeeded host outcome without readable answer text
+    // must not import an empty completed row — the gate trusts restored
+    // rows, so later result reads would stay empty. Keep the round pending
+    // until the answer is readable; queued revival may still adopt identity.
+    const textUnreadable =
+      verdict === 'terminal' && !terminalTextOf(childTranscript);
+    if (textUnreadable) verdict = 'pending';
     if (verdict === 'unknown') {
       const reason =
         hostState.kind === 'unknown' ? hostState.reason : 'unknown';
@@ -361,7 +368,9 @@ async function recoverRetainedSession(
         // the execution claim on purpose and the host may resume the round
         // after a restart, so a guessed stop import would lie.
         return refuse(
-          `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or use task_revive with a new prompt. No prompt was sent`,
+          textUnreadable
+            ? `Task ${sessionID} host outcome is terminal but its answer text is not readable yet; nothing was imported. Retry task_status later, or use task_revive with a new prompt. No prompt was sent`
+            : `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or use task_revive with a new prompt. No prompt was sent`,
         );
       }
       // Identity adoption still requires a decipherable latest input; the
@@ -374,12 +383,12 @@ async function recoverRetainedSession(
     }
     round = composeHostRound(hostState, latestInputAt);
     if (verdict === 'terminal') {
-      const text = terminalTextOf(childTranscript);
-      if (text !== undefined) round.text = text;
+      round.text = terminalTextOf(childTranscript);
     }
-    // With queuedAdoption the unreadable composition is the pending round;
-    // identity is returned below without an import. Every other unreadable
-    // shape refuses here.
+    // A downgraded (textless) round composes as pending under
+    // queuedAdoption: identity is returned below without an import, so
+    // task_revive owns the continuation. Every other unreadable shape
+    // refuses here.
     if (round.verdict === 'unreadable' && !queuedAdoption) {
       return refuse(
         `Task ${sessionID} transcript could not be classified (${round.reason ?? 'unreadable'}); no prompt was sent`,

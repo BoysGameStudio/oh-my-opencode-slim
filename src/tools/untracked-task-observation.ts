@@ -166,7 +166,8 @@ async function readTranscript(
     const round = composeHostRound(state, latestInputAt);
     if (state.kind === 'terminal') {
       const text = terminalTextOf(transcript);
-      if (text !== undefined) round.text = text;
+      if (text) round.text = text;
+      else round.reason = 'answer text is not readable yet';
     }
     return { live, round };
   } catch (error) {
