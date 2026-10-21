@@ -1253,6 +1253,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "Phototonic",
+      "name": "Lucas Wright",
+      "avatar_url": "https://avatars.githubusercontent.com/u/35551999?v=4",
+      "profile": "https://github.com/Phototonic",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"
