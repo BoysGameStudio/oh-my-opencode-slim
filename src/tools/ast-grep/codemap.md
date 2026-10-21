@@ -64,6 +64,7 @@ The implementation follows a layered architecture:
 3. CLI's JSON pass reports matches with `replacement` fields but does not write files
 4. For apply requests with matches in the raw report, a second non-JSON `--update-all` pass writes the files; report truncation never gates writes, and apply failures/timeouts return errors
 5. Tool formats successful results with `[DRY RUN]` or `[APPLIED]` indicators and before/after snippets
+   - Write success is recorded independently of parsed matches; truncated reports retain the applied/dry-run status without claiming complete totals
 6. Output is surfaced to user via metadata
 
 ### Binary Availability Flow

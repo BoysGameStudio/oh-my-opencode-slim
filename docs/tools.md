@@ -49,6 +49,8 @@ Fast, structural code search and refactoring - more powerful than plain text gre
 the replacements. Report-size limits do not limit which matching rewrites
 are applied. Write failures and timeouts return errors instead of a successful
 `[APPLIED]` report.
+If the report is truncated, the output distinguishes successful writes from
+dry-run previews and does not claim complete replacement or file totals.
 
 Before the built-in `grep`/`glob` tools run, the plugin pre-checks that the
 requested `path` is valid, using the same resolution rules as the host:

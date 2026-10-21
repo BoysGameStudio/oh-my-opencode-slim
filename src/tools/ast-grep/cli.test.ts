@@ -82,33 +82,52 @@ describe('runSg rewrite', () => {
 
     expect(result.error).toBeUndefined();
     expect(result.totalMatches).toBe(1);
+    expect(result.rewritesApplied).toBe(true);
     expect(result.matches[0].replacement).toBe('console.error("add", a, b)');
+    expect(formatReplaceResult(result, false)).toContain(
+      '[APPLIED] 1 replacements in 1 files',
+    );
     expect(readFileSync(file, 'utf8')).toBe(
       SOURCE.replace('console.log', 'console.error'),
     );
   });
 
-  test('writes even when the first match exceeds the report limit', async () => {
-    // More than the 1 MiB report budget; no complete match fits in the report.
-    const big = `console.log("${'x'.repeat(1024 * 1024 + 1)}");\n`;
-    writeFileSync(file, big);
+  test.each([true, false])(
+    'reports honestly when the first match exceeds the report limit (apply=%s)',
+    async (updateAll) => {
+      // More than the 1 MiB report budget; no complete match fits in the report.
+      const big = `console.log("${'x'.repeat(1024 * 1024 + 1)}");\n`;
+      writeFileSync(file, big);
 
-    const result = await runSgInChild({
-      pattern: 'console.log($$$ARGS)',
-      rewrite: 'console.error($$$ARGS)',
-      lang: 'javascript',
-      paths: [file],
-      updateAll: true,
-    });
+      const result = await runSgInChild({
+        pattern: 'console.log($$$ARGS)',
+        rewrite: 'console.error($$$ARGS)',
+        lang: 'javascript',
+        paths: [file],
+        updateAll,
+      });
 
-    expect(result.error).toBeUndefined();
-    expect(result.matches).toEqual([]);
-    expect(result.truncated).toBe(true);
-    expect(result.truncatedReason).toBe('max_output_bytes');
-    expect(readFileSync(file, 'utf8')).toBe(
-      big.replace('console.log', 'console.error'),
-    );
-  });
+      expect(result.error).toBeUndefined();
+      expect(result.matches).toEqual([]);
+      expect(result.truncated).toBe(true);
+      expect(result.truncatedReason).toBe('max_output_bytes');
+      expect(result.rewritesApplied).toBe(updateAll);
+      expect(readFileSync(file, 'utf8')).toBe(
+        updateAll ? big.replace('console.log', 'console.error') : big,
+      );
+      const output = formatReplaceResult(result, !updateAll);
+      expect(output).toContain(
+        updateAll
+          ? '[APPLIED] Replacements written.'
+          : '[DRY RUN] No files changed.',
+      );
+      expect(output).toContain('Report truncated (max_output_bytes)');
+      expect(output).toContain('replacement and file totals unavailable');
+      expect(output).not.toContain('No matches found');
+      expect(output).not.toContain('0 replacements');
+      if (!updateAll) expect(output).toContain('dryRun=false');
+    },
+  );
 
   test('leaves the file alone without updateAll', async () => {
     const result = await runSgInChild({
@@ -121,6 +140,9 @@ describe('runSg rewrite', () => {
     expect(result.error).toBeUndefined();
     expect(result.totalMatches).toBe(1);
     expect(result.matches[0].replacement).toBe('console.error("add", a, b)');
+    expect(formatReplaceResult(result, true)).toContain(
+      '[DRY RUN] 1 replacements in 1 files',
+    );
     expect(readFileSync(file, 'utf8')).toBe(SOURCE);
   });
 
@@ -172,6 +194,7 @@ describe('runSg rewrite', () => {
       );
 
       expect(result.error).toBe(applyError);
+      expect(result.rewritesApplied).not.toBe(true);
       expect(result.matches).toEqual([]);
       expect(formatReplaceResult(result, false)).toBe(`Error: ${applyError}`);
       expect(readFileSync(file, 'utf8')).toBe(SOURCE);

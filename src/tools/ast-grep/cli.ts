@@ -186,6 +186,7 @@ export async function runSg(options: RunOptions): Promise<SgResult> {
   // JSON mode reports rewrites but never writes them, even with --update-all.
   // Check the raw report before truncating it: a single match can exceed the
   // entire report budget and leave no parseable matches below.
+  let rewritesApplied = false;
   if (
     options.rewrite &&
     options.updateAll &&
@@ -200,6 +201,7 @@ export async function runSg(options: RunOptions): Promise<SgResult> {
         error: applyError,
       };
     }
+    rewritesApplied = true;
   }
 
   const outputTruncated = stdout.length >= DEFAULT_MAX_OUTPUT_BYTES;
@@ -231,6 +233,7 @@ export async function runSg(options: RunOptions): Promise<SgResult> {
           truncated: true,
           truncatedReason: 'max_output_bytes',
           error: 'Output too large and could not be parsed',
+          rewritesApplied,
         };
       }
     } else {
@@ -247,6 +250,7 @@ export async function runSg(options: RunOptions): Promise<SgResult> {
   return {
     matches: finalMatches,
     totalMatches,
+    rewritesApplied,
     truncated: outputTruncated || matchesTruncated,
     truncatedReason: outputTruncated
       ? 'max_output_bytes'
