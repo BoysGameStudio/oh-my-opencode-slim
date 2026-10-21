@@ -84,7 +84,7 @@ profiles; unrelated sessions remain excluded from the parent's event handling.
 
 A child observed before it can be attributed to a task launch is retained as a
 provisional placeholder. It remains resolvable by task ID or alias for
-`task_status`, but is omitted from the operational Background Job Board listing.
+`task_status`, but is not treated as delegated work by the plugin.
 A placeholder does not trigger stopped-job recovery or completed/error publication
 wakes for its parent, including after repeated executions: it is not yet known to
 be delegated work. This lets another plugin own a child session's notifications.
@@ -519,7 +519,8 @@ Look into background tasks.
 
 ## State The Orchestrator Must Track
 
-The prompt/runtime treats background tasks as a small job board:
+The runtime treats background tasks as a small job board (machine state only —
+it is never rendered into a prompt):
 
 | Field | Meaning |
 |-------|---------|
@@ -534,10 +535,10 @@ The prompt/runtime treats background tasks as a small job board:
 
 Cancelled, errored, and stopped sessions can remain retained for a later
 `task_revive`. They may be revived immediately once their retained state has
-been verified safe. Acknowledgement controls parent and job-board consumption
+been verified safe. Acknowledgement controls parent consumption
 and reusable-pool display, not same-session revival. Stopped sessions stay out
 of the ordinary `task()` reuse pool because that generation has no terminal
-result; after ack they appear under Retained / Recovery.
+result; after ack they are retained for `task_revive`.
 
 The current todo list can represent user-visible work, but task IDs and file
 ownership need to be explicit in the orchestrator's working context.
@@ -583,7 +584,7 @@ Behavior:
 - Only sessions known as the parent `orchestrator` via session metadata.
 - Host client APIs are authoritative (`session.get`, `todo`, `children`,
   `status`, `promptAsync` with the nested directory request shape). The local
-  Background Job Board is never read or used as a gate.
+  job board is never read or used as a gate.
 - Wake requires valid host response shapes, parent currently idle, and at least
   one TODO with status `pending` or `in_progress`. Unknown/malformed status
   fails closed. **Active children do not suppress a wake.**
@@ -651,8 +652,8 @@ channels would duplicate that delivery, so on v2 they are **structurally off**
 — not configurable:
 
 - The passive Background Job Board is never injected into orchestrator
-  prompts. `backgroundJobs.boardInjection` is a v1-only switch: on v2 an
-  explicit `true` is ignored with a load-time warning.
+  prompts. That is true on v1 too: the board render was removed (#1647), so
+  there is no `backgroundJobs.boardInjection` switch left.
 - The periodic idle evaluation described above never runs.
   `backgroundJobs.orchestratorWake.periodicWakeEnabled` is honored on v1
   only: on v2 an explicit `true` is ignored with a load-time warning.
@@ -671,13 +672,15 @@ the send survives for a later wake. The pointers live in a newly appended,
 tagged volatile message through the cache-safe injection helper; historical
 messages, frozen prompts, and tool definitions are not rewritten. The shared
 input-wait, parent-busy, and no-progress gates still apply. This does not add
-restart persistence; v1's throttle behavior is unchanged. On v2, terminal retirement is
-observation-based: the plugin watches the host's native `<subagent>`
-deliveries in the parent's transcript and retires the matching record, with a
-timestamp fallback for a missed observation. On v1, `boardInjection: false`
-keeps tracking, wake, and `task_status` working — the orchestrator simply no
-longer passively sees the board, and terminal retirement runs through
-prompt-shape consumption instead.
+restart persistence; v1's throttle behavior is unchanged.
+On both hosts, terminal retirement is observation-based: the plugin watches
+the parent's transcript for a delivery it can attribute — the host's native
+`<subagent>` delivery on v2, the plugin's own tagged `<completed-job>` push on
+v1, or the revived-run notification — and retires exactly that run
+(generation- and revision-fenced). A timestamp fallback retires a completed,
+error, or cancelled record once the parent demonstrably moved past the terminal
+report. The board is never injected on any host: `backgroundJobs.boardInjection`
+was removed, and `task_status` is always the pull channel.
 
 Child-input wakes wait 250 ms before notifying the parent, on both host
 versions. Per-kind policy applies: by default only question asks wake the
@@ -709,16 +712,19 @@ labels; full option descriptions stay in the host UI. A pending request
 suppresses the generic “await completion” status guidance. Shorter notices do not skip the host's
 normal model step after a tool result or guarantee that a model emits no filler.
 
-With the board off, the plugin still retires natively delivered results: on
-the parent's next real user turn they are registered, and once the prompt
-advances they are reconciled. Stopped jobs are **not** retired that way,
-because a stop has no native notification. They stay stopped and
+The plugin retires a terminal run when it observes the delivery that reported
+it: the host's native completion part, the plugin's own tagged
+`<completed-job>` push, or the revived-run notification. The observation is
+fenced to the exact run (generation and terminal revision), so a reopened or
+re-published run is never consumed by an older delivery. A completed, error, or
+cancelled record also retires once the parent demonstrably moved past the
+terminal report (a later parent turn). Stopped jobs are **not** retired that
+way, because a stop has no native notification. They stay stopped and
 unreconciled, so the stopped-job recovery wake still reports them, and
 `task_revive` acknowledges them when the parent resumes the work. The
-recovery wake and overflow notices point at `task_status` instead of the
-board. Reopen corrections are still delivered with the board off, in a
-board-free variant that points at `task_status`: if a reconciled job reopens
-to running, the parent is told once not to rely on its earlier result.
+recovery wake and overflow notices point at `task_status`. Reopen corrections
+point at `task_status` as well: if a reconciled job reopens to running, the
+parent is told once not to rely on its earlier result.
 
 For external manual work, the orchestrator first gives the user concrete steps,
 then calls `wait_for_user` as its final tool action. This explicit signal covers
@@ -734,30 +740,29 @@ uses the `question` tool as the blocking boundary instead. On v2 hosts
 `wait_for_user` is never registered; the orchestrator always uses the native
 `question` tool, whose open form also suppresses automatic wakes.
 
-### Background Job Board Injection
+### No Job Board In The Prompt
 
-Board placement is change-only; the placement rule itself is not configurable. A fresh board part is
-placed only when the rendered board text differs from the board last injected
-for that parent — one board per state change of the job set. Once placed, the
-board is frozen: later turns replay it byte-identically on its original anchor
-message, so bytes the provider already cached never change. Unchanged turns
-inject nothing at all — no board part and no marker — because they carry zero
-new information. A transition to an empty board set is itself a state change
-and renders once.
+The job board is never rendered into a prompt — on any host. It stays a
+machine-side projection: dedupe by objective, alias authority, stall tracking,
+the terminal gate, session adoption, and generations keep working, but no
+prompt surface lists them. There is no switch to turn the render back on; the
+`backgroundJobs.boardInjection` key was removed with the render.
 
-Placement only ever targets a user-role tail (a board part appended to the
-last real user message, keeping the message count stable so the provider's
-tail cache breakpoint lands on stable content). An assistant tail is never a
-placement target: a board appended there could not be retained for replay, so
-it would silently vanish from the next payload and break the byte prefix —
-the pending state change renders on the next user-side tail instead.
+Terminal facts travel as one-shot pushes instead:
 
-Retained boards are in-memory per parent session and are cleared at session
-end; they are not restored across a plugin restart beyond what the current
-OpenCode message history still carries. Board injection is v1-only: on v2
-hosts the board never renders (the native notifier and inbox delivery replace
-it), and on v1 the `backgroundJobs.boardInjection: false` switch turns the
-render off while tracking, wake, and `task_status` keep working.
+- The host's native notifier delivers a run's FIRST terminal publication
+  (completed, error) to the parent on both host versions. The plugin publishes
+  nothing beside it.
+- A later publication of the same run (rev>1: a child that self-continued, or
+  a direct prompt to the child session) has no native notifier. On v1 the
+  plugin pushes ONE self-contained `<completed-job>` delta (alias, task, state,
+  result) through the same bounded delta queue the stopped-job recovery uses,
+  so the result survives a busy parent and the per-parent publication throttle.
+  The wake that carries it is a bare resume pointer: the delta holds the
+  facts. On v2 the publication wake stays a bare resume pointer and the
+  result is pulled with `task_status`.
+- Overflowed pushes keep a durable pointer to `task_status` instead of
+  listing the coalesced facts inline.
 
 ### Runtime Liveness Reconciliation
 
@@ -783,10 +788,9 @@ or cancellation.
 
 Stopped-job recovery facts are checked again by task ID and run generation
 before a queued recovery wake is delivered. The inline detail queue is bounded;
-when it overflows, the wake carries an explicit overflow signal directing the
-orchestrator to inspect all unreconciled stopped jobs on the board. With board
-injection off, the overflow signal instead lists the overflowed task IDs that
-are still stopped (up to 64 per parent, with a note for any beyond that) so
+when it overflows, the wake carries an explicit overflow signal that lists the
+overflowed task IDs that are still stopped (up to 64 per parent, with a note
+for any beyond that) so
 the orchestrator can check each with `task_status`.
 
 Malformed status entries and failed status requests are surfaced as `status
@@ -962,9 +966,9 @@ with a summary stating that abort was not confirmed.
 
 Late completion, busy, retry, or error events cannot replace a published hard
 timeout, and a hard wall-clock timeout is not recoverable through the existing
-external task-wait timeout path. The timeout outcome remains visible to the
-parent through the normal terminal-unreconciled Background Job Board flow; no
-prompt or raw task-result rewrite is used. The timeout path has no multiplexer
+external task-wait timeout path. The timeout outcome stays on the
+machine board as a terminal-unreconciled record the parent can pull with
+`task_status`; no prompt or raw task-result rewrite is used. The timeout path has no multiplexer
 coupling: pane lifecycle runs entirely in the TUI client and reacts only to
 session events, so the former permanent logical pane-close intent was removed
 together with the server-side pane lifecycle.
