@@ -1105,9 +1105,9 @@ function reconcileExecutionBatch(
 // (host `SessionInbox` steer/queue delivery; the native notifier never
 // delivers `stopped`). Observing that delivery retires the tracked record
 // directly, replacing the prompt-shape registration bookkeeping
-// (`rememberInjectedTerminalJobs` + `reconcileConsumedTerminalJobs`) on the
-// v2 path. v1 is structurally board-on: its prompt-shape path owns
-// retirement, so this pass never runs there.
+// on the v2 path. On v1 the native delivery is untagged, so the plugin
+// cannot attribute it; those runs retire through the plugin's own tagged
+// push or the stale-terminal fallback instead.
 
 type ObservedNativeDelivery = NativeDelivery & {
   /** Dedupe key: the delivery part's own message/part identity. */

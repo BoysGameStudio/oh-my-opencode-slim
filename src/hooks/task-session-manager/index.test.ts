@@ -377,7 +377,6 @@ function createBoardlessInjectionState(
       contextFilesForPrompt: () => [],
       prune: () => {},
     },
-    retainedTailBoards: new Map(),
   } as unknown as InjectionState;
 }
 
