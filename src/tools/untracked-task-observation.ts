@@ -1,14 +1,18 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 import {
+  attributeHostRoundToTranscript,
   classifyTerminalEvidence,
   fetchChildTranscript,
+  latestInputAtOf,
+  terminalTextOf,
 } from '../utils/child-transcript';
 import { isRecord } from '../utils/guards';
 import { getClient } from '../utils/opencode-client';
 import { SESSION_ID_PATTERN, withTimeout } from '../utils/session';
 import {
-  attributeHostRound,
+  composeHostRound,
   getRuntimeSessionStatusSnapshot,
+  hostRoundStateOf,
 } from '../utils/session-runtime-status';
 
 /** Each untracked host read (ownership, transcript) refuses after 5 s. */
@@ -25,7 +29,7 @@ export interface UntrackedEvidence {
   };
   round?:
     | Awaited<ReturnType<typeof classifyTerminalEvidence>>
-    | ReturnType<typeof attributeHostRound>;
+    | ReturnType<typeof composeHostRound>;
   roundError?: unknown;
 }
 
@@ -162,7 +166,22 @@ async function readTranscript(
     if (!v2) {
       return { live, round: classifyTerminalEvidence(transcript) };
     }
-    return { live, round: attributeHostRound(hostInfo, transcript) };
+    const state = attributeHostRoundToTranscript(
+      hostRoundStateOf(hostInfo),
+      transcript,
+    );
+    const latestInputAt = latestInputAtOf(transcript);
+    const round = composeHostRound(state, latestInputAt);
+    if (state.kind === 'terminal') {
+      const text = terminalTextOf(transcript);
+      if (text) round.text = text;
+      else if (state.outcome === 'succeeded')
+        return {
+          live,
+          round: { verdict: 'incomplete', startedAt: latestInputAt },
+        };
+    }
+    return { live, round };
   } catch (error) {
     return { live, roundError: error };
   }

@@ -572,10 +572,13 @@ describe('task_message', () => {
     } catch (error) {
       message = (error as Error).message;
     }
-    expect(message).toContain('task_revive and sessionID: "ses_child1"');
+    expect(message).toContain(
+      'subagent(sessionID: "ses_child1", prompt: "...")',
+    );
     expect(message).not.toContain('task_result');
     expect(message).not.toContain('task(');
     expect(message).not.toContain('task_id');
+    expect(message).not.toContain('task_revive');
   });
 
   test('v2 exposes sessionID and accepts the task_id alias', async () => {
@@ -635,7 +638,7 @@ describe('task_message', () => {
     expect(prompt).not.toHaveBeenCalled();
   });
 
-  test('a board-missed settled child on v2 routes with the sessionID param', async () => {
+  test('a board-missed settled child on v2 routes with the native resume call', async () => {
     const board = new BackgroundJobBoard();
     const prompt = makePrompt();
     client = { session: { prompt } };
@@ -644,7 +647,10 @@ describe('task_message', () => {
         sessionID: 'parent-1',
       } as any)
       .catch((e: Error) => e)) as Error;
-    expect(error.message).toContain('task_revive and sessionID: "ses_child1"');
+    expect(error.message).toContain(
+      'subagent(sessionID: "ses_child1", prompt: "...")',
+    );
+    expect(error.message).not.toContain('task_revive');
   });
 
   test('a board-missed alias keeps the bare unknown error', async () => {
@@ -685,6 +691,29 @@ describe('task_message', () => {
       } as any)
       .catch((e: Error) => e)) as Error;
     expect(error.message).toBe('Unknown task ID or alias: ses_child1');
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  test('a refused alias still enumerates recent handles', async () => {
+    const board = new BackgroundJobBoard();
+    registerRunningChild(board);
+    const prompt = makePrompt();
+    client = { session: { prompt } };
+    const task_message = createTaskMessageTool({
+      input: { directory: '/test', client } as any,
+      backgroundJobBoard: board,
+      resolveCanonicalTaskRef: async () => ({
+        kind: 'refused',
+        reason: 'Unknown task ID or alias: fix-9',
+      }),
+    }).task_message;
+    const error = (await task_message
+      .execute({ task_id: 'fix-9', message: 'go' }, {
+        sessionID: 'parent-1',
+      } as any)
+      .catch((e: Error) => e)) as Error;
+    expect(error.message).toContain('Unknown task ID or alias: fix-9');
+    expect(error.message).toContain('recent:');
     expect(prompt).not.toHaveBeenCalled();
   });
 
@@ -752,14 +781,17 @@ describe('task_message', () => {
     expect(result).not.toContain('nudge');
   });
 
-  test('v2 schema exposes delivery and rejects invalid values', () => {
+  test('v2 schema is queue-only: no delivery parameter', () => {
     const board = new BackgroundJobBoard();
     const v2 = createTool(board, 'v2');
-    expect(Object.keys(v2.args)).toContain('delivery');
-    expect(v2.args.delivery.safeParse('queue').success).toBe(true);
-    expect(v2.args.delivery.safeParse('steer').success).toBe(true);
-    expect(v2.args.delivery.safeParse('push').success).toBe(false);
-    expect(v2.args.delivery.safeParse(undefined).success).toBe(true);
+    // The native host model face cannot express a steer; the parameter is
+    // gone from the schema, not merely defaulted.
+    expect(Object.keys(v2.args)).not.toContain('delivery');
+    expect(Object.keys(v2.args).sort()).toEqual([
+      'message',
+      'sessionID',
+      'task_id',
+    ]);
   });
 
   test('v1 schema has no delivery key and emits no delivery', async () => {
@@ -778,48 +810,25 @@ describe('task_message', () => {
     expect(body).not.toHaveProperty('delivery');
   });
 
-  test('omitted delivery matches explicit queue on v2', async () => {
-    const runOnce = async (extra: Record<string, unknown>) => {
-      const board = new BackgroundJobBoard();
-      registerRunningChild(board);
-      const prompt = makePrompt();
-      client = { session: makeSession(prompt) };
-      const result = await createTool(board, 'v2').execute(
-        { sessionID: 'ses_child1', message: 'Update', ...extra },
-        { sessionID: 'parent-1' } as any,
-      );
-      return { result, body: prompt.mock.calls[0]?.[0].body };
-    };
-
-    const omitted = await runOnce({});
-    const queued = await runOnce({ delivery: 'queue' });
-    expect(omitted.body).toEqual(queued.body);
-    expect(omitted.body).not.toHaveProperty('delivery');
-    expect(omitted.body.noReply).toBe(true);
-    expect(omitted.result).toBe(queued.result);
-    expect(omitted.result).toContain('queued');
-  });
-
-  test('explicit steer on v2 adds delivery and reports acceptance', async () => {
+  test('v2 queues without a delivery hint and reports queue semantics', async () => {
     const board = new BackgroundJobBoard();
     registerRunningChild(board);
     const prompt = makePrompt();
     client = { session: makeSession(prompt) };
 
     const result = await createTool(board, 'v2').execute(
-      { sessionID: 'ses_child1', message: 'Update', delivery: 'steer' },
+      { sessionID: 'ses_child1', message: 'Update' },
       { sessionID: 'parent-1' } as any,
     );
 
     const body = prompt.mock.calls[0]?.[0].body;
     expect(body.noReply).toBe(true);
-    expect(body.delivery).toBe('steer');
-    expect(result).toMatch(/steer/i);
-    expect(result).toContain('not confirmed');
-    expect(result).not.toMatch(/read|confirm.*child|applied|acknowledged/i);
+    expect(body).not.toHaveProperty('delivery');
+    expect(result).toContain('queued');
+    expect(result).not.toMatch(/steer/i);
   });
 
-  test('steer refuses a terminal task without leaving a message lease', async () => {
+  test('v2 refuses a terminal task with the native resume call', async () => {
     const board = new BackgroundJobBoard();
     registerRunningChild(board);
     board.updateStatus({ taskID: 'ses_child1', state: 'completed' });
@@ -828,10 +837,10 @@ describe('task_message', () => {
 
     await expect(
       createTool(board, 'v2').execute(
-        { sessionID: 'ses_child1', message: 'Too late', delivery: 'steer' },
+        { sessionID: 'ses_child1', message: 'Too late' },
         { sessionID: 'parent-1' } as any,
       ),
-    ).rejects.toThrow('task_revive');
+    ).rejects.toThrow('subagent(sessionID: "ses_child1", prompt: "...")');
     expect(prompt).not.toHaveBeenCalled();
 
     const job = board.get('ses_child1');

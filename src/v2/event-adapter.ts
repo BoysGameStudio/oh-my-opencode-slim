@@ -27,9 +27,12 @@
  * `session.execution.started/succeeded/failed/interrupted` events; the
  * stream carries neither `session.idle` nor busy/idle `session.status`.
  * The execution events are synthesized into the v1 lifecycle shapes below.
- * A terminal execution event synthesizes both a `session.status` idle and
- * a `session.idle`, so a consumer watching both must tolerate duplicate
- * idle delivery (the documented double-idle invariant).
+ * Every synthesized lifecycle status preserves the host envelope `created`
+ * as `activityAt` (busy AND terminal idle), so terminal evidence keeps its
+ * host-clock attribution. A terminal execution event synthesizes both a
+ * `session.status` idle and a `session.idle`, so a consumer watching both
+ * must tolerate duplicate idle delivery (the documented double-idle
+ * invariant).
  *
  * The synthesized shapes are pinned to what the v1 consumers actually read:
  * - `session.created` early registration (task-session-manager

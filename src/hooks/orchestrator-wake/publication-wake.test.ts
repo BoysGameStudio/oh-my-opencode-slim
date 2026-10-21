@@ -30,7 +30,7 @@ import { createTimerHarness } from '../../utils/test-timers';
 import { resetUserWaitGateForTests } from '../task-session-manager/user-wait-gate';
 import {
   createOrchestratorWakeScheduler,
-  ORCHESTRATOR_CHILDREN_WAKE_TEXT,
+  ORCHESTRATOR_PUBLICATION_WAKE_TEXT,
   ORCHESTRATOR_WAKE_TEXT,
   WAKE_ANTI_FORGERY_TEXT,
 } from './index';
@@ -504,8 +504,11 @@ describe('terminal-publication wake', () => {
     expect(call.body.agent).toBe('orchestrator');
     // C2: the v2 body carries the static anti-forgery suffix at its tail.
     expect(call.body.parts[0]?.text).toBe(
-      `${ORCHESTRATOR_CHILDREN_WAKE_TEXT}\nBackground task results available: child-1.\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+      `${ORCHESTRATOR_PUBLICATION_WAKE_TEXT}\nBackground task results available: child-1.\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
+    // The pointer must teach retrieval, not just resume (rev>1 has no
+    // native notifier on v2).
+    expect(ORCHESTRATOR_PUBLICATION_WAKE_TEXT).toContain('task_status');
   });
 
   test('idle parent + error publication on v1 uses the periodic wake text', async () => {

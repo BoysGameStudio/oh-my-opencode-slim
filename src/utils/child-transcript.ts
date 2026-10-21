@@ -23,6 +23,7 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 
 import { isRecord } from './guards';
+import type { HostRoundState } from './session-runtime-status';
 
 export type ChildTerminalEvidence =
   | { kind: 'ready'; text: string }
@@ -531,83 +532,70 @@ function textOf(message: TranscriptMessage): string {
     .join('\n');
 }
 
-/** Evidence for the round after the latest input, bound to a host terminal
- *  `time.idle`. `newer-assistant` means a reply was created after the host
- *  idle, so the host terminal does not cover the newest transcript activity. */
-export type HostTranscriptRoundEvidence =
-  | {
-      kind: 'ok';
-      latestInputAt: number | undefined;
-      text: string | undefined;
-    }
-  | { kind: 'no-input' }
-  | {
-      kind: 'newer-assistant';
-      at: number;
-      latestInputAt: number | undefined;
-    }
-  | { kind: 'unreadable'; reason: string };
-
-/**
- * Validate and read the host transcript round up to `terminalIdleAt`.
- * Malformed entries fail closed, exactly like the retained v2 classifier;
- * they are never skipped. A missing assistant timestamp cannot be bound to
- * the host idle, so it also fails closed.
- */
-export function hostTranscriptRoundOf(
+/** Invalidate a parsed host terminal when its transcript has newer assistant
+ * activity. This adds attribution only; hostRoundStateOf/composeHostRound
+ * still own projection parsing, input boundaries, and outcome composition. */
+export function attributeHostRoundToTranscript(
+  state: HostRoundState,
   transcript: unknown,
-  terminalIdleAt?: number,
-): HostTranscriptRoundEvidence {
-  if (transcript === undefined) {
-    return { kind: 'unreadable', reason: 'transcript source unavailable' };
+): HostRoundState {
+  if (state.kind !== 'terminal') return state;
+  const entries = transcriptEntries(transcript);
+  if (!Array.isArray(entries)) {
+    return { kind: 'unknown', reason: entries.reason };
   }
-  if (responseError(transcript) !== undefined) {
-    return { kind: 'unreadable', reason: 'transcript read failed' };
-  }
-  if (!isRecord(transcript) || !Array.isArray(transcript.data)) {
-    return { kind: 'unreadable', reason: 'malformed transcript response' };
-  }
-  const messages: TranscriptMessage[] = [];
-  for (const entry of transcript.data) {
-    if (!isRecord(entry) || !isRecord(entry.info)) {
-      return { kind: 'unreadable', reason: 'malformed transcript entries' };
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index] as TranscriptMessage;
+    const source = sourceTypeOf(entry);
+    if (source === 'user' || source === 'synthetic') break;
+    if (source !== 'assistant') continue;
+    const at = transcriptOrderKey(entry);
+    if (at === undefined) {
+      return { kind: 'unknown', reason: 'assistant time is missing' };
     }
-    messages.push(entry);
+    const finished = assistantCompletedAt(entry);
+    if (
+      at > state.idleAt ||
+      (finished !== undefined && finished > state.idleAt)
+    ) {
+      return { kind: 'pending' };
+    }
   }
+  return state;
+}
+
+/** Latest delivered user/synthetic input timestamp in a host transcript. */
+export function latestInputAtOf(transcript: unknown): number | undefined {
+  const entries = transcriptEntries(transcript);
+  if (!Array.isArray(entries)) return undefined;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index] as TranscriptMessage;
+    const source = sourceTypeOf(entry);
+    if (source === 'user' || source === 'synthetic') {
+      return transcriptOrderKey(entry);
+    }
+  }
+  return undefined;
+}
+
+/** Text of the latest assistant entry after the latest user/synthetic input. */
+export function terminalTextOf(transcript: unknown): string | undefined {
+  const entries = transcriptEntries(transcript);
+  if (!Array.isArray(entries)) return undefined;
   let boundary = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const source = sourceTypeOf(messages[index] as TranscriptMessage);
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index] as TranscriptMessage;
+    const source = sourceTypeOf(entry);
     if (source === 'user' || source === 'synthetic') {
       boundary = index;
       break;
     }
   }
-  if (boundary < 0) return { kind: 'no-input' };
-  const latestInputAt = transcriptOrderKey(
-    messages[boundary] as TranscriptMessage,
-  );
-  let text: string | undefined;
-  for (let index = boundary + 1; index < messages.length; index += 1) {
-    const message = messages[index] as TranscriptMessage;
-    if (sourceTypeOf(message) !== 'assistant') continue;
-    const at = transcriptOrderKey(message);
-    if (at === undefined) {
-      return { kind: 'unreadable', reason: 'assistant time is missing' };
-    }
-    if (terminalIdleAt !== undefined && at > terminalIdleAt) {
-      return { kind: 'newer-assistant', at, latestInputAt };
-    }
-    text = textOf(message);
+  for (let index = entries.length - 1; index > boundary; index -= 1) {
+    const entry = entries[index] as TranscriptMessage;
+    if (sourceTypeOf(entry) === 'assistant') return textOf(entry);
   }
-  return { kind: 'ok', latestInputAt, text };
-}
-
-/** Latest delivered user/synthetic input timestamp in a host transcript.
- *  Malformed transcripts fail closed as undefined, matching the round
- *  evidence reader. */
-export function latestInputAtOf(transcript: unknown): number | undefined {
-  const evidence = hostTranscriptRoundOf(transcript);
-  return evidence.kind === 'ok' ? evidence.latestInputAt : undefined;
+  return undefined;
 }
 
 /**

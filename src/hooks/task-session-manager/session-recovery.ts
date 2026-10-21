@@ -28,6 +28,7 @@ import {
 import { STOP_CONFIRMATION_GRACE_MS } from '../../utils/background-job-terminal-gate';
 import type { BackgroundTaskConcurrency } from '../../utils/background-task-concurrency';
 import {
+  attributeHostRoundToTranscript,
   classifyCurrentDeliveredRound,
   classifyV2HistoricalRound,
   fetchChildTranscript,
@@ -35,6 +36,7 @@ import {
   responseError,
   stringifyError,
   type TranscriptMessage,
+  terminalTextOf,
   transcriptOrderKey,
 } from '../../utils/child-transcript';
 import { isRecord } from '../../utils/guards';
@@ -44,7 +46,9 @@ import { pendingSessionPrune } from '../../utils/pending-session-prunes';
 import { delay } from '../../utils/polling';
 import { SESSION_ID_PATTERN, withTimeout } from '../../utils/session';
 import {
-  attributeHostRound,
+  composeHostRound,
+  hostRoundStateOf,
+  hostRoundVerdict,
   readLiveSession,
 } from '../../utils/session-runtime-status';
 import {
@@ -52,6 +56,7 @@ import {
   parseTaskIdFromTaskOutput,
   parseTaskStatusOutput,
 } from '../../utils/task';
+import { v2ResumeCall } from '../../v2/delegation';
 import type { MessagePart, MessageWithParts } from '../types';
 import { messageCreatedAt, parseNativeDelivery } from './native-delivery';
 import {
@@ -182,7 +187,9 @@ async function recoverRetainedSession(
         );
       } catch {
         return refuse(
-          `${prefix}. A host-session prune is in progress for this task; retry task_revive.`,
+          options.hostFlavor === 'v2'
+            ? `${prefix}. A host-session prune is in progress for this task; retry with ${v2ResumeCall(sessionID)}.`
+            : `${prefix}. A host-session prune is in progress for this task; retry task_revive.`,
         );
       }
       hosted = await readHostSession(client, directory, sessionID);
@@ -355,13 +362,29 @@ async function recoverRetainedSession(
   let round: ReturnType<typeof classifyCurrentDeliveredRound>;
   let queuedAdoption = false;
   if (options.hostFlavor === 'v2') {
-    round = attributeHostRound(hosted.hostInfo, childTranscript);
-    if (round.verdict === 'unreadable') {
+    const latestInputAt = latestInputAtOf(childTranscript);
+    const hostState = attributeHostRoundToTranscript(
+      hostRoundStateOf(hosted.hostInfo),
+      childTranscript,
+    );
+    let verdict = hostRoundVerdict(hostState, latestInputAt);
+    const text = terminalTextOf(childTranscript);
+    // Do not freeze an empty success (incident 1115). Failure/interruption
+    // can legitimately have no answer; their composed terminal state stays.
+    const textUnreadable =
+      verdict === 'terminal' &&
+      hostState.kind === 'terminal' &&
+      hostState.outcome === 'succeeded' &&
+      !text;
+    if (textUnreadable) verdict = 'pending';
+    if (verdict === 'unknown') {
+      const reason =
+        hostState.kind === 'unknown' ? hostState.reason : 'unknown';
       return refuse(
-        `Task ${sessionID} host state could not be verified (${round.reason ?? 'unreadable'}); no prompt was sent`,
+        `Task ${sessionID} host state could not be verified (${reason}); no prompt was sent`,
       );
     }
-    if (round.verdict === 'incomplete') {
+    if (verdict === 'pending') {
       queuedAdoption =
         request.purpose === 'revive' &&
         request.allowQueuedContinuation === true;
@@ -370,16 +393,26 @@ async function recoverRetainedSession(
         // the execution claim on purpose and the host may resume the round
         // after a restart, so a guessed stop import would lie.
         return refuse(
-          `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or use task_revive with a new prompt. No prompt was sent`,
+          textUnreadable
+            ? `Task ${sessionID} host outcome is terminal but its answer text is not readable yet; nothing was imported. Retry task_status later, or continue it with ${v2ResumeCall(sessionID)}. No prompt was sent`
+            : `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or continue it with ${v2ResumeCall(sessionID)}. No prompt was sent`,
         );
       }
       // Identity adoption still requires a decipherable latest input; the
       // old classifier refused exactly this shape before queueing.
-      if (latestInputAtOf(childTranscript) === undefined) {
+      if (latestInputAt === undefined) {
         return refuse(
           `Task ${sessionID} transcript could not be classified (no delivered user round); no prompt was sent`,
         );
       }
+    }
+    round = composeHostRound(hostState, latestInputAt);
+    if (verdict === 'terminal' && text) round.text = text;
+    // Queued adoption returns identity below without importing this round.
+    if (round.verdict === 'unreadable' && !queuedAdoption) {
+      return refuse(
+        `Task ${sessionID} transcript could not be classified (${round.reason ?? 'unreadable'}); no prompt was sent`,
+      );
     }
   } else {
     round = classifyCurrentDeliveredRound(childTranscript);

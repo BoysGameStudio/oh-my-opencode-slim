@@ -14,6 +14,11 @@ import { isRecord } from './guards';
 import { log } from './logger';
 import { getClient } from './opencode-client';
 import {
+  pendingForeignRead,
+  raceEvidenceDeadline,
+  readHostSessionInfo,
+} from './session-info-read';
+import {
   getRuntimeSessionStatusSnapshot,
   type RuntimeSessionStatusSnapshot,
   runtimeSessionStatus,
@@ -126,29 +131,6 @@ export function consumeTerminalCommitToken(
 
 /** Platform timer handle; fake harnesses may return bare numeric ids. */
 type TimerHandle = Timer;
-
-interface TimerFns {
-  setTimeout: (callback: () => void, delay: number) => TimerHandle;
-  clearTimeout: (timer: TimerHandle) => void;
-}
-
-export function raceEvidenceDeadline<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  timers?: TimerFns,
-): Promise<T | undefined> {
-  const settled = promise.catch(() => undefined);
-  if (timeoutMs <= 0) return settled;
-  const setTimer =
-    timers?.setTimeout ?? ((callback, delay) => setTimeout(callback, delay));
-  const clearTimer = timers?.clearTimeout ?? ((timer) => clearTimeout(timer));
-  const deadline = Promise.withResolvers<undefined>();
-  const timer = setTimer(() => deadline.resolve(undefined), timeoutMs);
-  timer.unref?.();
-  return Promise.race([settled, deadline.promise]).finally(() =>
-    clearTimer(timer),
-  );
-}
 
 export function runtimeObservationFromSnapshot(
   snapshot: RuntimeSessionStatusSnapshot,
@@ -318,46 +300,16 @@ function observationIdentity(token: ObservationToken): string {
   ]);
 }
 
-const sessionInfoReads = new WeakMap<
-  object,
-  Map<string, { identity: string; promise: Promise<unknown> }>
->();
-
 /** Share the raw, still-open host read with the rehydration existence probe.
  * A consumer deadline must not release this slot or authorize a new read. */
 export function readSessionInfoForObservation(
   input: PluginInput,
   token: ObservationToken,
 ): Promise<unknown> {
-  const client = getClient(input);
-  const session = client?.session;
-  if (typeof session?.get !== 'function') return Promise.resolve(undefined);
-  let reads = sessionInfoReads.get(session);
-  if (!reads) {
-    reads = new Map();
-    sessionInfoReads.set(session, reads);
-  }
-  const identity = observationIdentity(token);
-  const existing = reads.get(token.taskID);
-  if (existing)
-    return existing.identity === identity
-      ? existing.promise
-      : Promise.reject(
-          new Error('An earlier session-info observation is still in flight.'),
-        );
-  const promise = Promise.resolve().then(() =>
-    session.get({
-      path: { id: token.taskID },
-      query: { directory: input.directory },
-    }),
-  );
-  reads.set(token.taskID, { identity, promise });
-  const release = () => {
-    if (reads.get(token.taskID)?.promise === promise)
-      reads.delete(token.taskID);
-  };
-  void promise.then(release, release);
-  return promise;
+  return readHostSessionInfo(input, {
+    taskID: token.taskID,
+    identity: observationIdentity(token),
+  });
 }
 
 export function createBackgroundJobTerminalGate(options: {
@@ -797,6 +749,18 @@ export function createBackgroundJobTerminalGate(options: {
     if (entry && entry.identity !== identity)
       return { kind: 'blocked', retryAfter: entry.settled };
     if (!entry) {
+      // Outcome reads go through the cross-component registry: a plain
+      // probe may occupy the raw read under a different identity. Defer
+      // before the deadline race — the registry serializes and re-issues
+      // under our identity once the occupant settles, so no attempt is
+      // burned on a chained wait (greptile P1 4339476556).
+      if (key.startsWith('outcome:') && options.input) {
+        const wait = pendingForeignRead(options.input, {
+          taskID: token.taskID,
+          identity,
+        });
+        if (wait) return { kind: 'blocked', retryAfter: wait };
+      }
       const underlying = Promise.resolve().then(operation);
       const release = () => {
         if (openReads.get(key)?.underlying === underlying)

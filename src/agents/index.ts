@@ -55,10 +55,12 @@ const ORCHESTRATOR_DEFAULT_TOOL_NAMES = [
   'task_cancel',
   'task_message',
   'task_reply',
-  'task_revive',
   'task_status',
   'acp_run',
 ] as const;
+/** v1-only control tool: retired on v2, which continues retained sessions
+ * through the native delegation resume parameter. */
+const ORCHESTRATOR_V1_ONLY_TOOL_NAMES = ['task_revive'] as const;
 const MARKETPLACE_TOOL_NAMES = [
   'marketplace_inspect',
   'marketplace_manage',
@@ -661,6 +663,7 @@ function applyDefaultPermissions(
   configuredSkills?: readonly string[],
   disabledSkills?: readonly string[],
   nestedDispatchEnabled = false,
+  hostFlavor?: string,
   isPrimaryAgent = false,
 ): void {
   // A shorthand string is a user-level rule for every tool. Keep its original
@@ -688,8 +691,12 @@ function applyDefaultPermissions(
     agent.name === 'orchestrator'
       ? (existing.question ?? 'allow')
       : (existing.question ?? 'deny');
+  const orchestratorDefaultToolNames = [
+    ...ORCHESTRATOR_DEFAULT_TOOL_NAMES,
+    ...(hostFlavor === 'v2' ? [] : ORCHESTRATOR_V1_ONLY_TOOL_NAMES),
+  ];
   const orchestratorDefaultPermissions = Object.fromEntries(
-    ORCHESTRATOR_DEFAULT_TOOL_NAMES.map((toolName) => [
+    orchestratorDefaultToolNames.map((toolName) => [
       toolName,
       existing[toolName] ?? (agent.name === 'orchestrator' ? 'allow' : 'deny'),
     ]),
@@ -990,6 +997,7 @@ export function createAgents(
       override?.skills,
       runtime.disabledSkills,
       nestedDispatchEnabled,
+      options?.hostFlavor,
     );
     return agent;
   });
@@ -1005,6 +1013,7 @@ export function createAgents(
       override?.skills,
       runtime.disabledSkills,
       nestedDispatchEnabled,
+      options?.hostFlavor,
     );
     return agent;
   });
@@ -1015,6 +1024,7 @@ export function createAgents(
       undefined,
       runtime.disabledSkills,
       nestedDispatchEnabled,
+      options?.hostFlavor,
     );
     return agent;
   });
@@ -1040,6 +1050,7 @@ export function createAgents(
       undefined,
       runtime.disabledSkills,
       nestedDispatchEnabled,
+      options?.hostFlavor,
     );
     return agent;
   });
@@ -1105,6 +1116,7 @@ export function createAgents(
     orchestratorOverride?.skills,
     runtime.disabledSkills,
     nestedDispatchEnabled,
+    options?.hostFlavor,
     true,
   );
 

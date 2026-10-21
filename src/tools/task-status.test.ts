@@ -1,11 +1,18 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { createAliasAuthority } from '../hooks/task-session-manager/session-recovery';
+import {
+  createToolLoopGuardHook,
+  LOOP_GUARD_WARNING,
+} from '../hooks/tool-loop-guard/hook';
 import { BackgroundJobBoard } from '../utils/background-job-board';
+import { boardFixture } from '../utils/background-job-fixture';
 import {
   type BackgroundJobTerminalGate,
   createBackgroundJobTerminalGate,
 } from '../utils/background-job-terminal-gate';
 import { buildPluginInput } from '../v2/client-shim';
+import { createCancelTaskTool } from './cancel-task';
+import { createTaskMessageTool } from './task-message';
 import { createTaskStatusTool } from './task-status';
 
 let client: Record<string, any>;
@@ -806,23 +813,31 @@ describe('task_status result mode', () => {
     expect(await h.execute()).toContain('state: running (unconfirmed)');
     expect(h.messages).not.toHaveBeenCalled();
   });
-  test.each(['error', 'cancelled', 'stopped'] as const)(
-    'quiescent %s is rejected only after checking activity',
+  test.each(['error', 'cancelled'] as const)(
+    'quiescent %s is rejected only after checking activity and marks the result consumed',
     async (state) => {
       const h = makeResultTool();
       await h.settle(state);
       h.status.mockClear();
       await expect(h.execute()).rejects.toThrow(
-        state === 'error'
-          ? 'ended in error'
-          : state === 'cancelled'
-            ? 'was cancelled'
-            : 'no confirmed completed result',
+        state === 'error' ? 'ended in error' : 'was cancelled',
       );
       expect(h.status).toHaveBeenCalledTimes(1);
+      // error/cancelled throw text IS the delivered result → mark used.
       expect(h.board.get(h.run.taskID)?.lastUsedAt).toBeGreaterThan(0);
     },
   );
+  test('quiescent stopped is refused without marking the result consumed', async () => {
+    const h = makeResultTool();
+    await h.settle('stopped');
+    h.status.mockClear();
+    const before = h.board.get(h.run.taskID)?.lastUsedAt;
+    await expect(h.execute()).rejects.toThrow('no confirmed completed result');
+    expect(h.status).toHaveBeenCalledTimes(1);
+    // stopped has no delivered result: markUsed would silently open the
+    // duplicate-dispatch escape hatch, so it must not run.
+    expect(h.board.get(h.run.taskID)?.lastUsedAt).toBe(before);
+  });
   test('acknowledged completed result stays retrievable on matching evidence', async () => {
     const h = makeResultTool();
     await h.settle('completed', true);
@@ -928,6 +943,51 @@ describe('task_status result mode', () => {
       expect(context).toHaveBeenCalledTimes(1);
     },
   );
+  test.each([{ created: 14 }, { created: 11, completed: 14 }, {}])(
+    'untracked v2 never serves an answer outside its host terminal (%j)',
+    async (time) => {
+      const board = new BackgroundJobBoard();
+      const input = buildPluginInput({
+        session: {
+          get: async () => ({
+            parentID: 'parent-1',
+            outcome: 'succeeded',
+            time: { idle: 13 },
+          }),
+          context: async () => [
+            { id: 'u1', type: 'user', text: 'ask', time: { created: 10 } },
+            {
+              id: 'a1',
+              type: 'assistant',
+              text: 'PARTIAL',
+              time,
+            },
+          ],
+        },
+      } as never) as never;
+      const tool = createTaskStatusTool({ input, backgroundJobBoard: board });
+      const context = { sessionID: 'parent-1' } as never;
+      const status = await tool.task_status.execute(
+        { task_id: 'ses_child1' },
+        context,
+      );
+      expect(String(status)).not.toContain('state: completed');
+      expect(String(status)).not.toContain('PARTIAL');
+      const result = tool.task_status.execute(
+        { task_id: 'ses_child1', result: true },
+        context,
+      );
+      if (Object.keys(time).length === 0) {
+        await expect(result).rejects.toThrow('no terminal evidence');
+      } else {
+        const output = await result;
+        expect(String(output)).toContain('running (unconfirmed)');
+        expect(String(output)).not.toContain('PARTIAL');
+      }
+      expect(board.list('parent-1')).toHaveLength(0);
+    },
+  );
+
   test('unknown alias and empty task id are rejected', async () => {
     const h = makeResultTool();
     await expect(h.execute('exp-99')).rejects.toThrow('Unknown task ID');
@@ -980,5 +1040,405 @@ describe('task_status result mode', () => {
       expect(String(output)).toContain('Task exp-1 (ses_child1)');
       expect(String(output)).toContain('state: busy');
     }
+  });
+});
+
+/**
+ * v2 hosts expose no live session-status map, so a tracked task stays
+ * `running (unconfirmed)` on the board. The probe closes that gap: one
+ * bounded host-info read for an attributable terminal outcome, fed through
+ * the terminal gate's ordinary observe/reconcile API (the gate owns the
+ * publication — this path NEVER calls board.commitTerminal).
+ */
+describe('task_status v2 terminal-outcome probe', () => {
+  function makeProbeTool(
+    options: {
+      outcome?: string;
+      idle?: number;
+      resultFirstRead?: boolean;
+      getFails?: boolean;
+    } = {},
+  ) {
+    const board = new BackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: 'ses_child1',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'probe',
+      now: 1,
+    });
+    let getCalls = 0;
+    const get = mock(async () => {
+      if (options.getFails) throw new Error('host read failed');
+      const idle =
+        options.resultFirstRead && getCalls++ === 0 ? 0 : (options.idle ?? 5);
+      return {
+        data: {
+          id: 'ses_child1',
+          parentID: 'parent-1',
+          ...(options.outcome !== undefined
+            ? { outcome: options.outcome }
+            : {}),
+          time: { idle },
+        },
+      };
+    });
+    // v2 shape: session.get present, session.status deliberately absent.
+    const input = {
+      directory: '/test',
+      client: { session: { get } },
+      hostFlavor: 'v2',
+    } as never;
+    // The gate's own session-info read must share the host clock, as it does
+    // in the plugin composition root. On result:true, the first gate read is
+    // deliberately stale, so the classifier's fresh read is load-bearing.
+    const gate = createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      input,
+      hostOutcomeClock: 'shared-unix-ms',
+    });
+    statusGates.push(gate);
+    const tool = createTaskStatusTool({
+      input,
+      backgroundJobBoard: board,
+      terminalGate: gate,
+      now: () => 1_000,
+    });
+    return { board, run, gate, get, tool };
+  }
+
+  const context = { sessionID: 'parent-1' } as never;
+
+  test('a failing host-info read degrades to the unconfirmed reply instead of throwing', async () => {
+    const h = makeProbeTool({ getFails: true });
+    const output = await h.tool.task_status.execute(
+      { task_id: 'exp-1' },
+      context,
+    );
+    expect(String(output)).toContain('state: running (unconfirmed)');
+    expect(String(output)).toContain('status_uncertain: true');
+    const refusal = await h.tool.task_status.execute(
+      { task_id: 'exp-1', result: true },
+      context,
+    );
+    expect(String(refusal)).toContain('state: running (unconfirmed)');
+  });
+
+  test('a refused alias enumerates recent handles in both modes', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'ses_child1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'probe',
+      now: 1,
+    });
+    const { task_status } = makeTool({
+      board,
+      resolveCanonicalTaskRef: async () => ({
+        kind: 'refused',
+        reason: 'Unknown task ID or alias: fix-9',
+      }),
+    });
+    for (const args of [
+      { task_id: 'fix-9' },
+      { task_id: 'fix-9', result: true },
+    ]) {
+      const error = (await task_status
+        .execute(args, { sessionID: 'parent-1' } as never)
+        .catch((e: Error) => e)) as Error;
+      expect(error.message).toContain('Unknown task ID or alias: fix-9');
+      expect(error.message).toContain('recent:');
+    }
+  });
+
+  test('plain query publishes the terminal state from an attributable outcome', async () => {
+    const h = makeProbeTool({ outcome: 'succeeded', idle: 5 });
+    const output = await h.tool.task_status.execute(
+      { task_id: 'exp-1' },
+      context,
+    );
+    expect(String(output)).toContain('Task exp-1 (ses_child1)');
+    expect(String(output)).toContain('state: completed');
+    expect(String(output)).not.toContain('unconfirmed');
+    expect(String(output)).not.toContain('status_uncertain');
+    expect(h.board.get('ses_child1')).toMatchObject({
+      state: 'completed',
+      resultSummary: 'Host reported outcome: succeeded.',
+    });
+    // The classifier read and gate attribution read are separate by design.
+    expect(h.get).toHaveBeenCalledTimes(2);
+  });
+
+  test('result:true retrieves the published result instead of refusing', async () => {
+    const h = makeProbeTool({
+      outcome: 'succeeded',
+      idle: 5,
+      resultFirstRead: true,
+    });
+    const output = await h.tool.task_status.execute(
+      { task_id: 'exp-1', result: true },
+      context,
+    );
+    expect(output).toBe('Host reported outcome: succeeded.');
+    expect(h.board.get('ses_child1')?.state).toBe('completed');
+    // Initial gate probe (stale idle), the classifier's read (reused by the
+    // result ownership check), and the gate attribution read.
+    expect(h.get).toHaveBeenCalledTimes(3);
+  });
+
+  test('interrupted publishes stopped and never becomes completed', async () => {
+    const h = makeProbeTool({ outcome: 'interrupted', idle: 5 });
+    const output = await h.tool.task_status.execute(
+      { task_id: 'exp-1' },
+      context,
+    );
+    expect(String(output)).toContain('state: stopped');
+    expect(String(output)).not.toContain('state: completed');
+    expect(h.board.get('ses_child1')).toMatchObject({
+      state: 'stopped',
+      resultSummary: 'Host reported outcome: interrupted.',
+    });
+    // The result read refuses: an interruption is not a completion.
+    await expect(
+      h.tool.task_status.execute({ task_id: 'exp-1', result: true }, context),
+    ).rejects.toThrow('has no confirmed completed result');
+  });
+
+  test('failed publishes the error family', async () => {
+    const h = makeProbeTool({ outcome: 'failed', idle: 5 });
+    const output = await h.tool.task_status.execute(
+      { task_id: 'exp-1' },
+      context,
+    );
+    expect(String(output)).toContain('state: error');
+    expect(h.board.get('ses_child1')).toMatchObject({
+      state: 'error',
+      resultSummary: 'Host reported outcome: failed.',
+    });
+  });
+
+  test.each([
+    [{ outcome: undefined, idle: undefined }, 'no host terminal outcome'],
+    [{ outcome: 'cancelled', idle: 5 }, 'unrecognized host outcome'],
+  ])(
+    'an unattributable host read renders the unchanged uncertainty (%j)',
+    async (hostInfo) => {
+      const h = makeProbeTool(hostInfo as { outcome?: string; idle?: number });
+      const output = await h.tool.task_status.execute(
+        { task_id: 'exp-1' },
+        context,
+      );
+      expect(String(output)).toContain('Task exp-1 (ses_child1)');
+      expect(String(output)).toContain('state: running (unconfirmed)');
+      expect(String(output)).toContain('status_uncertain: true');
+      expect(String(output)).toContain(
+        'next: state unconfirmed; await the completion notice, do not poll task_status.',
+      );
+      expect(String(output)).not.toContain(
+        '[guidance]: The task is still running.',
+      );
+      expect(h.board.get('ses_child1')?.state).toBe('running');
+    },
+  );
+
+  test('an unattributable host read keeps the result-mode refusal with push-not-poll guidance', async () => {
+    const h = makeProbeTool();
+    const output = await h.tool.task_status.execute(
+      { task_id: 'exp-1', result: true },
+      context,
+    );
+    expect(String(output)).toContain('state: running (unconfirmed)');
+    expect(String(output)).toContain(
+      'next: a completion notice will arrive; continue other work and do not poll task_status.',
+    );
+    expect(h.board.get('ses_child1')?.state).toBe('running');
+  });
+
+  test('a host read failure stays uncertain rather than throwing', async () => {
+    const h = makeProbeTool();
+    h.get.mockImplementation(async () => {
+      throw new Error('session get failed');
+    });
+    const output = await h.tool.task_status.execute(
+      { task_id: 'exp-1' },
+      context,
+    );
+    expect(String(output)).toContain('state: running (unconfirmed)');
+    expect(h.board.get('ses_child1')?.state).toBe('running');
+  });
+});
+
+/**
+ * Unknown-handle errors enumerate the parent's live handles so an alias typo
+ * is recoverable from the error itself. The enumerated line must stay
+ * parse-safe: alias + agent + state only, `recent: `-prefixed.
+ */
+describe('task_status unknown-handle enumeration', () => {
+  const BANNED_PREFIXES = ['state:', 'Task ', 'task_id:', 'sessionID:'];
+
+  function seededBoard(): BackgroundJobBoard {
+    const board = new BackgroundJobBoard();
+    const seeds: Array<{
+      taskID: string;
+      agent: string;
+      state: 'running' | 'completed' | 'cancelled';
+    }> = [
+      { taskID: 'ses_a1', agent: 'fixer', state: 'completed' },
+      { taskID: 'ses_a2', agent: 'fixer', state: 'running' },
+      { taskID: 'ses_a3', agent: 'explorer', state: 'running' },
+      { taskID: 'ses_a4', agent: 'explorer', state: 'cancelled' },
+      { taskID: 'ses_a5', agent: 'oracle', state: 'completed' },
+      { taskID: 'ses_a6', agent: 'fixer', state: 'running' },
+    ];
+    seeds.forEach((seed, index) => {
+      board.registerLaunch({
+        taskID: seed.taskID,
+        parentSessionID: 'parent-1',
+        agent: seed.agent,
+        description: seed.taskID,
+        now: index + 1,
+      });
+      if (seed.state !== 'running') {
+        boardFixture.updateStatus(board, {
+          taskID: seed.taskID,
+          state: seed.state,
+          resultSummary: seed.state,
+          now: index + 1,
+        });
+      }
+    });
+    return board;
+  }
+
+  /** Last 5 by launchedAt: ses_a1 is evicted from the enumeration window. */
+  const EXPECTED_RECENT =
+    'recent: fix-2 fixer running; exp-1 explorer running; exp-2 explorer cancelled; ora-1 oracle completed; fix-3 fixer running';
+
+  function assertParseSafe(recentLine: string | undefined): void {
+    expect(recentLine).toBeDefined();
+    for (const banned of BANNED_PREFIXES) {
+      expect(recentLine?.startsWith(banned)).toBe(false);
+    }
+  }
+
+  test('task_status enumerates the parent-scoped handles on an unknown ref', async () => {
+    client = { session: {} };
+    const board = seededBoard();
+    const { task_status } = makeTool({ board });
+    const error = await task_status
+      .execute({ task_id: 'fix-9' }, { sessionID: 'parent-1' } as never)
+      .catch((thrown: Error) => thrown);
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toContain('Unknown task ID or alias: fix-9');
+    expect(message).toContain(EXPECTED_RECENT);
+    expect(message).not.toContain('ses_a');
+    assertParseSafe(
+      message.split('\n').find((line) => line.startsWith('recent: ')),
+    );
+  });
+
+  test('task_status keeps the bare unknown error with an empty board', async () => {
+    client = { session: {} };
+    const { task_status } = makeTool({ board: new BackgroundJobBoard() });
+    const error = await task_status
+      .execute({ task_id: 'fix-9' }, { sessionID: 'parent-1' } as never)
+      .catch((thrown: Error) => thrown);
+    expect((error as Error).message).toBe('Unknown task ID or alias: fix-9');
+  });
+
+  test('task_message enumerates the handles through the shared unknown-ref error', async () => {
+    const board = seededBoard();
+    const { task_message } = createTaskMessageTool({
+      input: { directory: '/test', client: { session: {} } } as never,
+      backgroundJobBoard: board,
+    });
+    const error = await task_message
+      .execute({ task_id: 'fix-9', message: 'hello' }, {
+        sessionID: 'parent-1',
+      } as never)
+      .catch((thrown: Error) => thrown);
+    const message = (error as Error).message;
+    expect(message).toContain('Unknown task ID or alias: fix-9');
+    expect(message).toContain(EXPECTED_RECENT);
+    expect(message).not.toContain('ses_a');
+    assertParseSafe(
+      message.split('\n').find((line) => line.startsWith('recent: ')),
+    );
+  });
+
+  test('task_cancel enumerates the handles inside its unknown output', async () => {
+    const board = seededBoard();
+    const { task_cancel } = createCancelTaskTool({
+      input: { directory: '/test', client: { session: {} } } as never,
+      backgroundJobBoard: board,
+      shouldManageSession: () => true,
+    });
+    const output = String(
+      await task_cancel.execute({ task_id: 'fix-9' }, {
+        sessionID: 'parent-1',
+      } as never),
+    );
+    expect(output).toContain('task_id: fix-9');
+    expect(output).toContain('state: unknown');
+    expect(output).toContain(EXPECTED_RECENT);
+    expect(output).not.toContain('ses_a');
+    assertParseSafe(
+      output.split('\n').find((line) => line.startsWith('recent: ')),
+    );
+  });
+
+  test('the enumerated recent line never corrupts loop-guard taskID/state extraction', async () => {
+    const board = seededBoard();
+    const { task_cancel } = createCancelTaskTool({
+      input: { directory: '/test', client: { session: {} } } as never,
+      backgroundJobBoard: board,
+      shouldManageSession: () => true,
+    });
+    const unknownOutput = String(
+      await task_cancel.execute({ task_id: 'fix-9' }, {
+        sessionID: 'parent-1',
+      } as never),
+    );
+    const recentLine = unknownOutput
+      .split('\n')
+      .find((line) => line.startsWith('recent: '));
+    assertParseSafe(recentLine);
+
+    const hook = createToolLoopGuardHook();
+    const feed = async (callID: string, output: string) => {
+      await hook['tool.execute.before'](
+        { tool: 'task_status', sessionID: 's1', callID },
+        { args: { task_id: 'fix-9' } },
+      );
+      const result = { output, metadata: {} };
+      await hook['tool.execute.after'](
+        { tool: 'task_status', sessionID: 's1', callID },
+        result,
+      );
+      return result;
+    };
+    // Identical header + state, different enumeration payloads: the stream
+    // must still advance (the recent line is not part of the extraction).
+    for (let i = 1; i <= 2; i++) {
+      const result = await feed(
+        `c${i}`,
+        unknownOutput.replace(/recent: .*/, `recent: fix-${i} fixer completed`),
+      );
+      expect(String(result.output)).not.toContain(LOOP_GUARD_WARNING);
+    }
+    const third = await feed(
+      'c3',
+      unknownOutput.replace(/recent: .*/, 'recent: fix-3 fixer running'),
+    );
+    expect(String(third.output)).toContain(LOOP_GUARD_WARNING);
+
+    // A real state change still resets the stream.
+    const changed = await feed(
+      'c4',
+      unknownOutput.replace('state: unknown', 'state: running'),
+    );
+    expect(String(changed.output)).not.toContain(LOOP_GUARD_WARNING);
   });
 });

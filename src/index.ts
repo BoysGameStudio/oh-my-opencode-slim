@@ -1601,8 +1601,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     taskMessageTools = createTaskMessageTool({
       input: ctx,
       backgroundJobBoard: backgroundJobCoordinator,
-      promptMessageIDFor: (taskID, generation) =>
-        revivedRunTracker.promptMessageIDFor(taskID, generation),
       resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
       isDisposed: () => instanceDisposed,
     });
@@ -1654,10 +1652,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     });
 
     // v2 hosts skip wait_for_user: the native `question` tool covers the
-    // blocking boundary there. v1 has no question tool and keeps the
-    // registration unchanged; the generic disabled_tools filter below
-    // still removes it on either flavor when listed.
+    // blocking boundary there. task_revive remains a v1-only recovery tool;
+    // v2 resumes retained sessions through native subagent(sessionID, prompt).
+    // v1 registration is unchanged; the generic disabled_tools filter below
+    // still removes either tool when listed.
     const shouldRegisterWaitForUser = hostFlavor !== 'v2';
+    const shouldRegisterTaskRevive = hostFlavor !== 'v2';
     const shouldRegisterWebfetch = runtime.webfetch.enabled !== false;
     const shouldRegisterInterview = !runtime.disabledCommands.has('interview');
     const interviewTools = shouldRegisterInterview
@@ -1670,7 +1670,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       ...taskCancelTools,
       ...taskMessageTools,
       ...taskReplyTools,
-      ...taskReviveTools,
+      ...(shouldRegisterTaskRevive ? taskReviveTools : {}),
       ...taskStatusTools,
       ...(shouldRegisterWaitForUser ? waitForUserTools : {}),
       ...interviewTools,
@@ -1718,7 +1718,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   const toolThreshold = minimumExpectedToolCount(
     runtime.disabledTools,
     runtime.webfetch.enabled !== false,
-    hostFlavor !== 'v2',
+    hostFlavor,
   );
   if (
     agentCount < HEALTH_CHECK.minAgents ||
