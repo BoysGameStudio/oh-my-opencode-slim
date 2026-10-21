@@ -50,8 +50,6 @@ function createDeps(board: BackgroundJobBoard, now: () => number) {
       clearSession: mock(() => {}),
       prune: mock(() => {}),
     },
-    terminalJobsInjectedByParent: new Map(),
-    pendingInjectedTerminalJobsByParent: new Map(),
     backgroundJobSupervisor,
   };
 }
