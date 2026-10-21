@@ -1102,6 +1102,24 @@ describe('v2 client shim delegation', () => {
     },
   );
 
+  test('list accepts the official 2.1 nullable terminal cursor', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        list: async () => ({
+          data: [{ id: 'ses_terminal' }],
+          cursor: { previous: null, next: null },
+        }),
+      } as never),
+    );
+    expect(
+      await (
+        input.client as {
+          session: { list: (args: unknown) => Promise<unknown> };
+        }
+      ).session.list({ query: {} }),
+    ).toEqual({ data: [{ id: 'ses_terminal' }] });
+  });
+
   test('list rejects a repeated cursor', async () => {
     const input = buildPluginInput(
       makeCtx({

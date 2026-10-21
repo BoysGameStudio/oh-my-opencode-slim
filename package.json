@@ -115,7 +115,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
-    "@opencode/plugin": "2.0.18",
+    "@opencode/plugin": "2.1.2",
     "@types/jsdom": "30",
     "@types/node": "^26.6.2",
     "@types/semver": "^7.7.1",

@@ -5,8 +5,8 @@ and OpenCode v2 (`opencode2`) from a single published package. This document
 describes how each host loads the plugin, what is supported where, and how to
 register it.
 
-The repository baseline is **oh-my-opencode-slim v2.2.25** (see
-`package.json`), with live host verification on **OpenCode v2.0.7**. The
+The source baseline for this compatibility work is **oh-my-opencode-slim
+v3.0.5**, with historical live host verification on **OpenCode v2.0.7**. The
 plugin requires OpenCode v2.0.7+ on v2 hosts; older v2 hosts are unsupported.
 Bundled-skill delivery requires the host's in-process skill registration
 channel (a `ctx.skill` draft with `add`), available on OpenCode v2 hosts. On
@@ -15,10 +15,15 @@ removed, and v1-era skill drafts expose `{source, list}` rather than `add`.
 The adapter targets the v2 plugin API surface (see
 [The v2 plugin API surface](#the-v2-plugin-api-surface-this-adapter-uses)),
 and the compile-time mirror guard below is pinned to `@opencode/plugin`
-2.0.18 (revalidated: `bun run typecheck` passes against 2.0.18 with no
-official session-hook surface drift from the 2.0.15 pin; the event
-adapter ignores unknown event types, so no new mapping is required.
-Live host verification remains the v2.0.7 baseline above).
+2.1.2. Typecheck covers the consumed listing filters, nullable continuation
+cursors, native execution event envelope, compaction result names and the
+existing hook/permission contracts. This is not live 2.1.2 verification.
+
+The 2.1 replay renames do not require rewriting host-owned data here: the
+compaction bridge leaves `result.native` and `metadata.keepID` untouched.
+OMO does not use the removed credential-configuration write shape in its
+adapter. The list shim implements only the directory/parent filters its
+callers consume, not every filter exposed by the host API.
 
 ## How it works
 
@@ -70,10 +75,9 @@ Three builds are produced:
 | `./tui` | `dist/tui2.js` | `build:tui` | same external set as `build:plugin` (composes the v1 TUI entry; inlines zod) |
 
 The optional `@opentui/*` pins (0.5.11) provide the v2 TUI entry's rendering
-stack. `@opencode/plugin` 2.0.18 raised its (optional) peer floor to
-`>=0.5.12`; the floor is not enforced on the plugin loading path, so the
-pins deliberately stay at 0.5.11 until the live-verified host baseline
-moves past v2.0.7 and the TUI smoke is re-run. `@opentui/solid` pins
+stack. The development-only `@opencode/plugin` 2.1.2 contract declares an
+optional OpenTUI peer floor of `>=0.6.6`. Runtime pins stay unchanged in
+this patch; TUI runtime compatibility with 2.1.2 is unverified. `@opentui/solid` pins
 `solid-js` exactly (0.5.12 still requires 1.9.12), so any future OpenTUI
 bump must re-check that pin.
 
@@ -110,7 +114,7 @@ orchestrator-wake children-driven degraded mode are exercised end-to-end
 on the stable host — live mock-driven re-verification on 2026-09-09
 included a queued wake firing after 60 s of parent idle with a stalled
 background child). v2 conformance is compile-time-pinned by the
-mirror-conformance guard against the `@opencode/plugin` 2.0.18
+mirror-conformance guard against the `@opencode/plugin` 2.1.2
 devDependency and exercised by the mock-driven bridge tests. Every v2
 API the adapter touches is
 capability-probed at runtime (`s.switchModel`, `ctx.generate`, …), so a host

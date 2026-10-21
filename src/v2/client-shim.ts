@@ -374,7 +374,8 @@ export function createSessionListShim(
         if (!isRecord(page.cursor)) {
           throw new Error('[v2] session.list returned an invalid cursor');
         }
-        next = page.cursor.next;
+        // The official 2.1 client permits null for an absent continuation.
+        next = page.cursor.next ?? undefined;
         if (next !== undefined && (typeof next !== 'string' || !next)) {
           throw new Error('[v2] session.list returned an invalid cursor');
         }
