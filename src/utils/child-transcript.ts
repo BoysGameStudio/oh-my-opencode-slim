@@ -23,6 +23,7 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 
 import { isRecord } from './guards';
+import type { HostRoundState } from './session-runtime-status';
 
 export type ChildTerminalEvidence =
   | { kind: 'ready'; text: string }
@@ -522,6 +523,38 @@ function textOf(message: TranscriptMessage): string {
     .map((part) => (part as { text: string }).text.trim())
     .filter((text) => text.length > 0)
     .join('\n');
+}
+
+/** Invalidate a parsed host terminal when its transcript has newer assistant
+ * activity. This adds attribution only; hostRoundStateOf/composeHostRound
+ * still own projection parsing, input boundaries, and outcome composition. */
+export function attributeHostRoundToTranscript(
+  state: HostRoundState,
+  transcript: unknown,
+): HostRoundState {
+  if (state.kind !== 'terminal') return state;
+  const entries = transcriptEntries(transcript);
+  if (!Array.isArray(entries)) {
+    return { kind: 'unknown', reason: entries.reason };
+  }
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index] as TranscriptMessage;
+    const source = sourceTypeOf(entry);
+    if (source === 'user' || source === 'synthetic') break;
+    if (source !== 'assistant') continue;
+    const at = transcriptOrderKey(entry);
+    if (at === undefined) {
+      return { kind: 'unknown', reason: 'assistant time is missing' };
+    }
+    const finished = assistantCompletedAt(entry);
+    if (
+      at > state.idleAt ||
+      (finished !== undefined && finished > state.idleAt)
+    ) {
+      return { kind: 'pending' };
+    }
+  }
+  return state;
 }
 
 /** Latest delivered user/synthetic input timestamp in a host transcript. */

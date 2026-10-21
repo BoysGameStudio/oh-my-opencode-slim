@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { PluginInput } from '@opencode-ai/plugin';
 import {
+  attributeHostRoundToTranscript,
   classifyAssistantTurnEvidence,
   classifyTerminalEvidence,
   fetchChildTranscript,
@@ -8,6 +9,119 @@ import {
   stringifyError,
   terminalTextOf,
 } from './child-transcript';
+import { composeHostRound, hostRoundStateOf } from './session-runtime-status';
+
+// #1642's host-attribution cases, expressed through #1635's parser/composer
+// rather than restoring the superseded historical-round classifier.
+describe('V2 host outcome attribution', () => {
+  const input = {
+    info: { id: 'input', role: 'user', time: { created: 10 } },
+    parts: [{ type: 'text', text: 'work' }],
+  };
+  const answer = {
+    info: {
+      id: 'answer',
+      role: 'assistant',
+      time: { created: 11, completed: 12 },
+    },
+    parts: [{ type: 'text', text: 'RESULT' }],
+  };
+  const host = { outcome: 'succeeded', time: { idle: 13 } };
+  const classify = (transcript: unknown, info = host) =>
+    composeHostRound(
+      attributeHostRoundToTranscript(hostRoundStateOf(info), transcript),
+      latestInputAtOf(transcript),
+    );
+
+  test('uses the host outcome without requiring a transcript idle marker', () => {
+    const transcript = { data: [input, answer] };
+    expect(classify(transcript)).toMatchObject({ verdict: 'completed' });
+    expect(terminalTextOf(transcript)).toBe('RESULT');
+  });
+
+  test.each([{ created: 14 }, { created: 11, completed: 14 }])(
+    'never attributes assistant activity newer than the terminal (%j)',
+    (time) => {
+      const newer = { ...answer, info: { ...answer.info, time } };
+      expect(classify({ data: [input, answer, newer] }).verdict).toBe(
+        'incomplete',
+      );
+      expect(classify({ data: [input, newer, answer] }).verdict).toBe(
+        'incomplete',
+      );
+    },
+  );
+
+  test.each(['failed', 'interrupted'])(
+    'recognizes textless %s outcomes',
+    (outcome) => {
+      const round = classify({ data: [input] }, { ...host, outcome });
+      expect(round.verdict).toBe(
+        outcome === 'failed' ? 'error' : 'interrupted',
+      );
+      if (outcome === 'failed') {
+        expect(round.text).toBe(
+          'The historical round failed before an assistant result.',
+        );
+      }
+    },
+  );
+
+  test.each([
+    { outcome: 'succeeded' },
+    { time: { idle: 13 } },
+    { outcome: 'succeeded', time: { idle: Number.NaN } },
+  ])('refuses partial or malformed host projections (%j)', (info) => {
+    const transcript = { data: [input, answer] };
+    expect(
+      composeHostRound(
+        attributeHostRoundToTranscript(hostRoundStateOf(info), transcript),
+        latestInputAtOf(transcript),
+      ).verdict,
+    ).toBe('unreadable');
+  });
+
+  test('pending host work cannot borrow a historical transcript terminal', () => {
+    const transcript = {
+      data: [
+        input,
+        answer,
+        {
+          info: {
+            id: 'idle',
+            sourceType: 'idle',
+            outcome: 'succeeded',
+            time: { created: 13 },
+          },
+          parts: [],
+        },
+      ],
+    };
+    expect(
+      composeHostRound(
+        attributeHostRoundToTranscript(hostRoundStateOf({}), transcript),
+        latestInputAtOf(transcript),
+      ).verdict,
+    ).toBe('incomplete');
+  });
+
+  test('newer input invalidates the older host terminal', () => {
+    const newerInput = {
+      ...input,
+      info: { ...input.info, time: { created: 14 } },
+    };
+    expect(classify({ data: [input, answer, newerInput] }).verdict).toBe(
+      'incomplete',
+    );
+  });
+
+  test.each([
+    undefined,
+    { data: [input, { ...answer, info: { role: 'assistant' } }] },
+  ])('unreadable transcript evidence fails closed (%j)', (transcript) => {
+    expect(classify(transcript).verdict).toBe('unreadable');
+  });
+});
 
 function message(overrides: {
   id?: string;

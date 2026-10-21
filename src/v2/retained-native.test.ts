@@ -250,6 +250,54 @@ describe('v2 historical context', () => {
     },
   );
 
+  test.each(['succeeded', 'failed', 'interrupted'] as const)(
+    'newer assistant activity blocks an older %s outcome',
+    async (outcome) => {
+      for (const time of [{ created: 14 }, { created: 11, completed: 14 }]) {
+        const board = new BackgroundJobBoard();
+        const input = host({
+          get: () => ({
+            id: CHILD,
+            parentID: PARENT,
+            agent: 'fixer',
+            outcome,
+            time: { created: 9, idle: 13 },
+          }),
+          context: () => [
+            ...round(),
+            {
+              id: 'new-answer',
+              type: 'assistant',
+              agent: 'fixer',
+              time,
+              content: [{ type: 'text', text: 'PARTIAL' }],
+            },
+          ],
+        });
+        const recover = createSessionRecovery({
+          input: input as never,
+          backgroundJobBoard: board,
+          hostFlavor: 'v2',
+        });
+        expect(
+          (await recover({ parentSessionID: PARENT, requested: CHILD })).kind,
+        ).toBe('refused');
+        expect(board.get(CHILD)).toBeUndefined();
+        // An explicit queued continuation may adopt identity, never import
+        // the obsolete terminal or newer partial answer as a settled row.
+        expect(
+          await recover({
+            parentSessionID: PARENT,
+            requested: CHILD,
+            purpose: 'revive',
+            allowQueuedContinuation: true,
+          }),
+        ).toMatchObject({ kind: 'adoptable', taskID: CHILD });
+        expect(board.get(CHILD)).toBeUndefined();
+      }
+    },
+  );
+
   test('a newer synthetic blocks an older succeeded outcome', async () => {
     // Host-state triage: the succeeded outcome predates the newest input
     // (the synthetic), so no terminal covers that round. Recovery reports
@@ -666,17 +714,15 @@ test('real parent context pairs an alias through the shim', async () => {
   expect(description.length).toBeGreaterThan(0);
 });
 
-test('host outcome triage: interrupted stops, failed errors, and a terminal outcome imports the newest assistant', async () => {
-  // Host-state triage imports the interrupted round without an assistant
-  // and, for a newer unclosed assistant, retains stopped rather than
-  // trusting an older idle.
+test('host outcome triage: interrupted stops, failed errors, and newer assistant activity prevents import', async () => {
+  // A host terminal covers assistant activity only up to its idle time.
   const interruptedInput = host({
     get: () => ({
       id: CHILD,
       parentID: PARENT,
       agent: 'fixer',
       outcome: 'interrupted',
-      time: { created: 9, idle: 11 },
+      time: { created: 9, idle: 13 },
     }),
   });
   const interruptedBoard = new BackgroundJobBoard();
@@ -696,7 +742,7 @@ test('host outcome triage: interrupted stops, failed errors, and a terminal outc
       parentID: PARENT,
       agent: 'fixer',
       outcome: 'failed',
-      time: { created: 9, idle: 11 },
+      time: { created: 9, idle: 13 },
     }),
   });
   const failedBoard = new BackgroundJobBoard();
@@ -747,18 +793,15 @@ test('host outcome triage: interrupted stops, failed errors, and a terminal outc
         : round(),
   });
   const newerBoard = new BackgroundJobBoard();
-  await createSessionRecovery({
+  const newerResult = await createSessionRecovery({
     input: newerAssistantInput as never,
     backgroundJobBoard: newerBoard,
     hostFlavor: 'v2',
     stableStoppedMs: 0,
   })({ parentSessionID: PARENT, requested: CHILD });
-  // Host state is authoritative: the succeeded outcome after the latest
-  // input imports as completed, and the newest assistant text is the result.
-  expect(newerBoard.get(CHILD)).toMatchObject({
-    state: 'completed',
-    resultSummary: 'ANSWER-B',
-  });
+  // The older success cannot certify ANSWER-B, even without a newer input.
+  expect(newerResult.kind).toBe('refused');
+  expect(newerBoard.get(CHILD)).toBeUndefined();
 });
 
 // A completed compaction cut the context (page.complete false): an older
