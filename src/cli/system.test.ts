@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, mock, test } from 'bun:test';
+import { describe, expect, mock, spyOn, test } from 'bun:test';
+import type { SpawnSyncReturns } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -79,12 +80,54 @@ describe('system', () => {
     }
   });
 
-  test('getOpenCodeVersion returns string or null', async () => {
-    const version = await getOpenCodeVersion();
-    if (version !== null) {
-      expect(typeof version).toBe('string');
-    } else {
+  test('getOpenCodeVersion parses stdout on success', async () => {
+    const childProcess = await import('node:child_process');
+    const fakeResult = (stdout: string): SpawnSyncReturns<string> => ({
+      status: 0,
+      stdout,
+      stderr: '',
+      pid: 1234,
+      output: [],
+      signal: null,
+    });
+    const spawnSpy = spyOn(childProcess, 'spawnSync').mockImplementation(
+      (cmd: string, args?: readonly string[]) => {
+        // Hermetic: intercept the PATH resolver too, so the test does not
+        // depend on opencode being installed on the host.
+        if (cmd === 'which' || cmd === 'where') {
+          return fakeResult('/usr/local/bin/opencode\n');
+        }
+        if (args?.includes('--version')) {
+          return fakeResult('1.2.3\n');
+        }
+        return undefined;
+      },
+    );
+
+    try {
+      const version = await getOpenCodeVersion();
+      expect(version).toBe('1.2.3');
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  test('getOpenCodeVersion returns null on failure', async () => {
+    const childProcess = await import('node:child_process');
+    const spawnSpy = spyOn(childProcess, 'spawnSync').mockReturnValue({
+      status: 1,
+      stdout: '',
+      stderr: 'command not found',
+      pid: 1234,
+      output: [],
+      signal: null,
+    } as any);
+
+    try {
+      const version = await getOpenCodeVersion();
       expect(version).toBeNull();
+    } finally {
+      spawnSpy.mockRestore();
     }
   });
 });

@@ -65,3 +65,13 @@ export function textFromContent(
 ): string {
   return joinTextParts(content, '');
 }
+
+/** Join user-authored text parts, excluding synthetic plugin additions. */
+export function userTextFromContent(
+  content: Array<Record<string, unknown>>,
+): string {
+  return joinTextParts(
+    content.filter((part) => part.synthetic !== true),
+    '',
+  );
+}

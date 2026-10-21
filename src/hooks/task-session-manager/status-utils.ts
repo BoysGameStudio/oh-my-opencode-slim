@@ -1,9 +1,5 @@
-import type {
-  BackgroundJobRecord,
-  BackgroundJobStore,
-  ContextFile,
-} from '../../utils';
-import { guardCompletedStatusText, parseTaskStatusOutput } from '../../utils';
+import type { BackgroundJobRecord, BackgroundJobStore } from '../../utils';
+import { parseTaskStatusOutput } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
 
@@ -31,9 +27,10 @@ export function isLateCancelledTaskError(
 export function formatCancelledTaskStatusOutput(
   taskID: string,
   summary = 'cancelled',
+  idParam = 'task_id',
 ): string {
   return [
-    `task_id: ${taskID}`,
+    `${idParam}: ${taskID}`,
     'state: cancelled',
     '',
     '<task_error>',
@@ -42,85 +39,10 @@ export function formatCancelledTaskStatusOutput(
   ].join('\n');
 }
 
-export function updateBackgroundJobFromOutput(
-  output: unknown,
-  backgroundJobBoard: BackgroundJobStore,
-  taskContextTracker: {
-    pendingManagedTaskIds: Set<string>;
-    contextFilesForPrompt(taskId: string): ContextFile[];
-    prune(board: { taskIDs(): Set<string> }): void;
-  },
-): BackgroundJobRecord | undefined {
-  if (typeof output !== 'string') return undefined;
-
-  const status = parseTaskStatusOutput(output);
-  if (!status) return undefined;
-
-  log('[task-session-manager] parsed task output status', {
-    taskID: status.taskID,
-    state: status.state,
-    timedOut: status.timedOut,
-    hasResult: Boolean(status.result),
-  });
-
-  const existing = backgroundJobBoard.get(status.taskID);
-  if (isLateCancelledTaskError(existing, status.state)) {
-    log('[task-session-manager] suppressed late cancelled task error', {
-      taskID: status.taskID,
-      alias: existing?.alias,
-      parsedState: status.state,
-      boardState: existing?.state,
-      terminalState: existing?.terminalState,
-      result: status.result,
-    });
-    return existing;
-  }
-
-  const guarded = guardCompletedStatusText(
-    status.state,
-    status.result,
-    existing?.resultSummary,
-  );
-
-  const updated = backgroundJobBoard.updateStatus({
-    taskID: status.taskID,
-    state: guarded.state,
-    timedOut: status.timedOut,
-    resultSummary: guarded.resultSummary,
-    lastStatusError: guarded.lastStatusError,
-  });
-  if (!updated) {
-    log('[task-session-manager] ignored status for unknown background job', {
-      taskID: status.taskID,
-      state: status.state,
-    });
-    return undefined;
-  }
-
-  log('[task-session-manager] background job status updated', {
-    taskID: updated.taskID,
-    alias: updated.alias,
-    parentSessionID: updated.parentSessionID,
-    state: updated.state,
-    terminalUnreconciled: updated.terminalUnreconciled,
-    timedOut: updated.timedOut,
-  });
-
-  if (backgroundJobBoard.isTerminalUnreconciled(updated.taskID)) {
-    taskContextTracker.pendingManagedTaskIds.delete(updated.taskID);
-    backgroundJobBoard.addContext(
-      updated.taskID,
-      taskContextTracker.contextFilesForPrompt(updated.taskID),
-    );
-    taskContextTracker.prune(backgroundJobBoard);
-  }
-
-  return updated;
-}
-
 export function normalizeLateCancelledTaskOutput(
   output: { output: unknown; metadata?: unknown },
   backgroundJobBoard: BackgroundJobStore,
+  idParam = 'task_id',
 ): void {
   if (typeof output.output !== 'string') return;
   const status = parseTaskStatusOutput(output.output);
@@ -137,6 +59,7 @@ export function normalizeLateCancelledTaskOutput(
   output.output = formatCancelledTaskStatusOutput(
     status.taskID,
     backgroundJobBoard.getResultSummary(status.taskID),
+    idParam,
   );
   if (isObjectRecord(output) && isObjectRecord(output.metadata)) {
     output.metadata.state = 'cancelled';

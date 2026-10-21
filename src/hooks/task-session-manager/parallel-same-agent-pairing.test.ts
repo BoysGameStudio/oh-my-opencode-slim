@@ -1,14 +1,30 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, test } from 'bun:test';
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
+import { createBackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { BackgroundTaskConcurrency } from '../../utils/background-task-concurrency';
 import { createTaskSessionManagerHook } from './index';
 import { createPendingCallTracker } from './pending-call-tracker';
 
 const PARENT = 'parent-1';
+const activeHooks: Array<{
+  hook: ReturnType<typeof createTaskSessionManagerHook>;
+  terminalGate: ReturnType<typeof createBackgroundJobTerminalGate>;
+}> = [];
+
+afterEach(async () => {
+  await Promise.all(
+    activeHooks.splice(0).map(async ({ hook, terminalGate }) => {
+      await hook.event({
+        event: { type: 'server.instance.disposed', properties: {} },
+      });
+      terminalGate.dispose();
+    }),
+  );
+});
 
 function createHook(
   board: BackgroundJobBoard,
@@ -17,7 +33,32 @@ function createHook(
     pendingCallTracker?: ReturnType<typeof createPendingCallTracker>;
   } = {},
 ) {
-  return createTaskSessionManagerHook(
+  const terminalGate = createBackgroundJobTerminalGate({
+    backgroundJobBoard: board,
+    readRuntime: async (_run, readStartedAt) => ({
+      kind: 'quiescent',
+      origin: 'test',
+      readStartedAt,
+      stable: true,
+    }),
+    readTerminalEvidence: async () => ({
+      data: [
+        {
+          info: {
+            id: 'test-assistant',
+            role: 'assistant',
+            time: { completed: Date.now() },
+            finish: 'stop',
+          },
+          parts: [{ type: 'text', text: 'Review finished.' }],
+        },
+      ],
+    }),
+  });
+  board.addTerminalStateListener((taskID) =>
+    extra.backgroundTaskConcurrency?.releaseTask(taskID),
+  );
+  const hook = createTaskSessionManagerHook(
     {
       client: { session: { status: mock(async () => ({ data: {} })) } },
       directory: '/tmp',
@@ -27,9 +68,12 @@ function createHook(
       maxSessionsPerAgent: 2,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
+      terminalGate,
       ...extra,
     },
   );
+  activeHooks.push({ hook, terminalGate });
+  return hook;
 }
 
 const HOST_LAUNCH = (taskID: string) =>
@@ -471,8 +515,8 @@ describe('parallel same-agent pairing (incident 2026-09-12)', () => {
       const { initLogger, flushLoggerForTesting } = await import(
         process.env.LOGGER_MODULE_URL
       );
-      const { readFileSync } = await import('node:fs');
-      initLogger('drain-fallback-b1');
+      const { readdirSync, readFileSync } = await import('node:fs');
+      initLogger();
       const board = new BackgroundJobBoard();
       const concurrency = new BackgroundTaskConcurrency({
         defaultConcurrency: 2,
@@ -534,9 +578,16 @@ describe('parallel same-agent pairing (incident 2026-09-12)', () => {
         { output: completed('ses_bbbb2222') },
       );
       await flushLoggerForTesting();
-      const lines = readFileSync(process.env.LOG_FILE_PATH, 'utf8').split(
-        '\\n',
-      );
+      const lines = readFileSync(
+        process.env.OPENCODE_LOG_DIR +
+          '/' +
+          readdirSync(process.env.OPENCODE_LOG_DIR).find(
+            (entry) =>
+              entry.startsWith('oh-my-opencode-slim.') &&
+              entry.endsWith('-' + process.pid + '.log'),
+          ),
+        'utf8',
+      ).split('\\n');
       console.log(
         JSON.stringify({
           drainWarnings: lines.filter((line) =>

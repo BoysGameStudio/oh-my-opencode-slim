@@ -33,15 +33,15 @@ describe('cache-impact snapshots (update deliberately — see file header)', () 
   });
 
   test('orchestrator system prompt', () => {
-    const prompt = buildOrchestratorPrompt(new Set());
+    const prompt = buildOrchestratorPrompt({ disabledAgents: new Set() });
     // Deterministic across invocations — a mismatch here means something
     // volatile (time, randomness, environment) leaked into the prompt.
-    expect(buildOrchestratorPrompt(new Set())).toBe(prompt);
+    expect(buildOrchestratorPrompt({ disabledAgents: new Set() })).toBe(prompt);
     expect(prompt).toMatchSnapshot();
   });
 
   test('transformed payload for the canonical conversation fixture', async () => {
-    const pipeline = createPipeline();
+    const pipeline = createPipeline({ goalPointer: true });
     pipeline.board.registerLaunch({
       taskID: 'task-snapshot',
       parentSessionID: SESSION_ID,

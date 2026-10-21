@@ -1,28 +1,56 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test';
 import { createInternalAgentTextPart } from '../../utils';
+import * as loggerModule from '../../utils/logger';
 import { SessionLifecycle } from '../session-lifecycle';
 import { resetUserWaitGateForTests } from '../task-session-manager/user-wait-gate';
 import {
   buildChildrenWakeFingerprint,
   buildOrchestratorWakeFingerprint,
+  CHILD_INPUT_WAKE_SETTLE_MS,
   CHILD_STALENESS_INTERVALS,
   childUpdateEvidenceMs,
   createOrchestratorWakeScheduler,
+  formatChildInputWaitDelta,
   formatStoppedJobDelta,
+  isGenuineOperatorMessage,
   isWakeChildActive,
   mapWakeChild,
+  ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT,
   ORCHESTRATOR_CHILDREN_WAKE_TEXT,
   ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT,
+  ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD,
   ORCHESTRATOR_WAKE_TEXT,
   ORCHESTRATOR_WAKE_UNCHANGED_CAP,
   resolveWakeMode,
   STOPPED_RECOVERY_OVERFLOW_TEXT,
+  STOPPED_RECOVERY_OVERFLOW_TEXT_NO_BOARD,
   STOPPED_RECOVERY_QUEUE_CAP,
   STOPPED_RECOVERY_WAKE_CHUNK,
+  WAKE_ANTI_FORGERY_TEXT,
+  WAKE_REPEAT_CORES,
+  WRITER_LANE_VERIFICATION_TEXT,
+  wakeRepeatMarker,
 } from './index';
 import {
+  clearWakeSession,
+  commitWakeReservation,
+  getSuppressedDuplicateWakes,
   getWakeProgress,
+  releaseWakeEvaluation,
+  reserveWakeBodyOccurrence,
   resetOrchestratorWakeGateForTests,
+  retryAfterWakeEvaluation,
+  rollbackWakeBodyOccurrence,
+  rollbackWakeReservation,
+  tryBeginWakeEvaluation,
 } from './wake-gate';
 
 type SessionClient = {
@@ -127,12 +155,16 @@ function createScheduler(options?: {
   enabled?: boolean;
   intervalMs?: number;
   mode?: 'auto' | 'todo' | 'children';
+  periodicWakeEnabled?: boolean;
+  boardInjectionEnabled?: boolean;
   hostFlavor?: string;
   sessionClient?: SessionClient | null;
   shouldManageSession?: (id: string) => boolean;
   hasInputWait?: (id: string) => boolean;
   isFallbackInProgress?: (id: string) => boolean;
   isStoppedJobRecoveryCurrent?: (taskID: string, generation: number) => boolean;
+  isChildInputWaitCurrent?: (taskID: string, requestID: string) => boolean;
+  isWriterLaneTask?: (taskID: string) => boolean;
   hasPendingDelegatedWork?: (id: string) => boolean;
   resolveSelection?: (sessionID: string) => Promise<{
     agent?: string;
@@ -156,12 +188,18 @@ function createScheduler(options?: {
       enabled: options?.enabled ?? true,
       intervalMs: options?.intervalMs ?? 60_000,
       ...(options?.mode ? { mode: options.mode } : {}),
+      ...(options?.periodicWakeEnabled !== undefined
+        ? { periodicWakeEnabled: options.periodicWakeEnabled }
+        : {}),
     },
     intervalMs: options?.intervalMs ?? 60_000,
+    boardInjectionEnabled: options?.boardInjectionEnabled,
     shouldManageSession: options?.shouldManageSession ?? (() => true),
     hasInputWait: options?.hasInputWait ?? (() => false),
     isFallbackInProgress: options?.isFallbackInProgress,
     isStoppedJobRecoveryCurrent: options?.isStoppedJobRecoveryCurrent,
+    isChildInputWaitCurrent: options?.isChildInputWaitCurrent,
+    isWriterLaneTask: options?.isWriterLaneTask,
     hasPendingDelegatedWork: options?.hasPendingDelegatedWork,
     resolveSelection: options?.resolveSelection,
     coordinator: options?.coordinator,
@@ -202,6 +240,296 @@ beforeEach(() => {
   globalThis.clearTimeout = clock.clearTimeout;
 });
 
+describe('child-input settling across host versions', () => {
+  test.each(
+    ['v1', 'v2'].flatMap((hostFlavor) =>
+      ['host read', 'selection'].flatMap((blockedAt) =>
+        ['duplicate', 'new ask'].map((arrival) => ({
+          hostFlavor,
+          blockedAt,
+          arrival,
+        })),
+      ),
+    ),
+  )(
+    '$hostFlavor defers a $arrival arriving during $blockedAt without a false stopped notice',
+    async ({ hostFlavor, blockedAt, arrival }) => {
+      const promptAsync = mock(async () => ({}));
+      let release!: () => void;
+      const pendingRead = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let blocked = false;
+      const get = mock(async () => {
+        if (blockedAt === 'host read' && !blocked) {
+          blocked = true;
+          await pendingRead;
+        }
+        return { data: {} };
+      });
+      const { scheduler } = createScheduler({
+        hostFlavor,
+        periodicWakeEnabled: false,
+        sessionClient:
+          hostFlavor === 'v2'
+            ? makeV2Client({
+                promptAsync,
+                get,
+                listChildren: [{ id: 'ses_child1' }],
+              })
+            : makeClient({ promptAsync, get, todos: [] }),
+        isChildInputWaitCurrent: () => true,
+        resolveSelection: async () => {
+          if (blockedAt === 'selection' && !blocked) {
+            blocked = true;
+            await pendingRead;
+          }
+          return { provenance: 'unknown' };
+        },
+      });
+      const ask = (requestID: string) =>
+        scheduler.triggerChildInputWaitWake(
+          'p1',
+          formatChildInputWaitDelta({
+            alias: 'fix-1',
+            taskID: 'ses_child1',
+            kind: 'permission',
+            requestID,
+            detail: 'permission: external_directory\npatterns: /approved/*',
+          }),
+          `ses_child1:${requestID}`,
+        );
+
+      ask('per_first');
+      await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS);
+      expect(blocked).toBe(true);
+      expect(promptAsync).not.toHaveBeenCalled();
+      ask(arrival === 'duplicate' ? 'per_first' : 'per_second');
+      release();
+      await clock.advance(0);
+      expect(promptAsync).not.toHaveBeenCalled();
+      expect(getWakeProgress('p1').unchangedWakeCount).toBe(0);
+
+      await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      const call = promptAsync.mock.calls[0]?.[0] as {
+        body: { parts: Array<{ text: string }> };
+      };
+      const text = call.body.parts[0]?.text ?? '';
+      expect(text).toContain(ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT);
+      expect(text).toContain('per_first');
+      if (arrival === 'new ask') expect(text).toContain('per_second');
+      expect(text).not.toContain(ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT);
+    },
+  );
+
+  test.each(['v1', 'v2'])(
+    '%s discards an auto-replied ask and still delivers a later pending ask',
+    async (hostFlavor) => {
+      const promptAsync = mock(async () => ({}));
+      let current = true;
+      const { scheduler } = createScheduler({
+        hostFlavor,
+        periodicWakeEnabled: false,
+        sessionClient:
+          hostFlavor === 'v2'
+            ? makeV2Client({
+                promptAsync,
+                listChildren: [{ id: 'ses_child1' }],
+              })
+            : makeClient({ promptAsync, todos: [] }),
+        isChildInputWaitCurrent: () => current,
+      });
+      const ask = (requestID: string) =>
+        scheduler.triggerChildInputWaitWake(
+          'p1',
+          formatChildInputWaitDelta({
+            alias: 'fix-1',
+            taskID: 'ses_child1',
+            kind: 'permission',
+            requestID,
+            detail: 'permission: external_directory\npatterns: /approved/*',
+          }),
+          `ses_child1:${requestID}`,
+        );
+
+      ask('per_auto');
+      await clock.advance(39);
+      current = false;
+      await scheduler.event({
+        event: {
+          type: 'permission.replied',
+          data: { sessionID: 'ses_child1', requestID: 'per_auto' },
+        },
+      });
+      await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS);
+      expect(promptAsync).not.toHaveBeenCalled();
+      expect(clock.pendingCount()).toBe(0);
+
+      current = true;
+      ask('per_pending');
+      await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS - 1);
+      expect(promptAsync).not.toHaveBeenCalled();
+      // Parent idle events must not bypass or restart the first deadline.
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      await clock.advance(1);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      const call = promptAsync.mock.calls[0]?.[0] as {
+        delivery?: string;
+        body: { parts: Array<{ text: string }> };
+      };
+      expect(call.body.parts[0]?.text).toContain('per_pending');
+      expect(call.body.parts[0]?.text).not.toContain('per_auto');
+      if (hostFlavor === 'v2') expect(call.delivery).toBe('queue');
+    },
+  );
+});
+
+describe('overflow input requests across host versions', () => {
+  test.each(['v1', 'v2'])(
+    '%s drops resolved overflow but preserves unretained requests',
+    async (hostFlavor) => {
+      const promptAsync = mock(async () => ({}));
+      let pending = true;
+      const { scheduler } = createScheduler({
+        hostFlavor,
+        periodicWakeEnabled: false,
+        boardInjectionEnabled: false,
+        sessionClient:
+          hostFlavor === 'v2'
+            ? makeV2Client({ promptAsync })
+            : makeClient({ promptAsync, todos: [] }),
+        isChildInputWaitCurrent: () => pending,
+      });
+      // 32 inline + 64 retained overflow IDs + one unretained request.
+      for (let i = 0; i < 97; i++) {
+        scheduler.triggerChildInputWaitWake(
+          'p1',
+          `input ${i}`,
+          `ses_${i}:per_${i}`,
+        );
+      }
+      pending = false;
+      await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      const text = promptAsync.mock.calls[0]?.[0]?.body.parts[0]?.text ?? '';
+      expect(text).toContain('Handle the pending request below');
+      expect(text).toContain('(+1 more overflowed entries were not retained)');
+      expect(text).not.toContain('ses_0');
+      expect(text).not.toContain('stopped without a terminal result');
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+    },
+  );
+});
+
+describe('forced wake blocker diagnostics', () => {
+  function captureBlockers() {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => entries.push({ message, data }),
+    );
+    return {
+      entries,
+      restore: () => spy.mockRestore(),
+      blockers: () =>
+        entries.filter(
+          (entry) =>
+            entry.message === '[orchestrator-wake] backstop not armed' ||
+            entry.message === '[orchestrator-wake] forced wake blocked',
+        ),
+    };
+  }
+
+  test.each(['stopped-job-recovery', 'child-input'] as const)(
+    'G3b %s queued while busy logs exactly once when blocked at idle twice',
+    async (trigger) => {
+      const capture = captureBlockers();
+      try {
+        let inputWait = false;
+        const promptAsync = mock(async () => ({}));
+        const { scheduler } = createScheduler({
+          hostFlavor: 'v2',
+          sessionClient: makeV2Client({ promptAsync }),
+          hasInputWait: () => inputWait,
+        });
+        await scheduler.event({
+          event: {
+            type: 'session.status',
+            properties: { sessionID: 'p1', status: { type: 'busy' } },
+          },
+        });
+        if (trigger === 'stopped-job-recovery') {
+          scheduler.triggerStoppedJobRecovery(
+            'p1',
+            'stop: child-1',
+            'child-1:1',
+          );
+        } else {
+          scheduler.triggerChildInputWaitWake(
+            'p1',
+            'ask: child-1',
+            'child-1:q1',
+          );
+        }
+        await clock.advance(0);
+        inputWait = true;
+        await scheduler.event({
+          event: {
+            type: 'session.status',
+            properties: { sessionID: 'p1', status: { type: 'idle' } },
+          },
+        });
+        await scheduler.event({
+          event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+        });
+        expect(promptAsync).not.toHaveBeenCalled();
+        expect(capture.blockers()).toEqual([
+          {
+            message: '[orchestrator-wake] forced wake blocked',
+            data: { sessionID: 'p1', trigger, reason: 'input-wait' },
+          },
+        ]);
+      } finally {
+        capture.restore();
+      }
+    },
+  );
+
+  test('G3c periodic and forced blockers of the same reason both log once', async () => {
+    const capture = captureBlockers();
+    try {
+      const { scheduler } = createScheduler({ hasInputWait: () => true });
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      scheduler.triggerStoppedJobRecovery('p1', 'stop: child-1', 'child-1:1');
+      scheduler.triggerStoppedJobRecovery('p1', 'stop: child-2', 'child-2:1');
+      expect(capture.blockers()).toEqual([
+        {
+          message: '[orchestrator-wake] backstop not armed',
+          data: { sessionID: 'p1', reason: 'input-wait' },
+        },
+        {
+          message: '[orchestrator-wake] forced wake blocked',
+          data: {
+            sessionID: 'p1',
+            trigger: 'stopped-job-recovery',
+            reason: 'input-wait',
+          },
+        },
+      ]);
+    } finally {
+      capture.restore();
+    }
+  });
+});
+
 afterEach(() => {
   globalThis.setTimeout = originalSetTimeout;
   globalThis.clearTimeout = originalClearTimeout;
@@ -224,6 +552,30 @@ describe('buildOrchestratorWakeFingerprint', () => {
 });
 
 describe('orchestrator wake scheduler', () => {
+  test('only the reservation owner can roll back a failed send without releasing waiters', () => {
+    const sessionID = 'guarded';
+    const owner = tryBeginWakeEvaluation(sessionID);
+    expect(owner).not.toBeNull();
+    if (!owner) return;
+    const waiter = mock(() => {});
+    retryAfterWakeEvaluation(sessionID, waiter);
+    getWakeProgress(sessionID).lastFingerprint = 'same-fingerprint';
+    getWakeProgress(sessionID).unchangedWakeCount = 1;
+    expect(commitWakeReservation(sessionID, owner, 'same-fingerprint')).toBe(
+      true,
+    );
+    expect(
+      commitWakeReservation(sessionID, Symbol('stranger'), 'same-fingerprint'),
+    ).toBe(false);
+    rollbackWakeReservation(sessionID, Symbol('stranger'));
+    expect(getWakeProgress(sessionID).unchangedWakeCount).toBe(2);
+    expect(getWakeProgress(sessionID).stopped).toBe(true);
+    rollbackWakeReservation(sessionID, owner);
+    expect(getWakeProgress(sessionID).unchangedWakeCount).toBe(1);
+    expect(getWakeProgress(sessionID).stopped).toBe(false);
+    releaseWakeEvaluation(sessionID, owner);
+    expect(waiter).not.toHaveBeenCalled();
+  });
   test('immediately wakes an idle parent after a stopped child with an active sibling', async () => {
     const promptAsync = mock(async () => ({}));
     const { scheduler } = createScheduler({
@@ -289,7 +641,6 @@ describe('orchestrator wake scheduler', () => {
     expect(call?.body.parts[0]?.text).toContain('alias: ora-7');
     expect(call?.body.parts[0]?.text).toContain('task: ses_x');
     expect(call?.body.parts[0]?.text).toContain('state: stopped');
-    expect(call?.body.parts[0]?.text).toContain('generation: 3');
     expect(call?.body.parts[0]?.text).toContain(
       'reason: stopped without a terminal result',
     );
@@ -497,6 +848,42 @@ describe('orchestrator wake scheduler', () => {
     expect(secondCall?.body.parts[0]?.text).toContain('task: ses_a');
   });
 
+  test.each(['v1', 'v2'] as const)(
+    '%s failed recovery retries the pending batch on its own timer',
+    async (flavor) => {
+      let fail = true;
+      const promptAsync = mock(async () => {
+        if (fail) throw new Error('temporary refusal');
+        return {};
+      });
+      const { scheduler } = createScheduler({
+        hostFlavor: flavor,
+        sessionClient:
+          flavor === 'v2'
+            ? makeV2Client({
+                promptAsync,
+                listChildren: [{ id: 'done', outcome: 'succeeded' }],
+              })
+            : makeClient({
+                promptAsync,
+                todos: [{ id: 't1', status: 'completed' }],
+              }),
+      });
+      scheduler.triggerStoppedJobRecovery('p1', 'recovery: ses_a', 'ses_a:1');
+      await clock.advance(0);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      fail = false;
+      await clock.advance(60_000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      const secondCall = (
+        promptAsync.mock.calls as unknown as Array<
+          [{ body: { parts: Array<{ text: string }> } }]
+        >
+      )[1]?.[0];
+      expect(secondCall?.body.parts[0]?.text).toContain('recovery: ses_a');
+    },
+  );
+
   test('a delivered recovery does not re-fire on the next idle', async () => {
     const promptAsync = mock(async () => ({}));
     const { scheduler } = createScheduler({
@@ -577,6 +964,98 @@ describe('orchestrator wake scheduler', () => {
     expect(text.match(/<stopped-job>/g)?.length).toBe(
       STOPPED_RECOVERY_WAKE_CHUNK,
     );
+  });
+
+  test('overflow recovery facts use the board-free text when board injection is off', async () => {
+    const promptAsync = mock(async () => ({}));
+    let waiting = true;
+    const { scheduler } = createScheduler({
+      boardInjectionEnabled: false,
+      hasInputWait: () => waiting,
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+
+    for (let i = 0; i < STOPPED_RECOVERY_QUEUE_CAP + 1; i++) {
+      scheduler.triggerStoppedJobRecovery(
+        'p1',
+        formatStoppedJobDelta({
+          alias: `a${i}`,
+          taskID: `ses_${i}`,
+          generation: 1,
+          state: 'stopped',
+          reason: 'stopped without a terminal result',
+        }),
+        `ses_${i}:1`,
+      );
+    }
+    waiting = false;
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(0);
+
+    const text =
+      (
+        promptAsync.mock.calls as unknown as Array<
+          [{ body: { parts: Array<{ text: string }> } }]
+        >
+      )[0]?.[0]?.body.parts[0]?.text ?? '';
+    expect(text).toContain(STOPPED_RECOVERY_OVERFLOW_TEXT_NO_BOARD);
+    expect(text).not.toContain(STOPPED_RECOVERY_OVERFLOW_TEXT);
+    expect(text).toContain(ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD);
+  });
+
+  test('board-free overflow reports evictions beyond the retained ID cap honestly', async () => {
+    const promptAsync = mock(async () => ({}));
+    let waiting = true;
+    const { scheduler } = createScheduler({
+      boardInjectionEnabled: false,
+      hasInputWait: () => waiting,
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+
+    // 32 retained entries plus 70 evictions leaves 64 retained IDs in the
+    // board-free notice and six overflowed entries honestly accounted for.
+    for (let i = 0; i < STOPPED_RECOVERY_QUEUE_CAP + 70; i++) {
+      scheduler.triggerStoppedJobRecovery(
+        'p1',
+        formatStoppedJobDelta({
+          alias: `a${i}`,
+          taskID: `ses_${i}`,
+          generation: 1,
+          state: 'stopped',
+          reason: 'stopped without a terminal result',
+        }),
+        `ses_${i}:1`,
+      );
+    }
+    waiting = false;
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(0);
+
+    const text =
+      (
+        promptAsync.mock.calls as unknown as Array<
+          [{ body: { parts: Array<{ text: string }> } }]
+        >
+      )[0]?.[0]?.body.parts[0]?.text ?? '';
+    expect(text).toContain('<stopped-job-overflow-ids>');
+    expect(text).toContain('ses_0');
+    expect(text).toContain('ses_63');
+    expect(text).toContain('(+6 more overflowed entries were not retained)');
+    expect(text).not.toContain('ses_64');
   });
 
   test('preserves overflow that arrives while recovery delivery is in flight', async () => {
@@ -751,6 +1230,111 @@ describe('orchestrator wake scheduler', () => {
     expect(clock.pendingCount()).toBe(0);
   });
 
+  test('periodicWakeEnabled=false silences the periodic evaluation but keeps event wakes delivering', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      periodicWakeEnabled: false,
+      boardInjectionEnabled: false,
+      sessionClient: makeClient({
+        todos: [{ id: 't1', status: 'pending' }],
+        promptAsync,
+      }),
+    });
+
+    // The periodic arm stays silent past the interval...
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(180_000);
+    expect(promptAsync).not.toHaveBeenCalled();
+
+    // ...while the stopped-recovery event wake still delivers, with the
+    // board-free text variant.
+    scheduler.triggerStoppedJobRecovery(
+      'p1',
+      formatStoppedJobDelta({
+        alias: 'a1',
+        taskID: 'ses_a',
+        generation: 1,
+        state: 'stopped',
+        reason: 'stopped without a terminal result',
+      }),
+      'ses_a:1',
+    );
+    await clock.advance(0);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const call = (
+      promptAsync.mock.calls as unknown as Array<
+        [{ body: { parts: Array<{ text: string }> } }]
+      >
+    )[0]?.[0];
+    expect(call?.body.parts[0]?.text).toContain(
+      ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD,
+    );
+    expect(call?.body.parts[0]?.text).not.toContain('Background Job Board');
+  });
+
+  test('v1 keeps the periodic evaluation when periodicWakeEnabled is left at its default', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v1',
+      sessionClient: makeClient({
+        todos: [{ id: 't1', status: 'pending' }],
+        promptAsync,
+      }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(180_000);
+    await clock.advance(120_000);
+    expect(promptAsync).toHaveBeenCalled();
+  });
+
+  test('a failed recovery delivery still retries on its own timer while periodicWakeEnabled=false', async () => {
+    let fail = true;
+    const promptAsync = mock(async () => {
+      if (fail) throw new Error('temporary refusal');
+      return {};
+    });
+    const { scheduler } = createScheduler({
+      periodicWakeEnabled: false,
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+
+    scheduler.triggerStoppedJobRecovery(
+      'p1',
+      formatStoppedJobDelta({
+        alias: 'a1',
+        taskID: 'ses_a',
+        generation: 7,
+        state: 'stopped',
+        reason: 'stopped without a terminal result',
+      }),
+      'ses_a:7',
+    );
+    await clock.advance(0);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    // The SDK-error retry rides the idle timer via retryReason even though
+    // the periodic evaluation itself is gated off.
+    fail = false;
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    const secondCall = (
+      promptAsync.mock.calls as unknown as Array<
+        [{ body: { parts: Array<{ text: string }> } }]
+      >
+    )[1]?.[0];
+    expect(secondCall?.body.parts[0]?.text).toContain('task: ses_a');
+  });
+
   test('is inactive when required session APIs are missing', async () => {
     const { scheduler } = createScheduler({
       sessionClient: {
@@ -802,7 +1386,7 @@ describe('orchestrator wake scheduler', () => {
       providerID: 'test',
       modelID: 'model-a',
     });
-    expect(call.body.variant).toBeUndefined();
+    expect(call.body.variant).toBe('high');
     expect(call.body.parts[0]?.text).toBe(
       `${ORCHESTRATOR_WAKE_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
@@ -1348,6 +1932,101 @@ describe('orchestrator wake scheduler', () => {
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
 
+  test('inject-no-rearm: injected non-operator nudges do not rearm the no-progress cap', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      intervalMs: 60_000,
+      sessionClient: makeClient({ promptAsync }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(getWakeProgress('p1').stopped).toBe(true);
+
+    // task_message-style noReply nudge with an operator-looking text part.
+    scheduler.observeChatMessage(
+      { sessionID: 'p1', messageID: 'nudge-1', noReply: true },
+      {
+        message: { id: 'nudge-1', role: 'user', sessionID: 'p1' },
+        parts: [{ type: 'text', text: 'status nudge' }],
+      },
+    );
+    // v2 command-marker submit: plain text with no message identity.
+    scheduler.observeChatMessage(
+      { sessionID: 'p1' },
+      {
+        message: { role: 'user', sessionID: 'p1' },
+        parts: [{ type: 'text', text: '/deepwork marker' }],
+      },
+    );
+    // Board-tagged injection that lost its synthetic flag.
+    scheduler.observeChatMessage(
+      { sessionID: 'p1', messageID: 'nudge-2' },
+      {
+        message: { id: 'nudge-2', role: 'user', sessionID: 'p1' },
+        parts: [
+          {
+            type: 'text',
+            text: 'board snapshot',
+            metadata: { 'oh-my-opencode-slim.backgroundJobBoard': true },
+          },
+        ],
+      },
+    );
+    expect(getWakeProgress('p1').stopped).toBe(true);
+    expect(getWakeProgress('p1').unchangedWakeCount).toBe(2);
+
+    // A genuine external operator message still rearms.
+    scheduler.observeChatMessage(
+      { sessionID: 'p1', messageID: 'user-real' },
+      {
+        message: { id: 'user-real', role: 'user', sessionID: 'p1' },
+        parts: [{ type: 'text', text: 'keep going' }],
+      },
+    );
+    expect(getWakeProgress('p1').stopped).toBe(false);
+    expect(getWakeProgress('p1').unchangedWakeCount).toBe(0);
+  });
+
+  test('phase-reminder veto now applies only to the anchored message', () => {
+    const anchoredParts = [
+      {
+        type: 'text',
+        text: 'operator text',
+        metadata: { 'oh-my-opencode-slim.phaseReminder': true },
+      },
+    ];
+    const nonAnchorParts = [{ type: 'text', text: 'operator text' }];
+
+    expect(
+      isGenuineOperatorMessage(
+        { messageID: 'm1' },
+        { id: 'm1', role: 'user' },
+        anchoredParts,
+      ),
+    ).toBe(false);
+
+    expect(
+      isGenuineOperatorMessage(
+        { messageID: 'm1' },
+        { id: 'm1', role: 'user' },
+        nonAnchorParts,
+      ),
+    ).toBe(true);
+
+    expect(
+      isGenuineOperatorMessage(
+        { messageID: 'm1', noReply: true },
+        { id: 'm1', role: 'user' },
+        nonAnchorParts,
+      ),
+    ).toBe(false);
+  });
+
   test('wake→busy→idle preserves the two-wake no-progress cap', async () => {
     const promptAsync = mock(async () => ({}));
     const { scheduler } = createScheduler({
@@ -1386,6 +2065,50 @@ describe('orchestrator wake scheduler', () => {
     });
     await clock.advance(180_000);
     expect(promptAsync).toHaveBeenCalledTimes(ORCHESTRATOR_WAKE_UNCHANGED_CAP);
+  });
+
+  test('reloading one location while another stays live resets only its wake state', async () => {
+    // Location A hits the two-wake no-progress cap on p1.
+    const promptA = mock(async () => ({}));
+    const { scheduler: schedulerA } = createScheduler({
+      directory: '/project-a',
+      sessionClient: makeClient({ promptAsync: promptA }),
+    });
+    await schedulerA.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    await clock.advance(60_000);
+    expect(promptA).toHaveBeenCalledTimes(ORCHESTRATOR_WAKE_UNCHANGED_CAP);
+    expect(getWakeProgress('p1').stopped).toBe(true);
+
+    // Location B stays live: its session is capped and mid-evaluation.
+    getWakeProgress('pb').stopped = true;
+    const ownerB = tryBeginWakeEvaluation('pb');
+    expect(ownerB).not.toBeNull();
+    const waiterB = mock(() => {});
+    retryAfterWakeEvaluation('pb', waiterB);
+
+    // Reload A: dispose its instance (B is still live, so no full clear).
+    await schedulerA.event({ event: { type: 'server.instance.disposed' } });
+
+    expect(getWakeProgress('p1').stopped).toBe(false);
+    expect(getWakeProgress('pb').stopped).toBe(true);
+    expect(tryBeginWakeEvaluation('pb')).toBeNull();
+    if (ownerB) releaseWakeEvaluation('pb', ownerB);
+    expect(waiterB).toHaveBeenCalledTimes(1);
+
+    // A's reloaded generation wakes p1 again instead of inheriting the cap.
+    const promptA2 = mock(async () => ({}));
+    const { scheduler: schedulerA2 } = createScheduler({
+      directory: '/project-a',
+      sessionClient: makeClient({ promptAsync: promptA2 }),
+    });
+    await schedulerA2.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptA2).toHaveBeenCalledTimes(1);
   });
 
   test('external busy (not wake-initiated) rearms the no-progress cap', async () => {
@@ -1473,6 +2196,38 @@ describe('orchestrator wake scheduler', () => {
     await clock.advance(59_000);
     expect(calls).toBe(2);
   });
+
+  test.each(['v1', 'v2'] as const)(
+    '%s failed wake sends do not consume the progress cap',
+    async (flavor) => {
+      const promptAsync = mock(async () => {
+        throw new Error('transport down');
+      });
+      const { scheduler } = createScheduler({
+        hostFlavor: flavor,
+        sessionClient:
+          flavor === 'v2'
+            ? makeV2Client({
+                promptAsync,
+                listChildren: [{ id: 'child', time: { updated: Date.now() } }],
+              })
+            : makeClient({ promptAsync }),
+      });
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      if (flavor === 'v2') {
+        // The first periodic evaluation only records the baseline fingerprint.
+        await clock.advance(60_000);
+      }
+      for (let i = 0; i < 4; i++) {
+        await clock.advance(60_000);
+        expect(promptAsync).toHaveBeenCalledTimes(i + 1);
+        expect(getWakeProgress('p1').stopped).toBe(false);
+      }
+      expect(getWakeProgress('p1').unchangedWakeCount).toBe(0);
+    },
+  );
 
   test('two hook instances share process-global in-flight and progress', async () => {
     const promptAsync = mock(async () => ({}));
@@ -1604,7 +2359,7 @@ describe('orchestrator wake scheduler', () => {
         [{ body: { variant?: string } }]
       >
     )[0]?.[0];
-    expect(call?.body.variant).toBeUndefined();
+    expect(call?.body.variant).toBe('low');
   });
 
   test('paired idle events do not create duplicate timers on one instance', async () => {
@@ -1673,33 +2428,29 @@ describe('session API capability probe', () => {
       hostFlavor: 'v2',
       sessionClient: makeV2Client(),
     });
-    expect(scheduler._test.wakeMode()).toBe('children');
-    expect(scheduler._test.capabilities().flavor).toBe('v2');
+    expect(scheduler).toBeDefined();
+    expect(resolveWakeMode('auto', { flavor: 'v2', hasTodo: false })).toBe(
+      'children',
+    );
   });
 
   test('explicit todo mode on v2 degrades to children; children pins children', () => {
-    expect(
-      createScheduler({
-        hostFlavor: 'v2',
-        mode: 'todo',
-        sessionClient: makeV2Client(),
-      }).scheduler._test.wakeMode(),
-    ).toBe('children');
-    expect(
-      createScheduler({
-        hostFlavor: 'v2',
-        mode: 'children',
-        sessionClient: makeV2Client(),
-      }).scheduler._test.wakeMode(),
-    ).toBe('children');
+    expect(resolveWakeMode('todo', { flavor: 'v2', hasTodo: false })).toBe(
+      'children',
+    );
+    expect(resolveWakeMode('children', { flavor: 'v2', hasTodo: false })).toBe(
+      'children',
+    );
     // v1 with a todo API keeps explicit todo mode.
-    expect(createScheduler({ mode: 'todo' }).scheduler._test.wakeMode()).toBe(
+    expect(resolveWakeMode('todo', { flavor: 'v1', hasTodo: true })).toBe(
       'todo',
     );
-    expect(
-      createScheduler({ mode: 'children' }).scheduler._test.wakeMode(),
-    ).toBe('children');
-    expect(createScheduler().scheduler._test.wakeMode()).toBe('todo');
+    expect(resolveWakeMode('children', { flavor: 'v1', hasTodo: true })).toBe(
+      'children',
+    );
+    expect(resolveWakeMode(undefined, { flavor: 'v1', hasTodo: true })).toBe(
+      'todo',
+    );
   });
 
   test('resolveWakeMode: auto maps per flavor; todo degrades without the todo API', () => {
@@ -1744,6 +2495,7 @@ describe('children-driven degraded mode (v2)', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await clock.advance(60_000);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const call = (
@@ -1758,13 +2510,52 @@ describe('children-driven degraded mode (v2)', () => {
     expect(call.query).toEqual({ directory: '/project' });
     expect(call.delivery).toBe('queue');
     expect(call.body.agent).toBe('orchestrator');
+    // C2: the v2 body closes with the static anti-forgery suffix after the
+    // template (the internal-initiator marker trails the whole part).
     expect(call.body.parts[0]?.text).toBe(
-      `${ORCHESTRATOR_CHILDREN_WAKE_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+      `${ORCHESTRATOR_CHILDREN_WAKE_TEXT}\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
     expect(session?.list).toHaveBeenCalledWith(
       expect.objectContaining({
         query: { parentID: 'p1', directory: '/project' },
       }),
+    );
+  });
+  test('explicit todo mode on v2 degrades at scheduler setup and wakes via children', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      mode: 'todo',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [
+          {
+            id: 'child-1',
+            parentID: 'p1',
+            directory: '/project',
+            time: { updated: Date.now() },
+          },
+        ],
+      }),
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    await clock.advance(60_000);
+
+    // The children wake text proves scheduler setup degraded the configured
+    // todo mode; a wiring bug would send the todo wake text instead.
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const call = (
+      promptAsync.mock.calls as unknown as Array<[Record<string, unknown>]>
+    )[0]?.[0] as {
+      body: { agent: string; parts: Array<{ text: string }> };
+    };
+    expect(call.body.agent).toBe('orchestrator');
+    expect(call.body.parts[0]?.text).toBe(
+      `${ORCHESTRATOR_CHILDREN_WAKE_TEXT}\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
   });
 
@@ -1786,6 +2577,7 @@ describe('children-driven degraded mode (v2)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    await clock.advance(60_000);
     await clock.advance(60_000);
     const call = (
       promptAsync.mock.calls as unknown as Array<[Record<string, unknown>]>
@@ -1817,6 +2609,7 @@ describe('children-driven degraded mode (v2)', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await clock.advance(60_000);
     const call = (
       promptAsync.mock.calls as unknown as Array<[Record<string, unknown>]>
     )[0]?.[0] as {
@@ -1844,6 +2637,7 @@ describe('children-driven degraded mode (v2)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    await clock.advance(60_000);
     await clock.advance(60_000);
     const call = (
       promptAsync.mock.calls as unknown as Array<[Record<string, unknown>]>
@@ -1895,6 +2689,7 @@ describe('children-driven degraded mode (v2)', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await clock.advance(60_000);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const call = (
@@ -1924,6 +2719,7 @@ describe('children-driven degraded mode (v2)', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await clock.advance(60_000);
     expect(promptAsync).not.toHaveBeenCalled();
 
     await scheduler.event({
@@ -1935,6 +2731,8 @@ describe('children-driven degraded mode (v2)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    // Restore re-enters with no baseline: the first evaluation records it.
+    await clock.advance(60_000);
     await clock.advance(60_000);
 
     expect(promptAsync).toHaveBeenCalledTimes(1);
@@ -2009,6 +2807,7 @@ describe('children-driven degraded mode (v2)', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await clock.advance(60_000);
     expect(promptAsyncLocal).toHaveBeenCalledTimes(1); // local child qualifies
 
     // Only a foreign-directory child: scoped out → no wake, spell ends.
@@ -2051,13 +2850,14 @@ describe('children-driven degraded mode (v2)', () => {
     });
     await clock.advance(60_000);
     await clock.advance(60_000);
+    await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(ORCHESTRATOR_WAKE_UNCHANGED_CAP);
     expect(getWakeProgress('p1').stopped).toBe(true);
     await clock.advance(180_000);
     expect(promptAsync).toHaveBeenCalledTimes(ORCHESTRATOR_WAKE_UNCHANGED_CAP);
   });
 
-  test('child update progress resets the unchanged cap', async () => {
+  test('defers periodic wakes while a child keeps making progress', async () => {
     const promptAsync = mock(async () => ({}));
     let updated = Date.now();
     const { scheduler } = createScheduler({
@@ -2073,17 +2873,62 @@ describe('children-driven degraded mode (v2)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    // The first periodic evaluation only records the baseline fingerprint:
+    // the parent just dispatched the child, so there is nothing actionable.
     await clock.advance(60_000);
-    expect(promptAsync).toHaveBeenCalledTimes(1);
-    // Each interval the host reports fresh child progress: every wake sees a
-    // new fingerprint, so the two-wake cap keeps resetting.
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(getWakeProgress('p1').lastFingerprint).toBeDefined();
+    // Baseline observation must not consume wake accounting or the busy
+    // marker, and the backstop timer stays armed for the stalled check.
+    expect(getWakeProgress('p1').unchangedWakeCount).toBe(0);
+    expect(getWakeProgress('p1').expectingWakeBusy).toBe(false);
+    expect(clock.pendingCount()).toBe(1);
+
     updated += 5_000;
     await clock.advance(60_000);
     updated += 5_000;
     await clock.advance(60_000);
-    expect(promptAsync).toHaveBeenCalledTimes(3);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(clock.pendingCount()).toBe(1);
     expect(getWakeProgress('p1').stopped).toBe(false);
-    expect(getWakeProgress('p1').unchangedWakeCount).toBe(1);
+    expect(getWakeProgress('p1').unchangedWakeCount).toBe(0);
+  });
+
+  test('defers when a child progresses during the latest snapshot recheck', async () => {
+    const promptAsync = mock(async () => ({}));
+    const updated = Date.now();
+    let listCalls = 0;
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listImpl: mock(async () => {
+          listCalls += 1;
+          return {
+            data: [
+              {
+                id: 'c1',
+                time: { updated: updated + (listCalls > 2 ? 5_000 : 0) },
+              },
+            ],
+          };
+        }),
+      }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    await clock.advance(60_000);
+
+    expect(listCalls).toBe(3);
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(clock.pendingCount()).toBe(1);
+    expect(getWakeProgress('p1').stopped).toBe(false);
+    expect(getWakeProgress('p1').unchangedWakeCount).toBe(0);
   });
 
   test('recovery wake bypasses the children condition', async () => {
@@ -2102,7 +2947,7 @@ describe('children-driven degraded mode (v2)', () => {
       >
     )[0]?.[0];
     expect(call?.body.parts[0]?.text).toBe(
-      `${ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+      `${ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT}\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
     expect(call?.delivery).toBe('queue');
   });
@@ -2134,7 +2979,6 @@ describe('children-driven degraded mode (v2)', () => {
     await clock.advance(60_000);
     expect(promptAsync).not.toHaveBeenCalled();
     expect(clock.pendingCount()).toBe(0);
-    expect(scheduler._test.lastStatusBySession.get('p1')?.status).toBe('busy');
   });
 
   test('event-tracked busy-set marks a child active without list evidence', async () => {
@@ -2156,6 +3000,7 @@ describe('children-driven degraded mode (v2)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    await clock.advance(60_000);
     await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
@@ -2209,6 +3054,7 @@ describe('children enumeration fallback (v2)', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
 
@@ -2228,6 +3074,7 @@ describe('children enumeration fallback (v2)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    await clock.advance(60_000);
     await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
@@ -2253,6 +3100,7 @@ describe('children enumeration fallback (v2)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    await clock.advance(60_000);
     await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
@@ -2306,7 +3154,6 @@ describe('children enumeration fallback (v2)', () => {
     });
     await clock.advance(60_000);
     expect(promptAsync).not.toHaveBeenCalled();
-    expect(scheduler._test.childEvidence.has('c1')).toBe(false);
   });
 
   test('terminal outcome from session.get suppresses the fallback wake', async () => {
@@ -2335,8 +3182,9 @@ describe('children enumeration fallback (v2)', () => {
 
   test('fallback child without an outcome still wakes on fresh evidence', async () => {
     const promptAsync = mock(async () => ({}));
+    const updated = Date.now();
     const get = mock(async () => ({
-      data: { time: { updated: Date.now() } },
+      data: { time: { updated } },
     }));
     const { scheduler } = createScheduler({
       hostFlavor: 'v2',
@@ -2352,6 +3200,7 @@ describe('children enumeration fallback (v2)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    await clock.advance(60_000);
     await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
@@ -2376,6 +3225,7 @@ describe('children enumeration fallback (v2)', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
 
@@ -2396,13 +3246,15 @@ describe('children enumeration fallback (v2)', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
 
   test('host evidence keeps a child active despite stale local evidence', async () => {
     const promptAsync = mock(async () => ({}));
+    const updated = Date.now();
     const get = mock(async () => ({
-      data: { time: { updated: Date.now() } },
+      data: { time: { updated } },
     }));
     const { scheduler } = createScheduler({
       hostFlavor: 'v2',
@@ -2426,20 +3278,22 @@ describe('children enumeration fallback (v2)', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
+    await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
 
   test('mixed fallback children: terminal suppressed, running wakes, get failure is fail-soft', async () => {
     const promptAsync = mock(async () => ({}));
+    const runningUpdated = Date.now();
     const get = mock(async (args: { path?: { id?: string } }) => {
       const id = args?.path?.id;
       if (id === 'c-terminal') {
         return {
-          data: { outcome: 'succeeded', time: { updated: Date.now() } },
+          data: { outcome: 'succeeded', time: { updated: 5_000 } },
         };
       }
       if (id === 'c-running') {
-        return { data: { time: { updated: Date.now() } } };
+        return { data: { time: { updated: runningUpdated } } };
       }
       if (id === 'c-throws') throw new Error('get unavailable');
       return { data: {} };
@@ -2460,6 +3314,7 @@ describe('children enumeration fallback (v2)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    await clock.advance(60_000);
     await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
@@ -2668,8 +3523,9 @@ describe('children enumeration fallback (v2)', () => {
 describe('children mode on v1 (explicit opt-in)', () => {
   test('enumerates via session.children and keeps the v1 promptAsync call shape', async () => {
     const promptAsync = mock(async () => ({}));
+    const updated = Date.now();
     const children = mock(async () => ({
-      data: [{ id: 'c1', time: { updated: Date.now() } }],
+      data: [{ id: 'c1', time: { updated } }],
     }));
     const status = mock(async () => ({ data: {} }));
     const { scheduler } = createScheduler({
@@ -2680,6 +3536,7 @@ describe('children mode on v1 (explicit opt-in)', () => {
     await scheduler.event({
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
+    await clock.advance(60_000);
     await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const call = (
@@ -2812,5 +3669,869 @@ describe('children-mode helpers', () => {
     expect(fp).toContain('c1::busy:42');
     expect(fp).toContain('c2:succeeded::');
     expect(buildChildrenWakeFingerprint([], tracked)).toBe('');
+  });
+});
+
+describe('evaluate verdict observability (INFO logs)', () => {
+  function captureVerdictLogs() {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    return {
+      verdicts: () =>
+        entries.filter(
+          (entry) => entry.message === '[orchestrator-wake] evaluate verdict',
+        ),
+      restore: () => spy.mockRestore(),
+    };
+  }
+
+  test('logs the wake verdict at both checkpoints in children mode', async () => {
+    const capture = captureVerdictLogs();
+    try {
+      const promptAsync = mock(async () => ({}));
+      const { scheduler } = createScheduler({
+        hostFlavor: 'v2',
+        intervalMs: 60_000,
+        sessionClient: makeV2Client({
+          promptAsync,
+          listChildren: [
+            {
+              id: 'child-1',
+              directory: '/project',
+              time: { updated: Date.now() },
+            },
+          ],
+        }),
+      });
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      // The first periodic evaluation only records the baseline fingerprint;
+      // its classification is logged but not delivered, so the captured
+      // verdicts below are the delivered wake's two checkpoints.
+      await clock.advance(60_000);
+      await clock.advance(60_000);
+      const verdicts = capture.verdicts();
+      expect(verdicts.length).toBe(3);
+      const delivered = verdicts.slice(-2);
+      expect(delivered[0]?.data).toMatchObject({
+        sessionID: 'p1',
+        verdict: 'wake',
+        mode: 'children',
+        checkpoint: 'initial',
+        recoveryWake: false,
+        childCount: 1,
+      });
+      expect(delivered[1]?.data).toMatchObject({
+        sessionID: 'p1',
+        verdict: 'wake',
+        checkpoint: 'recheck',
+      });
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+    } finally {
+      capture.restore();
+    }
+  });
+
+  test('logs the no-work verdict when every child has a terminal outcome', async () => {
+    const capture = captureVerdictLogs();
+    try {
+      const { scheduler } = createScheduler({
+        hostFlavor: 'v2',
+        intervalMs: 60_000,
+        sessionClient: makeV2Client({
+          listChildren: [{ id: 'child-1', outcome: 'succeeded' }],
+        }),
+      });
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      await clock.advance(60_000);
+      const verdicts = capture.verdicts();
+      expect(verdicts).toHaveLength(1);
+      expect(verdicts[0]?.data).toMatchObject({
+        sessionID: 'p1',
+        verdict: 'no-work',
+        mode: 'children',
+        checkpoint: 'initial',
+        recoveryWake: false,
+        childCount: 1,
+      });
+    } finally {
+      capture.restore();
+    }
+  });
+
+  test('logs backstop armed once and not-armed reason once across double idle', async () => {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    let waiting = false;
+    try {
+      const { scheduler } = createScheduler({
+        hasInputWait: () => waiting,
+      });
+      const idle = { type: 'session.idle', properties: { sessionID: 'p1' } };
+      await scheduler.event({ event: idle });
+      await scheduler.event({ event: idle });
+      expect(
+        entries.filter(
+          (entry) => entry.message === '[orchestrator-wake] backstop armed',
+        ),
+      ).toHaveLength(1);
+
+      waiting = true;
+      await scheduler.event({ event: idle });
+      await scheduler.event({ event: idle });
+      const blocked = entries.filter(
+        (entry) => entry.message === '[orchestrator-wake] backstop not armed',
+      );
+      expect(blocked).toHaveLength(1);
+      expect(blocked[0]?.data).toMatchObject({
+        sessionID: 'p1',
+        reason: 'input-wait',
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('reports the same blocker once per idle spell and again after an armed spell', async () => {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    let waiting = true;
+    try {
+      const { scheduler } = createScheduler({ hasInputWait: () => waiting });
+      const idle = { type: 'session.idle', properties: { sessionID: 'p1' } };
+      const status = (type: 'busy' | 'idle') => ({
+        event: {
+          type: 'session.status',
+          properties: { sessionID: 'p1', status: { type } },
+        },
+      });
+      const blocked = () =>
+        entries.filter(
+          (entry) =>
+            entry.message === '[orchestrator-wake] backstop not armed' &&
+            (entry.data as { reason?: string }).reason === 'input-wait',
+        );
+      const armed = () =>
+        entries.filter(
+          (entry) => entry.message === '[orchestrator-wake] backstop armed',
+        );
+
+      await scheduler.event({ event: idle });
+      await scheduler.event({ event: idle });
+      expect(blocked()).toHaveLength(1);
+      await scheduler.event(status('busy'));
+      await scheduler.event(status('idle'));
+      await scheduler.event({ event: idle });
+      expect(blocked()).toHaveLength(2);
+
+      waiting = false;
+      await scheduler.event({ event: idle });
+      await scheduler.event({ event: idle });
+      expect(armed()).toHaveLength(1);
+      waiting = true;
+      await scheduler.event({ event: idle });
+      await scheduler.event({ event: idle });
+      expect(blocked()).toHaveLength(3);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('logs the name and trigger of an SDK error with an empty message', async () => {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    try {
+      const failure = Object.assign(new Error(''), {
+        name: 'Session.SomeError',
+      });
+      const { scheduler } = createScheduler({
+        sessionClient: makeClient({
+          promptAsync: mock(async () => {
+            throw failure;
+          }),
+        }),
+      });
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      await clock.advance(60_000);
+      expect(entries).toContainEqual({
+        message: '[orchestrator-wake] wake suppressed after SDK error',
+        data: expect.objectContaining({
+          sessionID: 'p1',
+          trigger: 'periodic',
+          error: '{"name":"Session.SomeError"}',
+        }),
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('logs evaluation deferral and a progress-cap halt', async () => {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    try {
+      const { scheduler } = createScheduler({
+        sessionClient: makeClient({
+          childrenData: [{ id: 'child' }],
+          statusData: { child: { type: 'busy' } },
+        }),
+      });
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      await clock.advance(60_000);
+      expect(entries).toContainEqual({
+        message: '[orchestrator-wake] evaluate deferred',
+        data: {
+          sessionID: 'p1',
+          trigger: 'periodic',
+          checkpoint: 'initial',
+          reason: 'children-active',
+        },
+      });
+      await scheduler.event({
+        event: { type: 'session.deleted', properties: { sessionID: 'p1' } },
+      });
+      const wake = createScheduler();
+      await wake.scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      await clock.advance(60_000);
+      await clock.advance(60_000);
+      expect(
+        entries.some(
+          (entry) =>
+            entry.message === '[orchestrator-wake] backstop halted' &&
+            (entry.data as { reason?: string }).reason === 'progress-cap',
+        ),
+      ).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test.each([
+    { checkpoint: 'initial', blockedAt: 4 },
+    { checkpoint: 'recheck', blockedAt: 5 },
+    { checkpoint: 'selection', blockedAt: 6 },
+  ])(
+    'logs an input-wait abort at the $checkpoint checkpoint',
+    async ({ checkpoint, blockedAt }) => {
+      const entries: Array<{ message: string; data: unknown }> = [];
+      const spy = spyOn(loggerModule, 'log').mockImplementation(
+        (message: string, data?: unknown) => {
+          entries.push({ message, data });
+        },
+      );
+      let checks = 0;
+      try {
+        const { scheduler } = createScheduler({
+          hasInputWait: () => ++checks >= blockedAt,
+          resolveSelection: async () => ({ provenance: 'unknown' }),
+        });
+        await scheduler.event({
+          event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+        });
+        await clock.advance(60_000);
+        expect(entries).toContainEqual({
+          message: '[orchestrator-wake] evaluate aborted',
+          data: {
+            sessionID: 'p1',
+            trigger: 'periodic',
+            checkpoint,
+            reason: 'input-wait',
+          },
+        });
+      } finally {
+        spy.mockRestore();
+      }
+    },
+  );
+
+  test('reports when an active child deferral cannot rearm its backstop', async () => {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    let checks = 0;
+    try {
+      const { scheduler } = createScheduler({
+        hasInputWait: () => ++checks >= 5,
+        sessionClient: makeClient({
+          childrenData: [{ id: 'child' }],
+          statusData: { child: { type: 'busy' } },
+        }),
+      });
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      await clock.advance(60_000);
+      expect(entries).toContainEqual({
+        message: '[orchestrator-wake] backstop not armed',
+        data: { sessionID: 'p1', reason: 'input-wait' },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+describe('#1411 wake body dedupe', () => {
+  const WAKE_REPEAT_MARKER_OCC2 = `<system-reminder>\nRepeat wake #2: Finish any incomplete TODOs; await running agents. Do not respond to this reminder.\n</system-reminder>`;
+
+  test('repeat marker is strictly shorter than every mapped full text', () => {
+    for (const [text, core] of WAKE_REPEAT_CORES) {
+      for (const occurrence of [2, 10]) {
+        const saved = text.length - wakeRepeatMarker(core, occurrence).length;
+        expect(saved).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  /** Drive two legitimate delta-less periodic deliveries for one session
+   * (same fingerprint, within the unchanged cap) — the L1774 pattern. */
+  async function deliverTwoPeriodicWakes(promptAsync: ReturnType<typeof mock>) {
+    const { scheduler } = createScheduler({
+      intervalMs: 60_000,
+      sessionClient: makeClient({ promptAsync }),
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    return scheduler;
+  }
+
+  function partText(
+    promptAsync: ReturnType<typeof mock>,
+    index: number,
+  ): string | undefined {
+    const call = (
+      promptAsync.mock.calls as unknown as Array<
+        [{ body: { parts: Array<{ text: string }> } }]
+      >
+    )[index]?.[0];
+    return call?.body.parts[0]?.text;
+  }
+
+  test('second identical delta-less wake delivers a repeat marker, not the same body', async () => {
+    const promptAsync = mock(async () => ({}));
+    await deliverTwoPeriodicWakes(promptAsync);
+
+    const first = partText(promptAsync, 0);
+    const second = partText(promptAsync, 1);
+    expect(first).toBe(
+      `${ORCHESTRATOR_WAKE_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+    );
+    expect(second).not.toBe(first);
+    expect(second).toBe(
+      `${WAKE_REPEAT_MARKER_OCC2}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+    );
+    expect(second).toContain('Repeat wake #2');
+  });
+
+  test('delta-bearing stopped-job wake keeps the full template and does not bump the occurrence map', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+
+    scheduler.triggerStoppedJobRecovery(
+      'p1',
+      formatStoppedJobDelta({
+        alias: 'ora-7',
+        taskID: 'ses_x',
+        generation: 3,
+        state: 'stopped',
+        reason: 'stopped without a terminal result',
+      }),
+      'ses_x:3',
+    );
+    await clock.advance(0);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const text = partText(promptAsync, 0);
+    expect(text).toContain(ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT);
+    expect(text).toContain('task: ses_x');
+    expect(text).not.toContain('Repeat wake #');
+    expect(getSuppressedDuplicateWakes('p1')).toBe(0);
+    // Side-state read: nothing was recorded for this text by the wake.
+    expect(
+      reserveWakeBodyOccurrence('p1', ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT),
+    ).toMatchObject({ repeat: false, occurrence: 1 });
+  });
+
+  test('child-input wake keeps the full caveat template and is exempt from occurrence tracking', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+
+    scheduler.triggerChildInputWaitWake(
+      'p1',
+      formatChildInputWaitDelta({
+        alias: 'fix-1',
+        taskID: 'ses_child1',
+        kind: 'question',
+        requestID: 'que_1',
+        detail: 'request: que_1\nkind: question\nquestion: Which env?',
+      }),
+      'ses_child1:que_1',
+    );
+    await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const text = partText(promptAsync, 0);
+    expect(text).toContain(ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT);
+    expect(text).toContain('Which env?');
+    expect(text).not.toContain('Repeat wake #');
+    expect(getSuppressedDuplicateWakes('p1')).toBe(0);
+    expect(
+      reserveWakeBodyOccurrence('p1', ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT),
+    ).toMatchObject({ repeat: false, occurrence: 1 });
+  });
+
+  test('suppressed counter increments and the suppression log fires', async () => {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    try {
+      const promptAsync = mock(async () => ({}));
+      await deliverTwoPeriodicWakes(promptAsync);
+
+      expect(getSuppressedDuplicateWakes('p1')).toBe(1);
+      const suppression = entries.find(
+        (entry) =>
+          entry.message ===
+          '[orchestrator-wake] duplicate wake body suppressed',
+      );
+      expect(suppression?.data).toMatchObject({
+        sessionID: 'p1',
+        occurrence: 2,
+        suppressedTotal: 1,
+      });
+      expect(
+        (suppression?.data as { charsSaved?: number } | undefined)?.charsSaved,
+      ).toBe(ORCHESTRATOR_WAKE_TEXT.length - WAKE_REPEAT_MARKER_OCC2.length);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('resetOrchestratorWakeGateForTests clears occurrence state', async () => {
+    const promptAsync = mock(async () => ({}));
+    const scheduler = await deliverTwoPeriodicWakes(promptAsync);
+    expect(partText(promptAsync, 1)).toContain('Repeat wake #2');
+
+    resetOrchestratorWakeGateForTests();
+
+    // Re-arm the idle window on the same scheduler: with the gate reset the
+    // next delta-less wake delivers the full text again (occurrence 1).
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(3);
+    expect(partText(promptAsync, 2)).toBe(
+      `${ORCHESTRATOR_WAKE_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+    );
+  });
+
+  test('failed send rolls the occurrence back so the retry sends full text', async () => {
+    let attempt = 0;
+    const promptAsync = mock(async () => {
+      attempt += 1;
+      if (attempt === 1) throw new Error('send failed');
+      return {};
+    });
+    const { scheduler } = createScheduler({
+      intervalMs: 60_000,
+      sessionClient: makeClient({ promptAsync }),
+    });
+
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    // A failed first send counts no suppression.
+    expect(getSuppressedDuplicateWakes('p1')).toBe(0);
+    // The failed send must not leave the full text marked as delivered.
+    expect(
+      reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT),
+    ).toMatchObject({
+      repeat: false,
+      occurrence: 1,
+    });
+    resetOrchestratorWakeGateForTests();
+
+    // Retry: the rollback means the next attempt is occurrence 1 again, so it
+    // delivers the full template, never a "repeat" marker.
+    await scheduler.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'p1', status: { type: 'busy' } },
+      },
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(partText(promptAsync, 1)).toBe(
+      `${ORCHESTRATOR_WAKE_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+    );
+  });
+
+  test('rollbackWakeBodyOccurrence removes the sole occurrence and undoes a counted repeat', () => {
+    const first = reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT);
+    expect(first).toMatchObject({ repeat: false, occurrence: 1 });
+    rollbackWakeBodyOccurrence(
+      'p1',
+      ORCHESTRATOR_WAKE_TEXT,
+      first.occurrence,
+      first.reservation,
+    );
+    const again = reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT);
+    expect(again).toMatchObject({ repeat: false, occurrence: 1 });
+
+    const repeat = reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT);
+    expect(repeat).toMatchObject({ repeat: true, occurrence: 2 });
+    expect(getSuppressedDuplicateWakes('p1')).toBe(1);
+    rollbackWakeBodyOccurrence(
+      'p1',
+      ORCHESTRATOR_WAKE_TEXT,
+      repeat.occurrence,
+      repeat.reservation,
+    );
+    expect(getSuppressedDuplicateWakes('p1')).toBe(0);
+    expect(
+      reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT),
+    ).toMatchObject({ repeat: true, occurrence: 2 });
+
+    // No-op on an unknown text.
+    rollbackWakeBodyOccurrence(
+      'p1',
+      ORCHESTRATOR_CHILDREN_WAKE_TEXT,
+      1,
+      repeat.reservation,
+    );
+    // A stale send must not undo a newer reservation: the occurrence guard
+    // rejects the rollback once the stored count has moved on.
+    const stale = reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT);
+    expect(stale.occurrence).toBe(3);
+    rollbackWakeBodyOccurrence(
+      'p1',
+      ORCHESTRATOR_WAKE_TEXT,
+      1,
+      stale.reservation,
+    );
+    expect(
+      reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT),
+    ).toMatchObject({ repeat: true, occurrence: 4 });
+  });
+
+  test('a stale rollback cannot remove a newer reservation after the map is replaced', () => {
+    // Wake A reserves, then its session state is cleared while the send is
+    // still pending (LRU eviction, hook disposal, or session deletion).
+    const wakeA = reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT);
+    expect(wakeA.occurrence).toBe(1);
+    clearWakeSession('p1');
+
+    // Wake B reserves the same body for the same session: the occurrence
+    // number restarts at 1 in a fresh map.
+    const wakeB = reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT);
+    expect(wakeB.occurrence).toBe(1);
+    expect(wakeB.reservation).not.toBe(wakeA.reservation);
+
+    // Wake A's late rollback carries the same occurrence number, but the map
+    // it wrote into is no longer the session's, so it must not fire.
+    rollbackWakeBodyOccurrence(
+      'p1',
+      ORCHESTRATOR_WAKE_TEXT,
+      wakeA.occurrence,
+      wakeA.reservation,
+    );
+
+    // Wake B's reservation survives: the next wake is occurrence 2.
+    expect(
+      reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT),
+    ).toMatchObject({ repeat: true, occurrence: 2 });
+    expect(getSuppressedDuplicateWakes('p1')).toBe(1);
+  });
+
+  test('a store left over from before this change is backfilled, not crashed on', () => {
+    const key = Symbol.for('oh-my-opencode-slim.orchestrator-wake-gate');
+    resetOrchestratorWakeGateForTests();
+    const store = (
+      globalThis as unknown as Record<symbol, Record<string, unknown>>
+    )[key] as Record<string, unknown>;
+    delete store.deliveredDeltalessWakeTexts;
+    delete store.suppressedDuplicateWakes;
+
+    expect(
+      reserveWakeBodyOccurrence('p1', ORCHESTRATOR_WAKE_TEXT),
+    ).toMatchObject({
+      repeat: false,
+      occurrence: 1,
+    });
+    expect(getSuppressedDuplicateWakes('p1')).toBe(0);
+  });
+
+  test('children repeat marker keeps the await/assess guidance', () => {
+    const core = WAKE_REPEAT_CORES.get(ORCHESTRATOR_CHILDREN_WAKE_TEXT);
+    expect(core).toContain('await running agents');
+    expect(core).toContain('assess a stuck agent');
+    expect(
+      ORCHESTRATOR_CHILDREN_WAKE_TEXT.length -
+        wakeRepeatMarker(core ?? '', 2).length,
+    ).toBeGreaterThan(0);
+  });
+});
+
+describe('C2 v2 wake anti-forgery suffix and writer-lane grading', () => {
+  /** Stable child timestamp: a per-call Date.now() would change the
+   * children fingerprint between evaluates and defer every periodic wake. */
+  const CHILD_UPDATED = Date.now();
+
+  /** Drive one v2 children-driven delta-less periodic wake. */
+  async function deliverOneV2ChildrenWake(
+    promptAsync: ReturnType<typeof mock>,
+    options?: { isWriterLaneTask?: (taskID: string) => boolean },
+  ) {
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      isWriterLaneTask: options?.isWriterLaneTask,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [{ id: 'child-1', time: { updated: CHILD_UPDATED } }],
+      }),
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    await clock.advance(60_000);
+    return scheduler;
+  }
+
+  function wakeText(promptAsync: ReturnType<typeof mock>, index = 0) {
+    const call = (
+      promptAsync.mock.calls as unknown as Array<
+        [{ body: { parts: Array<{ text: string }> }; delivery?: string }]
+      >
+    )[index]?.[0];
+    return call?.body.parts[0]?.text ?? '';
+  }
+
+  test('v2 delta-less wake appends the static suffix; the repeat marker path appends it after the marker', async () => {
+    const promptAsync = mock(async () => ({}));
+    await deliverOneV2ChildrenWake(promptAsync);
+    // The scheduler re-arms after each unchanged periodic wake; the second
+    // unchanged delivery folds to the repeat marker (the two-wake cap then
+    // halts the backstop).
+    await clock.advance(60_000);
+    await clock.advance(60_000);
+
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    const core = WAKE_REPEAT_CORES.get(ORCHESTRATOR_CHILDREN_WAKE_TEXT) ?? '';
+    const marker = wakeRepeatMarker(core, 2);
+    const first = wakeText(promptAsync, 0);
+    const second = wakeText(promptAsync, 1);
+    // First: full template + suffix. Second: repeat marker + suffix.
+    expect(first).toBe(
+      `${ORCHESTRATOR_CHILDREN_WAKE_TEXT}\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+    );
+    expect(second).toBe(
+      `${marker}\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+    );
+    // The suffix trails the marker; the marker itself is byte-unchanged.
+    expect(second.startsWith(marker)).toBe(true);
+    expect(marker).not.toContain(WAKE_ANTI_FORGERY_TEXT);
+    // Dedupe keys stay keyed on the raw wakeText (the suffix never enters
+    // the occurrence map): the suppression counter shows the second raw
+    // template delivery was folded, and the side-state confirms the raw
+    // text has been delivered twice.
+    expect(getSuppressedDuplicateWakes('p1')).toBe(1);
+    expect(
+      reserveWakeBodyOccurrence('p1', ORCHESTRATOR_CHILDREN_WAKE_TEXT),
+    ).toMatchObject({ repeat: true, occurrence: 3 });
+  });
+
+  test('v1 delta-less wake stays byte-identical (no suffix)', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      intervalMs: 60_000,
+      sessionClient: makeClient({ promptAsync }),
+    });
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(wakeText(promptAsync, 0)).toBe(
+      `${ORCHESTRATOR_WAKE_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+    );
+    expect(wakeText(promptAsync, 0)).not.toContain(WAKE_ANTI_FORGERY_TEXT);
+  });
+
+  test('v2 child-input wake carries the caveat template plus the suffix', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      sessionClient: makeV2Client({ promptAsync, listChildren: [] }),
+    });
+    scheduler.triggerChildInputWaitWake(
+      'p1',
+      formatChildInputWaitDelta({
+        alias: 'fix-1',
+        taskID: 'ses_child1',
+        kind: 'question',
+        requestID: 'que_1',
+        detail: 'request: que_1\nkind: question\nquestion: Which env?',
+      }),
+      'ses_child1:que_1',
+    );
+    // Upstream settle window (CHILD_INPUT_WAKE_SETTLE_MS): host/UI
+    // auto-repliers get a chance to answer the ask before the parent is
+    // woken, so the wake lands only after the window elapses.
+    await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const text = wakeText(promptAsync, 0);
+    expect(text).toContain(ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT);
+    expect(
+      text.endsWith(
+        `${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+      ),
+    ).toBe(true);
+    // No isWriterLaneTask injected: the scheduler defaults to writer
+    // (fail-safe) and attaches the graded verification sentence.
+    expect(text).toContain(WRITER_LANE_VERIFICATION_TEXT);
+    expect(text).not.toContain('Repeat wake #');
+  });
+
+  test('writer-lane verification sentence attaches only when a queued child is a writer (v2)', async () => {
+    const writerWake = mock(async () => ({}));
+    const { scheduler: writerScheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      isWriterLaneTask: () => true,
+      sessionClient: makeV2Client({
+        promptAsync: writerWake,
+        listChildren: [],
+      }),
+    });
+    writerScheduler.triggerStoppedJobRecovery('p1', 'delta-writer', 't1:1');
+    await clock.advance(0);
+    expect(wakeText(writerWake, 0)).toContain(WRITER_LANE_VERIFICATION_TEXT);
+
+    // Read-only lane: no sentence.
+    const readerWake = mock(async () => ({}));
+    const { scheduler: readerScheduler } = createScheduler({
+      hostFlavor: 'v2',
+      intervalMs: 60_000,
+      isWriterLaneTask: () => false,
+      sessionClient: makeV2Client({
+        promptAsync: readerWake,
+        listChildren: [],
+      }),
+    });
+    readerScheduler.triggerStoppedJobRecovery('p2', 'delta-reader', 't2:1');
+    await clock.advance(0);
+    expect(wakeText(readerWake, 0)).not.toContain(
+      WRITER_LANE_VERIFICATION_TEXT,
+    );
+  });
+
+  test('v1 wake keeps zero suffix and zero writer sentence even with a writer predicate injected', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      intervalMs: 60_000,
+      isWriterLaneTask: () => true,
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+    scheduler.triggerStoppedJobRecovery(
+      'p1',
+      formatStoppedJobDelta({
+        alias: 'fix-1',
+        taskID: 'ses_x',
+        generation: 3,
+        state: 'stopped',
+        reason: 'stopped without a terminal result',
+      }),
+      'ses_x:3',
+    );
+    await clock.advance(0);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const text = wakeText(promptAsync, 0);
+    expect(text).toContain(ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT);
+    expect(text).not.toContain(WAKE_ANTI_FORGERY_TEXT);
+    expect(text).not.toContain(WRITER_LANE_VERIFICATION_TEXT);
   });
 });

@@ -5,13 +5,9 @@ import {
   type ToolDefinition,
   tool,
 } from '@opencode-ai/plugin';
+import { detectInlineImageMime } from '../../utils/image-signatures';
 import { buildBinaryResultMessage, saveBinary } from './binary';
-import {
-  buildCacheKey,
-  CACHE,
-  cacheFetchResult,
-  isInvalidLlmsResult,
-} from './cache';
+import { buildCacheKey, CACHE, conditionalHeaders, lookup } from './cache';
 import {
   DEFAULT_TIMEOUT_SECONDS,
   MAX_BINARY_DOWNLOAD_BYTES,
@@ -21,14 +17,15 @@ import {
   WEBFETCH_DESCRIPTION,
 } from './constants';
 import {
-  buildAllowedOrigins,
-  buildConditionalHeaders,
+  ACCEPT_BY_FORMAT,
   buildPermissionPatterns,
   decodeBody,
+  discard,
   extractHeaderMetadata,
   fetchWithUpgradeFallback,
   getBinaryKind,
   isBinaryContentType,
+  isCloudflareChallenge,
   isDocsLikeUrl,
   isGenericBinaryMime,
   isHtmlLikeContentType,
@@ -39,35 +36,79 @@ import {
   readBodyLimited,
   runWithScopedTimeout,
 } from './network';
+import type { CachedFetch, SmartfetchOptions } from './types';
 import {
-  decideSecondaryModelUse,
-  hasV2GenerateText,
-  resolveSecondaryModels,
-  runSecondaryModelWithFallback,
-} from './secondary-model';
-import type { RedirectStep, SmartfetchOptions } from './types';
-import {
-  buildLlmsRequiredMessage,
   buildRedirectResultMessage,
+  cleanFetchedMarkdown,
   cleanFetchedText,
   detectQualitySignals,
-  escapeHtml,
   extractFromHtml,
   extractHeadingsFromMarkdown,
   frontmatter,
   inferCanonicalUrlFromText,
-  joinRenderedContent,
-  pickContent,
   renderMessageForFormat,
   trimBlankRuns,
-  withTruncationMarker,
   wordCount,
 } from './utils';
 
 const z = tool.schema;
+const ARGS = {
+  url: z.httpUrl(),
+  format: z.enum(['text', 'markdown', 'html']).default('markdown'),
+  timeout: z
+    .number()
+    .positive()
+    .max(MAX_TIMEOUT_SECONDS)
+    .optional()
+    .describe('Timeout in seconds, max 120.'),
+  save_binary: z
+    .boolean()
+    .default(false)
+    .describe(
+      'Save binary payload to disk when it fits within the active download limit.',
+    ),
+};
+
+function pickContent(
+  fetchResult: CachedFetch,
+  format: 'text' | 'markdown' | 'html',
+) {
+  const content =
+    format === 'html'
+      ? fetchResult.sourceKind === 'html'
+        ? fetchResult.extractedMain
+          ? fetchResult.html
+          : fetchResult.rawContent
+        : renderMessageForFormat(
+            fetchResult.text || fetchResult.rawContent,
+            format,
+          )
+      : format === 'text'
+        ? cleanFetchedText(fetchResult.text)
+        : cleanFetchedMarkdown(fetchResult.markdown);
+  if (!fetchResult.truncated) return content;
+  return format === 'html'
+    ? `${content}\n<!-- [..content truncated..] -->`
+    : `${content}\n\n[..content truncated..]`;
+}
+
+/**
+ * Minimal conditional status header: only keys that change the caller's
+ * next decision survive (title, final_url when it differs from the
+ * requested URL, truncated, non-empty quality signals). Everything else
+ * lives in `ctx.metadata` for the UI channel.
+ */
+function statusHeader(meta: Record<string, unknown>): string {
+  const entries = Object.entries(meta).filter(
+    ([, value]) =>
+      value !== undefined && !(Array.isArray(value) && value.length === 0),
+  );
+  if (entries.length === 0) return '';
+  return frontmatter(Object.fromEntries(entries));
+}
 
 export function createWebfetchTool(
-  pluginCtx: PluginInput,
+  _pluginCtx: PluginInput,
   options: SmartfetchOptions = {},
 ): ToolDefinition {
   const binaryDir =
@@ -75,54 +116,27 @@ export function createWebfetchTool(
 
   return tool({
     description: WEBFETCH_DESCRIPTION,
-    args: {
-      url: z.httpUrl(),
-      format: z.enum(['text', 'markdown', 'html']).default('markdown'),
-      timeout: z
-        .number()
-        .positive()
-        .max(MAX_TIMEOUT_SECONDS)
-        .optional()
-        .describe('Timeout in seconds, max 120.'),
-      prompt: z
-        .string()
-        .optional()
-        .describe(
-          'Optional extraction task to run on the fetched content using a cheap secondary model.',
-        ),
-      extract_main: z.boolean().default(true),
-      prefer_llms_txt: z.enum(['auto', 'always', 'never']).default('auto'),
-      include_metadata: z.boolean().default(true),
-      save_binary: z
-        .boolean()
-        .default(false)
-        .describe(
-          'Save binary payload to disk when it fits within the active download limit.',
-        ),
-    },
-    async execute(args, ctx) {
-      const secondaryModels = resolveSecondaryModels({
-        webfetchModels: options.webfetchModels,
-        smallModel: options.smallModelRef?.() ?? undefined,
-        explorerModel: options.explorerModel,
-        librarianModel: options.librarianModel,
-      });
+    args: ARGS,
+    async execute(rawArgs, ctx) {
+      const args = z.object(ARGS).parse(rawArgs);
       const normalized = normalizeUrl(args.url);
       const url = new URL(normalized.url);
-      const cacheKey = buildCacheKey(
-        args.url,
-        args.extract_main,
-        args.prefer_llms_txt,
-        args.save_binary,
-      );
-      const shouldProbeLlmsTxt =
-        args.prefer_llms_txt === 'always' ||
-        (args.prefer_llms_txt === 'auto' && isDocsLikeUrl(url));
+      const cacheOptions = {
+        format: args.format,
+        save_binary: args.save_binary,
+      };
+      const cacheKey = buildCacheKey(args.url, cacheOptions);
+      const llmsCacheKey = buildCacheKey(args.url, {
+        ...cacheOptions,
+        format: undefined,
+      });
+      // llms.txt is plain text, not the raw page: probing only makes sense
+      // when the caller asked for extracted markdown/text output.
+      const shouldProbeLlmsTxt = args.format !== 'html' && isDocsLikeUrl(url);
       const permissionPatterns = buildPermissionPatterns(
         normalized,
         shouldProbeLlmsTxt,
       );
-      const allowedOrigins = buildAllowedOrigins(permissionPatterns);
 
       await ctx.ask({
         permission: 'webfetch',
@@ -134,7 +148,6 @@ export function createWebfetchTool(
           fallback_url: normalized.fallbackUrl,
           llms_probe_enabled: shouldProbeLlmsTxt,
           format: args.format,
-          prompt: args.prompt,
         },
       });
 
@@ -142,37 +155,14 @@ export function createWebfetchTool(
         (args.timeout ?? DEFAULT_TIMEOUT_SECONDS) * 1000,
         MAX_TIMEOUT_SECONDS * 1000,
       );
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(new Error(`timeout after ${timeoutMs}ms`)),
-        timeoutMs,
-      );
-      const abortHandler = () => controller.abort(ctx.abort.reason);
-      ctx.abort.addEventListener('abort', abortHandler, { once: true });
-
-      try {
-        let fetchResult = CACHE.get(cacheKey);
-        if (isInvalidLlmsResult(fetchResult)) {
-          CACHE.delete(cacheKey);
-          fetchResult = undefined;
-        }
-        const cacheHit = !!fetchResult;
-        if (fetchResult) {
-          fetchResult = {
-            ...fetchResult,
-            requestedUrl: args.url,
-            cacheHit: true,
-          };
-        }
-        if (!fetchResult) {
-          let staleFetchResult = CACHE.get(cacheKey, {
-            allowStale: true,
-            noDeleteOnStaleGet: true,
-          });
-          if (isInvalidLlmsResult(staleFetchResult)) {
-            CACHE.delete(cacheKey);
-            staleFetchResult = undefined;
-          }
+      return runWithScopedTimeout(ctx.abort, timeoutMs, async (signal) => {
+        signal.throwIfAborted();
+        const cachedLlms = shouldProbeLlmsTxt
+          ? lookup(llmsCacheKey)
+          : undefined;
+        const cached = cachedLlms?.fresh ? cachedLlms : lookup(cacheKey);
+        let fetchResult = cached.fresh ? cached.entry : undefined;
+        if (!cached.fresh) {
           let llmsProbeError: string | undefined;
 
           if (shouldProbeLlmsTxt) {
@@ -184,16 +174,14 @@ export function createWebfetchTool(
               Math.min(MAX_LLMS_PROBE_TIMEOUT_MS, timeoutMs),
             );
             const llms = await runWithScopedTimeout(
-              controller.signal,
+              signal,
               probeTimeoutMs,
-              (probeSignal) =>
-                probeLlmsText(url, timeoutMs, probeSignal, fallbackOrigin),
+              (probeSignal) => probeLlmsText(url, probeSignal, fallbackOrigin),
             );
             if (llms && 'text' in llms) {
               const llmsHeaders = llms.headers || {};
               const text = trimBlankRuns(llms.text);
               fetchResult = {
-                requestedUrl: args.url,
                 finalUrl: llms.url,
                 statusCode: llms.statusCode,
                 contentType: llmsHeaders.contentType || 'text/plain',
@@ -224,311 +212,220 @@ export function createWebfetchTool(
                   sourceKind: 'llms_txt',
                   extractedMain: false,
                 }),
-                llmsProbeTruncated: !!llms.truncated,
                 decodedCharset: llms.decodedCharset,
                 decodeFallback: llms.decodeFallback,
                 decodeWarning: llms.decodeWarning,
-                cacheHit: false,
               };
-              cacheFetchResult(
-                fetchResult,
-                args.extract_main,
-                args.prefer_llms_txt,
-                args.save_binary,
-              );
             } else if (llms?.error) {
               llmsProbeError = llms.error;
-            }
-
-            if (!fetchResult && args.prefer_llms_txt === 'always') {
-              const metadata = args.include_metadata
-                ? frontmatter({
-                    requested_url: args.url,
-                    used_llms_txt: false,
-                    llms_probe_error: llmsProbeError,
-                    prefer_llms_txt: args.prefer_llms_txt,
-                  })
-                : '';
-              return joinRenderedContent(
-                metadata,
-                renderMessageForFormat(
-                  buildLlmsRequiredMessage(args.url, llmsProbeError),
-                  args.format,
-                ),
-                args.format,
-              );
             }
           }
 
           if (!fetchResult) {
-            const { result, upgradedToHttps } = await fetchWithUpgradeFallback(
+            const validators = cached.entry
+              ? conditionalHeaders(cached.entry)
+              : {};
+            let { result, upgradedToHttps } = await fetchWithUpgradeFallback(
               normalized,
-              timeoutMs,
-              args.format,
-              controller.signal,
-              buildConditionalHeaders(staleFetchResult),
-              'GET',
-              allowedOrigins,
+              signal,
+              { Accept: ACCEPT_BY_FORMAT[args.format], ...validators },
             );
-            if ('blockedRedirect' in result) {
-              const metadata = args.include_metadata
-                ? frontmatter({
-                    requested_url: args.url,
-                    redirect_url: result.redirectUrl,
-                    status_code: result.statusCode,
-                    redirect_chain: result.redirectChain.map(
-                      (step: RedirectStep) =>
-                        `${step.status} ${step.from} -> ${step.to}`,
-                    ),
-                    upgraded_to_https: upgradedToHttps,
-                  })
-                : '';
-              return joinRenderedContent(
-                metadata,
-                renderMessageForFormat(
+            if (
+              !('blockedRedirect' in result) &&
+              result.response.status === 304 &&
+              cached.entry &&
+              Object.keys(validators).length > 0
+            ) {
+              const notModified = result;
+              await discard(notModified.response);
+              if (notModified.finalUrl === cached.entry.finalUrl) {
+                fetchResult = {
+                  ...cached.entry,
+                  etag:
+                    notModified.response.headers.get('etag') ||
+                    cached.entry.etag,
+                  lastModified:
+                    notModified.response.headers.get('last-modified') ||
+                    cached.entry.lastModified,
+                  redirectChain: notModified.redirectChain,
+                  upgradedToHttps,
+                };
+              } else {
+                // A redirect may now identify a different resource: fetch its body.
+                ({ result, upgradedToHttps } = await fetchWithUpgradeFallback(
+                  normalized,
+                  signal,
+                  { Accept: ACCEPT_BY_FORMAT[args.format] },
+                ));
+              }
+            }
+            if (!fetchResult) {
+              if ('blockedRedirect' in result) {
+                return renderMessageForFormat(
                   buildRedirectResultMessage(
                     args.url,
                     result.redirectUrl,
                     result.statusCode,
                   ),
                   args.format,
-                ),
-                args.format,
-              );
-            }
+                );
+              }
 
-            const { response, finalUrl, redirectChain } = result;
-            if (response.status === 304 && staleFetchResult) {
-              fetchResult = {
-                ...staleFetchResult,
-                requestedUrl: args.url,
-                finalUrl,
-                statusCode: staleFetchResult.statusCode,
-                redirectChain,
-                llmsProbeError,
-                cacheRevalidated: true,
-                upstreamStatusCode: 304,
-                cacheHit: false,
-              };
-              cacheFetchResult(
-                fetchResult,
-                args.extract_main,
-                args.prefer_llms_txt,
-                args.save_binary,
-              );
-            } else {
+              const { response, finalUrl, redirectChain } = result;
               if (!response.ok) {
+                await discard(response);
                 throw new Error(
-                  `Request failed with status code: ${response.status}`,
+                  `Request failed with status code: ${response.status}${isCloudflareChallenge(response) ? ' (Cloudflare browser challenge; retrying will not help, try another source)' : ''}`,
                 );
               }
               const headerMetadata = extractHeaderMetadata(
                 response.headers,
                 finalUrl,
               );
-              const explicitBinary = isBinaryContentType(
-                headerMetadata.contentType || '',
-              );
-              const genericBinaryMime = isGenericBinaryMime(
-                headerMetadata.contentType || '',
-              );
+              const declaredType = headerMetadata.contentType || '';
+              const explicitBinary = isBinaryContentType(declaredType);
+              const genericBinaryMime = isGenericBinaryMime(declaredType);
               const binaryDownloadLimit = args.save_binary
                 ? MAX_RESPONSE_BYTES
                 : MAX_BINARY_DOWNLOAD_BYTES;
-              if (
+              const oversizedBinary =
                 explicitBinary &&
                 !genericBinaryMime &&
                 typeof headerMetadata.contentLength === 'number' &&
-                headerMetadata.contentLength > binaryDownloadLimit
-              ) {
-                try {
-                  await response.body?.cancel();
-                } catch {
-                  // ignore cancel failures
-                }
-                fetchResult = {
-                  requestedUrl: args.url,
-                  finalUrl,
-                  statusCode: response.status,
-                  contentType:
-                    headerMetadata.contentType || 'application/octet-stream',
-                  charset: headerMetadata.charset,
-                  etag: headerMetadata.etag,
-                  lastModified: headerMetadata.lastModified,
-                  contentLength: headerMetadata.contentLength,
-                  filename: headerMetadata.filename,
-                  canonicalUrl: finalUrl,
-                  redirectChain,
-                  upgradedToHttps,
-                  truncated: false,
-                  binary: true,
-                  binaryKind: getBinaryKind(
-                    headerMetadata.contentType || 'application/octet-stream',
-                  ),
-                  downloadLimitBytes: binaryDownloadLimit,
-                  metadataOnly: true,
-                  data: undefined,
-                  llmsProbeError,
-                  llmsProbeTruncated: false,
-                  cacheHit: false,
-                };
-                cacheFetchResult(
-                  fetchResult,
-                  args.extract_main,
-                  args.prefer_llms_txt,
-                  args.save_binary,
-                );
+                headerMetadata.contentLength > binaryDownloadLimit;
+              let body = { data: new Uint8Array(), truncated: false };
+              if (oversizedBinary) {
+                await discard(response);
               } else {
                 const readLimit =
                   explicitBinary && !genericBinaryMime
                     ? binaryDownloadLimit
                     : MAX_RESPONSE_BYTES;
-                const body = await readBodyLimited(response, readLimit);
-                const provisionalDecoded =
-                  !headerMetadata.contentType ||
+                body = await readBodyLimited(response, readLimit);
+              }
+              const baseFetch = {
+                finalUrl,
+                statusCode: response.status,
+                ...headerMetadata,
+                redirectChain,
+                upgradedToHttps,
+                truncated: body.truncated,
+                llmsProbeError,
+              };
+              const provisionalDecoded =
+                !oversizedBinary &&
+                (!declaredType ||
                   genericBinaryMime ||
-                  /^text\//i.test(headerMetadata.contentType)
-                    ? decodeBody(
-                        body.data,
-                        headerMetadata.charset,
-                        headerMetadata.contentType,
-                      )
-                    : undefined;
-                const looksHtmlPayload = provisionalDecoded
-                  ? looksLikeHtmlText(provisionalDecoded.text)
-                  : false;
-                const contentType = headerMetadata.contentType
-                  ? genericBinaryMime && looksLikeTextBody(body.data)
-                    ? looksHtmlPayload
-                      ? 'text/html'
-                      : 'text/plain'
-                    : /^text\/plain(?:;|$)/i.test(headerMetadata.contentType) &&
-                        looksHtmlPayload
-                      ? 'text/html'
-                      : headerMetadata.contentType
-                  : looksLikeTextBody(body.data)
-                    ? looksHtmlPayload
-                      ? 'text/html'
-                      : 'text/plain'
-                    : 'application/octet-stream';
-
-                if (isBinaryContentType(contentType)) {
-                  const binaryTooLarge =
-                    body.truncated ||
-                    (typeof headerMetadata.contentLength === 'number' &&
-                      headerMetadata.contentLength > binaryDownloadLimit);
-                  fetchResult = {
-                    requestedUrl: args.url,
-                    finalUrl,
-                    statusCode: response.status,
-                    contentType,
-                    charset: headerMetadata.charset,
-                    etag: headerMetadata.etag,
-                    lastModified: headerMetadata.lastModified,
-                    contentLength: headerMetadata.contentLength,
-                    filename: headerMetadata.filename,
-                    canonicalUrl: finalUrl,
-                    redirectChain,
-                    upgradedToHttps,
-                    truncated: body.truncated,
-                    binary: true,
-                    binaryKind: getBinaryKind(contentType),
-                    downloadLimitBytes: binaryDownloadLimit,
-                    metadataOnly: binaryTooLarge,
-                    data: binaryTooLarge ? undefined : body.data,
-                    llmsProbeError,
-                    llmsProbeTruncated: false,
-                    cacheHit: false,
-                  };
-                  cacheFetchResult(
-                    fetchResult,
-                    args.extract_main,
-                    args.prefer_llms_txt,
-                    args.save_binary,
-                  );
-                } else {
-                  const decoded =
-                    provisionalDecoded ||
-                    decodeBody(body.data, headerMetadata.charset, contentType);
-                  const rawText = decoded.text;
-                  const extracted = isHtmlLikeContentType(contentType)
-                    ? await extractFromHtml(
-                        rawText,
-                        finalUrl,
-                        args.extract_main,
-                      )
-                    : (() => {
-                        const cleaned = cleanFetchedText(rawText);
-                        return {
-                          title: undefined,
-                          rawContent: cleaned,
-                          html: cleaned,
-                          text: cleaned,
-                          markdown: cleaned,
-                          extractedMain: false,
-                          canonicalUrl: undefined,
-                          headings: [],
-                        };
-                      })();
-
-                  fetchResult = {
-                    requestedUrl: args.url,
-                    finalUrl,
-                    statusCode: response.status,
-                    contentType,
-                    charset: headerMetadata.charset,
-                    etag: headerMetadata.etag,
-                    lastModified: headerMetadata.lastModified,
-                    contentLength: headerMetadata.contentLength,
-                    filename: headerMetadata.filename,
-                    canonicalUrl:
-                      extracted.canonicalUrl ||
-                      inferCanonicalUrlFromText(extracted.markdown, finalUrl) ||
+                  /^text\//i.test(declaredType))
+                  ? decodeBody(body.data, headerMetadata.charset, declaredType)
+                  : undefined;
+              const looksHtmlPayload = provisionalDecoded
+                ? looksLikeHtmlText(provisionalDecoded.text)
+                : false;
+              const sniffedImage =
+                !declaredType || genericBinaryMime
+                  ? detectInlineImageMime(body.data)
+                  : undefined;
+              let contentType = declaredType;
+              if (sniffedImage) {
+                contentType = sniffedImage;
+              } else if (!contentType) {
+                contentType = looksLikeTextBody(body.data)
+                  ? looksHtmlPayload
+                    ? 'text/html'
+                    : 'text/plain'
+                  : 'application/octet-stream';
+              } else if (
+                (genericBinaryMime && looksLikeTextBody(body.data)) ||
+                (/^text\/plain(?:;|$)/i.test(contentType) && looksHtmlPayload)
+              ) {
+                contentType = looksHtmlPayload ? 'text/html' : 'text/plain';
+              }
+              if (isBinaryContentType(contentType)) {
+                const binaryTooLarge =
+                  oversizedBinary ||
+                  body.truncated ||
+                  (typeof headerMetadata.contentLength === 'number' &&
+                    headerMetadata.contentLength > binaryDownloadLimit);
+                fetchResult = {
+                  ...baseFetch,
+                  contentType,
+                  canonicalUrl: finalUrl,
+                  binary: true,
+                  binaryKind: getBinaryKind(contentType),
+                  downloadLimitBytes: binaryDownloadLimit,
+                  data: binaryTooLarge ? undefined : body.data,
+                };
+              } else {
+                const decoded =
+                  provisionalDecoded ||
+                  decodeBody(body.data, headerMetadata.charset, contentType);
+                const rawText = decoded.text;
+                const isHtml = isHtmlLikeContentType(contentType);
+                const extracted = isHtml
+                  ? await extractFromHtml(
+                      rawText,
                       finalUrl,
-                    headings: extracted.headings?.length
-                      ? extracted.headings
-                      : extractHeadingsFromMarkdown(extracted.markdown),
-                    title: extracted.title,
-                    rawContent: extracted.rawContent,
-                    markdown: extracted.markdown,
+                      args.format !== 'html',
+                    )
+                  : (() => {
+                      const cleaned = cleanFetchedText(rawText);
+                      return {
+                        title: undefined,
+                        rawContent: cleaned,
+                        html: cleaned,
+                        text: cleaned,
+                        markdown: cleaned,
+                        extractedMain: false,
+                        canonicalUrl: undefined,
+                        headings: [],
+                      };
+                    })();
+                const count = wordCount(extracted.text);
+                const sourceKind = isHtml ? 'html' : 'text';
+                fetchResult = {
+                  ...baseFetch,
+                  contentType,
+                  canonicalUrl:
+                    extracted.canonicalUrl ||
+                    inferCanonicalUrlFromText(extracted.markdown, finalUrl) ||
+                    finalUrl,
+                  headings: extracted.headings?.length
+                    ? extracted.headings
+                    : extractHeadingsFromMarkdown(extracted.markdown),
+                  title: extracted.title,
+                  rawContent: extracted.rawContent,
+                  markdown: extracted.markdown,
+                  text: extracted.text,
+                  html: extracted.html,
+                  extractedMain: extracted.extractedMain,
+                  usedLlmsTxt: false,
+                  sourceKind,
+                  wordCount: count,
+                  qualitySignals: detectQualitySignals({
                     text: extracted.text,
-                    html: extracted.html,
+                    markdown: extracted.markdown,
+                    rawContent: extracted.rawContent,
+                    wordCount: count,
+                    sourceKind,
                     extractedMain: extracted.extractedMain,
-                    usedLlmsTxt: false,
-                    sourceKind: isHtmlLikeContentType(contentType)
-                      ? 'html'
-                      : 'text',
-                    upgradedToHttps,
-                    redirectChain,
-                    truncated: body.truncated,
-                    wordCount: wordCount(extracted.text),
-                    qualitySignals: detectQualitySignals({
-                      text: extracted.text,
-                      markdown: extracted.markdown,
-                      rawContent: extracted.rawContent,
-                      wordCount: wordCount(extracted.text),
-                      sourceKind: isHtmlLikeContentType(contentType)
-                        ? 'html'
-                        : 'text',
-                      extractedMain: extracted.extractedMain,
-                    }),
-                    llmsProbeError,
-                    llmsProbeTruncated: false,
-                    decodedCharset: decoded.decodedCharset,
-                    decodeFallback: decoded.decodeFallback,
-                    decodeWarning: decoded.decodeWarning,
-                    cacheHit: false,
-                  };
-                  cacheFetchResult(
-                    fetchResult,
-                    args.extract_main,
-                    args.prefer_llms_txt,
-                    args.save_binary,
-                  );
-                }
+                  }),
+                  decodedCharset: decoded.decodedCharset,
+                  decodeFallback: decoded.decodeFallback,
+                  decodeWarning: decoded.decodeWarning,
+                };
               }
             }
           }
+        }
+        if (!fetchResult) throw new Error('Fetch produced no result');
+        if (!cached.fresh) {
+          CACHE.set(
+            'usedLlmsTxt' in fetchResult && fetchResult.usedLlmsTxt
+              ? llmsCacheKey
+              : cacheKey,
+            fetchResult,
+          );
         }
 
         ctx.metadata({
@@ -544,299 +441,37 @@ export function createWebfetchTool(
         });
 
         if ('binary' in fetchResult) {
-          if (fetchResult.metadataOnly || !fetchResult.data) {
-            const metadata = args.include_metadata
-              ? frontmatter({
-                  requested_url: fetchResult.requestedUrl,
-                  final_url: fetchResult.finalUrl,
-                  canonical_url: fetchResult.canonicalUrl,
-                  status_code: fetchResult.statusCode,
-                  source_content_type: fetchResult.contentType,
-                  charset: fetchResult.charset,
-                  etag: fetchResult.etag,
-                  last_modified: fetchResult.lastModified,
-                  content_length: fetchResult.contentLength,
-                  filename: fetchResult.filename,
-                  binary_kind: fetchResult.binaryKind,
-                  redirect_chain: fetchResult.redirectChain.map(
-                    (step: RedirectStep) =>
-                      `${step.status} ${step.from} -> ${step.to}`,
-                  ),
-                  upgraded_to_https: fetchResult.upgradedToHttps,
-                  llms_probe_error: fetchResult.llmsProbeError,
-                  cache_revalidated: fetchResult.cacheRevalidated,
-                  cache_hit: fetchResult.cacheHit ?? cacheHit,
-                  upstream_status_code: fetchResult.upstreamStatusCode,
-                  truncated: fetchResult.truncated,
-                  download_limit_bytes:
-                    fetchResult.downloadLimitBytes ?? MAX_BINARY_DOWNLOAD_BYTES,
-                  binary_metadata_only: true,
-                })
-              : '';
-            return joinRenderedContent(
-              metadata,
-              renderMessageForFormat(
-                buildBinaryResultMessage(fetchResult),
-                args.format,
-              ),
-              args.format,
+          if (fetchResult.data && args.save_binary) {
+            const savedPath = await saveBinary(
+              binaryDir,
+              fetchResult.data,
+              fetchResult.contentType,
+              fetchResult.filename,
             );
+            return buildBinaryResultMessage(fetchResult, savedPath);
           }
+          const message = buildBinaryResultMessage(fetchResult);
           if (!args.save_binary) {
-            const metadata = args.include_metadata
-              ? frontmatter({
-                  requested_url: fetchResult.requestedUrl,
-                  final_url: fetchResult.finalUrl,
-                  canonical_url: fetchResult.canonicalUrl,
-                  status_code: fetchResult.statusCode,
-                  source_content_type: fetchResult.contentType,
-                  charset: fetchResult.charset,
-                  etag: fetchResult.etag,
-                  last_modified: fetchResult.lastModified,
-                  content_length: fetchResult.contentLength,
-                  filename: fetchResult.filename,
-                  binary_kind: fetchResult.binaryKind,
-                  redirect_chain: fetchResult.redirectChain.map(
-                    (step: RedirectStep) =>
-                      `${step.status} ${step.from} -> ${step.to}`,
-                  ),
-                  upgraded_to_https: fetchResult.upgradedToHttps,
-                  truncated: fetchResult.truncated,
-                  save_binary: false,
-                  cache_hit: fetchResult.cacheHit ?? cacheHit,
-                })
-              : '';
-            return joinRenderedContent(
-              metadata,
-              renderMessageForFormat(
-                `${fetchResult.binaryKind.toUpperCase()} content fetched but not saved. Re-run with save_binary=true to persist it.`,
-                args.format,
-              ),
-              args.format,
-            );
+            return `${message} Re-run with save_binary=true to persist it.`;
           }
-          const savedPath = await saveBinary(
-            binaryDir,
-            fetchResult.data,
-            fetchResult.contentType,
-            fetchResult.filename,
-          );
-          const metadata = args.include_metadata
-            ? frontmatter({
-                requested_url: fetchResult.requestedUrl,
-                final_url: fetchResult.finalUrl,
-                canonical_url: fetchResult.canonicalUrl,
-                status_code: fetchResult.statusCode,
-                source_content_type: fetchResult.contentType,
-                charset: fetchResult.charset,
-                etag: fetchResult.etag,
-                last_modified: fetchResult.lastModified,
-                content_length: fetchResult.contentLength,
-                filename: fetchResult.filename,
-                binary_kind: fetchResult.binaryKind,
-                redirect_chain: fetchResult.redirectChain.map(
-                  (step: RedirectStep) =>
-                    `${step.status} ${step.from} -> ${step.to}`,
-                ),
-                upgraded_to_https: fetchResult.upgradedToHttps,
-                llms_probe_error: fetchResult.llmsProbeError,
-                cache_revalidated: fetchResult.cacheRevalidated,
-                cache_hit: fetchResult.cacheHit ?? cacheHit,
-                upstream_status_code: fetchResult.upstreamStatusCode,
-                truncated: fetchResult.truncated,
-                download_limit_bytes:
-                  fetchResult.downloadLimitBytes ?? MAX_BINARY_DOWNLOAD_BYTES,
-                saved_path: savedPath,
-              })
-            : '';
-          return joinRenderedContent(
-            metadata,
-            renderMessageForFormat(
-              buildBinaryResultMessage(fetchResult, savedPath),
-              args.format,
-            ),
-            args.format,
-          );
+          // Saving is already on: repeating the request cannot succeed, so
+          // state the active limit and point at a smaller source instead.
+          return `${message} The active limit is ${MAX_RESPONSE_BYTES} bytes; fetch a smaller or more specific source.`;
         }
 
-        const baseContent = pickContent(fetchResult, args.format);
-        const secondaryModelDecision = decideSecondaryModelUse(
-          fetchResult,
-          args.prompt,
-          secondaryModels,
-          options.helperAgent,
-          hasV2GenerateText(pluginCtx),
-        );
-        const metadata = args.include_metadata
-          ? frontmatter({
-              requested_url: fetchResult.requestedUrl,
-              final_url: fetchResult.finalUrl,
-              canonical_url: fetchResult.canonicalUrl,
-              status_code: fetchResult.statusCode,
-              source_content_type: fetchResult.contentType,
-              charset: fetchResult.charset,
-              etag: fetchResult.etag,
-              last_modified: fetchResult.lastModified,
-              content_length: fetchResult.contentLength,
-              filename: fetchResult.filename,
-              headings: fetchResult.headings,
-              title: fetchResult.title,
-              source_kind: fetchResult.sourceKind,
-              used_llms_txt: fetchResult.usedLlmsTxt,
-              extracted_main: fetchResult.extractedMain,
-              redirect_chain: fetchResult.redirectChain.map(
-                (step: RedirectStep) =>
-                  `${step.status} ${step.from} -> ${step.to}`,
-              ),
-              upgraded_to_https: fetchResult.upgradedToHttps,
-              llms_probe_error: fetchResult.llmsProbeError,
-              llms_probe_truncated: fetchResult.llmsProbeTruncated,
-              cache_revalidated: fetchResult.cacheRevalidated,
-              cache_hit: fetchResult.cacheHit ?? cacheHit,
-              upstream_status_code: fetchResult.upstreamStatusCode,
-              truncated: fetchResult.truncated,
-              word_count: fetchResult.wordCount,
-              quality_signals: fetchResult.qualitySignals,
-              decoded_charset: fetchResult.decodedCharset,
-              decode_fallback: fetchResult.decodeFallback,
-              decode_warning: fetchResult.decodeWarning,
-              secondary_model: undefined,
-              secondary_model_skipped_reason:
-                !secondaryModelDecision.use && args.prompt
-                  ? secondaryModelDecision.reason
-                  : undefined,
-            })
-          : '';
-
-        if (!secondaryModelDecision.use) {
-          return joinRenderedContent(metadata, baseContent, args.format);
-        }
-
-        if (!secondaryModels.length) {
-          return joinRenderedContent(metadata, baseContent, args.format);
-        }
-        let secondaryRun:
-          | Awaited<ReturnType<typeof runSecondaryModelWithFallback>>
-          | undefined;
-        let secondaryModelError: string | undefined;
-        try {
-          secondaryRun = await runSecondaryModelWithFallback(
-            pluginCtx,
-            secondaryModels,
-            args.prompt || '',
-            fetchResult.markdown,
-            ctx.sessionID,
-            options.helperAgent,
-          );
-        } catch (error: unknown) {
-          secondaryModelError =
-            error instanceof Error ? error.message : String(error);
-        }
-
-        if (!secondaryRun) {
-          const degradedMetadata = args.include_metadata
-            ? frontmatter({
-                requested_url: fetchResult.requestedUrl,
-                final_url: fetchResult.finalUrl,
-                canonical_url: fetchResult.canonicalUrl,
-                status_code: fetchResult.statusCode,
-                source_content_type: fetchResult.contentType,
-                charset: fetchResult.charset,
-                etag: fetchResult.etag,
-                last_modified: fetchResult.lastModified,
-                content_length: fetchResult.contentLength,
-                filename: fetchResult.filename,
-                headings: fetchResult.headings,
-                title: fetchResult.title,
-                source_kind: fetchResult.sourceKind,
-                used_llms_txt: fetchResult.usedLlmsTxt,
-                extracted_main: fetchResult.extractedMain,
-                redirect_chain: fetchResult.redirectChain.map(
-                  (step: RedirectStep) =>
-                    `${step.status} ${step.from} -> ${step.to}`,
-                ),
-                upgraded_to_https: fetchResult.upgradedToHttps,
-                llms_probe_error: fetchResult.llmsProbeError,
-                llms_probe_truncated: fetchResult.llmsProbeTruncated,
-                cache_revalidated: fetchResult.cacheRevalidated,
-                cache_hit: fetchResult.cacheHit ?? cacheHit,
-                upstream_status_code: fetchResult.upstreamStatusCode,
-                truncated: fetchResult.truncated,
-                word_count: fetchResult.wordCount,
-                quality_signals: fetchResult.qualitySignals,
-                decoded_charset: fetchResult.decodedCharset,
-                decode_fallback: fetchResult.decodeFallback,
-                decode_warning: fetchResult.decodeWarning,
-                secondary_model: undefined,
-                secondary_model_skipped_reason: 'secondary_model_failed',
-                secondary_model_error: secondaryModelError,
-              })
-            : '';
-          return joinRenderedContent(
-            degradedMetadata,
-            baseContent,
-            args.format,
-          );
-        }
-
-        const metadataWithSecondary = args.include_metadata
-          ? frontmatter({
-              requested_url: fetchResult.requestedUrl,
-              final_url: fetchResult.finalUrl,
-              canonical_url: fetchResult.canonicalUrl,
-              status_code: fetchResult.statusCode,
-              source_content_type: fetchResult.contentType,
-              charset: fetchResult.charset,
-              etag: fetchResult.etag,
-              last_modified: fetchResult.lastModified,
-              content_length: fetchResult.contentLength,
-              filename: fetchResult.filename,
-              headings: fetchResult.headings,
-              title: fetchResult.title,
-              source_kind: fetchResult.sourceKind,
-              used_llms_txt: fetchResult.usedLlmsTxt,
-              extracted_main: fetchResult.extractedMain,
-              redirect_chain: fetchResult.redirectChain.map(
-                (step: RedirectStep) =>
-                  `${step.status} ${step.from} -> ${step.to}`,
-              ),
-              upgraded_to_https: fetchResult.upgradedToHttps,
-              llms_probe_error: fetchResult.llmsProbeError,
-              llms_probe_truncated: fetchResult.llmsProbeTruncated,
-              cache_revalidated: fetchResult.cacheRevalidated,
-              cache_hit: fetchResult.cacheHit ?? cacheHit,
-              upstream_status_code: fetchResult.upstreamStatusCode,
-              truncated: fetchResult.truncated,
-              word_count: fetchResult.wordCount,
-              quality_signals: fetchResult.qualitySignals,
-              decoded_charset: fetchResult.decodedCharset,
-              decode_fallback: fetchResult.decodeFallback,
-              decode_warning: fetchResult.decodeWarning,
-              secondary_model_input_truncated: secondaryRun.inputTruncated,
-              secondary_model_input_chars: secondaryRun.inputChars,
-              secondary_model_source_chars: secondaryRun.sourceChars,
-              secondary_model: `${secondaryRun.model.providerID}/${secondaryRun.model.modelID}${secondaryRun.model.variant ? `#${secondaryRun.model.variant}` : ''}`,
-            })
-          : '';
-        const secondaryRaw =
-          secondaryRun.text || 'No response from secondary model.';
-        const secondaryContent =
-          args.format === 'html'
-            ? withTruncationMarker(
-                `<pre>${escapeHtml(secondaryRaw)}</pre>`,
-                'html',
-                false,
-              )
-            : withTruncationMarker(secondaryRaw, args.format, false);
-        return joinRenderedContent(
-          metadataWithSecondary,
-          secondaryContent,
-          args.format,
-        );
-      } finally {
-        clearTimeout(timeout);
-        ctx.abort.removeEventListener('abort', abortHandler);
-      }
+        const content = pickContent(fetchResult, args.format);
+        const header = statusHeader({
+          title: fetchResult.title,
+          final_url:
+            fetchResult.finalUrl !== url.toString()
+              ? fetchResult.finalUrl
+              : undefined,
+          truncated: fetchResult.truncated || undefined,
+          quality_signals: fetchResult.qualitySignals,
+        });
+        if (args.format === 'html') return content;
+        return header ? `${header}${content}` : content;
+      });
     },
   });
 }

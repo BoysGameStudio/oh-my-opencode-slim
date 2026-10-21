@@ -1,15 +1,21 @@
 import type {
+  BackgroundJobAdoptionInput,
   BackgroundJobBoard,
   BackgroundJobLaunchInput,
   BackgroundJobLease,
   BackgroundJobPromptMetadata,
   BackgroundJobRecord,
   BackgroundJobStatusInput,
+  BackgroundJobTerminalInput,
   ContextFile,
+  RestoreRetainedSessionInput,
   WallClockTimeoutClaimInput,
-  WallClockTimeoutFinalizeInput,
 } from './background-job-board';
 import type { BackgroundJobStore } from './background-job-store';
+import type {
+  BackgroundJobTerminalGate,
+  TerminalCommitToken,
+} from './background-job-terminal-gate';
 import { log } from './logger';
 
 type TerminalStateListener = (taskID: string) => void;
@@ -97,7 +103,8 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     if (state === undefined) return; // Job was already cleaned up
 
     // Check if this session should now close
-    if (this.retryDeferredClose(taskID)) {
+    const closeNow = this.retryDeferredClose(taskID);
+    if (closeNow) {
       // Notify listeners that session should close
       for (const listener of this.terminalStateListeners) {
         try {
@@ -113,6 +120,15 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
 
     const record = this.board.get?.(taskID);
     if (record) {
+      // Observation only: every canonical terminal publication that
+      // reaches listener dispatch is logged with its record identity.
+      log('[job-coordinator] terminal state dispatch', {
+        taskID,
+        generation: record.generation,
+        state,
+        parentSessionID: record.parentSessionID,
+        deferredClose: closeNow,
+      });
       for (const listener of this.terminalOutcomeListeners) {
         try {
           listener(record);
@@ -182,6 +198,44 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     return record;
   }
 
+  abandonLaunch(
+    launched: BackgroundJobRecord,
+    replaced: BackgroundJobRecord,
+  ): boolean {
+    return this.board.abandonLaunch(launched, replaced);
+  }
+
+  restoreRetainedSession(
+    input: RestoreRetainedSessionInput,
+  ): BackgroundJobRecord | undefined {
+    const record = this.board.restoreRetainedSession(input);
+    if (!record) return undefined;
+    this.notifyLaunchIdentity({
+      kind: 'registered',
+      taskID: record.taskID,
+      parentSessionID: record.parentSessionID,
+      agent: record.agent,
+      alias: record.alias,
+    });
+    return record;
+  }
+
+  adoptTerminal(
+    input: BackgroundJobAdoptionInput,
+  ): BackgroundJobRecord | undefined {
+    const record = this.board.adoptTerminal(input);
+    if (!record) return;
+    const { taskID, parentSessionID, agent, alias } = record;
+    this.notifyLaunchIdentity({
+      kind: 'registered',
+      taskID,
+      parentSessionID,
+      agent,
+      alias,
+    });
+    return record;
+  }
+
   acquireCancellationLease(
     taskID: string,
     generation: number,
@@ -206,8 +260,13 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
   acquireTerminalNotificationLease(
     taskID: string,
     generation: number,
+    terminalRevision?: number,
   ): BackgroundJobLease | undefined {
-    return this.board.acquireTerminalNotificationLease(taskID, generation);
+    return this.board.acquireTerminalNotificationLease(
+      taskID,
+      generation,
+      terminalRevision,
+    );
   }
 
   validateLease(lease: BackgroundJobLease): boolean {
@@ -219,13 +278,20 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
   }
 
   updateStatus(
-    input: BackgroundJobStatusInput,
+    input: BackgroundJobStatusInput & { state: 'running' },
   ): BackgroundJobRecord | undefined {
     return this.board.updateStatus(input);
   }
 
-  updateFromStatusOutput(output: string): BackgroundJobRecord | undefined {
-    return this.board.updateFromStatusOutput(output);
+  commitTerminal(
+    input: BackgroundJobTerminalInput,
+    token: TerminalCommitToken,
+  ): BackgroundJobRecord | undefined {
+    return this.board.commitTerminal(input, token);
+  }
+
+  bindTerminalGate(gate: BackgroundJobTerminalGate): void {
+    this.board.bindTerminalGate(gate);
   }
 
   claimWallClockDeadline(
@@ -234,37 +300,17 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     return this.board.claimWallClockDeadline(input);
   }
 
-  finalizeWallClockTimeout(
-    input: WallClockTimeoutFinalizeInput,
-  ): BackgroundJobRecord | undefined {
-    return this.board.finalizeWallClockTimeout(input);
-  }
-
   markRunningFromLiveSession(
     taskID: string,
     now = Date.now(),
     expectedGeneration?: number,
+    observedTerminalRevision?: number,
   ): BackgroundJobRecord | undefined {
     return this.board.markRunningFromLiveSession(
       taskID,
       now,
       expectedGeneration,
-    );
-  }
-
-  markStopped(
-    taskID: string,
-    resultSummary: string,
-    observedAt = Date.now(),
-    expectedGeneration?: number,
-    now = Date.now(),
-  ): BackgroundJobRecord | undefined {
-    return this.board.markStopped(
-      taskID,
-      resultSummary,
-      observedAt,
-      expectedGeneration,
-      now,
+      observedTerminalRevision,
     );
   }
 
@@ -297,21 +343,15 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
   markReconciled(
     taskID: string,
     now = Date.now(),
+    expectedGeneration?: number,
+    expectedRevision?: number,
   ): BackgroundJobRecord | undefined {
-    return this.board.markReconciled(taskID, now);
-  }
-
-  markCancelled(
-    taskID: string,
-    reason?: string,
-    now = Date.now(),
-    options: {
-      force?: boolean;
-      expectedGeneration?: number;
-      cancellationLease?: BackgroundJobLease;
-    } = {},
-  ): BackgroundJobRecord | undefined {
-    return this.board.markCancelled(taskID, reason, now, options);
+    return this.board.markReconciled(
+      taskID,
+      now,
+      expectedGeneration,
+      expectedRevision,
+    );
   }
 
   // ── Query methods ────────────────────────────────────────────────
@@ -400,6 +440,23 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
 
   hasTerminalUnreconciled(parentSessionID: string): boolean {
     return this.board.hasTerminalUnreconciled(parentSessionID);
+  }
+
+  promoteProvisional(
+    taskID: string,
+    expectedParentSessionID?: string,
+    metadata?: {
+      agent?: string;
+      description?: string;
+      objective?: string;
+      background?: boolean;
+    },
+  ): BackgroundJobRecord | undefined {
+    return this.board.promoteProvisional(
+      taskID,
+      expectedParentSessionID,
+      metadata,
+    );
   }
 
   hasConvergenceSignals(taskID: string, threshold = 3): boolean {

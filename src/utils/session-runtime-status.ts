@@ -1,20 +1,24 @@
 import type { PluginInput } from '@opencode-ai/plugin';
+import type { CurrentRoundClassification } from './child-transcript';
 import { isRecord } from './guards';
 import { getClient } from './opencode-client';
 
 export type RuntimeSessionStatus = 'busy' | 'retry' | 'idle';
 export const DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS = 5_000;
+const openStatusReads = new WeakMap<object, Promise<void>>();
 
 export interface RuntimeSessionStatusSnapshot {
   statuses: ReadonlyMap<string, RuntimeSessionStatus>;
   malformedSessionIDs: ReadonlySet<string>;
   error?: string;
+  /** Slot availability only: never exposes the open read's evidence. */
+  retryAfter?: Promise<void>;
 }
 
 /**
  * Reads OpenCode's single live session-status map. An absent session in a
- * valid response is unknown: the endpoint only describes currently active
- * runners and does not prove that a background task has terminated.
+ * valid response is quiescent, not terminal. The gate still requires result
+ * attribution or stable valid absence before publishing a terminal state.
  */
 export async function getRuntimeSessionStatusSnapshot(
   input: PluginInput,
@@ -25,13 +29,43 @@ export async function getRuntimeSessionStatusSnapshot(
       typeof input.client?.session?.status === 'function'
         ? input.client
         : getClient(input);
+    if (typeof client?.session?.status !== 'function') {
+      return {
+        statuses: new Map(),
+        malformedSessionIDs: new Set(),
+        error: 'session-status capability unavailable on this host',
+      };
+    }
+    const openRead = openStatusReads.get(client.session);
+    if (openRead)
+      return {
+        statuses: new Map(),
+        malformedSessionIDs: new Set(),
+        error: 'Previous session-status read is still open',
+        retryAfter: openRead,
+      };
+    const controller = new AbortController();
+    const request = client.session.status({
+      query: { directory: input.directory },
+      signal: controller.signal,
+    });
+    const release = () => {
+      if (openStatusReads.get(client.session) === settled)
+        openStatusReads.delete(client.session);
+    };
+    const settled = request.then(release, release);
+    openStatusReads.set(client.session, settled);
     const response = await withTimeout(
-      client.session.status({
-        query: { directory: input.directory },
-      }),
+      request,
       options.timeoutMs ?? DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS,
-    );
-    if (!isRecord(response.data)) {
+    ).catch((error) => {
+      controller.abort();
+      throw error;
+    });
+    if (
+      (response.error !== undefined && response.error !== null) ||
+      !isRecord(response.data)
+    ) {
       return {
         statuses: new Map(),
         malformedSessionIDs: new Set(),
@@ -73,6 +107,25 @@ export async function getRuntimeSessionStatusSnapshot(
   }
 }
 
+export type LiveSession =
+  | { kind: RuntimeSessionStatus | 'absent' }
+  | { kind: 'unknown'; reason: string };
+
+/** One fresh read, reduced to what a single session's decision needs. */
+export async function readLiveSession(
+  input: PluginInput,
+  sessionID: string,
+  options: { timeoutMs?: number } = {},
+): Promise<LiveSession> {
+  const snapshot = await getRuntimeSessionStatusSnapshot(input, options);
+  if (
+    snapshot.error !== undefined ||
+    snapshot.malformedSessionIDs.has(sessionID)
+  )
+    return { kind: 'unknown', reason: snapshot.error ?? 'malformed entry' };
+  return { kind: snapshot.statuses.get(sessionID) ?? 'absent' };
+}
+
 export function runtimeSessionStatus(
   snapshot: RuntimeSessionStatusSnapshot,
   sessionID: string,
@@ -80,6 +133,95 @@ export function runtimeSessionStatus(
   if (snapshot.error) return undefined;
   if (snapshot.malformedSessionIDs.has(sessionID)) return undefined;
   return snapshot.statuses.get(sessionID);
+}
+
+/** v2 host round evidence derived from the `session.get` info projection.
+ *  `outcome` and `time.idle` are written atomically with the idle message;
+ *  both absent means the latest round has no terminal transition. */
+export type HostRoundState =
+  | {
+      kind: 'terminal';
+      outcome: 'succeeded' | 'failed' | 'interrupted';
+      idleAt: number;
+    }
+  | { kind: 'pending' }
+  | { kind: 'unknown'; reason: string };
+
+/** Parse the host round state from a session info payload. A partially
+ *  projected round (one of outcome/time.idle present) is abnormal data and
+ *  fails closed; both absent is pending. */
+export function hostRoundStateOf(
+  info: Record<string, unknown> | undefined,
+): HostRoundState {
+  const outcome = info?.outcome;
+  const time = isRecord(info?.time) ? info.time : undefined;
+  const idleAt = time?.idle;
+  const outcomePresent = outcome !== undefined && outcome !== null;
+  if (!outcomePresent && idleAt === undefined) return { kind: 'pending' };
+  if (
+    !outcomePresent ||
+    typeof idleAt !== 'number' ||
+    !Number.isFinite(idleAt) ||
+    (outcome !== 'succeeded' &&
+      outcome !== 'failed' &&
+      outcome !== 'interrupted')
+  ) {
+    return { kind: 'unknown', reason: 'host outcome and idle time disagree' };
+  }
+  return { kind: 'terminal', outcome, idleAt };
+}
+
+/** A terminal verdict requires an idle time strictly after the latest input;
+ *  otherwise the round is pending — never a guessed stop. Service-level
+ *  claims survive a graceful shutdown on purpose, so the host may still
+ *  resume the latest round after a restart. */
+export function hostRoundVerdict(
+  state: HostRoundState,
+  latestInputAt: number | undefined,
+): 'terminal' | 'pending' | 'unknown' {
+  if (state.kind === 'unknown') return 'unknown';
+  if (state.kind === 'pending') return 'pending';
+  return latestInputAt !== undefined && state.idleAt > latestInputAt
+    ? 'terminal'
+    : 'pending';
+}
+
+/** Legacy classification shape: pending is incomplete; unknown is unreadable. */
+export function composeHostRound(
+  state: HostRoundState,
+  latestInputAt: number | undefined,
+): CurrentRoundClassification {
+  const verdict = hostRoundVerdict(state, latestInputAt);
+  if (verdict === 'unknown') {
+    return {
+      verdict: 'unreadable',
+      reason: state.kind === 'unknown' ? state.reason : 'host state is unknown',
+    };
+  }
+  if (verdict !== 'terminal' || state.kind !== 'terminal') {
+    return { verdict: 'incomplete', startedAt: latestInputAt };
+  }
+  switch (state.outcome) {
+    case 'succeeded':
+      return {
+        verdict: 'completed',
+        startedAt: latestInputAt,
+        completedAt: state.idleAt,
+      };
+    case 'failed':
+      return {
+        verdict: 'error',
+        text: 'The historical round failed before an assistant result.',
+        startedAt: latestInputAt,
+        completedAt: state.idleAt,
+      };
+    case 'interrupted':
+      return {
+        verdict: 'interrupted',
+        startedAt: latestInputAt,
+        completedAt: state.idleAt,
+      };
+  }
 }
 
 async function withTimeout<T>(

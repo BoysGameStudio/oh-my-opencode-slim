@@ -52,8 +52,7 @@
  */
 import { describe, expect, mock, test } from 'bun:test';
 import { z } from 'zod';
-import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
-import { BackgroundJobBoard } from '../../utils';
+import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import {
   BACKGROUND_JOB_BOARD_METADATA_KEY,
   createTaskSessionManagerHook,
@@ -316,7 +315,6 @@ function createHook(board: BackgroundJobBoard) {
     } as never,
     {
       maxSessionsPerAgent: 4,
-      maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
     },
@@ -522,7 +520,7 @@ function runningBoard(): BackgroundJobBoard {
   board.registerLaunch({
     taskID: CHILD,
     parentSessionID: SESSION,
-    agent: 'librarian',
+    agent: 'explorer',
     description: 'research the scheduler',
   });
   return board;
@@ -613,7 +611,7 @@ describe('board injection keeps the ModelMessage[] array valid', () => {
     }
   });
 
-  test('A3: board text never rides on an assistant message even when the tail is an assistant turn', async () => {
+  test('A3: an assistant tail places no board at all — the render defers to a user tail', async () => {
     const board = runningBoard();
     const hook = createHook(board);
 
@@ -622,18 +620,29 @@ describe('board injection keeps the ModelMessage[] array valid', () => {
       finishedTaskAssistantTurn('a1', 'call-task-1'),
     ]);
 
-    // The board is present…
-    expect(boardTexts(out)).toHaveLength(1);
-    // …and it is carried by a user-role message appended at the very end.
+    // Change-only placement rule: an assistant tail is never a placement
+    // target. A board appended there could not be retained (splicing it
+    // back mid-array would orphan a tool pair), so it would silently vanish
+    // from the next payload — a byte-prefix break. Nothing is placed and
+    // the digest stays unpinned; the state renders on the next user tail.
+    expect(boardTexts(out)).toHaveLength(0);
     assertBoardTextOnlyOnUserMessages(out);
-    const tail = (out as AnyMessage[]).at(-1);
-    expect(tail?.info.role).toBe('user');
-    expect(tail?.parts.every(isBoardPart)).toBe(true);
-    // The assistant anchor itself is untouched by the board.
     const assistant = (out as AnyMessage[]).find(
       (message) => message.info.role === 'assistant',
     );
     expect(assistant?.parts.some(isBoardPart)).toBe(false);
+    expect((out as AnyMessage[]).at(-1)?.info.role).toBe('assistant');
+
+    // The deferred board lands on the next user-side tail.
+    const after = await request(hook, [
+      userTextTurn('u1', 'Coordinate the background research'),
+      finishedTaskAssistantTurn('a1', 'call-task-1'),
+      userTextTurn('u2', 'Summarize the findings'),
+    ]);
+    expect(boardTexts(after)).toHaveLength(1);
+    assertBoardTextOnlyOnUserMessages(after);
+    const tail = (after as AnyMessage[]).at(-1);
+    expect(tail?.info.role).toBe('user');
   });
 
   test('A4: a board on a still-present text-only user anchor is replayed byte-identically', async () => {

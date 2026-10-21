@@ -1,64 +1,21 @@
-import { describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard } from '../../utils/background-job-board';
-import { COMPLETED_WITHOUT_TEXT_DIAGNOSTIC } from '../../utils/task';
-import { updateBackgroundJobFromOutput } from './status-utils';
+import { expect, test } from 'bun:test';
+import {
+  extractTaskSummary,
+  formatCancelledTaskStatusOutput,
+} from './status-utils';
 
-function harness() {
-  const board = new BackgroundJobBoard();
-  board.registerLaunch({
-    taskID: 'child-1',
-    parentSessionID: 'parent-1',
-    agent: 'explorer',
-    description: 'trace bug',
-  });
-  const taskContextTracker = {
-    pendingManagedTaskIds: new Set<string>(),
-    contextFilesForPrompt: () => [],
-    prune: mock(() => {}),
-  };
-  return { board, taskContextTracker };
-}
+test('status utilities format diagnostics, not board transitions', () => {
+  expect(extractTaskSummary('<summary> stopped </summary>')).toBe('stopped');
+  expect(
+    formatCancelledTaskStatusOutput('child-1', 'user requested'),
+  ).toContain('<task_error>\nuser requested\n</task_error>');
+});
 
-describe('updateBackgroundJobFromOutput', () => {
-  test('does not enter completed from an empty completed status', () => {
-    const { board, taskContextTracker } = harness();
-    const updated = updateBackgroundJobFromOutput(
-      [
-        'task_id: child-1',
-        'state: completed',
-        '',
-        '<task_result>',
-        '</task_result>',
-      ].join('\n'),
-      board,
-      taskContextTracker,
-    );
-
-    expect(updated).toMatchObject({
-      state: 'error',
-      resultSummary: COMPLETED_WITHOUT_TEXT_DIAGNOSTIC,
-    });
-    expect(board.get('child-1')?.state).not.toBe('completed');
-  });
-
-  test('records completed when the status carries result text', () => {
-    const { board, taskContextTracker } = harness();
-    const updated = updateBackgroundJobFromOutput(
-      [
-        'task_id: child-1',
-        'state: completed',
-        '',
-        '<task_result>',
-        'final findings',
-        '</task_result>',
-      ].join('\n'),
-      board,
-      taskContextTracker,
-    );
-
-    expect(updated).toMatchObject({
-      state: 'completed',
-      resultSummary: 'final findings',
-    });
-  });
+test('cancelled status label follows the host identifier param', () => {
+  expect(formatCancelledTaskStatusOutput('child-1')).toContain(
+    'task_id: child-1',
+  );
+  expect(
+    formatCancelledTaskStatusOutput('child-1', 'cancelled', 'sessionID'),
+  ).toContain('sessionID: child-1');
 });

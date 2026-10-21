@@ -1,13 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
-import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
 import { BackgroundJobBoard, BackgroundTaskConcurrency } from '../../utils';
 import { createTaskSessionManagerHook } from './index';
-
-// Route getClient back to _ctx.client so the _ctx.client.session mock works
-// through the v2 lookup path (mirrors index.test.ts).
-mock.module('../../utils/opencode-client', () => ({
-  getClient: (input: { client: unknown }) => input.client as never,
-}));
 
 const LM_NEXUS_MODEL = 'lm-nexus/Qwen3.8-27B';
 const SATELLITE_MODEL = 'opencode/muse';
@@ -40,7 +33,6 @@ function createHook(options?: IntegrationHookOptions) {
     } as never,
     {
       maxSessionsPerAgent: 2,
-      maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
       backgroundJobBoard: options?.backgroundJobBoard,
       backgroundTaskConcurrency: options?.backgroundTaskConcurrency,
       getModelForAgent: options?.getModelForAgent,

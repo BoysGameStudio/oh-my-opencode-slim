@@ -80,7 +80,7 @@ describe('displayName', () => {
     const config: PluginConfig = {
       agents: {
         explorer: { displayName: 'helper' },
-        librarian: { displayName: 'helper' },
+        designer: { displayName: 'helper' },
       },
     };
 
@@ -93,7 +93,7 @@ describe('displayName', () => {
     const config: PluginConfig = {
       agents: {
         explorer: { displayName: 'advisor' },
-        librarian: { displayName: ' @advisor ' },
+        designer: { displayName: ' @advisor ' },
       },
     };
 

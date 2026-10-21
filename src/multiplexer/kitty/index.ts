@@ -11,6 +11,14 @@
  * because OpenCode spawns subagent commands in a process detached from the
  * kitty window's tty, where the tty-based remote-control path does not work.
  *
+ * Client-local anchoring:
+ * - detection is pane-scoped (`KITTY_WINDOW_ID`),
+ * - the parent window's tab is the anchor: launch and layout commands carry
+ *   `--match=window_id:<KITTY_WINDOW_ID>` so the active tab is never touched,
+ * - the new window is placed next to the parent window with
+ *   `--next-to=id:<KITTY_WINDOW_ID>` (`id:` is the window search field;
+ *   `window_id:` is a tab-level field and must not be used here).
+ *
  * Layout mapping:
  * - main-vertical → tall layout (full-height main pane on left, side panes stacked on right)
  * - main-horizontal → fat layout (full-width main pane on top, side panes tiled below)
@@ -19,22 +27,22 @@
  * - even-vertical → vertical layout (all panes stacked)
  *
  * Maps each plugin layout to the closest kitty built-in layout. kitty has no
- * per-window layout API, so the chosen layout is applied as a global change to
- * the active tab (overriding whatever layout was active there).
+ * per-window layout API, so the chosen layout is applied to the tab containing
+ * the parent window.
  */
 
 import type { MultiplexerLayout } from '../../config/schema';
 import { crossSpawn } from '../../utils/compat';
 import { log } from '../../utils/logger';
 import {
-  buildOpencodeAttachCommand,
   buildShellLaunchArgs,
+  buildViewCommand,
   findBinary,
   gracefulClosePane,
   normalizePathForShell,
-  resolveOpencodeExecutable,
+  redactViewerSecretArgs,
 } from '../shared';
-import type { Multiplexer, PaneResult } from '../types';
+import type { Multiplexer, PaneResult, PaneSpawnOptions } from '../types';
 
 export class KittyMultiplexer implements Multiplexer {
   readonly type = 'kitty' as const;
@@ -64,7 +72,7 @@ export class KittyMultiplexer implements Multiplexer {
   }
 
   isInsideSession(): boolean {
-    return !!process.env.KITTY_PID || !!process.env.KITTY_WINDOW_ID;
+    return !!process.env.KITTY_WINDOW_ID;
   }
 
   /**
@@ -82,22 +90,23 @@ export class KittyMultiplexer implements Multiplexer {
     description: string,
     serverUrl: string,
     directory: string,
+    options?: PaneSpawnOptions,
   ): Promise<PaneResult> {
+    // Anchor first: without the parent window id no target can be resolved, so
+    // no kitty command may be issued.
+    const parentWindowId = this.resolveParentWindowId();
+    if (!parentWindowId) {
+      log(
+        '[kitty] spawnPane: KITTY_WINDOW_ID is not set; cannot resolve the ' +
+          'parent window',
+      );
+      return { success: false, error: 'not_found' };
+    }
+
     const kitten = await this.getBinary();
     if (!kitten) {
       log('[kitty] spawnPane: kitten/kitty binary not found');
-      return { success: false };
-    }
-
-    // The kitty multiplexer only works when OpenCode is itself running inside
-    // a kitty window (so `kitten @` can reach the instance). If not, fail
-    // cleanly instead of shelling out to a command that cannot succeed.
-    if (!this.isInsideSession()) {
-      log(
-        '[kitty] spawnPane: OpenCode is not running inside a kitty session; ' +
-          'set multiplexer.type to a different backend or run OpenCode inside kitty',
-      );
-      return { success: false };
+      return { success: false, error: 'unavailable' };
     }
 
     // `listen_on` must be set in kitty.conf so kitty exports KITTY_LISTEN_ON.
@@ -109,45 +118,62 @@ export class KittyMultiplexer implements Multiplexer {
           'unix:/tmp/kitty-rc-$(USER)` to kitty.conf and restart kitty so the ' +
           'plugin can drive kitty via the socket.',
       );
-      return { success: false };
+      return { success: false, error: 'unavailable' };
     }
 
     // Map layout to kitty layout and location
     const { kittyLayout, location } = getKittyLayoutConfig(this.storedLayout);
 
-    // Ensure the correct layout is active
-    await this.ensureLayout(kittyLayout);
+    // Ensure the correct layout is active in the parent window's tab
+    await this.ensureLayout(kittyLayout, parentWindowId);
 
     try {
-      const opencodeCmd = buildOpencodeAttachCommand(
+      const opencodeCmd = buildViewCommand(
         sessionId,
         serverUrl,
         directory,
-        resolveOpencodeExecutable(),
+        options,
       );
 
       // Normalize for Windows/MSYS2/Git Bash (backslashes would be treated as
       // escape chars). No-op on macOS/Linux. Mirrors the herdr adapter.
       const attachDir = normalizePathForShell(directory);
 
-      // Launch in the user's interactive shell (fish/bash/zsh/sh) so the
-      // command resolves correctly — a hardcoded `sh -c` breaks under fish
-      // and misses login startup files where `opencode` may live on PATH.
+      // Launch in the user's interactive shell (fish/bash/zsh/sh): a hardcoded
+      // `sh -c` breaks under non-POSIX shells. The viewer command is absolute,
+      // so no PATH lookup is needed.
       const shellArgs = buildShellLaunchArgs(opencodeCmd);
+
+      // v2 remote hosts: the viewer must authenticate with
+      // OPENCODE_PASSWORD. Inject it through kitty's native `--env`
+      // mechanism at launch time, never through the shell command.
+      const viewerSecretArgs =
+        options?.viewerFlavor === 'v2-remote' &&
+        options.viewerPassword !== undefined
+          ? ['--env', `OPENCODE_PASSWORD=${options.viewerPassword}`]
+          : [];
 
       const args = [
         '@',
         'launch',
         '--type=window',
+        `--match=window_id:${parentWindowId}`,
         `--location=${location}`,
-        `--title=${description.slice(0, 60)}`,
+        `--next-to=id:${parentWindowId}`,
+        // The launch title doubles as FR-8 metadata (owner pid + child
+        // session id); it must survive intact, so it is never truncated.
+        `--title=${description}`,
         `--cwd=${attachDir}`,
         '--keep-focus',
+        ...viewerSecretArgs,
         '--',
         ...shellArgs,
       ];
 
-      log('[kitty] spawnPane: executing', { kitten, args });
+      log('[kitty] spawnPane: executing', {
+        kitten,
+        args: redactViewerSecretArgs(args),
+      });
 
       const proc = crossSpawn([kitten, ...args], {
         stdout: 'pipe',
@@ -168,6 +194,7 @@ export class KittyMultiplexer implements Multiplexer {
       const windowId = lines.length > 0 ? lines[lines.length - 1] : '';
 
       log('[kitty] spawnPane: result', {
+        command: opencodeCmd,
         exitCode,
         windowId,
         stderr: stderr.trim(),
@@ -178,10 +205,38 @@ export class KittyMultiplexer implements Multiplexer {
         return { success: true, paneId: windowId };
       }
 
-      return { success: false };
+      return { success: false, error: 'hard' };
     } catch (err) {
       log('[kitty] spawnPane: exception', { error: String(err) });
-      return { success: false };
+      return { success: false, error: 'hard' };
+    }
+  }
+
+  /**
+   * FR-8 sweep capability: every kitty window this client can reach, with
+   * its title. Needs `KITTY_LISTEN_ON`; without it no command is issued.
+   */
+  async listPanesWithTitles(): Promise<
+    Array<{ paneId: string; title: string }>
+  > {
+    if (!this.hasListenOn()) return [];
+    const kitten = await this.getBinary();
+    if (!kitten) return [];
+
+    try {
+      const proc = crossSpawn([kitten, '@', 'ls'], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: this.kittyEnv(),
+      });
+      const [exitCode, stdout] = await Promise.all([
+        proc.exited,
+        proc.stdout(),
+      ]);
+      if (exitCode !== 0) return [];
+      return collectKittyWindowTitles(JSON.parse(stdout) as unknown);
+    } catch {
+      return [];
     }
   }
 
@@ -202,8 +257,8 @@ export class KittyMultiplexer implements Multiplexer {
     }
     const kitten = await this.getBinary();
     return await gracefulClosePane(kitten, paneId, {
-      ctrlC: ['@', 'send-key', '--match', `id:${paneId}`, 'ctrl+c'],
-      close: ['@', 'close-window', '--match', `id:${paneId}`],
+      ctrlC: ['@', 'send-key', `--match=id:${paneId}`, 'ctrl+c'],
+      close: ['@', 'close-window', `--match=id:${paneId}`],
       acceptExitCode1: true,
       emptyPaneReturnsTrue: true,
       env: this.kittyEnv(),
@@ -215,10 +270,11 @@ export class KittyMultiplexer implements Multiplexer {
     mainPaneSize: number,
   ): Promise<void> {
     void mainPaneSize; // kitty uses layout bias, not main pane size
-    if (!this.isInsideSession()) {
+    const parentWindowId = this.resolveParentWindowId();
+    if (!parentWindowId) {
       log(
-        '[kitty] applyLayout: OpenCode is not running inside a kitty session; ' +
-          'cannot target a kitty instance',
+        '[kitty] applyLayout: KITTY_WINDOW_ID is not set; cannot target a ' +
+          'kitty tab',
       );
       return;
     }
@@ -231,7 +287,7 @@ export class KittyMultiplexer implements Multiplexer {
     }
     this.storedLayout = layout;
     const { kittyLayout } = getKittyLayoutConfig(layout);
-    await this.ensureLayout(kittyLayout);
+    await this.ensureLayout(kittyLayout, parentWindowId);
   }
 
   private async runKitty(kitten: string, args: string[]): Promise<number> {
@@ -249,7 +305,7 @@ export class KittyMultiplexer implements Multiplexer {
     if (exitCode !== 0) {
       log('[kitty] command failed', {
         command: args[1],
-        args: [kitten, ...args],
+        args: redactViewerSecretArgs([kitten, ...args]),
         exitCode,
         stderr: stderr.trim(),
       });
@@ -258,7 +314,10 @@ export class KittyMultiplexer implements Multiplexer {
     return exitCode;
   }
 
-  private async ensureLayout(kittyLayout: string): Promise<void> {
+  private async ensureLayout(
+    kittyLayout: string,
+    parentWindowId: string,
+  ): Promise<void> {
     // Skip if this layout is already applied (avoids redundant global switches).
     // Tracking the applied layout (not a boolean) lets applyLayout switch to a
     // different layout even after panes have spawned.
@@ -269,6 +328,7 @@ export class KittyMultiplexer implements Multiplexer {
       const exitCode = await this.runKitty(kitten, [
         '@',
         'goto-layout',
+        `--match=window_id:${parentWindowId}`,
         kittyLayout,
       ]);
       // Only record on success so a transient failure can retry.
@@ -281,6 +341,15 @@ export class KittyMultiplexer implements Multiplexer {
   private async getBinary(): Promise<string | null> {
     await this.isAvailable();
     return this.binaryPath;
+  }
+
+  /**
+   * The window this client runs in; its tab is the anchor for every pane
+   * operation. Re-resolved from the environment on each call.
+   */
+  private resolveParentWindowId(): string | null {
+    const windowId = process.env.KITTY_WINDOW_ID?.trim();
+    return windowId ? windowId : null;
   }
 
   /**
@@ -299,12 +368,54 @@ export class KittyMultiplexer implements Multiplexer {
 }
 
 /**
+ * Flatten `kitten @ ls` output (OS windows → tabs → windows) into
+ * `{ paneId, title }` entries. Tolerates both the nested tab shape and a
+ * flat `windows` array so a kitty version difference degrades to "no
+ * titles" rather than to a wrong pane.
+ */
+function collectKittyWindowTitles(
+  value: unknown,
+): Array<{ paneId: string; title: string }> {
+  const panes: Array<{ paneId: string; title: string }> = [];
+  if (!Array.isArray(value)) return panes;
+
+  const collect = (windows: unknown): void => {
+    if (!Array.isArray(windows)) return;
+    for (const window of windows) {
+      if (!window || typeof window !== 'object') continue;
+      const record = window as { id?: unknown; title?: unknown };
+      if (typeof record.id !== 'string' && typeof record.id !== 'number') {
+        continue;
+      }
+      panes.push({
+        paneId: String(record.id),
+        title: typeof record.title === 'string' ? record.title : '',
+      });
+    }
+  };
+
+  for (const osWindow of value) {
+    if (!osWindow || typeof osWindow !== 'object') continue;
+    const record = osWindow as { tabs?: unknown; windows?: unknown };
+    collect(record.windows);
+    if (Array.isArray(record.tabs)) {
+      for (const tab of record.tabs) {
+        if (!tab || typeof tab !== 'object') continue;
+        collect((tab as { windows?: unknown }).windows);
+      }
+    }
+  }
+  return panes;
+}
+
+/**
  * Map plugin layout to kitty layout and launch location.
  *
  * Each plugin layout maps to the closest kitty built-in layout
  * (tall/fat/grid/horizontal/vertical). kitty has no per-window layout, so the
- * chosen layout is applied globally to the active tab. `--location=after` is
- * used for spawning since the layout engine places new windows.
+ * chosen layout is applied to the parent window's tab. `--location=after`
+ * places the new window right after the parent window selected via
+ * `--next-to=id:<parent>`.
  */
 function getKittyLayoutConfig(layout: MultiplexerLayout): {
   kittyLayout: string;
@@ -313,11 +424,11 @@ function getKittyLayoutConfig(layout: MultiplexerLayout): {
   switch (layout) {
     case 'main-vertical':
       // tall = full-height main pane on left, side panes stacked on right
-      // after = place new window after active window (stacked vertically)
+      // after = place new window after the parent window (stacked vertically)
       return { kittyLayout: 'tall', location: 'after' };
     case 'main-horizontal':
       // fat = full-width main pane on top, side panes tiled below
-      // after = place new window after active window (tiled horizontally)
+      // after = place new window after the parent window (tiled horizontally)
       return { kittyLayout: 'fat', location: 'after' };
     case 'tiled':
       // grid = all windows in a balanced grid, same size

@@ -2,6 +2,8 @@ import { afterEach, describe, expect, mock, test } from 'bun:test';
 import * as fs from 'node:fs/promises';
 import type { Server } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { PluginConfig } from '../config';
 import { DEFAULT_DASHBOARD_PORT, readDashboardAuthFile } from './dashboard';
 import { createDashboardManager } from './dashboard-manager';
@@ -21,6 +23,13 @@ mock.module('../utils/opencode-client', () => ({
 const managers = new Set<ReturnType<typeof createInterviewManagerImpl>>();
 // Held-port servers from bindFreePort that await dashboard adoption.
 const heldServers = new Set<Server>();
+const tempDirs = new Set<string>();
+
+async function makeTempDir(prefix = 'manager-test-'): Promise<string> {
+  const dir = await fs.mkdtemp(join(tmpdir(), prefix));
+  tempDirs.add(dir);
+  return dir;
+}
 
 function createInterviewManager(
   ...args: Parameters<typeof createInterviewManagerImpl>
@@ -43,6 +52,10 @@ afterEach(async () => {
       server.close();
     }
   }
+  for (const dir of tempDirs) {
+    tempDirs.delete(dir);
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 });
 
 // Mock context pattern from interview.test.ts
@@ -55,11 +68,16 @@ function createMockContext(overrides?: {
   promptImpl?: (args: any) => Promise<unknown>;
 }) {
   const messagesData = overrides?.messagesData ?? [];
+  let sideCount = 0;
   const sessionMock = {
     get: mock(async (args: { path: { id: string } }) => ({
       data: { id: args.path.id },
     })),
     messages: mock(async () => ({ data: messagesData })),
+    create: mock(async () => {
+      sideCount += 1;
+      return { data: { id: `side-${sideCount}` } };
+    }),
     prompt: mock(async (args: any) => {
       if (overrides?.promptImpl) {
         return await overrides.promptImpl(args);
@@ -119,7 +137,7 @@ describe('interview manager - per-session mode', () => {
     });
 
     test('creates interview with /interview command', async () => {
-      const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+      const tempDir = await makeTempDir();
       const ctx = createMockContext({ directory: tempDir });
       const config = createTestConfig({ port: 0 });
 
@@ -135,7 +153,6 @@ describe('interview manager - per-session mode', () => {
         output,
       );
 
-      // Should inject kickoff prompt into output
       expect(output.parts.length).toBe(1);
       expect(output.parts[0].type).toBe('text');
       expect(output.parts[0].text).toContain('My App Idea');
@@ -146,7 +163,7 @@ describe('interview manager - per-session mode', () => {
     });
 
     test('marks interview as abandoned on session.deleted event', async () => {
-      const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+      const tempDir = await makeTempDir();
       const ctx = createMockContext({ directory: tempDir });
       const config = createTestConfig({ port: 0 });
 
@@ -183,7 +200,7 @@ describe('interview manager - per-session mode', () => {
     });
 
     test('disposes the per-session server idempotently', async () => {
-      const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+      const tempDir = await makeTempDir();
       const manager = createInterviewManager(
         createMockContext({ directory: tempDir }),
         createTestConfig({ port: 0 }),
@@ -198,15 +215,15 @@ describe('interview manager - per-session mode', () => {
           },
           { parts: [] },
         );
-        await manager.dispose();
-        await manager.dispose();
+        expect(manager.dispose()).toBeUndefined();
+        expect(manager.dispose()).toBeUndefined();
       } finally {
-        await fs.rm(tempDir, { recursive: true, force: true });
+        await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
       }
     });
 
     test('registers session when interview is created', async () => {
-      const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+      const tempDir = await makeTempDir();
       const ctx = createMockContext({ directory: tempDir });
 
       const { port: freePort, server } = await bindFreePort();
@@ -217,9 +234,6 @@ describe('interview manager - per-session mode', () => {
       });
 
       const manager = createInterviewManager(ctx, config, { server });
-
-      // Wait for dashboard init
-      await new Promise((r) => setTimeout(r, 100));
 
       try {
         // Create interview (should trigger session registration)
@@ -265,7 +279,7 @@ describe('interview manager - per-session mode', () => {
     test('activates dashboard mode and creates interview', async () => {
       const { port: freePort, server } = await bindFreePort();
       heldServers.add(server);
-      const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+      const tempDir = await makeTempDir();
       const ctx = createMockContext({ directory: tempDir });
 
       const config = createTestConfig({
@@ -300,7 +314,7 @@ describe('interview manager - per-session mode', () => {
 
 describe('interview manager - state push callback wiring', () => {
   test('in dashboard mode, state push callback is wired', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
 
     const { port: freePort, server } = await bindFreePort();
@@ -311,9 +325,6 @@ describe('interview manager - state push callback wiring', () => {
     });
 
     const manager = createInterviewManager(ctx, config, { server });
-
-    // Wait for dashboard init
-    await new Promise((r) => setTimeout(r, 100));
 
     try {
       // Create interview
@@ -361,7 +372,7 @@ describe('interview manager - state push callback wiring', () => {
   });
 
   test('in per-session mode, setBaseUrlResolver is called', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
     const config = createTestConfig({ port: 0 });
 
@@ -391,7 +402,7 @@ describe('interview manager - state push callback wiring', () => {
 
 describe('interview manager - session registration', () => {
   test('registers session after handleCommandExecuteBefore in dashboard mode', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
 
     const { port: freePort, server } = await bindFreePort();
@@ -402,9 +413,6 @@ describe('interview manager - session registration', () => {
     });
 
     const manager = createInterviewManager(ctx, config, { server });
-
-    // Wait for dashboard init
-    await new Promise((r) => setTimeout(r, 100));
 
     try {
       // Create interview (should trigger session registration)
@@ -446,7 +454,7 @@ describe('interview manager - session registration', () => {
   });
 
   test('removes session on session.deleted event', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
 
     const { port: freePort, server } = await bindFreePort();
@@ -457,9 +465,6 @@ describe('interview manager - session registration', () => {
     });
 
     const manager = createInterviewManager(ctx, config, { server });
-
-    // Wait for dashboard init
-    await new Promise((r) => setTimeout(r, 100));
 
     try {
       // Create interview
@@ -516,8 +521,8 @@ describe('interview manager - session registration', () => {
   });
 
   test('clears fallback timer when last registered session is deleted', async () => {
-    const dashboardDir = await fs.mkdtemp('/tmp/manager-test-');
-    const clientDir = await fs.mkdtemp('/tmp/manager-test-');
+    const dashboardDir = await makeTempDir();
+    const clientDir = await makeTempDir();
     const dashboardCtx = createMockContext({ directory: dashboardDir });
     const clientCtx = createMockContext({ directory: clientDir });
 
@@ -528,6 +533,8 @@ describe('interview manager - session registration', () => {
       dashboard: true,
     });
 
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
     const intervalHandles: Array<{ unref: ReturnType<typeof mock> }> = [];
     const setIntervalSpy = mock(() => {
       const handle = { unref: mock(() => {}) };
@@ -537,20 +544,21 @@ describe('interview manager - session registration', () => {
     const clearIntervalSpy = mock(() => {});
 
     try {
-      createInterviewManager(dashboardCtx, config, { server });
+      (globalThis as any).setInterval = setIntervalSpy;
+      (globalThis as any).clearInterval = clearIntervalSpy;
 
-      // Wait for dashboard init
-      await new Promise((r) => setTimeout(r, 100));
-
-      const clientManager = createInterviewManager(clientCtx, config, {
-        timers: {
-          setInterval: setIntervalSpy as never,
-          clearInterval: clearIntervalSpy as never,
-        },
+      const dashboardManager = createInterviewManager(dashboardCtx, config, {
+        server,
+      });
+      // Deterministic init barrier: the awaited handleEvent runs
+      // ensureInitialized, whose dashboard election writes the
+      // credentials the client manager needs to avoid a per-session
+      // fallback server (a second fallback timer, hence a double clear).
+      await dashboardManager.handleEvent({
+        event: { type: 'session.warmup', properties: {} },
       });
 
-      // Wait for client init to connect to the dashboard
-      await new Promise((r) => setTimeout(r, 100));
+      const clientManager = createInterviewManager(clientCtx, config);
 
       const output = { parts: [] as Array<{ type: string; text?: string }> };
       await clientManager.handleCommandExecuteBefore(
@@ -577,13 +585,15 @@ describe('interview manager - session registration', () => {
       expect(clearIntervalSpy).toHaveBeenCalledWith(fallbackTimerHandle);
       expect(fallbackTimerHandle?.unref).toHaveBeenCalledTimes(1);
     } finally {
+      (globalThis as any).setInterval = originalSetInterval;
+      (globalThis as any).clearInterval = originalClearInterval;
       await fs.rm(dashboardDir, { recursive: true, force: true });
       await fs.rm(clientDir, { recursive: true, force: true });
     }
   });
 
   test('disposes dashboard resources idempotently', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
     const { port: freePort, server } = await bindFreePort();
     heldServers.add(server);
@@ -615,7 +625,7 @@ describe('interview manager - session registration', () => {
 
 describe('interview manager - edge cases', () => {
   test('does not roll back a claim during an overlapping in-process delivery', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
     const { port: freePort, server } = await bindFreePort();
     heldServers.add(server);
@@ -636,7 +646,13 @@ describe('interview manager - edge cases', () => {
     const runtime = {
       messages: async () => messages,
       notify: async () => {},
-      continue: async () => {
+      continue: async (_sessionID: string, text: string) => {
+        if (
+          text.includes('You are running an interview q&a session') ||
+          text.includes('Resume the interview')
+        ) {
+          return;
+        }
         submitAttempts++;
         if (submitAttempts === 1) {
           signalFirstDelivery();
@@ -645,6 +661,7 @@ describe('interview manager - edge cases', () => {
           throw new Error('session busy');
         }
       },
+      create: async () => 'side-overlap',
       rename: async () => {},
     };
     const manager = createDashboardManager(ctx, config, freePort, 'interview', {
@@ -718,8 +735,109 @@ describe('interview manager - edge cases', () => {
     }
   });
 
+  test('acknowledges delivered answers when history save fails', async () => {
+    const tempDir = await makeTempDir();
+    const ctx = createMockContext({ directory: tempDir });
+    const { port: freePort, server } = await bindFreePort();
+    heldServers.add(server);
+    const config = createTestConfig({ port: freePort, dashboard: true });
+    const messages: Array<{
+      info?: { role: string };
+      parts?: Array<{ type: string; text?: string }>;
+    }> = [];
+    let answerSends = 0;
+    const runtime = {
+      messages: async () => messages,
+      notify: async () => {},
+      continue: async (_sessionID: string, text: string) => {
+        if (text.includes('The user answered:')) answerSends++;
+      },
+      create: async () => 'side-history-failure',
+      rename: async () => {},
+    };
+    const manager = createDashboardManager(ctx, config, freePort, 'interview', {
+      runtime,
+      server,
+    });
+
+    try {
+      await manager.handleCommandExecuteBefore(
+        {
+          command: 'interview',
+          sessionID: 'session-history-failure',
+          arguments: 'History Failure Test',
+        },
+        { parts: [] },
+      );
+      const interviewId = manager.service.getActiveInterviewId(
+        'session-history-failure',
+      );
+      expect(interviewId).not.toBeNull();
+      if (!interviewId) throw new Error('Interview was not created');
+      messages.push({
+        info: { role: 'assistant' },
+        parts: [
+          {
+            type: 'text',
+            text: '<interview_state>{"summary":"Draft","questions":[{"id":"q-1","question":"What?","options":["A"]}]}</interview_state>',
+          },
+        ],
+      });
+
+      const state = await manager.service.getInterviewState(interviewId);
+      await fs.chmod(state.interview.markdownPath, 0o444);
+      try {
+        const auth = await readDashboardAuthFile(freePort);
+        expect(auth).not.toBeNull();
+        const response = await fetch(
+          `http://127.0.0.1:${freePort}/api/interviews/${interviewId}/answers?token=${auth?.token}`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              answers: [{ questionId: 'q-1', answer: 'A' }],
+            }),
+          },
+        );
+        expect(response.status).toBe(202);
+
+        const idleEvent = {
+          event: {
+            type: 'session.status',
+            properties: {
+              sessionID: 'session-history-failure',
+              status: { type: 'idle' },
+            },
+          },
+        };
+        await manager.handleEvent(idleEvent);
+        expect(answerSends).toBe(1);
+      } finally {
+        await fs.chmod(state.interview.markdownPath, 0o644);
+      }
+
+      const failedState = await manager.service.getInterviewState(interviewId);
+      expect(failedState.lastParseError).toContain(
+        'saving their history failed',
+      );
+      await manager.handleEvent({
+        event: {
+          type: 'session.status',
+          properties: {
+            sessionID: 'session-history-failure',
+            status: { type: 'idle' },
+          },
+        },
+      });
+      expect(answerSends).toBe(1);
+    } finally {
+      await manager.dispose();
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test('waits for accepted delivery before disposal and replacement polling', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
     const { port: freePort, server } = await bindFreePort();
     heldServers.add(server);
@@ -739,8 +857,15 @@ describe('interview manager - edge cases', () => {
     let submitAttempts = 0;
     const runtime = {
       messages: async () => messages,
+      create: async () => 'side-wait',
       notify: async () => {},
-      continue: async () => {
+      continue: async (_sessionID: string, text: string) => {
+        if (
+          text.includes('You are running an interview q&a session') ||
+          text.includes('Resume the interview')
+        ) {
+          return;
+        }
         submitAttempts++;
         signalFirstDelivery();
         await firstDeliveryGate;
@@ -844,7 +969,7 @@ describe('interview manager - edge cases', () => {
   });
 
   test('handles session.status event with idle status', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
     const config = createTestConfig({ port: 0 });
 
@@ -862,26 +987,25 @@ describe('interview manager - edge cases', () => {
         output,
       );
 
-      // Send idle status event
-      await manager.handleEvent({
-        event: {
-          type: 'session.status',
-          properties: {
-            sessionID: 'session-idle',
-            status: { type: 'idle' },
+      // Send idle status event and verify it resolves cleanly without throwing
+      await expect(
+        manager.handleEvent({
+          event: {
+            type: 'session.status',
+            properties: {
+              sessionID: 'session-idle',
+              status: { type: 'idle' },
+            },
           },
-        },
-      });
-
-      // Should not throw
-      expect(true).toBe(true);
+        }),
+      ).resolves.toBeUndefined();
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
 
   test('handles session.status event without sessionID in properties', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
     const config = createTestConfig({ port: 0 });
 
@@ -889,24 +1013,23 @@ describe('interview manager - edge cases', () => {
 
     try {
       // Send idle status event without sessionID
-      await manager.handleEvent({
-        event: {
-          type: 'session.status',
-          properties: {
-            status: { type: 'idle' },
+      await expect(
+        manager.handleEvent({
+          event: {
+            type: 'session.status',
+            properties: {
+              status: { type: 'idle' },
+            },
           },
-        },
-      });
-
-      // Should not throw
-      expect(true).toBe(true);
+        }),
+      ).resolves.toBeUndefined();
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
 
   test('handles unknown event types', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
     const config = createTestConfig({ port: 0 });
 
@@ -914,22 +1037,21 @@ describe('interview manager - edge cases', () => {
 
     try {
       // Send unknown event type
-      await manager.handleEvent({
-        event: {
-          type: 'unknown.event',
-          properties: { sessionID: 'session-unknown' },
-        },
-      });
-
-      // Should not throw
-      expect(true).toBe(true);
+      await expect(
+        manager.handleEvent({
+          event: {
+            type: 'unknown.event',
+            properties: { sessionID: 'session-unknown' },
+          },
+        }),
+      ).resolves.toBeUndefined();
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
 
   test('handles handleCommandExecuteBefore without sessionID', async () => {
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
     const config = createTestConfig({ port: 0 });
 
@@ -956,8 +1078,8 @@ describe('interview manager - edge cases', () => {
 
 describe('interview manager - integration with real dashboard', () => {
   test('two managers on same port: first becomes dashboard, second becomes session', async () => {
-    const tempDir1 = await fs.mkdtemp('/tmp/manager-test-');
-    const tempDir2 = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir1 = await makeTempDir();
+    const tempDir2 = await makeTempDir();
 
     const ctx1 = createMockContext({ directory: tempDir1 });
     const ctx2 = createMockContext({ directory: tempDir2 });
@@ -1061,8 +1183,8 @@ describe('interview manager - integration with real dashboard', () => {
   });
 
   test('does not redeliver after a successful delivery loses its ACK response', async () => {
-    const tempDir1 = await fs.mkdtemp('/tmp/manager-test-');
-    const tempDir2 = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir1 = await makeTempDir();
+    const tempDir2 = await makeTempDir();
     const { port, server } = await bindFreePort();
     heldServers.add(server);
     const config = createTestConfig({ port, dashboard: true });
@@ -1114,6 +1236,8 @@ describe('interview manager - integration with real dashboard', () => {
         },
       );
       expect(nudgeResponse.status).toBe(202);
+      const promptsAfterKickoff =
+        ctx2.client.session.promptAsync.mock.calls.length;
 
       await manager2.handleEvent({
         event: {
@@ -1125,7 +1249,9 @@ describe('interview manager - integration with real dashboard', () => {
         },
       });
       expect(droppedAck).toBe(true);
-      expect(ctx2.client.session.promptAsync).toHaveBeenCalledTimes(1);
+      expect(ctx2.client.session.promptAsync).toHaveBeenCalledTimes(
+        promptsAfterKickoff + 1,
+      );
 
       await manager2.handleEvent({
         event: {
@@ -1136,7 +1262,9 @@ describe('interview manager - integration with real dashboard', () => {
           },
         },
       });
-      expect(ctx2.client.session.promptAsync).toHaveBeenCalledTimes(1);
+      expect(ctx2.client.session.promptAsync).toHaveBeenCalledTimes(
+        promptsAfterKickoff + 1,
+      );
     } finally {
       globalThis.fetch = originalFetch;
       await fs.rm(tempDir1, { recursive: true, force: true });
@@ -1145,8 +1273,8 @@ describe('interview manager - integration with real dashboard', () => {
   });
 
   test('delivers a new answer claim after an earlier claim ACK is uncertain', async () => {
-    const tempDir1 = await fs.mkdtemp('/tmp/manager-test-');
-    const tempDir2 = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir1 = await makeTempDir();
+    const tempDir2 = await makeTempDir();
     const { port, server } = await bindFreePort();
     heldServers.add(server);
     const config = createTestConfig({ port, dashboard: true });
@@ -1236,6 +1364,8 @@ describe('interview manager - integration with real dashboard', () => {
       expect(firstClaim.answers).toEqual([
         { questionId: 'q-1', answer: 'First answer' },
       ]);
+      const promptsAfterKickoff =
+        ctx2.client.session.promptAsync.mock.calls.length;
 
       await manager2.handleEvent({
         event: {
@@ -1247,7 +1377,9 @@ describe('interview manager - integration with real dashboard', () => {
         },
       });
       expect(failedFirstAck).toBe(true);
-      expect(ctx2.client.session.promptAsync).toHaveBeenCalledTimes(1);
+      expect(ctx2.client.session.promptAsync).toHaveBeenCalledTimes(
+        promptsAfterKickoff + 1,
+      );
 
       const recoveredAck = await originalFetch(
         `${interviewUrl}/pending/ack${authQuery}`,
@@ -1282,7 +1414,9 @@ describe('interview manager - integration with real dashboard', () => {
           },
         },
       });
-      expect(ctx2.client.session.promptAsync).toHaveBeenCalledTimes(2);
+      expect(ctx2.client.session.promptAsync).toHaveBeenCalledTimes(
+        promptsAfterKickoff + 2,
+      );
     } finally {
       globalThis.fetch = originalFetch;
       await fs.rm(tempDir1, { recursive: true, force: true });
@@ -1315,7 +1449,7 @@ describe('interview manager - dashboard election failure fallback', () => {
       });
     });
 
-    const tempDir = await fs.mkdtemp('/tmp/manager-test-');
+    const tempDir = await makeTempDir();
     const ctx = createMockContext({ directory: tempDir });
     const config = createTestConfig({
       port,

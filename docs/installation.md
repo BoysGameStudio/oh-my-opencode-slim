@@ -24,7 +24,7 @@ bunx oh-my-opencode-slim@latest install
 Or use non-interactive mode:
 
 ```bash
-bunx oh-my-opencode-slim@latest install --no-tui --skills=yes --background-subagents=yes
+bunx oh-my-opencode-slim@latest install --no-tui --background-subagents=yes
 ```
 
 ### Configuration Options
@@ -33,8 +33,6 @@ The installer supports the following options:
 
 | Option | Description |
 |--------|-------------|
-| `--skills=yes|no` | Install bundled skills (default: yes) |
-| `--companion=ask\|yes\|no` | Install and enable the desktop Companion (`ask` by default; prompt defaults to no) |
 | `--preset=<name>` | Active generated config preset: `openai` or `opencode-go` (default: `openai`) |
 | `--background-subagents=ask\|yes\|no` | Configure the required background-subagents and Exa websearch environment exports (`ask` by default; prompt defaults to yes) |
 | `--background-subagents-target=<path>` | Write the background-subagents and websearch exports to a specific shell/profile file |
@@ -100,16 +98,13 @@ bunx oh-my-opencode-slim@latest install --reset
 
 ### After Installation
 
-The installer generates both OpenAI and OpenCode Go presets, with OpenAI active by default (using variant-aware GPT-5.6 models, including `gpt-5.6-terra (medium)` for Orchestrator, `gpt-5.6-sol (high)` for Oracle, `gpt-5.6-luna (medium)` for Fixer, and `gpt-5.6-luna` variants for other specialists). To make OpenCode Go active during install, run `bunx oh-my-opencode-slim@latest install --preset=opencode-go`. That preset uses Minimax-M3 for Orchestrator, so the installer also enables Observer with `opencode-go/mimo-v2.5` for visual analysis. To switch providers later or build a mixed setup, use **[Configuration Reference](configuration.md)** for the full option reference and the preset docs for copyable examples.
+The installer generates both OpenAI and OpenCode Go presets, with OpenAI active by default (using variant-aware GPT-6 models, including `gpt-6.1-sol` at `medium` for Orchestrator, `high` for Oracle, and `low` for Fixer, and `gpt-6-luna` variants for Explorer and Designer). To make OpenCode Go active during install, run `bunx oh-my-opencode-slim@latest install --preset=opencode-go`. That preset uses Minimax-M3 for Orchestrator, so the installer also enables Observer with `opencode-go/mimo-v2.5` for visual analysis. To switch providers later or build a mixed setup, use **[Configuration Reference](configuration.md)** for the full option reference and the preset docs for copyable examples.
 
-The plugin safely reconciles bundled skills on startup and after successful
-auto-updates. Missing bundled skills are installed, and previously managed skills
-are updated only when their local files still match a known plugin-installed
-version. If you customized a skill locally, the plugin preserves your active copy
-and stages the new bundled version under
-`~/.config/opencode/.oh-my-opencode-slim/skill-updates/` for manual review.
-Restart OpenCode after an auto-update to load the updated plugin and any changed
-skills.
+Bundled skills are registered in-process at plugin load — nothing is copied to
+disk, and plugin updates apply on the next OpenCode restart. Skills listed in
+`disabled_skills` are not registered. A same-named skill directory under
+`~/.config/opencode/skills/` overrides the bundled version (directory sources
+take precedence over plugin registrations).
 
 Then:
 
@@ -161,7 +156,7 @@ If not installed, direct the user to https://opencode.ai/docs first.
 The installer generates OpenAI and OpenCode Go presets, with OpenAI active by default:
 
 ```bash
-bunx oh-my-opencode-slim@latest install --no-tui --skills=yes
+bunx oh-my-opencode-slim@latest install --no-tui
 ```
 
 **Examples:**
@@ -169,14 +164,11 @@ bunx oh-my-opencode-slim@latest install --no-tui --skills=yes
 # Interactive install
 bunx oh-my-opencode-slim@latest install
 
-# Non-interactive with bundled skills
-bunx oh-my-opencode-slim@latest install --no-tui --skills=yes --background-subagents=yes
+# Non-interactive
+bunx oh-my-opencode-slim@latest install --no-tui --background-subagents=yes
 
 # Make the generated OpenCode Go preset active
 bunx oh-my-opencode-slim@latest install --preset=opencode-go
-
-# Non-interactive without skills
-bunx oh-my-opencode-slim@latest install --no-tui --skills=no
 
 # Force overwrite existing configuration
 bunx oh-my-opencode-slim@latest install --reset
@@ -236,7 +228,7 @@ Then manually create the config files at:
 
 If the installer reports that the configuration already exists, you have two options:
 
-1. **Keep existing config**: The installer will skip the configuration step and continue with other operations (like adding the plugin or installing skills).
+1. **Keep existing config**: The installer will skip the configuration step and continue with other operations (like adding the plugin).
 
 2. **Reset configuration**: Use `--reset` to overwrite:
    ```bash
@@ -348,7 +340,7 @@ See the [Multiplexer Integration Guide](multiplexer-integration.md) for more det
 
 3. Re-enable default agents:
 
-   In `~/.config/opencode/opencode.json`, remove the `disable: true` entries the installer added under `agent.explore` and `agent.general`.
+   In `~/.config/opencode/opencode.json`, remove any `disable: true` entries under `agent.explore` and `agent.general` (older installers added these). The plugin disables those built-in subagents at runtime, with or without installer entries. To keep an agent enabled, declare an entry under its name — `agents.<name>` on v2, `agent.<name>` on v1/legacy — that does not itself set `disable`/`disabled: true`.
 
 4. Remove the environment variable:
 
@@ -370,18 +362,7 @@ See the [Multiplexer Integration Guide](multiplexer-integration.md) for more det
    rm -f ~/.config/opencode/oh-my-opencode-slim.json.bak
    ```
 
-7. Remove skills installed by the installer:
-   ```bash
-   rm -rf ~/.config/opencode/skills/simplify
-   rm -rf ~/.config/opencode/skills/codemap
-   rm -rf ~/.config/opencode/skills/clonedeps
-   rm -rf ~/.config/opencode/skills/deepwork
-   rm -rf ~/.config/opencode/skills/reflect
-   rm -rf ~/.config/opencode/skills/worktrees
-   rm -rf ~/.config/opencode/skills/oh-my-opencode-slim
-   ```
-
-   > **Note:** The installer manages these specific skills. If you added others manually, they won't be affected.
+7. Bundled skills are registered in-process by the plugin — removing the plugin entry (previous step) removes them. If a legacy install copied skills under `~/.config/opencode/skills/`, the plugin removes its manifest-tracked copies automatically on next load; user-authored skills are never touched.
 
 8. Remove the desktop companion binary (if installed):
 

@@ -2,25 +2,44 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import type { ReusableSessionSelection } from './utils/background-job-board';
 
 /**
- * Per-session metadata projection for the clickable sidebar. Entries only
+ * Per-session alias/status projection for the clickable sidebar. Entries only
  * exist for sessions present in `activeSessions`; they never activate a
  * session by themselves. The key is always the full sessionID — never an
  * alias — and the parent link lives exclusively in `sessionParents`.
  */
 export interface TuiSessionDetails {
   alias?: string;
-  /** providerID/modelID observed for this specific session. */
-  model?: string;
   status?: 'busy' | 'retry';
 }
+
+/** Host-board sidebar sessions. Running entries carry only stable identity;
+ * terminal and stopped entries retain their destination metadata. */
+export type TuiReusableSession =
+  | (ReusableSessionSelection & { running?: never })
+  | {
+      taskID: string;
+      alias: string;
+      running: true;
+      terminalState?: never;
+      completedAt?: never;
+      lastUsedAt?: never;
+    };
 
 export interface TuiSnapshot {
   version: 1;
   updatedAt: number;
   agentModels: Record<string, string>;
   agentVariants: Record<string, string>;
+  /**
+   * Canonical agent ID → visible display name, for the sidebar label only.
+   * Keyed by the same canonical ID as `agentModels`/`activeSessions` so model
+   * lookup, row expansion and click handling keep using the canonical name;
+   * a missing or identical entry falls back to the ID.
+   */
+  agentDisplayNames: Record<string, string>;
   activeSessions: Record<string, string>;
   /**
    * Recording process per activity; used to sweep crash residue.
@@ -36,10 +55,18 @@ export interface TuiSnapshot {
    * cannot scope the sidebar; the session tree can.
    */
   sessionParents: Record<string, string>;
-  /** Per-active-session details (alias/model/status) for the sidebar. */
+  /** Per-active-session details (alias/status) for the sidebar. */
   sessionDetails: Record<string, TuiSessionDetails>;
+  /**
+   * Accessible terminal, stopped and running sessions per agent, keyed by parent
+   * sessionID. The board owns this process-local projection.
+   */
+  reusableByAgent: Record<string, Record<string, TuiReusableSession[]>>;
+  /** Host PID owning each parent projection, independent of activityPids. */
+  reusableOwners: Record<string, number>;
 }
 
+export const TUI_SESSION_PARENTS_MAX = 256;
 const STATE_DIR = 'oh-my-opencode-slim';
 const STATE_FILE = 'tui-state.json';
 const STATE_LOCK_RETRY_MS = 5;
@@ -83,10 +110,13 @@ function emptySnapshot(): TuiSnapshot {
     updatedAt: Date.now(),
     agentModels: {},
     agentVariants: {},
+    agentDisplayNames: {},
     activeSessions: {},
     activityPids: {},
     sessionParents: {},
     sessionDetails: {},
+    reusableByAgent: {},
+    reusableOwners: {},
   };
 }
 
@@ -115,14 +145,75 @@ function parseSessionDetails(
   const out: Record<string, TuiSessionDetails> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (entry === null || typeof entry !== 'object') continue;
-    const rec = entry as { alias?: unknown; model?: unknown; status?: unknown };
+    const rec = entry as { alias?: unknown; status?: unknown };
     const details: TuiSessionDetails = {};
     if (typeof rec.alias === 'string') details.alias = rec.alias;
-    if (typeof rec.model === 'string') details.model = rec.model;
     if (rec.status === 'busy' || rec.status === 'retry') {
       details.status = rec.status;
     }
     if (Object.keys(details).length > 0) out[key] = details;
+  }
+  return out;
+}
+
+function parseReusableByAgent(
+  value: unknown,
+): Record<string, Record<string, TuiReusableSession[]>> {
+  if (value === null || typeof value !== 'object') return {};
+  const out: Record<string, Record<string, TuiReusableSession[]>> = {};
+  for (const [parentID, byAgent] of Object.entries(
+    value as Record<string, unknown>,
+  )) {
+    if (byAgent === null || typeof byAgent !== 'object') continue;
+    const agents: Record<string, TuiReusableSession[]> = {};
+    for (const [agentName, entry] of Object.entries(
+      byAgent as Record<string, unknown>,
+    )) {
+      if (!Array.isArray(entry)) continue;
+      const sessions: TuiReusableSession[] = [];
+      for (const item of entry) {
+        if (item === null || typeof item !== 'object') continue;
+        const rec = item as {
+          taskID?: unknown;
+          alias?: unknown;
+          running?: unknown;
+          terminalState?: unknown;
+          completedAt?: unknown;
+          lastUsedAt?: unknown;
+        };
+        if (typeof rec.taskID !== 'string' || typeof rec.alias !== 'string') {
+          continue;
+        }
+        if (rec.running === true) {
+          sessions.push({
+            taskID: rec.taskID,
+            alias: rec.alias,
+            running: true,
+          });
+          continue;
+        }
+        if (
+          (rec.terminalState !== 'completed' &&
+            rec.terminalState !== 'error' &&
+            rec.terminalState !== 'cancelled' &&
+            rec.terminalState !== 'stopped') ||
+          typeof rec.lastUsedAt !== 'number'
+        ) {
+          continue;
+        }
+        sessions.push({
+          taskID: rec.taskID,
+          alias: rec.alias,
+          terminalState: rec.terminalState,
+          ...(typeof rec.completedAt === 'number'
+            ? { completedAt: rec.completedAt }
+            : {}),
+          lastUsedAt: rec.lastUsedAt,
+        });
+      }
+      if (sessions.length > 0) agents[agentName] = sessions;
+    }
+    if (Object.keys(agents).length > 0) out[parentID] = agents;
   }
   return out;
 }
@@ -137,10 +228,15 @@ function parseSnapshot(value: string): TuiSnapshot {
       typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
     agentModels: parsed.agentModels ?? {},
     agentVariants: parsed.agentVariants ?? {},
+    agentDisplayNames: parseStringRecord(parsed.agentDisplayNames),
     activeSessions: parsed.activeSessions ?? {},
     activityPids: parsePidRecord(parsed.activityPids),
     sessionParents: parseStringRecord(parsed.sessionParents),
     sessionDetails: parseSessionDetails(parsed.sessionDetails),
+    // The host-board projection is absent until its first write. Present
+    // values parse as arrays for the TUI's reusable-session navigation.
+    reusableByAgent: parseReusableByAgent(parsed.reusableByAgent),
+    reusableOwners: parsePidRecord(parsed.reusableOwners),
   };
 }
 
@@ -166,11 +262,10 @@ function readTuiSnapshotStrict(statePath: string): TuiSnapshot | null {
 }
 
 // Stat-based read cache for the polling TUI refresh (1/s per window).
-// Writers publish via tmp+rename, so a changed write normally has a new
-// dev/ino. Include ctimeMs as well because an external in-place rewrite can
-// preserve the inode, size, and mtime while still changing the contents.
-// Cache misses fall through to a normal read; any stat/read failure bypasses
-// the cache entirely.
+// Writers publish via tmp+rename, so a changed write always has a new
+// dev/ino — mtimeMs+size alone would also be sufficient, but inode
+// identity rules out same-mtime rewrites. Cache misses fall through to
+// a normal read; any stat/read failure bypasses the cache entirely.
 // Bounded LRU: a long-lived daemon polling many projects must not
 // retain a snapshot per visited path.
 const ASYNC_SNAPSHOT_CACHE_MAX = 8;
@@ -180,7 +275,7 @@ const asyncSnapshotCache = new Map<
 >();
 
 function snapshotStatKey(stat: fs.Stats): string {
-  return `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
+  return `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.size}`;
 }
 
 function rememberAsyncSnapshot(
@@ -247,7 +342,7 @@ function writeTuiSnapshot(snapshot: TuiSnapshot, projectDir: string): boolean {
   }
 }
 
-function isProcessRunning(pid: number): boolean {
+export function isProcessRunning(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -258,20 +353,14 @@ function isProcessRunning(pid: number): boolean {
 
 function isStateLockStale(lockPath: string): boolean {
   try {
-    const metadata = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as {
+    if (Date.now() - fs.statSync(lockPath).mtimeMs > STATE_LOCK_STALE_MS)
+      return true;
+    const { pid } = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as {
       pid?: unknown;
     };
-    if (typeof metadata.pid === 'number' && metadata.pid > 0) {
-      return !isProcessRunning(metadata.pid);
-    }
+    return typeof pid === 'number' && pid > 0 && !isProcessRunning(pid);
   } catch {
-    // A creator may still be writing metadata; use age as fallback.
-  }
-
-  try {
-    return Date.now() - fs.statSync(lockPath).mtimeMs > STATE_LOCK_STALE_MS;
-  } catch {
-    return false;
+    return false; // Lock released, or metadata still being written.
   }
 }
 
@@ -362,31 +451,24 @@ function statSnapshotFile(statePath: string): {
 }
 
 function cloneSnapshot(snapshot: TuiSnapshot): TuiSnapshot {
-  return {
-    version: snapshot.version,
-    updatedAt: snapshot.updatedAt,
-    agentModels: { ...snapshot.agentModels },
-    agentVariants: { ...snapshot.agentVariants },
-    activeSessions: { ...snapshot.activeSessions },
-    activityPids: { ...snapshot.activityPids },
-    sessionParents: { ...snapshot.sessionParents },
-    sessionDetails: Object.fromEntries(
-      Object.entries(snapshot.sessionDetails).map(([key, details]) => [
-        key,
-        { ...details },
-      ]),
-    ),
-  };
+  // Plain JSON throughout (records of strings/numbers and reusable-session
+  // records), so the structural clone also copies the reusableByAgent entry
+  // arrays the field-wise shallow copy used to share.
+  return structuredClone(snapshot);
 }
 
 export function snapshotSectionsEqual(a: TuiSnapshot, b: TuiSnapshot): boolean {
   return (
     JSON.stringify(a.agentModels) === JSON.stringify(b.agentModels) &&
     JSON.stringify(a.agentVariants) === JSON.stringify(b.agentVariants) &&
+    JSON.stringify(a.agentDisplayNames) ===
+      JSON.stringify(b.agentDisplayNames) &&
     JSON.stringify(a.activeSessions) === JSON.stringify(b.activeSessions) &&
     JSON.stringify(a.activityPids) === JSON.stringify(b.activityPids) &&
     JSON.stringify(a.sessionParents) === JSON.stringify(b.sessionParents) &&
-    JSON.stringify(a.sessionDetails) === JSON.stringify(b.sessionDetails)
+    JSON.stringify(a.sessionDetails) === JSON.stringify(b.sessionDetails) &&
+    JSON.stringify(a.reusableByAgent) === JSON.stringify(b.reusableByAgent) &&
+    JSON.stringify(a.reusableOwners) === JSON.stringify(b.reusableOwners)
   );
 }
 
@@ -423,40 +505,49 @@ function memoFor(statePath: string): TuiSnapshot | undefined {
   return entry.snapshot;
 }
 
-function updateSnapshot(
+export function updateSnapshot(
   projectDir: string,
   mutator: (snapshot: TuiSnapshot) => void,
-): void {
+): boolean {
   const statePath = getTuiStatePath(projectDir);
 
   const memo = memoFor(statePath);
   if (memo) {
     const candidate = cloneSnapshot(memo);
     mutator(candidate);
-    if (snapshotSectionsEqual(candidate, memo)) return; // no-op update
+    if (snapshotSectionsEqual(candidate, memo)) return true; // no-op update
   }
 
   try {
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
   } catch {
-    return;
+    return false;
   }
   const lock = acquireStateLock(statePath);
-  if (!lock) return;
+  if (!lock) return false;
 
   try {
     const snapshot = readTuiSnapshotStrict(statePath);
-    if (!snapshot) return;
+    if (!snapshot) return false;
     const before = cloneSnapshot(snapshot);
     mutator(snapshot);
     if (snapshotSectionsEqual(snapshot, before)) {
       rememberSnapshot(statePath, snapshot);
-      return;
+      return true;
     }
     snapshot.updatedAt = Date.now();
+    // Any write drops the oldest links past the cap but keeps active chains.
+    const { sessionParents: parents, activeSessions } = snapshot;
+    const keep = new Set<string>();
+    for (let id of Object.keys(activeSessions))
+      for (; parents[id] && !keep.has(id); id = parents[id]) keep.add(id);
+    for (const key of Object.keys(parents).slice(0, -TUI_SESSION_PARENTS_MAX))
+      if (!keep.has(key)) delete parents[key];
     if (writeTuiSnapshot(snapshot, projectDir)) {
       rememberSnapshot(statePath, snapshot);
+      return true;
     }
+    return false;
   } finally {
     releaseStateLock(lock);
   }
@@ -466,12 +557,17 @@ export function recordTuiAgentModels(
   input: {
     agentModels: Record<string, string>;
     agentVariants?: Record<string, string>;
+    /** Canonical ID → display name; omitted callers keep the last-known map. */
+    agentDisplayNames?: Record<string, string>;
   },
   projectDir: string,
 ): void {
   updateSnapshot(projectDir, (snapshot) => {
     snapshot.agentModels = { ...input.agentModels };
     snapshot.agentVariants = { ...(input.agentVariants ?? {}) };
+    if (input.agentDisplayNames !== undefined) {
+      snapshot.agentDisplayNames = { ...input.agentDisplayNames };
+    }
   });
 }
 
@@ -526,7 +622,7 @@ export function recordTuiAgentActivity(
 }
 
 /**
- * Update per-session sidebar details (alias/model/status) for an ACTIVE
+ * Update per-session sidebar details (alias/status) for an ACTIVE
  * session only. A late detail update after idle must never resurrect an
  * activity entry — the whole update is dropped when the session is gone
  * from `activeSessions` at commit time (under the same lock).
@@ -545,7 +641,7 @@ export function updateTuiSessionDetails(
 
 /**
  * Retract only the alias of an active session (e.g. its board record was
- * dropped). Model/status survive; the session stays visible in the
+ * dropped). Status survives; the session stays visible in the
  * sidebar under its abbreviated sessionID until it goes idle.
  */
 export function clearTuiSessionAlias(
@@ -605,16 +701,9 @@ export function recordTuiSessionParent(
   projectDir: string,
 ): void {
   updateSnapshot(projectDir, (snapshot) => {
+    delete snapshot.sessionParents[sessionID]; // Re-registered link is newest.
     snapshot.sessionParents[sessionID] = parentID;
   });
-}
-
-/** Resolve a session to its conversation root via the persistent index. */
-export function resolveTuiSessionRoot(
-  sessionID: string,
-  projectDir: string,
-): string {
-  return resolveSnapshotRoot(readTuiSnapshot(projectDir), sessionID);
 }
 
 /**

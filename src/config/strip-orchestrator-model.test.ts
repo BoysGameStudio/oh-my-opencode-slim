@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import { createAgents, projectAgentRuntimeState } from '../agents';
+import { RuntimeConfig } from './runtime';
 import { applyOrchestratorModelConfig } from './strip-orchestrator-model';
 
 describe('applyOrchestratorModelConfig', () => {
@@ -109,20 +111,26 @@ describe('applyOrchestratorModelConfig', () => {
   });
 
   test('allows TUI state to capture the configured model and variant before stripping', () => {
-    const agents = {
+    const runtime = RuntimeConfig.createDetached(
+      '/tmp/test-strip-orchestrator',
+      {
+        stripOrchestratorModel: true,
+      } as unknown as Parameters<typeof RuntimeConfig.createDetached>[1],
+    );
+
+    const agentDefs = createAgents(runtime);
+    const agentConfigs: Record<string, Record<string, unknown>> = {
       orchestrator: { model: 'openai/gpt-5', variant: 'high' },
     };
-    const tuiState = { ...agents.orchestrator };
 
-    applyOrchestratorModelConfig({
-      agents,
-      enabled: true,
-      presets: undefined,
-      configPreset: undefined,
-      runtimePreset: null,
+    const { projection } = projectAgentRuntimeState({
+      runtime,
+      agentDefs,
+      agentConfigs,
     });
 
-    expect(tuiState).toEqual({ model: 'openai/gpt-5', variant: 'high' });
-    expect(agents.orchestrator).toEqual({});
+    expect(projection.agentModels.orchestrator).toBe('openai/gpt-5');
+    expect(projection.agentVariants.orchestrator).toBe('high');
+    expect(agentConfigs.orchestrator).toEqual({});
   });
 });

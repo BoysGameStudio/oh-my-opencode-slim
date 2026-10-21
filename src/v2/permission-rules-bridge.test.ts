@@ -1,6 +1,6 @@
 /**
- * v2 per-session permission rules bridge (`ctx.permission.rules`, shipped
- * in v2.0.0 via #48351; verified against v2.0.3).
+ * v2 per-session permission rules bridge (`ctx.session.update` with a
+ * `permissions` payload, v2.0.5).
  *
  * The bridge installs exact-match permission rules derived from the child
  * agent's task-policy (the same plugin permission map that feeds the
@@ -12,33 +12,56 @@
  *
  * Coverage:
  * - (a) rules are applied when a plugin-managed child session is created
- * - (b) hosts without `permission.rules` no-op with a ONE-TIME
+ * - (b) hosts without `session.update` no-op with a ONE-TIME
  *   deterministic warning (the commit-2bf290ad degradation pattern)
  * - (c) duplicate session.created delivery for the same sessionID is
  *   idempotent (applied exactly once per child)
  * - (d) emitted rules contain no wildcard characters (`*`, `?`)
  * - (e) failures are logged, never thrown into the event pump
+ * - matrix: every built-in agent derives a non-empty, declaration-
+ *   faithful exact ruleset — whole-tool declarations included (resource
+ *   = the declared tool key), so read-only agents (which declare their
+ *   capability set as whole-tool effects) never strand a child on the
+ *   parent's inherited session rules
  * - gates: root sessions (no parentID) and foreign agents are never
- *   touched (ctx.permission.rules REPLACES the session-scoped list)
+ *   touched (session.update's `permissions` payload REPLACES the
+ *   session-scoped list)
  * - wiring: the createV2Setup event pump dispatches raw session.created
  *   events into the bridge (full-setup test, fixture pattern from
  *   setup-compaction.test.ts)
  */
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
-import * as path from 'node:path';
 import {
-  __resetPermissionRulesWarningForTesting,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from 'bun:test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+import { createAgents } from '../agents/index';
+import { PluginConfigSchema } from '../config';
+import { RuntimeConfig } from '../config/runtime';
+import {
   createPermissionRulesBridge,
   createV2Setup,
   deriveExactPermissionRules,
+  resetV2GenerationWarnings,
 } from './setup';
-import type { V2Context, V2PermissionRule } from './types';
+import type {
+  V2Context,
+  V2PermissionRule,
+  V2Session,
+  V2SessionPromptEvent,
+} from './types';
 
-/** Task-policy fixture: nested exact patterns alongside entries that can
- * ONLY be expressed with wildcards (the '*' catch-all key, whole-tool
- * string effects, wildcard resource patterns). Only the exact entries
- * may survive derivation. */
+/** Task-policy fixture: nested exact patterns alongside entries that
+ * cannot be expressed exactly (the '*' catch-all key, wildcard resource
+ * patterns). Whole-tool string effects derive an action-scoped rule
+ * (resource = the declared tool key); nested wildcard patterns and the
+ * catch-all key remain underivable. */
 const TASK_POLICY = {
   '*': 'deny',
   edit: 'deny',
@@ -53,8 +76,11 @@ const TASK_POLICY = {
 };
 
 /** deriveExactPermissionRules(TASK_POLICY) — insertion order, with the
- * v1→v2 action mapping (bash → execute+bash, task → subagent). */
+ * v1→v2 action mapping (bash → execute+bash, task → subagent). The
+ * whole-tool `edit: 'deny'` derives the host-canonical `'*'`-resource
+ * rule; only the wildcard-pattern shapes are skipped. */
 const EXACT_RULES: V2PermissionRule[] = [
+  { action: 'edit', resource: '*', effect: 'deny' },
   { action: 'execute', resource: 'git push', effect: 'ask' },
   { action: 'bash', resource: 'git push', effect: 'ask' },
   { action: 'subagent', resource: 'explorer', effect: 'allow' },
@@ -83,16 +109,38 @@ function makeChildCreatedEvent(
   };
 }
 
+/** Session-domain stub: `update` captures when a function is given; the
+ * no-argument shape is a reduced-host session domain without `update`. */
+function makeSession(update?: (input: unknown) => Promise<unknown>): V2Session {
+  return (update ? { update } : {}) as unknown as V2Session;
+}
+
 function makeBridge(options?: {
-  permission?: V2Context['permission'];
+  session?: V2Session;
   policy?: unknown;
   pluginAgents?: ReadonlySet<string>;
   onUnavailable?: () => void;
+  requireKnownIdentity?: boolean | (() => boolean);
+  marketplaceAgentNames?: () => ReadonlySet<string>;
+  knownAgentNames?: () => ReadonlySet<string>;
 }): ReturnType<typeof createPermissionRulesBridge> {
-  return createPermissionRulesBridge(options?.permission, {
+  return createPermissionRulesBridge(options?.session, {
     permissionForAgent: (agent) =>
-      agent === 'probe' ? (options?.policy ?? TASK_POLICY) : undefined,
+      agent === 'probe'
+        ? options && Object.hasOwn(options, 'policy')
+          ? options.policy
+          : TASK_POLICY
+        : undefined,
     pluginAgents: options?.pluginAgents ?? new Set(['probe']),
+    ...(options?.requireKnownIdentity !== undefined
+      ? { requireKnownIdentity: options.requireKnownIdentity }
+      : {}),
+    ...(options?.marketplaceAgentNames
+      ? { marketplaceAgentNames: options.marketplaceAgentNames }
+      : {}),
+    ...(options?.knownAgentNames
+      ? { knownAgentNames: options.knownAgentNames }
+      : {}),
     ...(options?.onUnavailable ? { onUnavailable: options.onUnavailable } : {}),
   });
 }
@@ -102,14 +150,27 @@ describe('deriveExactPermissionRules', () => {
     expect(deriveExactPermissionRules(TASK_POLICY)).toEqual(EXACT_RULES);
   });
 
-  test('whole-tool string effects and the string shorthand are skipped', () => {
-    // A whole-tool effect (edit: 'deny') has no exact resource to match,
-    // and the string shorthand applies to every action — both would
-    // require a wildcard, so neither may be emitted.
+  test('whole-tool effects derive host-canonical *-resource rules; the string shorthand is skipped', () => {
+    // A whole-tool effect (edit: 'deny') covers every resource of the
+    // tool; the host-canonical expression of that scope is the `'*'`
+    // resource — what `whollyDisabled` keys on and what the static agent
+    // registration emits. The string shorthand applies to every ACTION
+    // and is still skipped — the static agent rules carry it.
     expect(deriveExactPermissionRules('ask')).toEqual([]);
     expect(deriveExactPermissionRules({ edit: 'deny', read: 'allow' })).toEqual(
-      [],
+      [
+        { action: 'edit', resource: '*', effect: 'deny' },
+        { action: 'read', resource: '*', effect: 'allow' },
+      ],
     );
+    // v1→v2 action aliasing applies to whole-tool entries too.
+    expect(deriveExactPermissionRules({ bash: 'deny' })).toEqual([
+      { action: 'execute', resource: '*', effect: 'deny' },
+      { action: 'bash', resource: '*', effect: 'deny' },
+    ]);
+    expect(deriveExactPermissionRules({ task: 'deny' })).toEqual([
+      { action: 'subagent', resource: '*', effect: 'deny' },
+    ]);
   });
 
   test('question-mark wildcards are rejected like asterisks', () => {
@@ -127,23 +188,449 @@ describe('deriveExactPermissionRules', () => {
         webfetch: { 'https://x.example': 'maybe' },
       }),
     ).toEqual([]);
+    expect(deriveExactPermissionRules({ read: 'maybe' })).toEqual([]);
+  });
+});
+
+// ── Built-in agent derivation matrix (incident: explorer derived 0 rules) ──
+
+/** v1 tool keys the v2 evaluator addresses under a different action name. */
+const V1_KEY_TO_V2_ACTIONS: Record<string, readonly string[]> = {
+  task: ['subagent'],
+  bash: ['execute', 'bash'],
+};
+
+function v2ActionsForV1Key(key: string): readonly string[] {
+  return V1_KEY_TO_V2_ACTIONS[key] ?? [key];
+}
+
+type AgentPermissionMap = Record<
+  string,
+  'allow' | 'ask' | 'deny' | Record<string, 'allow' | 'ask' | 'deny'>
+>;
+
+/** Every whole-tool declaration (wildcard-free key, valid effect) must
+ * survive derivation as an action-scoped exact rule per v2 action. */
+function coversWholeToolDeclarations(
+  rules: V2PermissionRule[],
+  map: AgentPermissionMap,
+): boolean {
+  for (const [tool, value] of Object.entries(map)) {
+    if (typeof value !== 'string') continue;
+    if (value !== 'allow' && value !== 'deny' && value !== 'ask') continue;
+    if (tool.includes('*') || tool.includes('?')) continue;
+    for (const action of v2ActionsForV1Key(tool)) {
+      if (
+        !rules.some(
+          (rule) =>
+            rule.action === action &&
+            rule.resource === '*' &&
+            rule.effect === value,
+        )
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/** No-widening gate: every derived rule must trace back to a declaration —
+ * either the whole-tool entry its resource names, or a nested non-wildcard
+ * pattern entry on a tool key that maps to the rule's action. */
+function everyRuleIsDeclared(
+  rules: V2PermissionRule[],
+  map: AgentPermissionMap,
+): boolean {
+  for (const rule of rules) {
+    const declared = Object.entries(map).some(([tool, value]) => {
+      if (!v2ActionsForV1Key(tool).includes(rule.action)) return false;
+      if (
+        rule.resource !== '*' &&
+        (rule.resource.includes('*') || rule.resource.includes('?'))
+      )
+        return false;
+      if (value === rule.effect && rule.resource === '*') return true;
+      return (
+        !!value &&
+        typeof value === 'object' &&
+        value[rule.resource] === rule.effect
+      );
+    });
+    if (!declared) return false;
+  }
+  return true;
+}
+
+/** Host-canonical rule shapes: no wildcard ACTIONS; resources are the
+ * whole-tool `'*'` or wildcard-free patterns. */
+function rulesAreHostCanonical(rules: V2PermissionRule[]): boolean {
+  return rules.every(
+    (rule) =>
+      !rule.action.match(/[*?]/) &&
+      (rule.resource === '*' || !rule.resource.match(/[*?]/)),
+  );
+}
+
+/** Real resolved permission maps from the production agent pipeline
+ * (createAgents + applyDefaultPermissions — exactly what the bridge's
+ * permissionForAgent receives via the config() hook). Council mode is
+ * enabled so the councillor (the one built-in that DECLARES a read-only
+ * tool set) and the synthesis-only council agent are part of the matrix. */
+function builtInAgentPermissionMaps(): Map<string, AgentPermissionMap> {
+  const dir = 'v2-perm-rules-matrix';
+  RuntimeConfig.reset(dir);
+  RuntimeConfig.init(
+    dir,
+    PluginConfigSchema.parse({
+      council: {
+        presets: { default: { alpha: { model: 'test/councillor' } } },
+      },
+    }),
+  );
+  const maps = new Map<string, AgentPermissionMap>();
+  for (const agent of createAgents(RuntimeConfig.get(dir))) {
+    maps.set(agent.name, (agent.config.permission ?? {}) as AgentPermissionMap);
+  }
+  return maps;
+}
+
+describe('built-in agent permission-rule derivation matrix', () => {
+  // Shared, computed once: deriving from the real resolved maps keeps the
+  // matrix honest against definition drift.
+  let maps: Map<string, AgentPermissionMap>;
+  beforeAll(() => {
+    maps = builtInAgentPermissionMaps();
+  });
+
+  test('the expected built-in roster is present', () => {
+    for (const name of [
+      'orchestrator',
+      'explorer',
+      'oracle',
+      'designer',
+      'fixer',
+      'council',
+      'councillor',
+    ]) {
+      expect(maps.has(name), `agent ${name} missing from matrix`).toBe(true);
+    }
+  });
+
+  test.each([
+    'orchestrator',
+    'explorer',
+    'oracle',
+    'designer',
+    'fixer',
+    'council',
+    'councillor',
+  ])('%s derives a non-empty, declaration-faithful rule set', (name) => {
+    const map = maps.get(name) as AgentPermissionMap;
+    const rules = deriveExactPermissionRules(map);
+    // Incident fix: 0 rules meant the bridge skipped session.update and
+    // the child stayed on inherited parent session rules.
+    expect(rules.length).toBeGreaterThan(0);
+    expect(rulesAreHostCanonical(rules)).toBe(true);
+    expect(coversWholeToolDeclarations(rules, map)).toBe(true);
+    expect(everyRuleIsDeclared(rules, map)).toBe(true);
+  });
+
+  test('councillor (declared read-only set) derives read-class allow rules', () => {
+    const rules = deriveExactPermissionRules(
+      maps.get('councillor') as AgentPermissionMap,
+    );
+    for (const action of [
+      'read',
+      'glob',
+      'grep',
+      'lsp',
+      'list',
+      'codesearch',
+      'ast_grep_search',
+    ]) {
+      expect(rules).toContainEqual({
+        action,
+        resource: '*',
+        effect: 'allow',
+      });
+    }
+    // The declared write-class boundary is carried too.
+    for (const action of ['edit', 'write', 'apply_patch']) {
+      expect(rules).toContainEqual({
+        action,
+        resource: '*',
+        effect: 'deny',
+      });
+    }
+  });
+
+  test('council (synthesis-only) derives no allow rules', () => {
+    const rules = deriveExactPermissionRules(
+      maps.get('council') as AgentPermissionMap,
+    );
+    expect(rules.length).toBeGreaterThan(0);
+    expect(rules.every((rule) => rule.effect !== 'allow')).toBe(true);
+  });
+
+  test('fixer and designer derive question deny rules (default flip)', () => {
+    for (const name of ['fixer', 'designer'] as const) {
+      const rules = deriveExactPermissionRules(
+        maps.get(name) as AgentPermissionMap,
+      );
+      expect(rules).toContainEqual({
+        action: 'question',
+        resource: '*',
+        effect: 'deny',
+      });
+    }
+  });
+
+  test('explorer row (incident): bridge applies the derived rules to the child session', async () => {
+    const calls: RulesCall[] = [];
+    const bridge = createPermissionRulesBridge(
+      makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
+      {
+        permissionForAgent: (agent) => maps.get(agent),
+        pluginAgents: new Set(maps.keys()),
+      },
+    );
+
+    await bridge.observeSessionCreated(
+      makeChildCreatedEvent({ agent: 'explorer' }),
+    );
+
+    // Before the fix this was 0 calls ("no exact-match rules derivable")
+    // and the child kept the parent's inherited session-scoped rules.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].sessionID).toBe('ses_child_1');
+    expect(calls[0].permissions.length).toBeGreaterThan(0);
+    expect(rulesAreHostCanonical(calls[0].permissions)).toBe(true);
+    expect(calls[0].permissions).toContainEqual({
+      action: 'question',
+      resource: '*',
+      effect: 'deny',
+    });
+  });
+
+  test('councillor row: applied rules include the read-class allows', async () => {
+    const calls: RulesCall[] = [];
+    const bridge = createPermissionRulesBridge(
+      makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
+      {
+        permissionForAgent: (agent) => maps.get(agent),
+        pluginAgents: new Set(maps.keys()),
+      },
+    );
+
+    await bridge.observeSessionCreated(
+      makeChildCreatedEvent({ agent: 'councillor' }),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].permissions).toContainEqual({
+      action: 'read',
+      resource: '*',
+      effect: 'allow',
+    });
+    expect(calls[0].permissions).toContainEqual({
+      action: 'grep',
+      resource: '*',
+      effect: 'allow',
+    });
   });
 });
 
 describe('createPermissionRulesBridge', () => {
   beforeEach(() => {
-    __resetPermissionRulesWarningForTesting();
+    resetV2GenerationWarnings();
+  });
+
+  test('without session.get, ordinary prompts continue but observed unknown children block', async () => {
+    const ordinary = makeBridge({
+      session: makeSession(),
+    });
+    await expect(
+      ordinary.ensurePromptPermission('ses_ordinary_root'),
+    ).resolves.toBeUndefined();
+
+    const marketplace = makeBridge({
+      session: makeSession(),
+      requireKnownIdentity: true,
+    });
+    await marketplace.observeEvent({
+      type: 'session.created',
+      data: { sessionID: 'ses_marketplace_child', parentID: 'ses_parent' },
+    });
+    await expect(
+      marketplace.ensurePromptPermission('ses_marketplace_child'),
+    ).rejects.toThrow('child session identity is unknown');
+
+    await ordinary.dispose();
+    await marketplace.dispose();
+  });
+
+  test('blocks an unobserved root prompt when marketplace policy is active and lookup is unavailable', async () => {
+    const bridge = makeBridge({
+      session: makeSession(),
+      requireKnownIdentity: () => true,
+      marketplaceAgentNames: () => new Set(['package-agent']),
+    });
+
+    await expect(
+      bridge.ensurePromptPermission('ses_unobserved_marketplace_root'),
+    ).rejects.toThrow('child session identity is unknown');
+    await bridge.dispose();
+  });
+
+  test.each([
+    ['marketplace finalizes before the child event', true],
+    ['the child event precedes marketplace finalization', false],
+  ])(
+    'reads marketplace readiness live when %s',
+    async (_order, finalizedBeforeChild) => {
+      let finalized = finalizedBeforeChild;
+      const marketplace = makeBridge({
+        session: makeSession(),
+        requireKnownIdentity: () => finalized,
+      });
+      if (!finalizedBeforeChild) {
+        await marketplace.observeEvent({
+          type: 'session.created',
+          data: {
+            sessionID: 'ses_deferred_marketplace_child',
+            parentID: 'ses_parent',
+            agent: 'unclassified-agent',
+          },
+        });
+        await expect(
+          marketplace.ensurePromptPermission('ses_deferred_marketplace_child'),
+        ).resolves.toBeUndefined();
+        finalized = true;
+      } else {
+        await marketplace.observeEvent({
+          type: 'session.created',
+          data: {
+            sessionID: 'ses_deferred_marketplace_child',
+            parentID: 'ses_parent',
+            agent: 'unclassified-agent',
+          },
+        });
+      }
+      await expect(
+        marketplace.ensurePromptPermission('ses_deferred_marketplace_child'),
+      ).rejects.toThrow('child session identity is unknown');
+      await marketplace.dispose();
+    },
+  );
+
+  test('blocks direct root marketplace agents without replacing root permissions', async () => {
+    const calls: RulesCall[] = [];
+    const bridge = makeBridge({
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
+      pluginAgents: new Set(['probe', 'package-agent']),
+      requireKnownIdentity: () => true,
+      marketplaceAgentNames: () => new Set(['package-agent', 'PackageAlias']),
+    });
+    await bridge.observeEvent({
+      type: 'session.created',
+      data: { sessionID: 'ses_root_package', agent: 'package-agent' },
+    });
+
+    await expect(
+      bridge.ensurePromptPermission('ses_root_package'),
+    ).rejects.toThrow('direct root marketplace agent');
+    expect(calls).toEqual([]);
+    await bridge.dispose();
+  });
+
+  test('resolves root identities without an agent before admitting marketplace prompts', async () => {
+    let lookupCount = 0;
+    const bridge = makeBridge({
+      session: {
+        get: async () => {
+          lookupCount += 1;
+          return {
+            data: {
+              sessionID: 'ses_root_without_agent',
+              agent: 'host-orchestrator',
+            },
+          };
+        },
+        update: async () => ({}),
+      } as unknown as V2Session,
+      requireKnownIdentity: () => true,
+      marketplaceAgentNames: () => new Set(['package-agent']),
+      knownAgentNames: () => new Set(['host-orchestrator']),
+      pluginAgents: new Set(['probe']),
+    });
+    await bridge.observeEvent({
+      type: 'session.created',
+      data: { sessionID: 'ses_root_without_agent' },
+    });
+
+    await expect(
+      bridge.ensurePromptPermission('ses_root_without_agent'),
+    ).resolves.toBeUndefined();
+    expect(lookupCount).toBe(1);
+    await bridge.dispose();
+  });
+
+  test('fails closed for a root without an agent when session lookup is unavailable', async () => {
+    const bridge = makeBridge({
+      session: makeSession(),
+      requireKnownIdentity: () => true,
+      marketplaceAgentNames: () => new Set(['package-agent']),
+    });
+    await bridge.observeEvent({
+      type: 'session.created',
+      data: { sessionID: 'ses_root_without_agent' },
+    });
+
+    await expect(
+      bridge.ensurePromptPermission('ses_root_without_agent'),
+    ).rejects.toThrow('child session identity is unknown');
+    await bridge.dispose();
+  });
+
+  test('admits identified foreign-agent children without replacing their rules', async () => {
+    const updates: RulesCall[] = [];
+    const bridge = makeBridge({
+      session: makeSession(async (input) => {
+        updates.push(input as RulesCall);
+        return {};
+      }),
+      pluginAgents: new Set(['probe']),
+      requireKnownIdentity: () => true,
+      knownAgentNames: () => new Set(['host-foreign-agent']),
+    });
+    await bridge.observeEvent(
+      makeChildCreatedEvent({ agent: 'host-foreign-agent' }),
+    );
+
+    await expect(
+      bridge.ensurePromptPermission('ses_child_1'),
+    ).resolves.toBeUndefined();
+    expect(updates).toEqual([]);
+    await bridge.dispose();
   });
 
   test('(a) applies exact-match rules on a plugin-managed child session', async () => {
     const calls: RulesCall[] = [];
     const bridge = makeBridge({
-      permission: {
-        rules: async (input) => {
-          calls.push(input);
-          return {};
-        },
-      },
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
     });
 
     await bridge.observeSessionCreated(makeChildCreatedEvent({}));
@@ -156,12 +643,10 @@ describe('createPermissionRulesBridge', () => {
   test('(a-legacy) reads the legacy `properties` payload spelling', async () => {
     const calls: RulesCall[] = [];
     const bridge = makeBridge({
-      permission: {
-        rules: async (input) => {
-          calls.push(input);
-          return {};
-        },
-      },
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
     });
 
     await bridge.observeSessionCreated(makeChildCreatedEvent({}, 'properties'));
@@ -173,12 +658,10 @@ describe('createPermissionRulesBridge', () => {
   test('(c) duplicate session.created for the same sessionID applies once', async () => {
     const calls: RulesCall[] = [];
     const bridge = makeBridge({
-      permission: {
-        rules: async (input) => {
-          calls.push(input);
-          return {};
-        },
-      },
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
     });
 
     const event = makeChildCreatedEvent({});
@@ -193,13 +676,16 @@ describe('createPermissionRulesBridge', () => {
     const warnings: string[] = [];
     const onUnavailable = () => warnings.push('warn');
 
-    // Host without a permission domain at all (pre-2.0.0)...
+    // Host without a session domain at all...
     const domainless = makeBridge({ onUnavailable });
     await domainless.observeSessionCreated(makeChildCreatedEvent({}));
-    // ...and a host whose domain lacks the rules method. Both take the
-    // same capability-probe path.
-    const ruleless = makeBridge({ permission: {}, onUnavailable });
-    await ruleless.observeSessionCreated(
+    // ...and a host whose session domain lacks the update method. Both
+    // take the same capability-probe path.
+    const updateless = makeBridge({
+      session: makeSession(),
+      onUnavailable,
+    });
+    await updateless.observeSessionCreated(
       makeChildCreatedEvent({ sessionID: 'ses_child_2' }),
     );
 
@@ -209,22 +695,20 @@ describe('createPermissionRulesBridge', () => {
 
     // The latch is the only repeat-suppressor: after a reset the next
     // degraded host observation warns again (once).
-    __resetPermissionRulesWarningForTesting();
-    await ruleless.observeSessionCreated(
+    resetV2GenerationWarnings();
+    await updateless.observeSessionCreated(
       makeChildCreatedEvent({ sessionID: 'ses_child_3' }),
     );
     expect(warnings).toHaveLength(2);
   });
 
-  test('(d) emitted rules never contain wildcard characters', async () => {
+  test('(d) emitted rules are host-canonical (whole-tool * resource, no pattern wildcards)', async () => {
     const calls: RulesCall[] = [];
     const bridge = makeBridge({
-      permission: {
-        rules: async (input) => {
-          calls.push(input);
-          return {};
-        },
-      },
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
     });
 
     await bridge.observeSessionCreated(makeChildCreatedEvent({}));
@@ -233,18 +717,16 @@ describe('createPermissionRulesBridge', () => {
     expect(calls[0].permissions).toHaveLength(EXACT_RULES.length);
     for (const rule of calls[0].permissions) {
       expect(rule.action).not.toMatch(/[*?]/);
-      expect(rule.resource).not.toMatch(/[*?]/);
+      expect(rule.resource === '*' || !rule.resource.match(/[*?]/)).toBe(true);
       expect(['allow', 'deny', 'ask']).toContain(rule.effect);
     }
   });
 
-  test('(e) a throwing rules() is absorbed, never thrown into the pump', async () => {
+  test('(e) a throwing update() is absorbed, never thrown into the pump', async () => {
     const bridge = makeBridge({
-      permission: {
-        rules: async () => {
-          throw new Error('host rejected the ruleset');
-        },
-      },
+      session: makeSession(async () => {
+        throw new Error('host rejected the ruleset');
+      }),
     });
 
     await expect(
@@ -259,20 +741,18 @@ describe('createPermissionRulesBridge', () => {
 
   test('(e-retry) a failed application is retried by a duplicate session.created', async () => {
     // Regression (review on #1194): the applied marker used to be set
-    // before the host call, so a rejected rules() permanently stranded
+    // before the host call, so a rejected update() permanently stranded
     // the child on inherited session rules. Completion must latch only
     // on success; failure releases the slot for the next event.
     let attempts = 0;
     const calls: RulesCall[] = [];
     const bridge = makeBridge({
-      permission: {
-        rules: async (input) => {
-          attempts += 1;
-          if (attempts === 1) throw new Error('transient host failure');
-          calls.push(input);
-          return {};
-        },
-      },
+      session: makeSession(async (input) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('transient host failure');
+        calls.push(input as RulesCall);
+        return {};
+      }),
     });
 
     await expect(
@@ -290,13 +770,212 @@ describe('createPermissionRulesBridge', () => {
     expect(attempts).toBe(2);
   });
 
-  test('malformed events resolve without throwing (fail-soft)', async () => {
+  test('prompt-side application shares the in-flight update and surfaces failure', async () => {
+    let finishUpdate!: () => void;
     const bridge = makeBridge({
-      permission: {
-        rules: async () => {
-          throw new Error('must not be called');
+      session: makeSession(
+        () =>
+          new Promise((resolve) => {
+            finishUpdate = () => resolve({});
+          }),
+      ),
+    });
+    const eventApply = bridge.observeEvent(makeChildCreatedEvent({}));
+    let promptDone = false;
+    const promptApply = bridge
+      .ensurePromptPermission('ses_child_1')
+      .then(() => {
+        promptDone = true;
+      });
+    await Promise.resolve();
+    expect(promptDone).toBe(false);
+    finishUpdate();
+    await Promise.all([eventApply, promptApply]);
+    expect(promptDone).toBe(true);
+
+    const failed = makeBridge({
+      session: makeSession(async () => {
+        throw new Error('update failed');
+      }),
+    });
+    await failed.observeEvent(makeChildCreatedEvent({}));
+    await expect(failed.ensurePromptPermission('ses_child_1')).rejects.toThrow(
+      'update failed',
+    );
+  });
+
+  test('session.created observation remains pending until its rules update completes', async () => {
+    let finishUpdate!: () => void;
+    const bridge = makeBridge({
+      session: makeSession(
+        () =>
+          new Promise((resolve) => {
+            finishUpdate = () => resolve({});
+          }),
+      ),
+    });
+    let downstreamCanContinue = false;
+    const dispatch = bridge
+      .observeSessionCreated(makeChildCreatedEvent({}))
+      .then(() => {
+        downstreamCanContinue = true;
+      });
+
+    await Promise.resolve();
+    expect(downstreamCanContinue).toBe(false);
+    finishUpdate();
+    await dispatch;
+    expect(downstreamCanContinue).toBe(true);
+  });
+
+  test('unrelated session events do not stale an outstanding identity lookup', async () => {
+    let resolveLookup!: (value: unknown) => void;
+    const calls: RulesCall[] = [];
+    const getCalls: string[] = [];
+    const bridge = makeBridge({
+      session: {
+        get: async ({ sessionID }: { sessionID: string }) => {
+          getCalls.push(sessionID);
+          return await new Promise((resolve) => {
+            resolveLookup = resolve;
+          });
+        },
+        update: async (input: RulesCall) => {
+          calls.push(input);
+          return {};
+        },
+      } as unknown as V2Session,
+    });
+
+    const admission = bridge.ensurePromptPermission('ses_lookup_a');
+    await Promise.resolve();
+    expect(getCalls).toEqual(['ses_lookup_a']);
+    await bridge.observeEvent({
+      type: 'session.created',
+      data: {
+        sessionID: 'ses_unrelated_b',
+        parentID: 'ses_parent',
+        agent: 'probe',
+      },
+    });
+    resolveLookup({
+      data: { parentID: 'ses_parent', agent: 'probe' },
+    });
+    await admission;
+
+    expect(calls.map(({ sessionID }) => sessionID)).toEqual([
+      'ses_unrelated_b',
+      'ses_lookup_a',
+    ]);
+    await bridge.dispose();
+  });
+
+  test.each([
+    {
+      description: 'changed creation',
+      event: {
+        type: 'session.created',
+        data: {
+          sessionID: 'ses_lookup_a',
+          parentID: 'ses_parent',
+          agent: 'host-agent',
         },
       },
+    },
+    {
+      description: 'agent selection',
+      event: {
+        type: 'session.agent.selected',
+        data: {
+          sessionID: 'ses_lookup_a',
+          parentID: 'ses_parent',
+          agent: 'host-agent',
+        },
+      },
+    },
+    {
+      description: 'deletion',
+      event: {
+        type: 'session.deleted',
+        data: { sessionID: 'ses_lookup_a' },
+      },
+    },
+  ])(
+    'a stale identity lookup cannot overwrite a later $description event',
+    async ({ event }) => {
+      let resolveLookup!: (value: unknown) => void;
+      const calls: RulesCall[] = [];
+      const bridge = makeBridge({
+        session: {
+          get: async () =>
+            await new Promise((resolve) => {
+              resolveLookup = resolve;
+            }),
+          update: async (input: RulesCall) => {
+            calls.push(input);
+            return {};
+          },
+        } as unknown as V2Session,
+      });
+
+      const admission = bridge.ensurePromptPermission('ses_lookup_a');
+      await Promise.resolve();
+      await bridge.observeEvent(event);
+      resolveLookup({
+        data: { parentID: 'ses_parent', agent: 'probe' },
+      });
+      await admission;
+
+      expect(calls).toHaveLength(0);
+      await bridge.dispose();
+    },
+  );
+
+  test('duplicate creation events share one in-flight permission update', async () => {
+    let finishUpdate!: () => void;
+    const calls: RulesCall[] = [];
+    const bridge = makeBridge({
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        await new Promise<void>((resolve) => {
+          finishUpdate = resolve;
+        });
+        return {};
+      }),
+    });
+    const first = bridge.observeEvent(makeChildCreatedEvent({}));
+    await Promise.resolve();
+    const duplicate = bridge.observeEvent(makeChildCreatedEvent({}));
+    await Promise.resolve();
+
+    expect(calls).toHaveLength(1);
+    finishUpdate();
+    await Promise.all([first, duplicate]);
+    expect(calls).toHaveLength(1);
+    await bridge.dispose();
+  });
+
+  test('dispose prevents any later permission writes', async () => {
+    const calls: RulesCall[] = [];
+    const bridge = makeBridge({
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
+    });
+    await bridge.dispose();
+    await bridge.observeSessionCreated(makeChildCreatedEvent({}));
+    await expect(bridge.ensurePromptPermission('ses_child_1')).rejects.toThrow(
+      'disposed',
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  test('malformed events resolve without throwing (fail-soft)', async () => {
+    const bridge = makeBridge({
+      session: makeSession(async () => {
+        throw new Error('must not be called');
+      }),
     });
     await expect(
       bridge.observeSessionCreated(undefined as never),
@@ -316,12 +995,10 @@ describe('createPermissionRulesBridge', () => {
     const calls: RulesCall[] = [];
     const warnings: string[] = [];
     const bridge = makeBridge({
-      permission: {
-        rules: async (input) => {
-          calls.push(input);
-          return {};
-        },
-      },
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
       onUnavailable: () => warnings.push('warn'),
     });
 
@@ -329,8 +1006,8 @@ describe('createPermissionRulesBridge', () => {
       makeChildCreatedEvent({ parentID: undefined }),
     );
 
-    // ctx.permission.rules REPLACES the session-scoped list — a root
-    // session must not even probe the capability.
+    // session.update `permissions` REPLACES the session-scoped list — a
+    // root session must not even probe the capability.
     expect(calls).toHaveLength(0);
     expect(warnings).toHaveLength(0);
   });
@@ -339,12 +1016,10 @@ describe('createPermissionRulesBridge', () => {
     const calls: RulesCall[] = [];
     const warnings: string[] = [];
     const bridge = makeBridge({
-      permission: {
-        rules: async (input) => {
-          calls.push(input);
-          return {};
-        },
-      },
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
       pluginAgents: new Set(['probe']),
       onUnavailable: () => warnings.push('warn'),
     });
@@ -365,14 +1040,14 @@ describe('createPermissionRulesBridge', () => {
   test('an empty exact-match derivation skips the host call', async () => {
     const calls: RulesCall[] = [];
     const bridge = makeBridge({
-      permission: {
-        rules: async (input) => {
-          calls.push(input);
-          return {};
-        },
-      },
-      // read-only policies are whole-tool effects only: nothing to apply
-      policy: { edit: 'deny', read: 'allow' },
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
+      // Wildcard-only shapes are the genuinely underivable case: the
+      // catch-all key needs a wildcard on both axes and the MCP-style
+      // suffixed key carries one in the action.
+      policy: { '*': 'deny', 'github_*': 'allow' },
     });
 
     await bridge.observeSessionCreated(makeChildCreatedEvent({}));
@@ -380,30 +1055,90 @@ describe('createPermissionRulesBridge', () => {
 
     expect(calls).toHaveLength(0);
   });
-});
 
-/** Event stream that yields the given events, then parks forever (the
- * pump keeps consuming until dispose). */
-function eventIterable(
-  events: Array<Record<string, unknown>>,
-): AsyncIterable<Record<string, unknown>> {
-  let index = 0;
-  return {
-    [Symbol.asyncIterator]: () => ({
-      next: (): Promise<IteratorResult<Record<string, unknown>>> => {
-        if (index < events.length) {
-          return Promise.resolve({ value: events[index++], done: false });
-        }
-        return new Promise(() => {});
+  test('an explicitly compiled empty policy does not replace session permissions', async () => {
+    const calls: RulesCall[] = [];
+    const bridge = makeBridge({
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
+      policy: [],
+    });
+
+    await bridge.observeSessionCreated(makeChildCreatedEvent({}));
+
+    expect(calls).toHaveLength(0);
+  });
+
+  test('an unavailable policy fails without latching the child as applied', async () => {
+    const calls: RulesCall[] = [];
+    const bridge = makeBridge({
+      session: makeSession(async (input) => {
+        calls.push(input as RulesCall);
+        return {};
+      }),
+      policy: undefined,
+    });
+
+    await bridge.observeEvent(
+      makeChildCreatedEvent({ sessionID: 'ses_child_missing_policy' }),
+    );
+    await expect(
+      bridge.ensurePromptPermission('ses_child_missing_policy'),
+    ).rejects.toThrow('permission policy unavailable');
+    await bridge.observeSessionCreated(
+      makeChildCreatedEvent({ sessionID: 'ses_child_missing_policy' }),
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  test('dispose awaits held update and rejects an admission crossing cleanup', async () => {
+    let finishUpdate!: () => void;
+    const calls: RulesCall[] = [];
+    const bridge = makeBridge({
+      session: makeSession((input) => {
+        calls.push(input as RulesCall);
+        return new Promise((resolve) => {
+          finishUpdate = () => resolve({});
+        });
+      }),
+    });
+    const eventApply = bridge.observeEvent(
+      makeChildCreatedEvent({ sessionID: 'ses_child_held' }),
+    );
+    const admission = bridge.ensurePromptPermission('ses_child_held');
+    let admissionSucceeded = false;
+    const observedAdmission = admission.then(
+      () => {
+        admissionSucceeded = true;
       },
-      return: () =>
-        Promise.resolve({
-          value: undefined,
-          done: true,
-        } as IteratorResult<Record<string, unknown>>),
-    }),
-  };
-}
+      () => {
+        // The strict admission promise below is asserted separately; observe
+        // its rejection here too so the lifecycle test has no stray rejection.
+      },
+    );
+    await Promise.resolve();
+
+    let disposalFinished = false;
+    const disposal = bridge.dispose().then(() => {
+      disposalFinished = true;
+    });
+    await Promise.resolve();
+    expect(disposalFinished).toBe(false);
+    expect(admissionSucceeded).toBe(false);
+
+    finishUpdate();
+    await expect(admission).rejects.toThrow('barrier expired');
+    await eventApply;
+    await Promise.all([observedAdmission, disposal]);
+    expect(disposalFinished).toBe(true);
+    expect(admissionSucceeded).toBe(false);
+    expect(calls).toHaveLength(1);
+    await bridge.dispose();
+    expect(calls).toHaveLength(1);
+  });
+});
 
 describe('createV2Setup permission rules wiring', () => {
   let originalEnv: typeof process.env;
@@ -411,7 +1146,7 @@ describe('createV2Setup permission rules wiring', () => {
 
   beforeEach(async () => {
     originalEnv = { ...process.env };
-    fixtureRoot = await mkdtemp('/tmp/omo-v2-perm-rules-');
+    fixtureRoot = await mkdtemp(path.join(tmpdir(), 'omo-v2-perm-rules-'));
     const configDir = path.join(fixtureRoot, 'config');
     await Bun.write(
       path.join(configDir, 'oh-my-opencode-slim.json'),
@@ -431,105 +1166,582 @@ describe('createV2Setup permission rules wiring', () => {
         },
       }),
     );
-    process.env = {
-      ...originalEnv,
-      OPENCODE_CONFIG_DIR: configDir,
-      XDG_CONFIG_HOME: path.join(fixtureRoot, 'xdg-config'),
-      XDG_DATA_HOME: path.join(fixtureRoot, 'xdg-data'),
-      XDG_CACHE_HOME: path.join(fixtureRoot, 'xdg-cache'),
-      OPENCODE_LOG_DIR: path.join(fixtureRoot, 'logs'),
-    };
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    process.env.XDG_CONFIG_HOME = path.join(fixtureRoot, 'xdg-config');
+    process.env.XDG_DATA_HOME = path.join(fixtureRoot, 'xdg-data');
+    process.env.XDG_CACHE_HOME = path.join(fixtureRoot, 'xdg-cache');
+    process.env.OPENCODE_LOG_DIR = path.join(fixtureRoot, 'logs');
     delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
-    __resetPermissionRulesWarningForTesting();
+    resetV2GenerationWarnings();
   });
 
   afterEach(async () => {
-    process.env = originalEnv;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
     await rm(fixtureRoot, { recursive: true, force: true });
   });
 
-  test('the event pump applies child session rules via ctx.permission.rules', async () => {
-    const calls: RulesCall[] = [];
-    const projectDir = path.join(fixtureRoot, 'project');
-    const ctx = {
-      app: { name: 'opencode', version: 'v2-perm-rules-test' },
-      options: {},
-      location: {
-        directory: projectDir,
-        project: {
-          id: 'proj_perm_rules',
+  test.each([
+    { getAvailable: true, updateAvailable: true },
+    { getAvailable: false, updateAvailable: true },
+    { getAvailable: true, updateAvailable: false },
+    {
+      getAvailable: true,
+      updateAvailable: true,
+      abortRegistrationFailure: true,
+    },
+    {
+      getAvailable: true,
+      updateAvailable: true,
+      neverSettleUpdate: true,
+    },
+  ])(
+    'setup prompt barrier capability probe %#',
+    async ({
+      getAvailable,
+      updateAvailable,
+      abortRegistrationFailure = false,
+      neverSettleUpdate = false,
+    }) => {
+      const calls: RulesCall[] = [];
+      const projectDir = path.join(fixtureRoot, 'project');
+      let transformAgents!: (draft: unknown) => void;
+      const nativeAgents: Array<Record<string, unknown>> = [
+        {
+          id: 'explorer',
+          permissions: [
+            { action: 'read', resource: 'src/**', effect: 'deny' },
+            { action: 'read', resource: 'src/public.ts', effect: 'allow' },
+          ],
+        },
+      ];
+      let transformsApplied = false;
+      let publishEvent!: (event: Record<string, unknown>) => void;
+      let promptHandler:
+        | ((event: V2SessionPromptEvent) => Promise<void>)
+        | undefined;
+      let holdRulesUpdate = false;
+      let heldUpdatePending = false;
+      let finishRulesUpdate!: (error?: Error) => void;
+      const failedUpdateSessions = new Set<string>();
+      const failedLookupSessions = new Set<string>();
+      const getCalls: string[] = [];
+      let pendingLookupSessionID: string | undefined;
+      let rejectPendingLookup!: (error: Error) => void;
+      let registrationDisposals = 0;
+      let cleanedUp = false;
+      const eventQueue: Record<string, unknown>[] = [];
+      let wakeEvent: (() => void) | undefined;
+      let eventStreamStopped = false;
+      const requiredRegistrationError = new Error(
+        'required context registration failed',
+      );
+      const ctx = {
+        app: { name: 'opencode', version: 'v2-perm-rules-test' },
+        options: {},
+        location: {
           directory: projectDir,
-          canonical: projectDir,
+          project: {
+            id: 'proj_perm_rules',
+            directory: projectDir,
+            canonical: projectDir,
+          },
         },
-      },
-      agent: {
-        transform: async (cb: (draft: unknown) => void) => {
-          cb({
-            list: () => [],
-            get: () => undefined,
-            default: () => {},
-            update: () => {},
-            remove: () => {},
-          });
-          return { dispose: () => {} };
-        },
-        reload: async () => ({}),
-        list: async () => [],
-      },
-      session: {
-        hook: async () => ({ dispose: () => {} }),
-      },
-      permission: {
-        rules: async (input: RulesCall) => {
-          calls.push(input);
-          return {};
-        },
-      },
-      event: {
-        subscribe: () =>
-          eventIterable([
-            {
-              type: 'session.created',
-              data: {
-                sessionID: 'ses_probe_child',
-                parentID: 'ses_probe_parent',
-                agent: 'explorer',
+        agent: {
+          transform: async (cb: (draft: unknown) => void) => {
+            transformAgents = cb;
+            return {
+              dispose: () => {
+                registrationDisposals += 1;
               },
+            };
+          },
+          reload: async () => ({}),
+          list: async () => {
+            return nativeAgents;
+          },
+        },
+        mcp: {
+          transform: async (callback: (draft: unknown) => void) => {
+            callback({
+              list: () => [],
+              get: () => undefined,
+              set: () => {},
+              update: () => {},
+              remove: () => {},
+            });
+            return { dispose: () => {} };
+          },
+          reload: async () => {},
+        },
+        session: {
+          hook: async (name: string, callback: unknown) => {
+            if (name === 'context' && abortRegistrationFailure) {
+              throw requiredRegistrationError;
+            }
+            if (name === 'prompt') {
+              promptHandler = callback as typeof promptHandler;
+            }
+            return {
+              dispose: () => {
+                if (name === 'prompt' && abortRegistrationFailure) {
+                  return new Promise<void>(() => {});
+                }
+                registrationDisposals += 1;
+              },
+            };
+          },
+          ...(getAvailable
+            ? {
+                get: async ({ sessionID }: { sessionID: string }) => ({
+                  data: await (async () => {
+                    getCalls.push(sessionID);
+                    if (sessionID === pendingLookupSessionID) {
+                      return await new Promise<never>((_resolve, reject) => {
+                        rejectPendingLookup = reject;
+                      });
+                    }
+                    if (failedLookupSessions.has(sessionID)) {
+                      throw new Error('session lookup failed');
+                    }
+                    return sessionID === 'ses_probe_root'
+                      ? { agent: 'orchestrator' }
+                      : sessionID === 'ses_probe_foreign'
+                        ? { parentID: 'ses_parent', agent: 'host-agent' }
+                        : { parentID: 'ses_parent', agent: 'explorer' };
+                  })(),
+                }),
+              }
+            : {}),
+          ...(updateAvailable
+            ? {
+                update: async (input: RulesCall) => {
+                  calls.push(input);
+                  if (failedUpdateSessions.has(input.sessionID)) {
+                    throw new Error('held permission update failed');
+                  }
+                  if (
+                    neverSettleUpdate &&
+                    input.sessionID === 'ses_probe_child'
+                  ) {
+                    await new Promise<void>((resolve) => {
+                      finishRulesUpdate = () => resolve();
+                    });
+                  }
+                  if (holdRulesUpdate && !neverSettleUpdate) {
+                    heldUpdatePending = true;
+                    await new Promise<void>((resolve, reject) => {
+                      finishRulesUpdate = (error) =>
+                        error ? reject(error) : resolve();
+                    });
+                    heldUpdatePending = false;
+                  }
+                  return {};
+                },
+              }
+            : {}),
+        },
+        event: {
+          subscribe: () => ({
+            [Symbol.asyncIterator]: () => ({
+              next: async (): Promise<
+                IteratorResult<Record<string, unknown>>
+              > => {
+                while (eventQueue.length === 0 && !eventStreamStopped) {
+                  await new Promise<void>((resolve) => {
+                    wakeEvent = resolve;
+                  });
+                }
+                const event = eventQueue.shift();
+                return event
+                  ? { value: event, done: false }
+                  : { value: undefined, done: true };
+              },
+              return: async () => {
+                eventStreamStopped = true;
+                wakeEvent?.();
+                return { value: undefined, done: true } as IteratorResult<
+                  Record<string, unknown>
+                >;
+              },
+            }),
+          }),
+        },
+      } as unknown as V2Context;
+      publishEvent = (event) => {
+        eventQueue.push(event);
+        wakeEvent?.();
+        wakeEvent = undefined;
+      };
+
+      const setupPromise = createV2Setup()(ctx);
+      if (abortRegistrationFailure) {
+        const startedAt = Date.now();
+        await expect(setupPromise).rejects.toBe(requiredRegistrationError);
+        expect(Date.now() - startedAt).toBeLessThan(6_000);
+        return;
+      }
+      const cleanup = await setupPromise;
+
+      try {
+        // Simulate the host's batch flush after setup returned.
+        transformsApplied = true;
+        transformAgents({
+          list: () => nativeAgents,
+          get: () => undefined,
+          default: () => {},
+          // Like the host, finalized agent reads reflect plugin registration.
+          update: (
+            id: string,
+            mutate: (agent: Record<string, unknown>) => void,
+          ) => {
+            let agent = nativeAgents.find((entry) => entry.id === id);
+            if (!agent) {
+              agent = { id };
+              nativeAgents.push(agent);
+            }
+            mutate(agent);
+          },
+          remove: () => {},
+        });
+        expect(transformsApplied).toBe(true);
+        expect(promptHandler).toBeDefined();
+        const bridgeEnabled = updateAvailable;
+        const prompt = promptHandler as NonNullable<typeof promptHandler>;
+        holdRulesUpdate = bridgeEnabled;
+        if (getAvailable && bridgeEnabled && !neverSettleUpdate) {
+          pendingLookupSessionID = 'ses_probe_child';
+        }
+        let admissionFinished = false;
+        let admissionError: unknown;
+        const admission = prompt({
+          sessionID: 'ses_probe_child',
+          messageID: 'msg_before_creation',
+          prompt: { text: 'prompt before child creation' },
+        }).then(
+          () => {
+            admissionFinished = true;
+          },
+          (error: unknown) => {
+            admissionError = error;
+          },
+        );
+        if (getAvailable && bridgeEnabled) {
+          await Promise.resolve();
+          expect(getCalls).toContain('ses_probe_child');
+        }
+        publishEvent({
+          type: 'session.created',
+          data: {
+            sessionID: 'ses_probe_child',
+            parentID: 'ses_probe_parent',
+            agent: 'explorer',
+          },
+        });
+        // The pump dispatches asynchronously; poll briefly for the apply.
+        const deadline = Date.now() + 10_000;
+        while (calls.length === 0 && Date.now() < deadline) {
+          if (!bridgeEnabled) break;
+          await Bun.sleep(25);
+        }
+        if (neverSettleUpdate) {
+          expect(calls).toHaveLength(1);
+          await admission;
+          expect(String(admissionError)).toContain('timed out');
+          publishEvent({
+            type: 'session.created',
+            data: {
+              sessionID: 'ses_probe_next',
+              parentID: 'ses_probe_parent',
+              agent: 'explorer',
             },
-          ]),
-      },
-    } as unknown as V2Context;
+          });
+          const nextEventDeadline = Date.now() + 2_000;
+          while (calls.length < 2 && Date.now() < nextEventDeadline) {
+            await Bun.sleep(10);
+          }
+          expect(calls.map(({ sessionID }) => sessionID)).toEqual([
+            'ses_probe_child',
+            'ses_probe_next',
+          ]);
+          finishRulesUpdate();
+          await cleanup();
+          cleanedUp = true;
+          expect(registrationDisposals).toBeGreaterThan(0);
+          await Bun.sleep(0);
+          expect(calls).toHaveLength(2);
+          await expect(
+            (promptHandler as NonNullable<typeof promptHandler>)({
+              sessionID: 'ses_probe_late',
+              messageID: 'msg_late',
+              prompt: { text: 'late prompt' },
+            }),
+          ).rejects.toThrow('disposed');
+          expect(calls).toHaveLength(2);
+          return;
+        }
+        if (!bridgeEnabled) {
+          expect(calls).toHaveLength(0);
+          const managedPrompt = (
+            promptHandler as NonNullable<typeof promptHandler>
+          )({
+            sessionID: 'ses_probe_managed',
+            messageID: 'msg_managed',
+            prompt: { text: 'managed child input' },
+          });
+          await managedPrompt;
+          await (promptHandler as NonNullable<typeof promptHandler>)({
+            sessionID: 'ses_probe_foreign',
+            messageID: 'msg_foreign',
+            prompt: { text: 'foreign child input' },
+          });
+          await (promptHandler as NonNullable<typeof promptHandler>)({
+            sessionID: 'ses_probe_root',
+            messageID: 'msg_root',
+            prompt: { text: 'root input' },
+          });
+          expect(calls).toHaveLength(0);
+          return;
+        }
+        expect(calls).toHaveLength(1);
+        expect(heldUpdatePending).toBe(true);
+        if (getAvailable) {
+          rejectPendingLookup(new Error('creation beat identity lookup'));
+          await Promise.resolve();
+          expect(admissionFinished).toBe(false);
+        } else {
+          await admission; // update-only pre-creation prompt degrades
+          expect(admissionFinished).toBe(true);
+        }
+        let knownAdmissionFinished = false;
+        const knownAdmission = prompt({
+          sessionID: 'ses_probe_child',
+          messageID: 'msg_probe_child',
+          prompt: { text: 'first child input' },
+        }).then(() => {
+          knownAdmissionFinished = true;
+        });
+        await Promise.resolve();
+        expect(knownAdmissionFinished).toBe(false);
+        finishRulesUpdate();
+        await Promise.all([admission, knownAdmission]);
+        expect(admissionError).toBeUndefined();
+        expect(knownAdmissionFinished).toBe(true);
+        if (getAvailable) expect(admissionFinished).toBe(true);
+        holdRulesUpdate = false;
 
-    const cleanup = await createV2Setup()(ctx);
+        // Positive root/foreign and managed identities skip the optional lookup.
+        const beforeKnownUnmanagedEvents = calls.length;
+        publishEvent({
+          type: 'session.created',
+          data: { sessionID: 'ses_probe_root', agent: 'orchestrator' },
+        });
+        publishEvent({
+          type: 'session.created',
+          data: {
+            sessionID: 'ses_probe_foreign',
+            parentID: 'ses_parent',
+            agent: 'host-agent',
+          },
+        });
+        publishEvent({
+          type: 'session.created',
+          data: {
+            sessionID: 'ses_probe_barrier',
+            parentID: 'ses_parent',
+            agent: 'explorer',
+          },
+        });
+        const unmanagedDeadline = Date.now() + 2_000;
+        while (
+          calls.length === beforeKnownUnmanagedEvents &&
+          Date.now() < unmanagedDeadline
+        ) {
+          await Bun.sleep(10);
+        }
+        expect(calls.at(-1)?.sessionID).toBe('ses_probe_barrier');
+        const getCallsAfterKnownManaged = getCalls.length;
+        await prompt({
+          sessionID: 'ses_probe_root',
+          messageID: 'msg_root',
+          prompt: { text: 'root prompt' },
+        });
+        await prompt({
+          sessionID: 'ses_probe_foreign',
+          messageID: 'msg_foreign',
+          prompt: { text: 'foreign prompt' },
+        });
+        expect(getCalls).toHaveLength(getCallsAfterKnownManaged);
 
-    try {
-      // The pump dispatches asynchronously; poll briefly for the apply.
-      const deadline = Date.now() + 10_000;
-      while (calls.length === 0 && Date.now() < deadline) {
-        await Bun.sleep(25);
+        // Unknown lookup failure degrades this admission, but a later child
+        // creation still applies the native projection.
+        failedLookupSessions.add('ses_probe_unknown');
+        await (promptHandler as NonNullable<typeof promptHandler>)({
+          sessionID: 'ses_probe_unknown',
+          messageID: 'msg_unknown',
+          prompt: { text: 'unknown identity prompt' },
+        });
+        if (getAvailable) expect(getCalls).toContain('ses_probe_unknown');
+        const priorCalls = calls.length;
+        publishEvent({
+          type: 'session.created',
+          data: {
+            sessionID: 'ses_probe_unknown',
+            parentID: 'ses_parent',
+            agent: 'explorer',
+          },
+        });
+        const unknownDeadline = Date.now() + 2_000;
+        while (calls.length === priorCalls && Date.now() < unknownDeadline) {
+          await Bun.sleep(10);
+        }
+        expect(calls).toHaveLength(priorCalls + 1);
+
+        // A known managed identity never consults get, and a failed update
+        // rejects prompt admission rather than reporting false success.
+        failedUpdateSessions.add('ses_probe_failed');
+        publishEvent({
+          type: 'session.created',
+          data: {
+            sessionID: 'ses_probe_failed',
+            parentID: 'ses_parent',
+            agent: 'explorer',
+          },
+        });
+        await Bun.sleep(10);
+        const beforeFailedPromptLookupCount = getCalls.length;
+        await expect(
+          (promptHandler as NonNullable<typeof promptHandler>)({
+            sessionID: 'ses_probe_failed',
+            messageID: 'msg_failed',
+            prompt: { text: 'must not proceed' },
+          }),
+        ).rejects.toThrow('held permission update failed');
+        expect(getCalls).toHaveLength(beforeFailedPromptLookupCount);
+
+        if (getAvailable) {
+          const updatesBeforeAgentSelection = calls.length;
+          publishEvent({
+            type: 'session.agent.selected',
+            data: { sessionID: 'ses_probe_child', agent: 'host-agent' },
+          });
+          await Bun.sleep(10);
+          const lookupsBeforeForeignPrompt = getCalls.length;
+          await (promptHandler as NonNullable<typeof promptHandler>)({
+            sessionID: 'ses_probe_child',
+            messageID: 'msg_selected_foreign',
+            prompt: { text: 'selected foreign agent' },
+          });
+          expect(getCalls).toHaveLength(lookupsBeforeForeignPrompt);
+          expect(calls).toHaveLength(updatesBeforeAgentSelection);
+
+          publishEvent({
+            type: 'session.agent.selected',
+            data: { sessionID: 'ses_probe_child', agent: 'explorer' },
+          });
+          const selectedDeadline = Date.now() + 2_000;
+          while (
+            calls.length === updatesBeforeAgentSelection &&
+            Date.now() < selectedDeadline
+          ) {
+            await Bun.sleep(10);
+          }
+          expect(calls).toHaveLength(updatesBeforeAgentSelection + 1);
+          const lookupsBeforeDeletedPrompt = getCalls.length;
+          publishEvent({
+            type: 'session.deleted',
+            data: { sessionID: 'ses_probe_child' },
+          });
+          await Bun.sleep(10);
+          await (promptHandler as NonNullable<typeof promptHandler>)({
+            sessionID: 'ses_probe_child',
+            messageID: 'msg_after_delete',
+            prompt: { text: 'after deletion' },
+          });
+          expect(getCalls.length).toBe(lookupsBeforeDeletedPrompt + 1);
+        }
+        expect(calls[0].sessionID).toBe('ses_probe_child');
+        // The fixture's exact-match entry made it through the derivation
+        // (v1 `bash` maps to the v2 `execute` + `bash` actions).
+        expect(calls[0].permissions).toContainEqual({
+          action: 'execute',
+          resource: 'git push',
+          effect: 'ask',
+        });
+        expect(calls[0].permissions).toContainEqual({
+          action: 'bash',
+          resource: 'git push',
+          effect: 'ask',
+        });
+        // Ordered native host rules survive compilation unchanged, including
+        // the later exception: the read deny precedes the public.ts allow,
+        // and no compiled read rule or ask rule follows (the deny ceiling
+        // replays after them — see compileChildPermissions in
+        // src/agents/registry.ts — but this fixture's explorer baseline
+        // declares no read rules, so the exception is final).
+        const compiledPermissions = calls[0].permissions;
+        const narrowDenyIndex = compiledPermissions.findIndex(
+          (rule) =>
+            rule.action === 'read' &&
+            rule.resource === 'src/**' &&
+            rule.effect === 'deny',
+        );
+        const publicAllowIndex = compiledPermissions.findIndex(
+          (rule) =>
+            rule.action === 'read' &&
+            rule.resource === 'src/public.ts' &&
+            rule.effect === 'allow',
+        );
+        expect(narrowDenyIndex).toBeGreaterThanOrEqual(0);
+        expect(publicAllowIndex).toBeGreaterThan(narrowDenyIndex);
+        const afterAllow = compiledPermissions.slice(publicAllowIndex + 1);
+        expect(afterAllow.some((rule) => rule.action === 'read')).toBe(false);
+        expect(afterAllow.some((rule) => rule.effect === 'ask')).toBe(false);
+        expect(
+          afterAllow.some(
+            (rule) => rule.action !== 'read' && rule.effect === 'deny',
+          ),
+        ).toBe(true);
+        // Exception-level semantics: the public.ts allow survives the
+        // ceiling, everything else read-scoped stays denied.
+        const decideCompiled = (action: string, resource: string): string => {
+          const match = compiledPermissions.findLast(
+            (rule) =>
+              (rule.action === '*' || rule.action === action) &&
+              (rule.resource === '*' ||
+                rule.resource === resource ||
+                (rule.resource.endsWith('/**') &&
+                  resource.startsWith(rule.resource.slice(0, -3)))),
+          );
+          return match?.effect ?? 'ask';
+        };
+        expect(decideCompiled('read', 'src/public.ts')).toBe('allow');
+        expect(decideCompiled('read', 'src/other.ts')).toBe('deny');
+        expect(
+          calls[0].permissions.some(
+            (rule) =>
+              rule.action === 'execute' &&
+              rule.resource === 'git push' &&
+              rule.effect === 'ask',
+          ),
+        ).toBe(true);
+      } finally {
+        if (holdRulesUpdate) finishRulesUpdate();
+        if (!cleanedUp) await cleanup();
       }
-      expect(calls).toHaveLength(1);
-      expect(calls[0].sessionID).toBe('ses_probe_child');
-      // The fixture's exact-match entry made it through the derivation
-      // (v1 `bash` maps to the v2 `execute` + `bash` actions).
-      expect(calls[0].permissions).toContainEqual({
-        action: 'execute',
-        resource: 'git push',
-        effect: 'ask',
-      });
-      expect(calls[0].permissions).toContainEqual({
-        action: 'bash',
-        resource: 'git push',
-        effect: 'ask',
-      });
-      // Whatever else the resolved task-policy contributed stays
-      // wildcard-free (skill entries and the like).
-      for (const rule of calls[0].permissions) {
-        expect(rule.action).not.toMatch(/[*?]/);
-        expect(rule.resource).not.toMatch(/[*?]/);
-      }
-    } finally {
-      await cleanup();
-    }
-  }, 20_000);
+    },
+    20_000,
+  );
+
+  test('derives only the exact observer allow from the task pattern', () => {
+    // The '*' deny is skipped by the wildcard gate; it keeps living in the
+    // static agent registration. Only the exact observer allow survives.
+    expect(
+      deriveExactPermissionRules({
+        task: { '*': 'deny', observer: 'allow' },
+      }),
+    ).toEqual([{ action: 'subagent', resource: 'observer', effect: 'allow' }]);
+  });
 });

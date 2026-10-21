@@ -15,7 +15,6 @@
  *  (c) never produce duplicate completed results.
  */
 import { describe, expect, mock, test } from 'bun:test';
-import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
 import { BackgroundJobBoard } from '../../utils';
 import { createTaskSessionManagerHook } from './index';
 
@@ -31,7 +30,6 @@ function createHook(board: BackgroundJobBoard) {
     } as never,
     {
       maxSessionsPerAgent: 4,
-      maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
     },

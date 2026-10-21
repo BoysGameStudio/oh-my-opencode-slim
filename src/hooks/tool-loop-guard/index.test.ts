@@ -3,6 +3,7 @@ import type { ToolLoopGuardHook } from './hook';
 import {
   createToolLoopGuardHook,
   LOOP_GUARD_WARNING,
+  MAX_TRACKED_SESSIONS,
   WAIT_GUARD_MARKER,
   WAIT_GUARD_WARNING,
 } from './hook';
@@ -156,7 +157,7 @@ describe('tool-loop-guard', () => {
     }
   });
 
-  test('task_status and task_result share one stream for the same running task', async () => {
+  test('task_status and task_status result mode share one stream for the same running task', async () => {
     const statusOutput = makeTaskStatusOutput({ state: 'busy' });
     const resultOutput = [
       'task_id: ses_child1',
@@ -166,12 +167,31 @@ describe('tool-loop-guard', () => {
 
     for (let i = 1; i <= 3; i++) {
       const output = await runToolCall(
-        i % 2 === 1 ? 'task_status' : 'task_result',
+        'task_status',
         `poll${i}`,
-        { task_id: 'ses_child1' },
+        { task_id: 'ses_child1', ...(i % 2 === 0 ? { result: true } : {}) },
         i % 2 === 1 ? statusOutput : resultOutput,
       );
       if (i < 3) expect(output.output).not.toContain(LOOP_GUARD_WARNING);
+      else expect(output.output).toContain(LOOP_GUARD_WARNING);
+    }
+  });
+
+  test('recognizes v2 sessionID args and emitted labels', async () => {
+    const statusOutput = [
+      'sessionID: ses_child1',
+      'state: busy',
+      'agent: fixer',
+    ].join('\n');
+
+    for (let i = 1; i <= 3; i++) {
+      const output = await runToolCall(
+        'task_status',
+        `v2-${i}`,
+        { sessionID: 'ses_child1' },
+        statusOutput,
+      );
+      if (i < 3) expect(output.output).toBe(statusOutput);
       else expect(output.output).toContain(LOOP_GUARD_WARNING);
     }
   });
@@ -186,9 +206,9 @@ describe('tool-loop-guard', () => {
       statusOutput,
     );
     const withinTurn = await runToolCall(
-      'task_result',
+      'task_status',
       'turn-1-result',
-      { task_id: 'ses_child1' },
+      { task_id: 'ses_child1', result: true },
       'task_id: ses_child1\nstate: running',
     );
     expect(withinTurn.output).not.toContain(LOOP_GUARD_WARNING);
@@ -202,9 +222,9 @@ describe('tool-loop-guard', () => {
     hook.resetTurn('s1');
 
     const newTurn = await runToolCall(
-      'task_result',
+      'task_status',
       'turn-2-result',
-      { task_id: 'ses_child1' },
+      { task_id: 'ses_child1', result: true },
       'task_id: ses_child1\nstate: running',
     );
     expect(newTurn.output).not.toContain(LOOP_GUARD_WARNING);
@@ -230,19 +250,19 @@ describe('tool-loop-guard', () => {
     }
   });
 
-  test('task_result called repeatedly for a running task warns on 3rd call and does not block at call 5 and beyond', async () => {
+  test('task_status result mode called repeatedly for a running task warns on 3rd call and does not block at call 5 and beyond', async () => {
     const runningOutput = [
       'task_id: ses_child1',
       'state: running',
       'message: Task is still running. Wait for its terminal result.',
-      'next: use task_status to inspect the task',
+      'next: inspect the task without result',
     ].join('\n');
 
     for (let i = 1; i <= 6; i++) {
       const output = await runToolCall(
-        'task_result',
+        'task_status',
         `r${i}`,
-        { task_id: 'ses_child1' },
+        { task_id: 'ses_child1', result: true },
         runningOutput,
       );
       if (i < 3) {
@@ -351,16 +371,23 @@ describe('tool-loop-guard', () => {
   test('identical args with stable identical output warn but no block for non-readonly tool', async () => {
     // bash is not in BLOCK_TOOLS: warn at 3 but never throw even at 6.
     for (let i = 1; i <= 6; i++) {
-      await hook['tool.execute.before'](
-        beforeInput({ tool: 'bash', callID: `e${i}` }),
-        { args: { command: 'uname' } },
-      );
+      await expect(
+        hook['tool.execute.before'](
+          beforeInput({ tool: 'bash', callID: `e${i}` }),
+          { args: { command: 'uname' } },
+        ),
+      ).resolves.toBeUndefined();
+      const output = { output: 'Linux', metadata: {} };
       await hook['tool.execute.after'](
         afterInput({ tool: 'bash', callID: `e${i}` }),
-        { output: 'Linux', metadata: {} },
+        output,
       );
+      if (i < 3) {
+        expect(output.output).toBe('Linux');
+      } else {
+        expect(output.output).toContain(LOOP_GUARD_WARNING);
+      }
     }
-    // never throws (bash is not in BLOCK_TOOLS)
   });
 
   test('overlapping same-args calls with changing results never block', async () => {
@@ -428,6 +455,23 @@ describe('tool-loop-guard', () => {
     const count =
       String(out.output).split(LOOP_GUARD_WARNING.trim()).length - 1;
     expect(count).toBe(1);
+  });
+
+  test('bounds pending calls whose after hook never runs', async () => {
+    const args = { filePath: 'a.ts' };
+    await runIdenticalCall('c1', args);
+    const output = await runIdenticalCall('c2', args);
+    await hook['tool.execute.before'](beforeInput({ callID: 'c3' }), { args });
+    for (let i = 0; i <= MAX_TRACKED_SESSIONS; i++) {
+      await hook['tool.execute.before'](
+        beforeInput({ callID: `failed-${i}` }),
+        {
+          args: { filePath: `failed-${i}.ts` },
+        },
+      );
+    }
+    await hook['tool.execute.after'](afterInput({ callID: 'c3' }), output);
+    expect(output.output).not.toContain(LOOP_GUARD_WARNING);
   });
 
   test('resetSession clears loop guard state for a specific session', async () => {

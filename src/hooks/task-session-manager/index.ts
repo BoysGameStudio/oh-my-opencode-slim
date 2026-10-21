@@ -5,12 +5,10 @@ import {
   type BackgroundJobStore,
   type BackgroundJobSupervisor,
   type BackgroundTaskConcurrency,
-  COMPLETED_WITHOUT_TEXT_DIAGNOSTIC,
   clearBackgroundJobSuppression,
   deriveFullObjective,
   deriveTaskSessionLabel,
   getBackgroundJobLifecycleLedger,
-  isHostTerminalOutcome,
   isInternalInitiatorPart,
   log,
   parseTaskIdFromTaskOutput,
@@ -18,11 +16,22 @@ import {
   recordBackgroundJobSuppression,
 } from '../../utils';
 import {
-  extractChildTerminalEvidence,
+  type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
+  readSessionInfoForObservation,
+} from '../../utils/background-job-terminal-gate';
+import {
+  classifyTerminalEvidence,
   fetchChildTranscript,
 } from '../../utils/child-transcript';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { getClient } from '../../utils/opencode-client';
+import { withTimeout } from '../../utils/session';
+import {
+  DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS,
+  readLiveSession,
+} from '../../utils/session-runtime-status';
+import { isGenuineOperatorMessage } from '../orchestrator-wake/index';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
@@ -31,10 +40,13 @@ import {
   type InjectionState,
   injectBackgroundJobBoard,
   observeSyntheticTerminalPart,
+  pruneReopenCorrectionState,
   reconcileInjectedTerminalJobs,
   stabilizeRunningTaskParts,
   updateFromInjectedCompletion,
 } from './board-injection';
+import type { ChildInputWaitNotification } from './child-input-wait';
+import { clearChildInputWaitsForSession } from './child-input-wait';
 import { handleEvent } from './event-router';
 import { createIdleReconciler } from './idle-reconciliation';
 import { createIdleSessionTokens } from './idle-session-tokens';
@@ -51,45 +63,11 @@ import {
   handleToolExecuteBefore,
 } from './tool-execute-hooks';
 
-/** Extract the final assistant text from a child session transcript
- * (v1-shaped {data:[{info,parts}]} via the client shim's messages). Used
- * by the quiescent-outcome settle path so completed jobs reconcile with a
- * usable result summary instead of a placeholder. Delegates the fetch to
- * the shared `fetchChildTranscript` (which surfaces `response.error` as
- * a thrown Error — absorbed here, the settle path degrades to no text)
- * and classification to the shared extractor; the v2 shim shape drops
- * `info.time`, so the strict completion-time requirement is off
- * (terminality is confirmed via the host outcome gate before this
- * runs). */
-async function readFinalAssistantText(
-  client: ReturnType<typeof getClient>,
-  sessionID: string,
-  directory: string,
-): Promise<string | undefined> {
-  try {
-    const response = await fetchChildTranscript(client, sessionID, directory);
-    if (response === undefined) return undefined;
-    const evidence = extractChildTerminalEvidence(response, {
-      // v2 shim shape: flat {id, role} info without time/finish.
-      requireCompletionTime: false,
-      // v2 sessions can end with structurally valid non-assistant tails
-      // (synthetic/system/skill); the result lives in the last assistant
-      // message, so scan back to it instead of requiring an assistant
-      // tail.
-      scanBackToLastAssistant: true,
-    });
-    return evidence.kind === 'ready' ? evidence.text : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 export { BACKGROUND_JOB_BOARD_METADATA_KEY } from './board-injection';
 
 /**
- * Delay before recording an idle observation on a child job. The observation
- * remains provisional; terminal task output is the only path that establishes
- * completed/error/cancelled state.
+ * Delay for the parent's acknowledgement of already confirmed publications.
+ * Child evidence retries belong exclusively to the terminal gate.
  */
 const IDLE_RECONCILE_DELAY_MS = 2_000;
 
@@ -108,29 +86,25 @@ function rehydrateHistoricalRunningTasks(
   ) => string | undefined,
 ): string[] {
   const rehydrated: string[] = [];
-  const managedOrchestratorSessionIDs = new Set<string>();
+  const managedSessionIDs = new Set<string>();
 
   for (const message of messages) {
     if (!isMessageWithParts(message)) continue;
-    if (message.info.agent !== 'orchestrator') continue;
-
     const parentSessionID = message.info.sessionID;
     if (!parentSessionID) continue;
     if (!shouldManageSession(parentSessionID)) {
+      if (message.info.agent !== 'orchestrator') continue;
       registerSessionAsOrchestrator?.(parentSessionID);
       if (!shouldManageSession(parentSessionID)) continue;
     }
-    managedOrchestratorSessionIDs.add(parentSessionID);
+    managedSessionIDs.add(parentSessionID);
   }
 
   for (const message of messages) {
     if (!isMessageWithParts(message)) continue;
 
     const parentSessionID = message.info.sessionID;
-    if (
-      !parentSessionID ||
-      !managedOrchestratorSessionIDs.has(parentSessionID)
-    ) {
+    if (!parentSessionID || !managedSessionIDs.has(parentSessionID)) {
       continue;
     }
 
@@ -180,6 +154,7 @@ function rehydrateHistoricalRunningTasks(
         objective: deriveFullObjective({ description, prompt }) ?? label,
         background: true,
         preserveRun: true,
+        adopted: true,
         // Historical parts do not carry a trustworthy launch timestamp. Zero
         // also prevents this registration from looking like a live observation
         // to the first runtime-status reconciliation.
@@ -205,12 +180,10 @@ function rehydrateHistoricalRunningTasks(
 export function createTaskSessionManagerHook(
   _ctx: PluginInput,
   options: {
-    strategy?: 'latest' | 'checkpoint-compatible';
     maxSessionsPerAgent: number;
-    maxRetainedSnapshots: number;
-    readContextMinLines?: number;
-    readContextMaxFiles?: number;
     backgroundJobBoard?: BackgroundJobStore;
+    terminalGate?: BackgroundJobTerminalGate;
+    hostOutcomeClock?: 'shared-unix-ms';
     backgroundJobSupervisor?: BackgroundJobSupervisor;
     backgroundTaskConcurrency?: BackgroundTaskConcurrency;
     /** Shared by plugin generations for one admission runtime. */
@@ -225,6 +198,26 @@ export function createTaskSessionManagerHook(
     /** Opt-in provider → "foreground" map for same-provider background
      *  conversion. */
     sameProviderPolicy?: Record<string, 'foreground'>;
+    /** Host flavor marker ('v2' on OpenCode v2 hosts); selects the native
+     *  delegation vocabulary in model-visible tool guidance. Defaults v1. */
+    hostFlavor?: string;
+    /** v1-only honoured switch (runtime.backgroundJobs.boardInjection;
+     *  forced false on v2 at the RuntimeConfig layer). false on v1 =
+     *  boardless. */
+    boardInjection?: boolean;
+    /** Per-instance pairing flag for the background-default flip (v2 only);
+     *  see BackgroundDefaultFlipState in v2/delegation. */
+    isBackgroundDefaultFlipArmed?: () => boolean;
+    recoverRetainedSession?: (request: {
+      parentSessionID: string;
+      requested: string;
+      agent?: string;
+    }) => Promise<import('./session-recovery').RetainedRecoveryResult>;
+    resolveCanonicalTaskRef?: (
+      parentSessionID: string,
+      requested: string,
+    ) => Promise<import('./session-recovery').CanonicalTaskReference>;
+    isDisposed?: () => boolean;
     shouldManageSession: (sessionID: string) => boolean;
     /** Register a session as orchestrator when the transform hook detects
      *  an orchestrator message but the session isn't in the agent map yet. */
@@ -240,7 +233,12 @@ export function createTaskSessionManagerHook(
      *  router defer terminal bookkeeping for persistent 401/410 errors
      *  until recovery is impossible. */
     willAttemptFallback?: (sessionID: string) => boolean;
+    fallbackFailureReason?: (sessionID: string) => string;
     coordinator?: SessionLifecycle;
+    /** Surface a background child's newly opened input wait to the parent
+     * (question/permission that would otherwise park the child forever with
+     * the parent's turn already ended). */
+    onChildInputWait?: (notification: ChildInputWaitNotification) => void;
     /** Test seam only; production always uses the reconciliation delay. */
     idleReconcileDelayMs?: number;
     /** Test seam only; production uses the runtime reconciliation delay. */
@@ -252,11 +250,116 @@ export function createTaskSessionManagerHook(
     options.backgroundJobBoard ??
     new BackgroundJobBoard({
       maxReusablePerAgent: options.maxSessionsPerAgent,
-      readContextMinLines: options.readContextMinLines,
-      readContextMaxFiles: options.readContextMaxFiles,
     });
   const rehydrateState = getBackgroundJobLifecycleLedger(backgroundJobBoard);
   const rehydrateTombstones = rehydrateState.tombstones;
+  // Only adoptRequested reads boundaries, and v2 hosts never wire it.
+  const adoptionEnabled = options.hostFlavor !== 'v2';
+  const historyBoundaries = new Map<string, number>();
+  const adoptRequested = async (
+    parent: string,
+    requested: string,
+    agent: string,
+  ): Promise<'adopted' | 'unchecked' | 'rejected'> => {
+    const boundary = historyBoundaries.get(parent);
+    if (boundary === undefined) return 'unchecked';
+    if (options.isDisposed?.()) return 'rejected';
+    try {
+      const client = getClient(_ctx);
+      const query = { directory: _ctx.directory };
+      // Only the reads run under the deadline; adoption cannot run late.
+      const [{ data: info }, transcript, live] = await withTimeout(
+        Promise.all([
+          client.session.get({
+            path: { id: requested },
+            query,
+            throwOnError: true,
+          }),
+          client.session.messages({
+            path: { id: requested },
+            query: { ...query, limit: 1 },
+            throwOnError: true,
+          }),
+          readLiveSession(_ctx, requested),
+        ]),
+        DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS,
+        'Host child adoption timed out',
+      );
+      const suffix = info.title.match(/ \(@([^()]+) subagent\)$/);
+      const evidence = classifyTerminalEvidence(transcript);
+      // Adopt only if every gate holds (else the caller's refusal stands),
+      // in condition order:
+      //  1. the host child's parent is this session;
+      //  2. it was created before the parent's oldest visible message, so
+      //     the call that launched it is no longer in the visible history;
+      //  3. its title suffix names the requested agent;
+      //  4. its last message is a terminal result (completed or error) per
+      //     classifyTerminalEvidence, the terminal gate's own classifier;
+      //  5. fresh live status confirms quiescence (idle or valid absence);
+      //  6. no foreground fallback is pending for the child;
+      //  7. the parent's boundary did not change during the reads;
+      //  8. no deletion tombstone suppresses the child.
+      if (
+        info.parentID !== parent ||
+        !(info.time.created < boundary) ||
+        suffix?.[1] !== agent ||
+        (evidence.verdict !== 'completed' && evidence.verdict !== 'error') ||
+        (live.kind !== 'idle' && live.kind !== 'absent') ||
+        options.isFallbackInProgress?.(requested) ||
+        historyBoundaries.get(parent) !== boundary ||
+        options.isDisposed?.() ||
+        rehydrateTombstones.has(requested)
+      )
+        return 'rejected';
+      const adopted = backgroundJobBoard.adoptTerminal({
+        taskID: requested,
+        parentSessionID: parent,
+        agent,
+        description: info.title.slice(0, -suffix[0].length),
+        createdAt: info.time.created,
+        updatedAt: info.time.updated,
+        terminalState: evidence.verdict,
+        resultSummary: evidence.text,
+      });
+      return adopted ? 'adopted' : 'rejected';
+    } catch (error) {
+      log('[task-session-manager] host child adoption failed', String(error));
+      return 'rejected';
+    }
+  };
+
+  // Transcript-backed stop gate (false-stop incident): shared by the
+  // quiescent stop-confirmation timer and the periodic runtime-status
+  // reconciler so neither can publish `stopped` while the child's
+  // transcript already holds the terminal result. Unknown reads never
+  // terminate into stopped; the #1157 guarantee lives on a valid
+  // transcript that provably holds no result for this run.
+  const terminalGate =
+    options.terminalGate ??
+    createBackgroundJobTerminalGate({
+      backgroundJobBoard,
+      input: _ctx,
+      hostOutcomeClock: options.hostOutcomeClock,
+      readTerminalEvidence: async (taskID, historyBoundary) =>
+        fetchChildTranscript(
+          getClient(_ctx),
+          taskID,
+          _ctx.directory,
+          undefined,
+          undefined,
+          historyBoundary,
+        ).catch(() => undefined),
+      baselineFor: (taskID, generation) =>
+        options.revivedRunTracker?.baselineFor(taskID, generation),
+      attemptStartedAtFor: (taskID, generation) =>
+        options.revivedRunTracker?.attemptStartedAtFor(taskID, generation),
+      observationRevisionFor: (taskID, generation) =>
+        options.revivedRunTracker?.revisionFor(taskID, generation),
+      isObservationPending: (taskID, generation) =>
+        deferredInlineErrors.has(taskID) ||
+        (options.revivedRunTracker?.isObservationPending(taskID, generation) ??
+          false),
+    });
 
   const rememberDeletedSession = (sessionID: string): void => {
     const remember = (taskID: string): void => {
@@ -307,54 +410,17 @@ export function createTaskSessionManagerHook(
       // not tombstone+drop the live relaunched record.
       const generationAtProbeStart = backgroundJobBoard.get(taskID)?.generation;
       if (generationAtProbeStart === undefined) return;
+      const token = terminalGate.capture({
+        taskID,
+        generation: generationAtProbeStart,
+      });
+      if (!token) return;
       try {
-        const response = (await client.session.get({
-          path: { id: taskID },
-          query: { directory: _ctx.directory },
-        })) as {
-          data?: { outcome?: unknown };
-          outcome?: unknown;
-        };
-        const info = response?.data ?? response;
-        const outcome =
-          typeof info?.outcome === 'string' ? info.outcome : undefined;
-        if (!isHostTerminalOutcome(outcome)) return;
-        const existing = backgroundJobBoard.get(taskID);
-        if (existing?.state !== 'running') return;
-        // Settle through the same updateStatus semantics the
-        // readSessionOutcome consumers use (idle-reconciliation): a
-        // succeeded outcome is only reconciled with usable final text.
-        // The settle is bound to the generation captured at probe start
-        // (same freshness anchor as the NotFound guard below): a probe
-        // that started at gen N must not terminalize a same-ID relaunch
-        // (gen N+1) that landed while the get was in flight.
-        let resultText: string | undefined;
-        if (outcome === 'succeeded') {
-          resultText = await readFinalAssistantText(
-            client,
-            taskID,
-            _ctx.directory,
-          );
-        }
-        const settled = backgroundJobBoard.updateStatus({
+        await readSessionInfoForObservation(_ctx, token);
+        await terminalGate.reconcile({
           taskID,
-          expectedGeneration: generationAtProbeStart,
-          state: outcome === 'succeeded' && resultText ? 'completed' : 'error',
-          resultSummary:
-            outcome === 'succeeded'
-              ? resultText || COMPLETED_WITHOUT_TEXT_DIAGNOSTIC
-              : `Host reported outcome: ${outcome}.`,
+          generation: generationAtProbeStart,
         });
-        if (settled !== undefined && settled.state !== 'running') {
-          backgroundJobBoard.markReconciled(taskID);
-          log('[task-session-manager] settled rehydrated task from host', {
-            taskID,
-            alias: settled.alias,
-            parentSessionID: settled.parentSessionID,
-            outcome,
-            hasResultText: Boolean(resultText),
-          });
-        }
         return;
       } catch (err) {
         if ((err as { _tag?: string })?._tag === 'Session.NotFoundError') {
@@ -412,8 +478,15 @@ export function createTaskSessionManagerHook(
     string,
     Map<string, BackgroundJobExecution>
   >();
-  /** Managed sessions with a deferred failover error awaiting fallback outcome. */
-  const deferredFallbackErrors = new Set<string>();
+  /** Sessions with a deferred failover error awaiting the fallback
+   *  outcome (managed inline 401/410, or a background child's
+   *  failover-worthy error with an armed fallback chain), mapped to the
+   *  summary the idle backstop publishes when no recovery happens. */
+  const deferredInlineErrors = new Map<string, string>();
+  const withFallbackReason = (sessionID: string, text: string): string =>
+    [text, options.fallbackFailureReason?.(sessionID)]
+      .filter(Boolean)
+      .join('\n');
 
   // Forward refs for circular deps — set after corresponding managers exist.
   // These are captured by closure in createIdleReconciler and only called
@@ -428,68 +501,39 @@ export function createTaskSessionManagerHook(
   let hasInputWait: (sessionID: string) => boolean = () => false;
 
   const idleReconciler = createIdleReconciler({
-    backgroundJobBoard,
+    terminalGate,
     reconcileInjectedTerminalJobs: (parentSessionID: string) =>
       reconcileInjectedTerminalJobs(injectionState, parentSessionID),
-    // Fallback could not recover a deferred error; drop the deferred
-    // error and its injected-terminal tracking so the board shows the
-    // failure and follow-up reconciliation keeps consistent state.
-    onErrorTerminalize: (sessionID: string) => {
-      deferredFallbackErrors.delete(sessionID);
-      terminalJobsInjectedByParent.delete(sessionID);
-      pendingInjectedTerminalJobsByParent.delete(sessionID);
-    },
     idleReconcileDelayMs:
       options.idleReconcileDelayMs ?? IDLE_RECONCILE_DELAY_MS,
     isFallbackInProgress: options.isFallbackInProgress,
     hasInputWait: (s) => hasInputWait(s),
     getIdleSessionToken: (s) => getIdleSessionToken(s),
     isCurrentIdleSessionToken: (s, t) => isCurrentIdleSessionToken(s, t),
-    taskContextTracker,
-    revivedRunTracker: options.revivedRunTracker,
-    // v2: no live session-status map exists, but Session.Info.outcome
-    // publishes the terminal transition — use it to settle quiescent jobs
-    // to their accurate terminal state (v1 hosts keep the status-map
-    // confirmation and simply never hit this probe).
-    readSessionOutcome: async (sessionID) => {
-      try {
-        const client = getClient(_ctx);
-        if (typeof client.session?.get !== 'function') return undefined;
-        const response = (await client.session.get({
-          path: { id: sessionID },
-          query: { directory: _ctx.directory },
-        })) as {
-          data?: { outcome?: unknown };
-          outcome?: unknown;
-        };
-        const info = response?.data ?? response;
-        const outcome = info?.outcome;
-        if (typeof outcome !== 'string') return undefined;
-        if (outcome !== 'succeeded') return { outcome };
-        // Usable-result requirement (#1115 precedent): a completed job is
-        // only reconciled with its final assistant text. Extract it from
-        // the transcript; absent text falls back to the reconciler's
-        // stabilization probes.
-        const resultText = await readFinalAssistantText(
-          client,
-          sessionID,
-          _ctx.directory,
-        );
-        return { outcome, resultText };
-      } catch {
-        return undefined;
-      }
+    // Read-and-clear for the deferred-error backstop: consuming at fire
+    // time keeps a newer deferral authoritative and leaves no stale
+    // entries to poison a later reuse of the session.
+    consumeDeferredError: (sessionID) => {
+      const message = deferredInlineErrors.get(sessionID);
+      if (message === undefined) return;
+      deferredInlineErrors.delete(sessionID);
+      return withFallbackReason(sessionID, message);
     },
   });
   const runtimeStatusReconciler = createRuntimeStatusReconciler({
     input: _ctx,
     backgroundJobBoard,
     delayMs: options.runtimeStatusReconcileDelayMs,
-    taskContextTracker,
+    terminalGate,
   });
 
   const idleSessionTokens = createIdleSessionTokens({
-    onInvalidate: idleReconciler.onInvalidateIdle,
+    // Parent lifecycle invalidation must not strand a deferred child error.
+    // Live busy explicitly cancels its backstop and clears the deferral.
+    onInvalidate: (sessionID) => {
+      if (!deferredInlineErrors.has(sessionID))
+        idleReconciler.onInvalidateIdle(sessionID);
+    },
   });
   getIdleSessionToken = (s) => idleSessionTokens.getSessionToken(s);
   isCurrentIdleSessionToken = (s, t) =>
@@ -501,6 +545,11 @@ export function createTaskSessionManagerHook(
   });
   hasInputWait = (s) => inputWaits.hasInputWait(s);
 
+  // A background child's open question/permission must wake the parent even
+  // though the parent session itself has no input wait. The event router
+  // forwards new asks through the options.onChildInputWait dep (exactly one
+  // notification per new request id).
+
   if (options.coordinator) {
     options.coordinator.onSessionDeleted((sessionId) => {
       // Fallback teardown keeps process-global wait_for_user; genuine delete
@@ -511,13 +560,14 @@ export function createTaskSessionManagerHook(
         idleSessionTokens.clearSession(sessionId);
       }
       inputWaits.clearInputWaits(sessionId);
-      idleReconciler.clearIdleTimers(sessionId);
       // During a foreground fallback abort/re-prompt cycle, the session
       // is being torn down and immediately recreated with a fallback model.
       // Dropping the job from the board here would make the orchestrator
       // lose track of the task and report it as cancelled even though the
       // oracle actually completed.
       if (!options.isFallbackInProgress?.(sessionId)) {
+        idleReconciler.clearIdleTimers(sessionId);
+        deferredInlineErrors.delete(sessionId);
         options.backgroundTaskConcurrency?.releaseTask(sessionId);
         // The parent's child tasks are about to be dropped from the board.
         // Normally each child's own session.deleted releases its admission
@@ -541,18 +591,23 @@ export function createTaskSessionManagerHook(
       }
       terminalJobsInjectedByParent.delete(sessionId);
       pendingInjectedTerminalJobsByParent.delete(sessionId);
-      injectionState.retainedBoardSnapshots.delete(sessionId);
+      historyBoundaries.delete(sessionId);
       injectionState.retainedTailBoards.delete(sessionId);
+      // Orphaned reopen corrections must never surface in a recreated
+      // session; the board entries they referenced are being dropped too.
+      pruneReopenCorrectionState(injectionState, sessionId);
       taskContextTracker.clearSession(sessionId);
       taskContextTracker.prune(backgroundJobBoard);
       pendingCallTracker.clearSession(sessionId);
+      clearChildInputWaitsForSession(sessionId);
     });
   }
 
   const injectionState: InjectionState = {
     backgroundJobBoard,
-    maxRetainedSnapshots: options.maxRetainedSnapshots,
-    strategy: options.strategy ?? 'latest',
+    terminalGate,
+    hostFlavor: options.hostFlavor,
+    boardInjection: options.boardInjection !== false,
     lifecycleLedger: rehydrateState,
     processedInjectedCompletions: rehydrateState.processedInjectedCompletions,
     processedInjectedCompletionOrder:
@@ -568,7 +623,7 @@ export function createTaskSessionManagerHook(
     metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
     shouldManageSession: options.shouldManageSession,
     taskContextTracker,
-    retainedBoardSnapshots: new Map(),
+    lastInjectedBoardTextByParent: new Map(),
     retainedTailBoards: new Map(),
   };
 
@@ -581,6 +636,8 @@ export function createTaskSessionManagerHook(
   );
 
   return {
+    hasDeferredError: (sessionID: string): boolean =>
+      deferredInlineErrors.has(sessionID),
     markRevivedRunPending: (taskID: string): void => {
       taskContextTracker.pendingManagedTaskIds.add(taskID);
     },
@@ -634,6 +691,16 @@ export function createTaskSessionManagerHook(
         !options.shouldManageSession(sessionID) ||
         !Array.isArray(parts) ||
         parts.some(isInternalInitiatorPart) ||
+        // Shared genuine-operator gate with orchestrator-wake (single
+        // source of truth in ../orchestrator-wake/index.ts): noReply
+        // injections, identity-less v2 command-marker submits, and
+        // board/phase-tagged injections must not clear wait_for_user or
+        // invalidate idle timers. The local direct-synthetic and
+        // messageIdentity checks above stay as cheap pre-filters and the
+        // defense-in-depth identity seam (callers must still compute a
+        // messageIdentity); the shared helper owns the full genuineness
+        // verdict that neither seam reaches alone.
+        !isGenuineOperatorMessage(inputMessage, outputMessage, parts) ||
         !parts.some(
           (part) =>
             isObjectRecord(part) &&
@@ -665,6 +732,12 @@ export function createTaskSessionManagerHook(
         pendingCallTracker,
         taskContextTracker,
         getLifecycleEpoch: () => rehydrateState.nextEpoch,
+        hostFlavor: options.hostFlavor,
+        isBackgroundDefaultFlipArmed: options.isBackgroundDefaultFlipArmed,
+        recoverRetainedSession: options.recoverRetainedSession,
+        resolveCanonicalTaskRef: options.resolveCanonicalTaskRef,
+        isDisposed: options.isDisposed,
+        adoptRequested: adoptionEnabled ? adoptRequested : undefined,
       }),
 
     'tool.execute.after': async (
@@ -674,11 +747,12 @@ export function createTaskSessionManagerHook(
       await handleToolExecuteAfter(input, output, {
         directory: _ctx.directory,
         backgroundJobBoard,
+        terminalGate,
         backgroundJobSupervisor: options.backgroundJobSupervisor,
+        backgroundTaskConcurrency: options.backgroundTaskConcurrency,
+        getModelForAgent: options.getModelForAgent,
         bindConcurrencyTicket: (taskID, pending) =>
           pending.concurrencyTicket?.bind(taskID),
-        releaseConcurrencyTask: (taskID) =>
-          options.backgroundTaskConcurrency?.releaseTask(taskID),
         recordLifecycleSuppression: (taskID) =>
           recordBackgroundJobSuppression(backgroundJobBoard, taskID),
         pendingCallTracker,
@@ -690,6 +764,7 @@ export function createTaskSessionManagerHook(
           const deletionEpoch = rehydrateState.deletionEpochs.get(taskID);
           return deletionEpoch !== undefined && lifecycleEpoch < deletionEpoch;
         },
+        hostFlavor: options.hostFlavor,
       });
       runtimeStatusReconciler.schedule();
     },
@@ -699,6 +774,20 @@ export function createTaskSessionManagerHook(
       output: { messages?: unknown },
     ): Promise<void> => {
       const messages = Array.isArray(output.messages) ? output.messages : [];
+      if (adoptionEnabled) {
+        let viewSession: unknown;
+        let viewStart = Number.POSITIVE_INFINITY;
+        for (const message of messages) {
+          if (!isObjectRecord(message) || !isObjectRecord(message.info))
+            continue;
+          viewSession ??= message.info.sessionID;
+          const { time } = message.info;
+          if (isObjectRecord(time) && typeof time.created === 'number')
+            viewStart = Math.min(viewStart, time.created);
+        }
+        if (typeof viewSession === 'string' && viewStart !== Infinity)
+          historyBoundaries.set(viewSession, viewStart);
+      }
 
       // Keep still-running task tool results byte-stable so a live background
       // lane never rewrites mid-history bytes and invalidates the prompt
@@ -718,11 +807,12 @@ export function createTaskSessionManagerHook(
         probeRehydratedTaskSession(taskID);
       }
 
+      if (rehydratedTaskIDs.length > 0) {
+        await runtimeStatusReconciler.reconcile();
+      }
+
       for (const [messageIndex, message] of messages.entries()) {
         if (!isUserMessageWithParts(message)) continue;
-        if (message.info.agent && message.info.agent !== 'orchestrator') {
-          continue;
-        }
         if (
           !message.info.sessionID ||
           !options.shouldManageSession(message.info.sessionID)
@@ -736,7 +826,7 @@ export function createTaskSessionManagerHook(
         }
 
         for (const [partIndex, part] of message.parts.entries()) {
-          updateFromInjectedCompletion(
+          await updateFromInjectedCompletion(
             injectionState,
             part,
             message,
@@ -744,10 +834,6 @@ export function createTaskSessionManagerHook(
             partIndex,
           );
         }
-      }
-
-      if (rehydratedTaskIDs.length > 0) {
-        await runtimeStatusReconciler.reconcile();
       }
     },
 
@@ -774,7 +860,12 @@ export function createTaskSessionManagerHook(
         const sessionID =
           input.event.properties?.info?.id ?? input.event.properties?.sessionID;
         if (sessionID) {
-          deferredFallbackErrors.delete(sessionID);
+          // deferredInlineErrors is intentionally NOT cleared here: the
+          // event router's session.deleted branch owns the deferral —
+          // it publishes the deferred error for genuine deletions and
+          // keeps it (with a re-armed backstop) through fallback
+          // teardown. An unconditional clear would swallow the error
+          // and strand a mid-fallback record in `running` forever.
           if (!options.isFallbackInProgress?.(sessionID)) {
             const hardTimedOut =
               backgroundJobBoard.field(sessionID, 'deadlineExceededAt') !==
@@ -786,25 +877,28 @@ export function createTaskSessionManagerHook(
 
       if (input.event.type === 'server.instance.disposed') {
         runtimeStatusReconciler.dispose();
+        if (!options.terminalGate) terminalGate.dispose();
       }
       return handleEvent(input, {
         inputWaits,
         idleSessionTokens,
         options,
         idleReconciler,
-        deferredFallbackErrors,
+        withFallbackReason,
+        deferredInlineErrors,
         backgroundJobBoard,
+        terminalGate,
         pendingCallTracker,
         taskContextTracker,
         terminalJobsInjectedByParent,
         pendingInjectedTerminalJobsByParent,
-        retainedBoardSnapshots: injectionState.retainedBoardSnapshots,
         backgroundJobSupervisor: options.backgroundJobSupervisor,
         bindConcurrencyTicket: (taskID, pending) =>
           pending.concurrencyTicket?.bind(taskID),
         observeSyntheticTerminalPart: (part) =>
           observeSyntheticTerminalPart(injectionState, part),
         revivedRunTracker: options.revivedRunTracker,
+        onChildInputWait: options.onChildInputWait,
       }).then(() => runtimeStatusReconciler.schedule());
     },
   };

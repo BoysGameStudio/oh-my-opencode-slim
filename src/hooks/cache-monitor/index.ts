@@ -238,7 +238,7 @@ export function createCacheMonitorHook(options: CacheMonitorOptions = {}) {
       ) {
         state.plateauWarned = true;
         logger(
-          '[cache-monitor] cache-read plateau: the provider is reusing the same frozen prefix while sizeable uncached input accumulates — the reusable prefix has stopped growing (issue #874 signature). Consider backgroundJobs.strategy "checkpoint-compatible" — see docs/cache-verification.md.',
+          '[cache-monitor] cache-read plateau: the provider is reusing the same frozen prefix while sizeable uncached input accumulates — the reusable prefix has stopped growing (issue #874 signature). See docs/cache-verification.md.',
           {
             sessionID: message.sessionID,
             requestNumber: state.completedRequests,

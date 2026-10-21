@@ -25,6 +25,7 @@
 
 import type { PluginInput } from '@opencode-ai/plugin';
 import { log } from './logger';
+import { withTimeout } from './session';
 
 type OpencodeClient = PluginInput['client'];
 
@@ -61,37 +62,6 @@ export const SYSTEM_AGENTS: ReadonlySet<string> = new Set([
   'summary',
   'title',
 ]);
-
-/**
- * Select a registered agent for a plugin-created helper session.
- *
- * The list is supplied by the plugin generation rather than read from disk,
- * so disabled agents and custom agent configuration are reflected without a
- * hot-path config read. The orchestrator is deliberately excluded because an
- * `agent: 'orchestrator'` message makes the task-session manager adopt the
- * throwaway session as a managed orchestrator session.
- */
-export function resolveHelperSessionAgent(
-  availableAgents: Iterable<string>,
-  finalAgentConfig?: Record<string, unknown>,
-): string | undefined {
-  for (const name of availableAgents) {
-    if (name === FALLBACK_TOP_LEVEL_AGENT || SYSTEM_AGENTS.has(name)) continue;
-
-    const config = finalAgentConfig?.[name];
-    if (
-      config &&
-      typeof config === 'object' &&
-      !Array.isArray(config) &&
-      (config as Record<string, unknown>).disable === true
-    ) {
-      continue;
-    }
-
-    return name;
-  }
-  return undefined;
-}
 
 export interface ResolveSessionAgentOptions {
   /**
@@ -212,7 +182,11 @@ async function safely<T>(
   operation: () => Promise<T> | T,
 ): Promise<T | undefined> {
   try {
-    return await operation();
+    return await withTimeout(
+      Promise.resolve(operation()),
+      5_000,
+      'Agent probe timed out',
+    );
   } catch {
     return undefined;
   }
@@ -259,7 +233,7 @@ export async function resolveSessionAgent(
       }) => Promise<unknown>;
       messages?: (args: {
         path: { id: string };
-        query?: { directory: string };
+        query: { directory?: string; limit: number };
       }) => Promise<unknown>;
     };
     const probeArgs = {
@@ -287,7 +261,12 @@ export async function resolveSessionAgent(
 
     if (typeof sessionApi.messages === 'function') {
       const list = unwrapData(
-        await safely(() => sessionApi.messages?.(probeArgs)),
+        await safely(() =>
+          sessionApi.messages?.({
+            path: probeArgs.path,
+            query: { ...probeArgs.query, limit: 50 },
+          }),
+        ),
       );
       if (Array.isArray(list)) {
         for (let index = list.length - 1; index >= 0; index--) {

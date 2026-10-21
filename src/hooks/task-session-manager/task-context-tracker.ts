@@ -1,9 +1,10 @@
+import { statSync } from 'node:fs';
 import path from 'node:path';
 import type { ContextFile } from '../../utils';
+import { log } from '../../utils/logger';
 
 interface PendingContextFile {
   path: string;
-  lines: Set<number>;
   lastReadAt: number;
 }
 
@@ -24,12 +25,8 @@ export function createTaskContextTracker() {
       for (const file of files) {
         const pending = context.get(file.path) ?? {
           path: file.path,
-          lines: new Set<number>(),
           lastReadAt: file.lastReadAt,
         };
-        for (const line of file.lineNumbers ?? []) {
-          pending.lines.add(line);
-        }
         pending.lastReadAt = Math.max(pending.lastReadAt, file.lastReadAt);
         context.set(file.path, pending);
       }
@@ -54,11 +51,46 @@ export function createTaskContextTracker() {
       if (!context) return [];
       return [...context.values()].map((file) => ({
         path: file.path,
-        lineCount: file.lines.size,
         lastReadAt: file.lastReadAt,
       }));
     },
   };
+}
+
+/**
+ * Drop read-context entries whose path no longer resolves to a regular
+ * file on disk (deleted, renamed, unreadable). The read-context list is
+ * path-only, so existence is the whole check: a sync `stat` per entry,
+ * never a content read, so validation cannot stall the session on large
+ * files.
+ */
+export function filterStaleContextFiles(
+  directory: string,
+  files: ContextFile[],
+): ContextFile[] {
+  const kept: ContextFile[] = [];
+  for (const file of files) {
+    const resolved = path.isAbsolute(file.path)
+      ? file.path
+      : path.join(directory, file.path);
+    try {
+      if (!statSync(resolved).isFile()) {
+        log('[task-session-manager] dropped stale read context', {
+          path: file.path,
+          reason: 'not-a-file',
+        });
+        continue;
+      }
+    } catch {
+      log('[task-session-manager] dropped stale read context', {
+        path: file.path,
+        reason: 'missing',
+      });
+      continue;
+    }
+    kept.push(file);
+  }
+  return kept;
 }
 
 export function extractReadFiles(
@@ -76,17 +108,9 @@ export function extractReadFiles(
       ? extractPath
       : relative;
 
-  const matchedLines = new Set<number>();
-  for (const match of output.output.matchAll(/^([0-9]+):/gm)) {
-    matchedLines.add(Number(match[1]));
-  }
-  const lineNumbers = [...matchedLines];
-
   return [
     {
       path: normalized,
-      lineCount: lineNumbers.length,
-      lineNumbers,
       lastReadAt: Date.now(),
     },
   ];

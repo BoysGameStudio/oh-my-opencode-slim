@@ -8,12 +8,12 @@ import {
   recordInternalAdmission,
 } from './internal-admissions';
 import {
-  __resetChatHeadersOrderingTripwireForTesting,
   type ChatHeaderSessionStates,
   createChatHeadersBridge,
   createSessionContextHandler,
   createSessionPromptBridge,
   observeChatHeaderState,
+  resetV2GenerationWarnings,
 } from './setup';
 import type {
   V2Context,
@@ -193,7 +193,7 @@ describe('observeChatHeaderState', () => {
 describe('createChatHeadersBridge', () => {
   beforeEach(() => {
     __resetInternalAdmissionsForTesting();
-    __resetChatHeadersOrderingTripwireForTesting();
+    resetV2GenerationWarnings();
   });
 
   test('sets x-initiator: agent for an internal Copilot primary request', async () => {
@@ -481,7 +481,7 @@ describe('internal admission recording', () => {
 
     expect(seq).toHaveLength(1);
     const admitted = seq[0].i as { id?: string };
-    expect(admitted.id).toMatch(/^msg_/);
+    expect(admitted.id).toMatch(/^msg_omos_[0-9a-f-]{36}$/);
     expect(isInternalAdmission('ses_syn', admitted.id ?? '')).toBe(true);
   });
 

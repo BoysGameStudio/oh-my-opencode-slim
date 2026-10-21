@@ -9,6 +9,7 @@ import { existsSync } from 'node:fs';
 import { basename, isAbsolute } from 'node:path';
 import { crossSpawn } from '../utils/compat';
 import { log } from '../utils/logger';
+import type { PaneSpawnOptions } from './types';
 
 export function quoteShellArg(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -21,15 +22,25 @@ export function normalizePathForShell(directory: string): string {
     : directory;
 }
 
+/** Quote an executable for sh -lc: bare fallback stays bare, Windows
+ * backslashes become / so MSYS2/Git Bash single quotes don't preserve them. */
+function formatExecutableForShell(executable: string): string {
+  if (executable === 'opencode') return executable;
+  return quoteShellArg(normalizePathForShell(executable));
+}
+
 export function buildOpencodeAttachCommand(
   sessionId: string,
   serverUrl: string,
   directory: string,
-  executable = 'opencode',
+  // Resolved host binary (falls back to bare 'opencode'): pane shells
+  // (zellij `sh -lc`, tmux server PATH) may not have `opencode` on PATH
+  // (e.g. linuxbrew installs), #514.
+  executable = resolveOpencodeExecutable(),
 ): string {
   const attachDir = normalizePathForShell(directory);
   return [
-    executable === 'opencode' ? executable : quoteShellArg(executable),
+    formatExecutableForShell(executable),
     'attach',
     quoteShellArg(serverUrl),
     '--session',
@@ -37,6 +48,165 @@ export function buildOpencodeAttachCommand(
     '--dir',
     quoteShellArg(attachDir),
   ].join(' ');
+}
+
+/**
+ * Viewer command flavor, one per host deployment mode (FR-2 matrix):
+ * `v1` attaches to a reflected server URL; `v2-shared` lets the viewer
+ * rediscover the shared background service itself; `v2-remote` connects to
+ * the same explicit `--server` the parent client uses.
+ */
+export type ViewerFlavor = 'v1' | 'v2-shared' | 'v2-remote';
+
+export type ViewerCommandOptions = Pick<
+  PaneSpawnOptions,
+  'viewerFlavor' | 'viewerSurface'
+> & {
+  /** Absolute host binary; defaults to the resolved host binary (falls
+   back to bare `opencode`). */
+  executable?: string;
+};
+
+/**
+ * Builds the pane viewer command for one host flavor (FR-2 command matrix).
+ * Every adapter routes through here so the matrix lives in exactly one place.
+ *
+ * - `v1`: `<resolved-binary> attach <url> --session <id> --dir <dir>`
+ *   (was bare `opencode`; now resolveOpencodeExecutable())
+ * - `v2-shared`: `<resolved-binary> --session <id> <dir>` — the viewer
+ *   discovers the same shared background service by itself; no URL is passed.
+ * - `v2-remote`: `<resolved-binary> --server <url> --session <id> <dir>` — the
+ *   `OPENCODE_PASSWORD` secret is never part of the command text; adapters
+ *   inject it at pane creation through their native spawn-time environment
+ *   mechanism, or through `withParentEnvPassword` where none exists.
+ *
+ * `mini` uses `attach ... --mini` on v1 (OpenCode >= 1.17.10). On v2 it
+ * uses the `mini` subcommand, which rejects a positional directory; adapters
+ * pin the pane cwd instead (herdr/kitty/wezterm natively, tmux `-c`,
+ * Zellij `--cwd`, cmux-tui `cd`).
+ */
+export function buildViewCommand(
+  sessionId: string,
+  serverUrl: string,
+  directory: string,
+  options: ViewerCommandOptions = {},
+): string {
+  const flavor = options.viewerFlavor ?? 'v1';
+  const executable = options.executable ?? resolveOpencodeExecutable();
+  const mini = options.viewerSurface === 'mini';
+  if (flavor === 'v1') {
+    const attach = buildOpencodeAttachCommand(
+      sessionId,
+      serverUrl,
+      directory,
+      executable,
+    );
+    return mini ? `${attach} --mini` : attach;
+  }
+  const viewDir = normalizePathForShell(directory);
+  return [
+    formatExecutableForShell(executable),
+    ...(mini ? ['mini'] : []),
+    ...(flavor === 'v2-remote' ? ['--server', quoteShellArg(serverUrl)] : []),
+    '--session',
+    quoteShellArg(sessionId),
+    ...(viewerNeedsPaneCwd(options) ? [] : [quoteShellArg(viewDir)]),
+  ].join(' ');
+}
+
+/** Only v2 mini omits the directory, so its adapter must pin the pane cwd. */
+export function viewerNeedsPaneCwd(
+  options: ViewerCommandOptions = {},
+): boolean {
+  return (
+    options.viewerSurface === 'mini' && (options.viewerFlavor ?? 'v1') !== 'v1'
+  );
+}
+
+/** Shells whose `-c` argument is a POSIX script. */
+const POSIX_SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh']);
+
+/**
+ * Whether the resolved shell can run a POSIX script. Used to gate the
+ * `/proc`-based viewer-secret bridge (cmux-tui, wezterm): unknown and Windows
+ * shells count as non-POSIX, so the caller fails closed instead of feeding a
+ * command-substitution script to a shell that cannot parse it.
+ */
+export function isPosixShell(shell: string): boolean {
+  return POSIX_SHELLS.has(shellName(shell));
+}
+
+/**
+ * Whether the shell supports the POSIX `cd '...' && ...` viewer wrapper,
+ * not general `&&` support. POSIX shells and fish (since 3.0) are supported;
+ * nu, cmd, and PowerShell wrappers are not handled.
+ */
+const AND_CHAIN_SHELLS = new Set([...POSIX_SHELLS, 'fish']);
+
+export function shellSupportsAndChain(shell = process.env.SHELL): boolean {
+  return AND_CHAIN_SHELLS.has(shellName(shell ?? '/bin/sh'));
+}
+
+/**
+ * Wraps `command` in a POSIX script that recovers the viewer password from
+ * this process's own `/proc/<pid>/environ` (readable by the owning user only)
+ * and exports it (as `OPENCODE_PASSWORD` by default) before running the
+ * command. Adapters whose CLI has no spawn-time env mechanism (zellij,
+ * cmux-tui, wezterm) use this so
+ * the secret never appears in command text or argv — it exists only in the
+ * pane's environment at viewer start.
+ *
+ * Precedence matches the v2 host wiring: `OPENCODE_PASSWORD` first, then
+ * `OPENCODE_SERVER_PASSWORD`. `/proc/<pid>/environ` is NUL-separated and is
+ * split with `tr`, so the value is read line-wise: a password containing
+ * newlines is recovered only up to its first line (documented limitation).
+ *
+ * `exportAs` names the variable the viewer reads: v2 viewers read
+ * `OPENCODE_PASSWORD` (the default, with the precedence above), while a v1
+ * `opencode attach` viewer reads only `OPENCODE_SERVER_PASSWORD`, so that is
+ * the only variable consulted for it.
+ */
+export function withParentEnvPassword(
+  command: string,
+  exportAs:
+    | 'OPENCODE_PASSWORD'
+    | 'OPENCODE_SERVER_PASSWORD' = 'OPENCODE_PASSWORD',
+): string {
+  const environ = `/proc/${process.pid}/environ`;
+  const read = (name: string): string =>
+    `$(tr '\\0' '\\n' < ${environ} 2>/dev/null | sed -n 's/^${name}=//p' | head -n 1)`;
+  // A v1 viewer authenticates with exactly what `opencode attach` reads, so
+  // a stray v2 `OPENCODE_PASSWORD` must not take precedence there.
+  const lookup =
+    exportAs === 'OPENCODE_SERVER_PASSWORD'
+      ? [`_omo_pw=${read('OPENCODE_SERVER_PASSWORD')}`]
+      : [
+          `_omo_pw=${read('OPENCODE_PASSWORD')}`,
+          `[ -n "$_omo_pw" ] || _omo_pw=${read('OPENCODE_SERVER_PASSWORD')}`,
+        ];
+  return [
+    ...lookup,
+    `if [ -n "$_omo_pw" ]; then export ${exportAs}="$_omo_pw"; fi`,
+    'unset _omo_pw',
+    command,
+  ].join('\n');
+}
+
+/**
+ * Masks the viewer secret in spawn argv before it reaches a log payload.
+ * The secret travels as a spawn-time environment entry (`-e` / `--env`), so
+ * masking `OPENCODE_PASSWORD=…` / `OPENCODE_SERVER_PASSWORD=…` values keeps
+ * every log line secret-free; viewer commands never contain it.
+ */
+export function redactViewerSecretArgs(args: readonly string[]): string[] {
+  return args.map((arg) => {
+    const separator = arg.indexOf('=');
+    if (separator === -1) return arg;
+    const name = arg.slice(0, separator);
+    return name === 'OPENCODE_PASSWORD' || name === 'OPENCODE_SERVER_PASSWORD'
+      ? `${name}=<redacted>`
+      : arg;
+  });
 }
 
 /**
@@ -52,8 +222,7 @@ export function resolveOpencodeExecutable(): string {
  * Build the `[shell, ...shellArgs, command]` array for launching a command in
  * the user's interactive shell. OpenCode respects the user's shell when running
  * commands; multiplexer panes must do the same, otherwise a hardcoded `sh -c`
- * breaks under non-POSIX shells (fish, nu, powershell, ...) or misses login
- * startup files (where `opencode` may be on PATH).
+ * breaks under non-POSIX shells (fish, nu, powershell, ...).
  *
  * Mirrors OpenCode's own `Shell.args()` resolution:
  * - nu / fish: `<shell> -c <command>` (no login mode)
@@ -69,10 +238,7 @@ export function resolveOpencodeExecutable(): string {
  */
 export function buildShellLaunchArgs(command: string): string[] {
   const shell = process.env.SHELL || '/bin/sh';
-  const name = (shell.split(/[/\\]/).at(-1) ?? 'sh').replace(
-    /\.(exe|EXE)$/,
-    '',
-  );
+  const name = shellName(shell);
 
   if (name === 'nu' || name === 'fish') {
     return [shell, '-c', command];
@@ -106,6 +272,23 @@ export function buildShellLaunchArgs(command: string): string[] {
   return [shell, '-c', command];
 }
 
+/** Resolved basename of a shell path, without a `.exe` suffix. */
+function shellName(shell: string): string {
+  return (shell.split(/[/\\]/).at(-1) ?? 'sh').replace(/\.(exe|EXE)$/, '');
+}
+
+/**
+ * Whether the resolved interactive shell treats `#` as a comment. Adapters
+ * that prefix a POSIX comment data marker to a command must omit it when the
+ * shell has no `#` comments (only `cmd` today). Reuses the same shell-name
+ * resolution as `buildShellLaunchArgs` so the two can never disagree.
+ */
+export function shellSupportsHashComments(
+  shell = process.env.SHELL || '/bin/sh',
+): boolean {
+  return shellName(shell) !== 'cmd';
+}
+
 export function resolveHostOpencodeBinary(
   options: {
     override?: string;
@@ -134,13 +317,25 @@ export function resolveHostOpencodeBinary(
   return null;
 }
 
+/**
+ * Log prefix of one `findBinary` probe: `[<binaryName>]` by default. Callers
+ * that probe a differently named distribution binary (cmux probes `cmux` as a
+ * legacy fallback while its logs are prefixed `[cmux-tui]`) pass `logPrefix`.
+ */
+export function findBinaryLogPrefix(
+  binaryName: string,
+  logPrefix?: string,
+): string {
+  return `[${logPrefix ?? binaryName}]`;
+}
+
 export async function findBinary(
   binaryName: string,
-  options: { verify?: boolean } = {},
+  options: { verify?: boolean; logPrefix?: string } = {},
 ): Promise<string | null> {
   const isWindows = process.platform === 'win32';
   const cmd = isWindows ? 'where' : 'which';
-  const logPrefix = `[${binaryName}]`;
+  const logPrefix = findBinaryLogPrefix(binaryName, options.logPrefix);
 
   try {
     const proc = crossSpawn([cmd, binaryName], {
@@ -163,7 +358,7 @@ export async function findBinary(
       return null;
     }
 
-    log(`${logPrefix} findBinary: found`, { path });
+    log(`${logPrefix} findBinary: found ${path}`);
 
     // Verify the binary works if requested
     if (options.verify) {
@@ -207,6 +402,13 @@ export interface GracefulClosePaneOptions {
   acceptExitCode1?: boolean;
   /** Return true for empty/unknown paneId instead of false (zellij/herdr behavior). */
   emptyPaneReturnsTrue?: boolean;
+  /**
+   * Treat a failed close as success only when its stderr proves the pane is
+   * already gone. Stricter than `acceptExitCode1` for backends whose CLI also
+   * exits 1 on transport/protocol errors while the pane still exists (a false
+   * success would make the caller forget a live pane).
+   */
+  isAlreadyClosed?: (stderr: string) => boolean;
   /** Env to pass to the kitten/kitty invocations (e.g. KITTY_LISTEN_ON). */
   env?: Record<string, string | undefined>;
 }
@@ -231,156 +433,21 @@ export async function gracefulClosePane(
 
     await new Promise((r) => setTimeout(r, GRACEFUL_SHUTDOWN_DELAY_MS));
 
+    const inspectStderr = options.isAlreadyClosed !== undefined;
     const proc = crossSpawn([binary, ...options.close], {
       stdout: 'ignore',
-      stderr: 'ignore',
+      stderr: inspectStderr ? 'pipe' : 'ignore',
       env: options.env,
     });
     const exitCode = await proc.exited;
 
     if (exitCode === 0) return true;
+    if (options.isAlreadyClosed) {
+      return options.isAlreadyClosed(await proc.stderr());
+    }
     if (options.acceptExitCode1 && exitCode === 1) return true;
     return false;
   } catch {
     return false;
   }
-}
-
-export interface SessionReadinessOptions {
-  /** Override the per-attempt readiness probe (default: GET /session/status). */
-  checkSessionReady?: (
-    url: URL,
-    sessionId: string,
-    signal: AbortSignal,
-  ) => Promise<boolean>;
-  /** Injectable cancellation-safe delay for backoff between attempts. */
-  delay?: (milliseconds: number) => Promise<void>;
-  /** Per-attempt abort timeout in milliseconds (default 1000). */
-  readinessAttemptTimeoutMs?: number;
-  /**
-   * Absolute deadline for the whole wait in milliseconds (default 2000).
-   * The wait stops once `now()` passes `deadlineMs` after the first probe,
-   * regardless of how many attempts remain, so a hanging probe can never
-   * stretch the total beyond the deadline.
-   */
-  readinessDeadlineMs?: number;
-  /** Injectable clock for deterministic deadline tests (default Date.now). */
-  now?: () => number;
-  /**
-   * Abort the whole wait (e.g. manager cleanup/disposal). Resolves false;
-   * in-flight probes are aborted through this signal.
-   */
-  signal?: AbortSignal;
-}
-
-const SESSION_READINESS_DEADLINE_MS = 2_000;
-const SESSION_READINESS_DELAYS_MS = [50, 100, 200, 400, 500, 500, 250] as const;
-
-/**
- * Poll the OpenCode `/session/status` endpoint until the child session is
- * attachable, bounded by an absolute deadline (default 2s) rather than a
- * fixed number of independently-timed attempts.
- *
- * Adapter contract: this gate is used by the generic pane adapters (tmux,
- * zellij, herdr, kitty). The cmux adapter is explicitly excluded: cmux
- * sessions are managed by CmuxSessionLifecycle, which has its own spawn
- * machinery (server health check plus deferred spawn retry with a TTL) and
- * never calls this function.
- *
- * Prevents the attach-before-ready race where `opencode attach --session
- * <id>` launches before the server has published the session and falls back
- * to the new-session picker TUI. Returns false when the session never became
- * ready within the deadline or when the caller's abort signal fires.
- */
-export async function waitForSessionReady(
-  serverUrl: string,
-  sessionId: string,
-  options: SessionReadinessOptions = {},
-): Promise<boolean> {
-  const check = options.checkSessionReady ?? defaultSessionReady;
-  const delay = options.delay ?? defaultDelay;
-  const attemptTimeoutMs = options.readinessAttemptTimeoutMs ?? 1_000;
-  const deadlineMs =
-    options.readinessDeadlineMs ?? SESSION_READINESS_DEADLINE_MS;
-  const now = options.now ?? Date.now;
-  const signal = options.signal;
-  const deadlineAt = now() + deadlineMs;
-  const url = new URL('/session/status', serverUrl);
-
-  const abortedPromise = signal
-    ? new Promise<false>((resolve) => {
-        if (signal.aborted) resolve(false);
-        else
-          signal.addEventListener('abort', () => resolve(false), {
-            once: true,
-          });
-      })
-    : null;
-  const neverPromise = new Promise<never>(() => {});
-
-  for (let attempt = 0; ; attempt++) {
-    if (signal?.aborted) return false;
-    const remaining = deadlineAt - now();
-    if (remaining <= 0) return false;
-
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      Math.min(attemptTimeoutMs, remaining),
-    );
-    timeout.unref?.();
-    const onAbort = () => controller.abort();
-    signal?.addEventListener('abort', onAbort, { once: true });
-
-    let ready = false;
-    try {
-      ready = await Promise.race([
-        check(url, sessionId, controller.signal),
-        abortedPromise ?? neverPromise,
-        new Promise<boolean>((resolve) =>
-          controller.signal.addEventListener('abort', () => resolve(false), {
-            once: true,
-          }),
-        ),
-      ]);
-    } catch {
-      // A session can briefly be unreachable while OpenCode publishes it.
-    } finally {
-      clearTimeout(timeout);
-      signal?.removeEventListener('abort', onAbort);
-    }
-    if (ready) return true;
-    if (signal?.aborted) return false;
-
-    // Recompute against the deadline so a slow probe can never push the
-    // total delay past it.
-    const remainingAfterProbe = deadlineAt - now();
-    if (remainingAfterProbe <= 0) return false;
-    const delayMs = SESSION_READINESS_DELAYS_MS[attempt];
-    if (delayMs === undefined) return false;
-    await Promise.race([
-      delay(Math.min(delayMs, remainingAfterProbe)),
-      abortedPromise ?? neverPromise,
-    ]);
-  }
-}
-
-async function defaultSessionReady(
-  url: URL,
-  sessionId: string,
-  signal: AbortSignal,
-): Promise<boolean> {
-  const response = await fetch(url, { signal });
-  if (!response.ok) return false;
-  const statuses = (await response.json()) as Record<
-    string,
-    { type?: string } | undefined
-  >;
-  return ['idle', 'running', 'busy', 'retry'].includes(
-    statuses[sessionId]?.type ?? '',
-  );
-}
-
-function defaultDelay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

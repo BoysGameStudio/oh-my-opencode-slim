@@ -1,27 +1,25 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
-  autoRescueComparators,
-  permissiveComparators,
-  prefix,
+  commonEdges,
   rescueByLcs,
   rescueByPrefixSuffix,
+  sameRescueLine,
   seek,
   seekMatch,
-  suffix,
 } from './matching';
 
 describe('apply-patch/matching', () => {
-  test('seek finds matches with unicode and trim-end', () => {
-    expect(seek(['console.log(“hola”);  '], ['console.log("hola");'], 0)).toBe(
-      0,
-    );
-  });
-
-  test('seek does not rescue trim-only matches with different indentation', () => {
-    expect(seek(['  console.log("hola");'], ['console.log("hola");'], 0)).toBe(
-      -1,
-    );
+  test.each([
+    ['unicode + trim-end', 'console.log(“hola”);  ', 'console.log("hola");'],
+    ['indentation', '  console.log("hola");', 'console.log("hola");'],
+    [
+      'curly + straight quotes',
+      'const title = "it\'s ready";',
+      'const title = “it’s ready”;',
+    ],
+  ])('seek matches %s', (_, fileLine, patchLine) => {
+    expect(seek([fileLine], [patchLine], 0)).toBe(0);
   });
 
   test('prefix and suffix detect common edges', () => {
@@ -36,26 +34,39 @@ describe('apply-patch/matching', () => {
       'const footer = “Fin”;',
     ];
 
-    expect(prefix(oldLines, newLines)).toBe(1);
-    expect(suffix(oldLines, newLines, 1)).toBe(1);
+    expect(commonEdges(oldLines, newLines, sameRescueLine)).toEqual({
+      prefixLength: 1,
+      suffixLength: 1,
+    });
   });
 
-  test('rescueByPrefixSuffix rescues a single stale block', () => {
+  test('rescueByPrefixSuffix rescues a stale block with multiline edges', () => {
     const result = rescueByPrefixSuffix(
-      ['top', 'const title = “Hola”;', 'stale-value', 'const footer = “Fin”;'],
-      ['const title = "Hola";', 'old-value', 'const footer = "Fin";'],
-      ['const title = “Hola”;', 'new-value', 'const footer = “Fin”;'],
+      ['L1', 'x', 'L1', 'L2 “q”', 'stale', 'R1', 'R2', 'R1', 'y'],
+      ['L1', 'L2 "q"', 'old', 'R1', 'R2'],
+      ['L1', 'L2 “q”', 'new-value', 'R1', 'R2'],
       0,
     );
 
     expect(result).toEqual({
       kind: 'match',
       hit: {
-        start: 2,
+        start: 4,
         del: 1,
         add: ['new-value'],
       },
     });
+  });
+
+  test('rescueByPrefixSuffix does not anchor on indentation-only edges', () => {
+    const result = rescueByPrefixSuffix(
+      ['  left', 'stale-value', 'right'],
+      ['left', 'old-value', 'right'],
+      ['left', 'new-value', 'right'],
+      0,
+    );
+
+    expect(result).toEqual({ kind: 'miss' });
   });
 
   test('rescueByPrefixSuffix marks ambiguity when multiple locations exist', () => {
@@ -188,28 +199,12 @@ describe('apply-patch/matching', () => {
     ).toEqual({ kind: 'miss' });
   });
 
-  test('seek matches mixed curly and straight quotes', () => {
-    expect(
-      seek(
-        ['const title = “it’s ready”;'],
-        ['const title = "it\'s ready";'],
-        0,
-      ),
-    ).toBe(0);
-  });
-
   test('seekMatch reports when the match was only tolerant and safe', () => {
     expect(
       seekMatch(['console.log(“hola”);  '], ['console.log("hola");'], 0),
     ).toEqual({
       index: 0,
-      comparator: 'unicode-trim-end',
       exact: false,
     });
-  });
-
-  test('comparator separation distinguishes safe rescue from permissive comparators', () => {
-    expect(autoRescueComparators).toHaveLength(4);
-    expect(permissiveComparators).toHaveLength(6);
   });
 });

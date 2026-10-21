@@ -96,8 +96,8 @@ function createHook(options: {
     } as never,
     {
       maxSessionsPerAgent: 2,
-      maxRetainedSnapshots: 4,
       backgroundJobBoard: options.board,
+      hostOutcomeClock: 'shared-unix-ms', // The fixture shares Date.now with the gate.
       backgroundJobSupervisor: options.supervisor,
       backgroundTaskConcurrency: options.concurrency,
       shouldManageSession: () => true,
@@ -178,7 +178,8 @@ describe('rehydrate session.get existence probe', () => {
     });
 
     // Rehydrate registers generation 1 and the probe starts against it.
-    await runTransform(hook, 'child-stale-probe');
+    const transform = runTransform(hook, 'child-stale-probe');
+    await flushProbe();
     const relaunched = board.registerLaunch({
       taskID: 'child-stale-probe',
       parentSessionID: 'parent-1',
@@ -190,6 +191,7 @@ describe('rehydrate session.get existence probe', () => {
     // The stale NotFound resolves only now — it must NOT tombstone or
     // drop the live relaunched record.
     gate.resolve();
+    await transform;
     await flushProbe();
 
     expect(board.get('child-stale-probe')).toMatchObject({
@@ -217,7 +219,8 @@ describe('rehydrate session.get existence probe', () => {
     });
 
     // Rehydrate registers generation 1 and the probe starts against it.
-    await runTransform(hook, 'child-stale-settle');
+    const transform = runTransform(hook, 'child-stale-settle');
+    await flushProbe();
     const relaunched = board.registerLaunch({
       taskID: 'child-stale-settle',
       parentSessionID: 'parent-1',
@@ -230,6 +233,7 @@ describe('rehydrate session.get existence probe', () => {
     // terminalize the relaunched generation (updateStatus rejects via
     // the probe-start generation; no markReconciled).
     gate.resolve();
+    await transform;
     await flushProbe();
 
     expect(board.get('child-stale-settle')).toMatchObject({
@@ -261,7 +265,11 @@ describe('rehydrate session.get existence probe', () => {
     const hook = createHook({
       board,
       getSession: mock(async () => ({
-        data: { id: 'child-done', outcome: 'succeeded' },
+        data: {
+          id: 'child-done',
+          outcome: 'succeeded',
+          time: { idle: Date.now() },
+        },
       })),
       getMessages: mock(async () => ({
         data: [
@@ -277,10 +285,8 @@ describe('rehydrate session.get existence probe', () => {
     await flushProbe();
 
     expect(board.get('child-done')).toMatchObject({
-      // markReconciled transitions state after settling (same as the
-      // idle-reconciliation outcome consumer); terminalState is the
-      // durable terminal record.
-      state: 'reconciled',
+      // Confirmation is not acknowledgement: this result still needs delivery.
+      state: 'completed',
       terminalState: 'completed',
       resultSummary: 'final answer',
     });
@@ -290,14 +296,17 @@ describe('rehydrate session.get existence probe', () => {
     const board = new BackgroundJobBoard();
     const hook = createHook({
       board,
-      getSession: mock(async () => ({ outcome: 'failed' })),
+      getSession: mock(async () => ({
+        outcome: 'failed',
+        time: { idle: Date.now() },
+      })),
     });
 
     await runTransform(hook, 'child-failed');
     await flushProbe();
 
     expect(board.get('child-failed')).toMatchObject({
-      state: 'reconciled',
+      state: 'error',
       terminalState: 'error',
       resultSummary: 'Host reported outcome: failed.',
     });

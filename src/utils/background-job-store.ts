@@ -1,18 +1,24 @@
 import type {
+  BackgroundJobAdoptionInput,
   BackgroundJobLaunchInput,
   BackgroundJobLease,
   BackgroundJobPromptMetadata,
   BackgroundJobRecord,
   BackgroundJobStatusInput,
+  BackgroundJobTerminalInput,
   ContextFile,
+  RestoreRetainedSessionInput,
   WallClockTimeoutClaimInput,
-  WallClockTimeoutFinalizeInput,
 } from './background-job-board';
 import {
   clearSuppression as clearSuppressionPersisted,
   persistedBackgroundJobState,
   recordSuppression as recordSuppressionPersisted,
 } from './background-job-persistence';
+import type {
+  BackgroundJobTerminalGate,
+  TerminalCommitToken,
+} from './background-job-terminal-gate';
 
 export type BackgroundJobSyntheticTerminalOccurrencePhase =
   | 'observed'
@@ -127,17 +133,23 @@ export function getBackgroundJobLifecycleLedger(
 /** Record a task drop/eviction as a rehydrate and late-output tombstone.
  * Write-through: the persisted tombstone (and its deletion epoch) is
  * updated together with the in-memory ledger so the two can never
- * diverge across a restart. */
+ * diverge across a restart. Cleared only by clearBackgroundJobSuppression
+ * via registerLaunch — an explicit (re)launch/adoption is proof of life;
+ * the deletion epoch intentionally survives for generation fencing. */
 export function recordBackgroundJobSuppression(
   store: BackgroundJobStore,
   taskID: string,
+  terminal?: {
+    state: 'completed' | 'error' | 'cancelled';
+    resultSummary: string;
+  },
 ): void {
   const ledger = getBackgroundJobLifecycleLedger(store);
   if (ledger.tombstones.has(taskID)) return;
   ledger.tombstones.add(taskID);
   const epoch = ++ledger.nextEpoch;
   ledger.deletionEpochs.set(taskID, epoch);
-  recordSuppressionPersisted(taskID, epoch);
+  recordSuppressionPersisted(taskID, epoch, terminal);
 }
 
 /** Clear only the active rehydrate tombstone for a proven new launch.
@@ -162,6 +174,27 @@ export function clearBackgroundJobSuppression(
 export interface BackgroundJobStore {
   // ── Mutation methods ──────────────────────────────────────────────
   registerLaunch(input: BackgroundJobLaunchInput): BackgroundJobRecord;
+  /** Restore the record a launch replaced after the host explicitly refused
+   * it. False once that launch's generation no longer owns the row. */
+  abandonLaunch(
+    launched: BackgroundJobRecord,
+    replaced: BackgroundJobRecord,
+  ): boolean;
+  /** Cache-only import of an absent verified host session. */
+  restoreRetainedSession(
+    input: RestoreRetainedSessionInput,
+  ): BackgroundJobRecord | undefined;
+  /**
+   * Insert an already-terminal (`reconciled`) record for a child session the
+   * store does not hold; returns undefined when it does. Unlike
+   * `commitTerminal`, no terminal-gate token is consumed, so the caller must
+   * supply host evidence itself: an idle child whose transcript classifies as
+   * completed/error via `classifyTerminalEvidence`. Fires no terminal-state
+   * listener. Not a way to settle runs the terminal gate tracks.
+   */
+  adoptTerminal(
+    input: BackgroundJobAdoptionInput,
+  ): BackgroundJobRecord | undefined;
   acquireCancellationLease(
     taskID: string,
     generation: number,
@@ -177,30 +210,26 @@ export interface BackgroundJobStore {
   acquireTerminalNotificationLease(
     taskID: string,
     generation: number,
+    terminalRevision?: number,
   ): BackgroundJobLease | undefined;
   validateLease(lease: BackgroundJobLease): boolean;
   releaseLease(lease: BackgroundJobLease): boolean;
   updateStatus(
-    input: BackgroundJobStatusInput,
+    input: BackgroundJobStatusInput & { state: 'running' },
   ): BackgroundJobRecord | undefined;
-  updateFromStatusOutput(output: string): BackgroundJobRecord | undefined;
+  commitTerminal(
+    input: BackgroundJobTerminalInput,
+    token: TerminalCommitToken,
+  ): BackgroundJobRecord | undefined;
+  bindTerminalGate(gate: BackgroundJobTerminalGate): void;
   claimWallClockDeadline(
     input: WallClockTimeoutClaimInput,
-  ): BackgroundJobRecord | undefined;
-  finalizeWallClockTimeout(
-    input: WallClockTimeoutFinalizeInput,
   ): BackgroundJobRecord | undefined;
   markRunningFromLiveSession(
     taskID: string,
     now?: number,
     expectedGeneration?: number,
-  ): BackgroundJobRecord | undefined;
-  markStopped(
-    taskID: string,
-    resultSummary: string,
-    observedAt?: number,
-    expectedGeneration?: number,
-    now?: number,
+    observedTerminalRevision?: number,
   ): BackgroundJobRecord | undefined;
   noteStopConfirmation(
     taskID: string,
@@ -217,16 +246,11 @@ export interface BackgroundJobStore {
    * Acknowledge the terminal notification delivered to the parent session.
    * This is a prompt-lifecycle acknowledgement, not filesystem reconciliation.
    */
-  markReconciled(taskID: string, now?: number): BackgroundJobRecord | undefined;
-  markCancelled(
+  markReconciled(
     taskID: string,
-    reason?: string,
     now?: number,
-    options?: {
-      force?: boolean;
-      expectedGeneration?: number;
-      cancellationLease?: BackgroundJobLease;
-    },
+    expectedGeneration?: number,
+    expectedRevision?: number,
   ): BackgroundJobRecord | undefined;
   clearParent(parentSessionID: string): void;
   drop(taskID: string): void;
@@ -265,6 +289,18 @@ export interface BackgroundJobStore {
   hasRunningJobs(): boolean;
   hasRunning(parentSessionID: string): boolean;
   hasTerminalUnreconciled(parentSessionID: string): boolean;
+  /** Attributing evidence promotes a placeholder into a tracked task.
+   *  Terminal promotions re-emit the suppressed recovery wake. */
+  promoteProvisional(
+    taskID: string,
+    expectedParentSessionID?: string,
+    metadata?: {
+      agent?: string;
+      description?: string;
+      objective?: string;
+      background?: boolean;
+    },
+  ): BackgroundJobRecord | undefined;
   hasConvergenceSignals(taskID: string, threshold?: number): boolean;
   formatForPrompt(parentSessionID: string, now?: number): string | undefined;
   formatForPromptWithMetadata(

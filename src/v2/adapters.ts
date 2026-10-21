@@ -4,15 +4,21 @@
  * - `parseModelRef`: "provider/model" string → v2 Model.Ref.
  * - `adaptPermissions`: v1 permission map → v2 Rule[] (with v2 permissive base +
  *   `task`→`subagent`, `bash`→`execute` mapping).
- * - `rewritePromptForV2`: rewrite v1 delegation syntax in agent/system prompts.
  * - `delegationVocabulary`: native per-flavor delegation tool/param names for
  *   prompt-build sites (v2 `subagent`/`agent` vs v1 `task`/`subagent_type`).
+ * - `controlParamName`: native per-flavor identifier param for the control
+ *   tools, shared with `delegationVocabulary`'s resume param.
  * - `adaptTool`: v1 ToolDefinition ({description,args,execute}) → v2 Tool.Info.
  * - `applyAgentToDraft`: mutate a v2 agent draft entry from a v1 agent config.
  */
 
 import { log } from '../utils/logger';
-import type { ModelRef, V2AgentDraft, V2ToolDefinition } from './types';
+import type {
+  ModelRef,
+  V2AgentDraft,
+  V2PermissionRule,
+  V2ToolDefinition,
+} from './types';
 
 /** Parse a v1 "provider/model" string into a v2 Model.Ref. */
 export function parseModelRef(model: unknown): ModelRef | undefined {
@@ -45,7 +51,7 @@ const V2_DEFAULT_PERMISSIONS = [
 /** Map a v1 permission key (the tool) to v2 (action, resource). The host
  * evaluator matches the tool against `action` and the path/pattern against
  * `resource`. v1 `task` is v2 `subagent`; v1 `bash` is v2 `execute`. */
-function v1PermKeyToV2(
+export function v1PermKeyToV2(
   key: string,
 ): Array<{ action: string; resource: string }> {
   if (key === 'task') return [{ action: 'subagent', resource: '*' }];
@@ -56,6 +62,10 @@ function v1PermKeyToV2(
     ];
   return [{ action: key, resource: '*' }];
 }
+
+export const TASK_V2_ACTIONS: ReadonlySet<string> = Object.freeze(
+  new Set(v1PermKeyToV2('task').map((t) => t.action)),
+);
 
 /** Convert a v1 permission map (or shorthand string) into v2 permission rules. */
 export function adaptPermissions(
@@ -97,37 +107,49 @@ export function adaptPermissions(
   return rules;
 }
 
-/** Rewrite v1 delegation syntax to v2. v2 renamed `task` → `subagent` and
- * `subagent_type` → `agent`. Applied to agent prompts at registration and to
- * the runtime system prompt so the orchestrator emits valid v2 tool calls. */
-export function rewritePromptForV2(text: unknown): unknown {
-  if (typeof text !== 'string') return text;
-  return text
-    .replace(/\bsubagent_type\b/g, 'agent')
-    .replace(/\btask\s*\(/g, 'subagent(');
+/** Model-visible identifier parameter for control tools (`task_status`,
+ * `task_reply`, `task_revive`, `task_message`, `task_cancel`) —
+ * the same per-host vocabulary as the delegation resume param. v2 hosts use
+ * `sessionID`; v1 hosts (and any unknown flavor) use `task_id`. */
+export function controlParamName(hostFlavor: string | undefined): string {
+  return hostFlavor === 'v2' ? 'sessionID' : 'task_id';
 }
 
 /** Native delegation vocabulary for a host flavor. v2 hosts expose the
  * built-in `subagent` tool with the `agent` parameter; v1 hosts (and any
  * unknown flavor) use `task` with `subagent_type`. Prompt-build sites call
- * this so generated text matches the host's actual tool directly, instead
- * of emitting v1 wording and relying on `rewritePromptForV2` — which
- * remains as belt-and-suspenders for user-customized presets that still
- * contain v1 wording. */
+ * this so generated text matches the host's actual tool directly; every
+ * user-supplied prompt (inline `prompt`, `<agent>.md`/append files,
+ * `orchestratorPrompt` snippets, custom and ACP agent prompts, council
+ * councillor prompts) must likewise be written in the host's own
+ * vocabulary, since no prompt rewriting is applied. */
 export interface DelegationVocabulary {
   /** Name of the host's delegation tool: `subagent` on v2, `task` on v1. */
   tool: string;
   /** Name of the tool's agent-selector parameter: `agent` on v2,
    * `subagent_type` on v1. */
   agentParam: string;
+  /** Name of the delegation tool's existing-session argument, shared with
+   * the control tools (`controlParamName`): `sessionID` on v2, `task_id` on
+   * v1. Resuming a child session requires this exact parameter; the wrong
+   * name silently spawns a new session instead. */
+  resumeParam: string;
 }
 
 export function delegationVocabulary(
   hostFlavor: string | undefined,
 ): DelegationVocabulary {
   return hostFlavor === 'v2'
-    ? { tool: 'subagent', agentParam: 'agent' }
-    : { tool: 'task', agentParam: 'subagent_type' };
+    ? {
+        tool: 'subagent',
+        agentParam: 'agent',
+        resumeParam: controlParamName(hostFlavor),
+      }
+    : {
+        tool: 'task',
+        agentParam: 'subagent_type',
+        resumeParam: controlParamName(hostFlavor),
+      };
 }
 
 /** Adapt a v1 tool definition ({description, args, execute}) to a v2 tool. */
@@ -153,7 +175,7 @@ export function adaptTool(
     // model-visible tool definitions. Without this flag the tool registers
     // cleanly but is confined to the `execute` tool's JS runtime — session
     // tool catalogs then yield `Unknown tool: <name>`. Additive field;
-    // older hosts ignore it.
+    // hosts that don't recognize the field ignore it.
     options: { codemode: false },
     execute: async (input: unknown, context: unknown) => {
       if (!execute) return { output: {} };
@@ -166,7 +188,11 @@ export function adaptTool(
       const v1Ctx = {
         sessionID: ctx?.sessionID ?? '',
         messageID: ctx?.messageID ?? '',
-        agent: ctx?.agent ?? 'orchestrator',
+        agent:
+          ctx?.agent ??
+          (name === 'marketplace_inspect' || name === 'marketplace_manage'
+            ? undefined
+            : 'orchestrator'),
         directory,
         worktree: directory,
         abort: new AbortController().signal,
@@ -206,6 +232,7 @@ export function applyAgentToDraft(
   draft: V2AgentDraft,
   name: string,
   v1: Record<string, unknown>,
+  compiledPermissions?: readonly V2PermissionRule[],
 ): void {
   const model = parseModelRef(v1.model);
   draft.update(name, (agent) => {
@@ -215,24 +242,45 @@ export function applyAgentToDraft(
       (v1.mode as string) ?? (name === 'orchestrator' ? 'primary' : 'subagent');
     agent.hidden = v1.hidden === true;
     if (typeof v1.description === 'string') agent.description = v1.description;
-    if (typeof v1.prompt === 'string')
-      agent.system = rewritePromptForV2(v1.prompt);
+    if (typeof v1.prompt === 'string') agent.system = v1.prompt;
     if (model) {
       agent.model = {
         id: model.id,
         providerID: model.providerID,
         ...(v1.variant ? { variant: v1.variant } : {}),
       };
+    } else {
+      // Absence is meaningful: finalized registrations with no model inherit
+      // the session model instead of retaining an earlier draft's model.
+      delete agent.model;
     }
-    const request: Record<string, unknown> = {
-      settings: {},
-      headers: {},
-      body: {},
-    };
+    const request = asRecord(agent.request) ?? {};
+    const settings = asRecord(request.settings) ?? {};
+    const requestConfig = asRecord(v1.request);
+    for (const field of ['settings', 'headers', 'body']) {
+      const incoming = asRecord(requestConfig?.[field]);
+      if (incoming) {
+        request[field] = { ...(asRecord(request[field]) ?? {}), ...incoming };
+      }
+    }
+    Object.assign(settings, asRecord(request.settings));
     if (typeof v1.temperature === 'number') {
-      (request.settings as Record<string, unknown>).temperature =
-        v1.temperature;
+      settings.temperature = v1.temperature;
     }
+    // v1 `options` are provider-specific request options; the v2 host merges
+    // `request.body` into the outgoing provider request body. Dropping them
+    // here would silently lose configured thinking/reasoning options on v2.
+    if (
+      v1.options &&
+      typeof v1.options === 'object' &&
+      !Array.isArray(v1.options)
+    ) {
+      request.body = {
+        ...(asRecord(request.body) ?? {}),
+        ...(v1.options as Record<string, unknown>),
+      };
+    }
+    if (Object.keys(settings).length > 0) request.settings = settings;
     agent.request = request;
     // v2 permission evaluation is last-match-wins (findLast). v1 `tools` lists
     // which tools an agent MAY use (implicit allow); the `permission` map holds
@@ -246,6 +294,85 @@ export function applyAgentToDraft(
         }
       }
     }
-    agent.permissions = [...toolsAllow, ...adaptPermissions(v1.permission)];
+    agent.permissions = compiledPermissions
+      ? compiledPermissions.map((rule) => ({ ...rule }))
+      : [...toolsAllow, ...adaptPermissions(v1.permission)];
   });
+}
+
+/** Capture native Agent.Info values as the host-config projection used by the
+ * registry. Ordered native permissions are kept outside that v1-shaped config
+ * because v1 permission maps cannot represent their order or resources. */
+export function snapshotNativeAgentForRegistry(
+  agent: Record<string, unknown>,
+): {
+  config: Record<string, unknown>;
+  permissions: V2PermissionRule[];
+} {
+  const model = asRecord(agent.model);
+  const request = asRecord(agent.request);
+  const settings = asRecord(request?.settings);
+  const config: Record<string, unknown> = {};
+
+  if (typeof agent.description === 'string')
+    config.description = agent.description;
+  if (typeof agent.system === 'string') config.prompt = agent.system;
+  if (typeof agent.mode === 'string') config.mode = agent.mode;
+  if (typeof agent.hidden === 'boolean') config.hidden = agent.hidden;
+  if (typeof model?.providerID === 'string' && typeof model.id === 'string') {
+    config.model = `${model.providerID}/${model.id}`;
+  }
+  if (typeof model?.variant === 'string') config.variant = model.variant;
+  if (settings) {
+    if (typeof settings.temperature === 'number') {
+      config.temperature = settings.temperature;
+    }
+  }
+
+  // Native request headers/body are intentionally captured as host request
+  // values too; applyAgentToDraft merges these into the existing request.
+  if (request) {
+    config.request = {
+      ...(asRecord(request.settings)
+        ? { settings: { ...asRecord(request.settings) } }
+        : {}),
+      ...(asRecord(request.headers)
+        ? { headers: { ...asRecord(request.headers) } }
+        : {}),
+      ...(asRecord(request.body)
+        ? { body: { ...asRecord(request.body) } }
+        : {}),
+    };
+  }
+
+  const permissions = Array.isArray(agent.permissions)
+    ? agent.permissions.flatMap((rule): V2PermissionRule[] => {
+        const value = asRecord(rule);
+        if (
+          !value ||
+          typeof value.action !== 'string' ||
+          typeof value.resource !== 'string' ||
+          (value.effect !== 'allow' &&
+            value.effect !== 'ask' &&
+            value.effect !== 'deny')
+        ) {
+          return [];
+        }
+        return [
+          {
+            action: value.action,
+            resource: value.resource,
+            effect: value.effect,
+          },
+        ];
+      })
+    : [];
+
+  return { config, permissions };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }

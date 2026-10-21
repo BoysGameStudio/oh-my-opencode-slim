@@ -34,28 +34,49 @@ synthesizes their outputs into one answer.
 Each councillor in a preset is registered as a dynamic subagent named
 `councillor-<name>` (e.g. `councillor-alpha`, `councillor-beta`), each
 with its own configured model. The orchestrator dispatches all councillors
-in parallel via OpenCode's native `task()` tool at depth 1, and each
+in parallel via the host's native delegation tool (`task()` on v1,
+`subagent()` on v2) at depth 1, and each
 councillor appears as its own TUI pane.
+
+A seat session receives only the prompt it is dispatched with — nothing else
+from the parent conversation — so the orchestrator embeds a brief summary of
+the needed context into each seat prompt. Councillors do have read-only
+codebase tools (read/glob/grep and friends); that boundary is enforced by
+permission config, never by prompt text.
+
+Once every councillor has responded (or the orchestrator's bounded wait on
+a silent seat expires — see [Failure behavior](#failure-behavior)), the
+orchestrator calls the council agent with the question plus a final
+`Seats: <id, id>` line listing the session IDs the seat dispatches returned;
+the harness resolves those IDs from its Background Job Board and attaches the
+full stored responses before the call runs, so the orchestrator never
+re-types the seat text itself. The
+council agent itself waits for no one: it has no tools and starts from
+whatever its context carries.
+
+### Who dispatches whom
+
+The **orchestrator** dispatches all councillor seats and the council
+synthesizer — the council agent itself dispatches nobody (it has no tools):
 
 ```text
 User / Orchestrator
         |
-        v
-Council agent (@council, your configured synthesizer model)
-        |
-        +--> task(): councillor-alpha (configured model)
-        +--> task(): councillor-beta  (configured model)
-        +--> task(): councillor-gamma (configured model)
+        +--> task(): councillor-alpha (configured model)   } dispatched
+        +--> task(): councillor-beta  (configured model)   } in parallel
+        +--> task(): councillor-gamma (configured model)   } by the orchestrator
         |
         v
-Council agent synthesizes councillor results
+task(subagent_type='council', prompt=<question + 'Seats: <id, id>' line>)
+        |
+        v   harness resolves the returned IDs and attaches every seat response
+Council agent (no tools) synthesizes the responses
         |
         v
-Final answer
+Structured report: Council Response / Per-Councillor Details / Council Summary
 ```
 
-The council agent waits for all councillors to respond (or fail), then
-synthesizes their results into a single report.
+> The diagram shows v1 wording; on v2 the same dispatches use `subagent()`.
 
 ---
 
@@ -70,13 +91,13 @@ Add a council model and at least one council preset to your plugin config:
   "preset": "openai",
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.6" }
+      "council": { "model": "openai/gpt-6" }
     }
   },
   "council": {
     "presets": {
       "default": {
-        "alpha": { "model": "openai/gpt-5.6-luna" },
+        "alpha": { "model": "openai/gpt-6-luna" },
         "beta": { "model": "google/gemini-3-pro" },
         "gamma": { "model": "openai/gpt-5.3-codex" }
       }
@@ -85,10 +106,29 @@ Add a council model and at least one council preset to your plugin config:
 }
 ```
 
-Then use it directly:
+Then ask for it in your message. Council Mode is **keyword-triggered**: the
+orchestrator's static prompt carries only the seat roster (a `## Council`
+line listing the seats), and the `council-inject` hook watches orchestrator
+user messages and injects the full Council Mode procedure **once** — on the
+first message that carries a trigger. The block then stays in history as a
+standing procedure: later triggers don't re-inject it, so the token cost is
+paid once per session, not per trigger. Code blocks and inline code are
+stripped before matching, and slash commands never trigger:
+
+- **English**: `council` / `@council`, `councillor`, `consensus`,
+  `second opinion`, `roundtable`, `multiple opinions`, `multiple models`,
+  `several models`, `multi-model`, `multi-agent`, `panel`, `deliberate`,
+  `deliberation`, `diverse perspectives`, `sounding board`
+- **简体中文**: `议会`, `顾问团`, `圆桌`, `共识`, `第二意见`, `多方意见`,
+  `多模型`, `多个模型`, `几个模型`, `别的模型`, `其他模型`, `多代理`, `多智能体`
+- **日本語**: `評議会`, `協議会`, `円卓`, `合意`, `セカンドオピニオン`,
+  `複数のモデル`, `マルチエージェント`
+- **한국어**: `평의회`, `위원회`, `원탁`, `합의`, `세컨드 오피니언`,
+  `여러 모델`, `멀티에이전트`
+- **فارسی**: `شورا`, `انجمن`, `میزگرد`, `اجماع`, `نظر دوم`, `چند مدل`, `چندعامله`
 
 ```text
-@council What is the safest migration strategy for this schema change?
+Run a council: what is the safest migration strategy for this schema change?
 ```
 
 ---
@@ -104,7 +144,7 @@ Then use it directly:
 
     "presets": {
       "default": {
-        "alpha": { "model": "openai/gpt-5.6-luna" }
+        "alpha": { "model": "openai/gpt-6-luna" }
       }
     }
   }
@@ -124,7 +164,7 @@ Each entry inside a preset is one councillor:
 |-------|------|----------|-------------|
 | `model` | string \| array | Yes | A `provider/model` string, or an ordered fallback chain tried until one responds |
 | `variant` | string | No | Optional variant/reasoning setting (applies to chain entries without their own) |
-| `prompt` | string | No | Optional role guidance prepended to the user prompt |
+| `prompt` | string | No | Optional role guidance appended to the councillor's system prompt |
 
 ### Council agent (synthesizer) config
 
@@ -136,7 +176,7 @@ Configure it using the normal agent system:
 {
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.6", "variant": "high" }
+      "council": { "model": "openai/gpt-6", "variant": "high" }
     }
   }
 }
@@ -169,7 +209,7 @@ When `model` is an array, the councillor walks the chain in order:
       "review": {
         "reviewer": {
           "model": [
-            "openai/gpt-5.6",
+            "openai/gpt-6",
             { "id": "google/gemini-3-pro", "variant": "high" },
             "anthropic/claude-opus-4-6"
           ],
@@ -227,13 +267,13 @@ Councillor models always come from:
 {
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.6" }
+      "council": { "model": "openai/gpt-6" }
     }
   },
   "council": {
     "presets": {
       "second-opinion": {
-        "reviewer": { "model": "openai/gpt-5.6-luna" }
+        "reviewer": { "model": "openai/gpt-6-luna" }
       }
     }
   }
@@ -246,14 +286,14 @@ Councillor models always come from:
 {
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.6" }
+      "council": { "model": "openai/gpt-6" }
     }
   },
   "council": {
     "default_preset": "balanced",
     "presets": {
       "balanced": {
-        "alpha": { "model": "openai/gpt-5.6-luna" },
+        "alpha": { "model": "openai/gpt-6-luna" },
         "beta": { "model": "google/gemini-3-pro" },
         "gamma": { "model": "anthropic/claude-opus-4-6" }
       }
@@ -274,7 +314,7 @@ Each councillor can receive its own steering prompt:
     "presets": {
       "review-board": {
         "reviewer": {
-          "model": "openai/gpt-5.6-luna",
+          "model": "openai/gpt-6-luna",
           "prompt": "Focus on bugs, edge cases, and failure modes."
         },
         "architect": {
@@ -291,12 +331,13 @@ Each councillor can receive its own steering prompt:
 }
 ```
 
-The councillor sees:
+The councillor sees the role prompt appended to the tail of its **system
+prompt** (not the user prompt):
 
 ```text
+<councillor system prompt>
+
 <role prompt>
----
-<user prompt>
 ```
 
 ---
@@ -305,18 +346,42 @@ The councillor sees:
 
 ### Invocation
 
+Ask for consensus in your message — see the [trigger list](#quick-setup)
+above; the first trigger keyword in a session injects the Council Mode
+procedure (once — later triggers don't re-inject), and the orchestrator
+dispatches every councillor seat in parallel:
+
 ```text
-@council Should we use a job queue or an outbox pattern here?
+Should we use a job queue or an outbox pattern here? Get a council's opinion.
 ```
 
-The orchestrator may also delegate to `@council` for high-stakes or
-ambiguous decisions.
+The orchestrator may also run a council on its own for high-stakes or
+ambiguous decisions. The injection is keyword-triggered and paid once per
+session, so sessions that never ask pay zero tokens for the procedure.
+
+**Disabling injection.** Turn the keyword injection off entirely with
+`disabled_hooks: ["council-inject"]` (see
+[Hooks](configuration.md#hooks)). The council agent and councillor seats
+stay available — you can still dispatch them by name — but the automatic
+procedure injection no longer happens. The seat roster in the orchestrator
+prompt remains as the only static cost; with the hook disabled it grows a
+one-line manual dispatch hint (`Seats: ... — dispatch via <tool>() when the
+user asks for consensus.`) because no procedure block will ever appear.
+
+**Disabling the council.** Listing `council` in `disabled_agents` disables
+the whole chain (council agent, councillor seats, seat pointer, keyword
+injection). Without council config at all, the chain is never built.
 
 ### What you see
 
-Each councillor appears as its own TUI pane, dispatched in parallel. As they
-complete, their responses stream into the panes. Once all councillors have
-responded (or failed), the council agent synthesizes their results.
+Each councillor is dispatched in parallel as its own TUI pane while it
+runs; when idle, councillors are hidden from the @-mention menu (they are
+still dispatchable by name). As they complete, their responses stream into
+the panes. Once all councillors have responded (or failed), the
+orchestrator calls the council agent with a `Seats: <id, id>` line of the
+dispatch-returned session IDs, and
+the harness attaches the collected responses to that call; the council
+agent synthesizes the report.
 
 ### Output
 
@@ -329,20 +394,13 @@ Council responses include:
    uncertainty, and a consensus confidence rating of `unanimous`, `majority`,
    or `split`.
 
-A footer tracks participation:
-
-```text
----
-*Council: 2/3 councillors responded (alpha: gpt-5.6-luna, beta: gemini-3-pro)*
-```
-
 ### Failure behavior
 
 | Scenario | Behavior |
 |----------|----------|
-| Some councillors fail | Synthesize from the successful ones |
-| All councillors fail | Return an error |
-| Preset has zero councillors | Return an error |
+| Some councillors fail | Synthesize from the successful ones; failed seats are marked in the report |
+| All councillors fail | The report lists every seat as failed; there is no synthesized answer to present |
+| Empty seat response | Retried once, then marked as failed if still empty |
 
 ---
 
@@ -350,9 +408,8 @@ A footer tracks participation:
 
 ### Removed `master` fields
 
-The `council.master` field and other `master`-prefixed fields have been
-removed. A deprecation warning is logged this release if a config still
-contains them, but they no longer have any effect.
+The `council.master*` keys were removed: ignored with a warning (see
+[Removed config keys](configuration.md#removed-config-keys)).
 
 Prefer this instead:
 
@@ -360,7 +417,7 @@ Prefer this instead:
 {
   "presets": {
     "openai": {
-      "council": { "model": "openai/gpt-5.6" }
+      "council": { "model": "openai/gpt-6" }
     }
   }
 }
@@ -368,9 +425,10 @@ Prefer this instead:
 
 ### Reserved keys inside presets
 
-- A preset key named `master` is ignored
-- Legacy nested `councillors` objects are still accepted for backward
-  compatibility
+- A preset key named `master` was removed: the entry is ignored with a warning.
+- Nested legacy `councillors` objects were removed: the wrapper and the
+  councillors inside it are ignored with a warning. Put councillors directly
+  under the preset.
 
 ---
 

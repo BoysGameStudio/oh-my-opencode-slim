@@ -29,6 +29,10 @@ The built-in tool is Exa-backed (optionally Parallel), needs no API key, and is 
 | `context7` | Official library documentation (up-to-date) | `https://mcp.context7.com/mcp` |
 | `gh_grep` | GitHub code search via grep.app | `https://mcp.grep.app` |
 
+### User-defined entries win
+
+If you define an MCP server with the same name in `opencode.json` / `opencode.jsonc` (for example `mcp.gh_grep`), your entry is used as-is and the plugin does not inject its built-in for that key. A partial entry is used as-is too: fields missing from your entry are not back-filled from the built-in. To disable a built-in entirely without defining your own, use `disabled_mcps` in the oh-my-opencode-slim config.
+
 ---
 
 ## Default Permissions Per Agent
@@ -36,10 +40,9 @@ The built-in tool is Exa-backed (optionally Parallel), needs no API key, and is 
 | Agent | Default MCPs |
 |-------|-------------|
 | `orchestrator` | `*`, `!context7` |
-| `librarian` | `context7`, `gh_grep` |
+| `explorer` | `context7`, `gh_grep` |
 | `designer` | none |
 | `oracle` | none |
-| `explorer` | none |
 | `fixer` | none |
  | `councillor` | none |
 
@@ -58,7 +61,7 @@ Control which MCPs each agent can use via the `mcps` array in your preset config
 | `["!*"]` | Deny all MCPs |
 
 **Rules:**
-- `*` expands to all available MCPs
+- `*` expands to all available enabled MCPs
 - `!item` excludes a specific MCP
 - Conflicts (e.g. `["a", "!a"]`) → deny wins
 
@@ -71,9 +74,6 @@ Control which MCPs each agent can use via the `mcps` array in your preset config
       "orchestrator": {
         "mcps": ["*", "!context7"]
       },
-      "librarian": {
-        "mcps": ["context7", "gh_grep"]
-      },
       "oracle": {
         "mcps": ["*", "!gh_grep"]
       },
@@ -84,6 +84,11 @@ Control which MCPs each agent can use via the `mcps` array in your preset config
   }
 }
 ```
+
+> **Tip:** Omit the `mcps` key entirely to inherit the per-agent defaults from
+> the table above. An explicit `mcps` value (including `[]`) always wins — so
+> a generated or hand-written `explorer.mcps: []` disables explorer's
+> `context7`/`gh_grep` access. Only set `mcps` when you intend to override.
 
 ---
 
@@ -98,3 +103,8 @@ To disable specific MCPs for all agents regardless of preset, add them to `disab
 ```
 
 This is useful when you want to cut external network calls entirely (e.g. air-gapped environments or cost control).
+
+An explicit `agents.<name>.mcps` list replaces the agent's defaults.
+MCP availability, native core-tool permissions, and host restrictions remain
+separate. For installed packages, see
+[Marketplace customization](marketplace.md#customize-an-installed-agent).

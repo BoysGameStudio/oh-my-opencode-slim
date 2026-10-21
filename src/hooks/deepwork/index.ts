@@ -1,22 +1,34 @@
+import { stripFrontmatter } from '../../cli/custom-skills';
+import skillMarkdown from '../../skills/deepwork/SKILL.md' with {
+  type: 'text',
+};
 import { createInternalAgentTextPart } from '../../utils';
 import { registerCommandHook } from '../command-hook-utils';
 
 const COMMAND_NAME = 'deepwork';
 
-function activationPrompt(task: string): string {
+// SKILL.md is the single contract source. The /deepwork command is
+// self-contained: it injects the full body (bundled at build time) plus the
+// pinned per-session path, so it works regardless of whether the resident
+// skill is registered — listing `deepwork` in disabled_skills removes the
+// resident listing without losing the command (#1332).
+const instructions = stripFrontmatter(skillMarkdown).trim();
+
+/**
+ * The activation message's head announcement. Single contract source: the
+ * deepwork-goal hook skips injection while this exact sentence (or any
+ * intact quote of it) is visible in a genuine part, because it already
+ * names the head path.
+ */
+export function routerHeadAnnouncement(sessionID: string): string {
+  return `Your deepwork router head is \`.slim/deepwork/${sessionID}.md\`; the skill covers setup, planning, gates, and state rules.`;
+}
+
+function activationPrompt(task: string, sessionID: string): string {
   return [
-    'Use the deepwork skill for this task. Treat it as a heavy coding session.',
+    instructions,
     '',
-    'Deepwork requirements:',
-    '- before planning, delegation, or creating state, inspect existing `.gitignore` and `.ignore`; add only missing entries without duplicates: `.gitignore` must contain `.slim/deepwork/`, and `.ignore` must contain `!.slim/deepwork/` and `!.slim/deepwork/**`; this keeps state git-local yet OpenCode-readable;',
-    '- create/update a `.slim/deepwork/` progress file;',
-    '- save code/doc deliverables to project paths (e.g. `src/`, `docs/`); reserve `.slim/deepwork/` strictly for progress files;',
-    '- keep OpenCode todos synced with the current phase;',
-    '- draft a phased implementation/delegation plan with a small number of coherent phases based on dependencies and natural delivery boundaries; do not split work merely to reduce review scope;',
-    '- before execution, show the user a compact overview with phase titles/order, delegated specialists and ownership/scope, plus the Oracle review total, gate after each phase, and a short reason for each;',
-    '- execute phase by phase with background specialists where useful;',
-    '- wait for hook-driven background completion, reconcile results, validate and update state, then ask `@oracle` to review every planned phase before continuing;',
-    '- batch material actionable Oracle findings, including simplify/readability feedback, into one bounded remediation pass and validate it with focused evidence; only re-review when the remediation changes the reviewed decision/risk or the original concern cannot otherwise be verified.',
+    routerHeadAnnouncement(sessionID),
     '',
     'Task:',
     task,
@@ -54,7 +66,10 @@ export function createDeepworkCommandHook(): {
         return;
       }
 
-      output.parts.push({ type: 'text', text: activationPrompt(task) });
+      output.parts.push({
+        type: 'text',
+        text: activationPrompt(task, input.sessionID),
+      });
     },
   };
 }

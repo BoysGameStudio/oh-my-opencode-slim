@@ -25,7 +25,7 @@ const CouncillorModelSchema = z
       .min(1),
   ])
   .describe(
-    'Model ID in provider/model format (e.g. "openai/gpt-5.6-luna"), or an ' +
+    'Model ID in provider/model format (e.g. "openai/gpt-6-luna"), or an ' +
       'ordered fallback chain (array of model IDs or { id, variant } entries) ' +
       'tried in order until one responds.',
   );
@@ -50,7 +50,7 @@ export const CouncillorConfigSchema = z
       .string()
       .optional()
       .describe(
-        'Optional role/guidance injected into the councillor user prompt',
+        'Optional role/guidance appended to the councillor system prompt',
       ),
   })
   .transform((c) => {
@@ -69,42 +69,27 @@ export type CouncillorConfig = z.infer<typeof CouncillorConfigSchema>;
  * A named preset grouping several councillors.
  *
  * All keys are treated as councillor names mapping to councillor configs.
- * The reserved key `"master"` is silently ignored (legacy from when
- * council-master was a separate agent).
+ * The legacy `master` key is rejected at the key level, so the restriction
+ * is visible in the published JSON schema (propertyNames.pattern) too.
  */
 export const CouncilPresetSchema = z
-  .record(z.string(), z.record(z.string(), z.unknown()))
+  .record(
+    z
+      .string()
+      .regex(/^(?!master$)/)
+      .describe('Councillor name; the legacy "master" key was removed'),
+    z.record(z.string(), z.unknown()),
+    {
+      error: (iss) =>
+        iss.code === 'invalid_key'
+          ? 'the legacy "master" preset key was removed'
+          : undefined,
+    },
+  )
   .transform((entries, ctx) => {
     const councillors: Record<string, CouncillorConfig> = {};
 
     for (const [key, raw] of Object.entries(entries)) {
-      // Silently skip the legacy "master" key - no longer parsed as a
-      // councillor. Old configs with per-preset master overrides won't
-      // error, but the override has no effect.
-      if (key === 'master') continue;
-
-      // Legacy nested format: old configs wrapped councillors in a
-      // "councillors" key inside each preset. Unwrap them into the
-      // parent so the config still works without migration.
-      if (key === 'councillors' && typeof raw === 'object' && raw !== null) {
-        for (const [innerKey, innerRaw] of Object.entries(
-          raw as Record<string, unknown>,
-        )) {
-          const innerParsed = CouncillorConfigSchema.safeParse(innerRaw);
-          if (!innerParsed.success) {
-            ctx.addIssue({
-              code: z.ZodIssueCode.custom,
-              message: `Invalid councillor "${innerKey}" (nested under legacy "councillors" key): ${innerParsed.error.issues
-                .map((i) => i.message)
-                .join(', ')}`,
-            });
-            return z.NEVER;
-          }
-          councillors[innerKey] = innerParsed.data;
-        }
-        continue;
-      }
-
       const parsed = CouncillorConfigSchema.safeParse(raw);
       if (!parsed.success) {
         ctx.addIssue({
@@ -121,8 +106,6 @@ export const CouncilPresetSchema = z
     return councillors;
   });
 
-export type CouncilPreset = z.infer<typeof CouncilPresetSchema>;
-
 /**
  * Top-level council configuration.
  *
@@ -132,7 +115,7 @@ export type CouncilPreset = z.infer<typeof CouncilPresetSchema>;
  *   "council": {
  *     "presets": {
  *       "default": {
- *         "alpha": { "model": "openai/gpt-5.6-luna" },
+ *         "alpha": { "model": "openai/gpt-6-luna" },
  *         "beta":  { "model": "openai/gpt-5.3-codex" },
  *         "gamma": { "model": "google/gemini-3-pro" }
  *       }
@@ -145,18 +128,18 @@ export const CouncilConfigSchema = z
   .object({
     presets: z.record(z.string(), CouncilPresetSchema),
     default_preset: z.string().default('default'),
+    master: z.never({ error: 'council.master was removed' }).optional(),
+    master_timeout: z
+      .never({ error: 'council.master_timeout was removed' })
+      .optional(),
+    master_fallback: z
+      .never({ error: 'council.master_fallback was removed' })
+      .optional(),
   })
   .passthrough()
-  .transform((data) => {
-    // Detect deprecated fields and attach warning for consumers
-    const deprecated: string[] = [];
-    if ('master' in data) deprecated.push('master');
-
-    return {
-      presets: data.presets,
-      default_preset: data.default_preset,
-      _deprecated: deprecated.length > 0 ? deprecated : undefined,
-    };
-  });
+  .transform((data) => ({
+    presets: data.presets,
+    default_preset: data.default_preset,
+  }));
 
 export type CouncilConfig = z.infer<typeof CouncilConfigSchema>;

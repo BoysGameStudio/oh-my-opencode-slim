@@ -1,12 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
+import { createBackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { handleEvent } from './event-router';
 
-function createDeps(
-  board: BackgroundJobBoard,
-  now: () => number,
-  options: { fallbackInProgress?: boolean; managesSession?: boolean } = {},
-) {
+function createDeps(board: BackgroundJobBoard, now: () => number) {
   const backgroundJobSupervisor = {
     onSessionDeleted: mock((sessionID: string) => {
       board.drop(sessionID);
@@ -26,20 +23,23 @@ function createDeps(
       sessionTokens: new Map<string, symbol>(),
     },
     options: {
-      shouldManageSession: () => options.managesSession !== false,
+      shouldManageSession: () => true,
       now,
-      willAttemptFallback: () => true,
-      isFallbackInProgress: () => options.fallbackInProgress === true,
     },
     idleReconciler: {
       scheduleIdleReconciliation: mock(() => {}),
       scheduleChildIdleReconciliation: mock(() => {}),
+      scheduleDeferredErrorBackstop: mock(() => {}),
       scheduleErrorTerminalize: mock(() => {}),
       clearIdleTimers: mock(() => {}),
       clearAllTimers: mock(() => []),
     },
-    deferredFallbackErrors: new Set<string>(),
+    deferredInlineErrors: new Map<string, string>(),
     backgroundJobBoard: board,
+    terminalGate: createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      now,
+    }),
     pendingCallTracker: {
       peekByParentAndAgent: mock(() => undefined),
       clearSession: mock(() => {}),
@@ -51,7 +51,6 @@ function createDeps(
     },
     terminalJobsInjectedByParent: new Map(),
     pendingInjectedTerminalJobsByParent: new Map(),
-    retainedBoardSnapshots: new Map(),
     backgroundJobSupervisor,
   };
 }
@@ -70,86 +69,6 @@ async function route(
 }
 
 describe('task session event generation fences', () => {
-  test('terminalizes a fatal child error even when a fallback chain is available', async () => {
-    const board = new BackgroundJobBoard();
-    board.registerLaunch({
-      taskID: 'child-fatal',
-      parentSessionID: 'parent-1',
-      agent: 'fixer',
-      description: 'fatal child',
-      now: 100,
-    });
-    const deps = createDeps(board, () => 100);
-
-    await route(deps, 'session.status', {
-      sessionID: 'child-fatal',
-      status: { type: 'busy' },
-    });
-    await route(deps, 'session.error', {
-      sessionID: 'child-fatal',
-      error: { message: 'invalid API key' },
-    });
-
-    expect(board.get('child-fatal')).toMatchObject({
-      state: 'error',
-      resultSummary: 'invalid API key',
-    });
-    expect(deps.deferredFallbackErrors.has('child-fatal')).toBe(false);
-  });
-
-  test('defers only failover-eligible child errors while fallback is active', async () => {
-    const board = new BackgroundJobBoard();
-    board.registerLaunch({
-      taskID: 'child-rate-limit',
-      parentSessionID: 'parent-1',
-      agent: 'fixer',
-      description: 'rate limited child',
-      now: 100,
-    });
-    const deps = createDeps(board, () => 100, {
-      fallbackInProgress: true,
-      managesSession: false,
-    });
-
-    await route(deps, 'session.status', {
-      sessionID: 'child-rate-limit',
-      status: { type: 'busy' },
-    });
-    await route(deps, 'session.error', {
-      sessionID: 'child-rate-limit',
-      error: { message: 'rate limit exceeded' },
-    });
-
-    expect(board.get('child-rate-limit')?.state).toBe('running');
-    expect(deps.deferredFallbackErrors.has('child-rate-limit')).toBe(true);
-
-    const fatalBoard = new BackgroundJobBoard();
-    fatalBoard.registerLaunch({
-      taskID: 'child-fatal-active',
-      parentSessionID: 'parent-1',
-      agent: 'fixer',
-      description: 'fatal child',
-      now: 100,
-    });
-    const fatalDeps = createDeps(fatalBoard, () => 100, {
-      fallbackInProgress: true,
-      managesSession: false,
-    });
-    await route(fatalDeps, 'session.status', {
-      sessionID: 'child-fatal-active',
-      status: { type: 'busy' },
-    });
-    await route(fatalDeps, 'session.error', {
-      sessionID: 'child-fatal-active',
-      error: { message: 'invalid API key' },
-    });
-
-    expect(fatalBoard.get('child-fatal-active')).toMatchObject({
-      state: 'error',
-      resultSummary: 'invalid API key',
-    });
-  });
-
   test('quarantines an interleaved old idle/error/busy sequence after same-ID relaunch', async () => {
     let clock = 100;
     const board = new BackgroundJobBoard();
@@ -208,6 +127,7 @@ describe('task session event generation fences', () => {
     await route(deps, 'session.status', {
       sessionID: 'child-1',
       status: { type: 'busy' },
+      activityAt: clock,
     });
     expect(board.get('child-1')).toMatchObject({ lastLiveBusyAt: 201 });
   });

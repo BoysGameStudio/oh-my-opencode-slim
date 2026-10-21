@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 type SpawnResult = {
   exited: Promise<number>;
@@ -65,6 +68,46 @@ describe('gracefulClosePane', () => {
       acceptExitCode1: true,
     });
     expect(ok).toBe(true);
+  });
+
+  test('isAlreadyClosed: a failed close counts only when stderr proves the pane is gone', async () => {
+    const closeWith = (stderr: string, exitCode = 1) =>
+      crossSpawnMock.mockImplementation((args: string[]) => ({
+        exited: Promise.resolve(args.includes('kill-pane') ? exitCode : 0),
+        stdout: () => Promise.resolve(''),
+        stderr: () => Promise.resolve(args.includes('kill-pane') ? stderr : ''),
+      }));
+    const options = {
+      ctrlC: ['cli', 'send-text', '--pane-id', '5', '\u0003'],
+      close: ['cli', 'kill-pane', '--pane-id', '5'],
+      isAlreadyClosed: (stderr: string) => /no such pane \d+/.test(stderr),
+    };
+    const { gracefulClosePane } = await importShared();
+
+    closeWith('Error: no such pane 5');
+    expect(await gracefulClosePane('wezterm', '5', options)).toBe(true);
+
+    closeWith('Error while decoding response pdu');
+    expect(await gracefulClosePane('wezterm', '5', options)).toBe(false);
+
+    closeWith('', 0);
+    expect(await gracefulClosePane('wezterm', '5', options)).toBe(true);
+  });
+
+  test('isAlreadyClosed takes precedence over acceptExitCode1', async () => {
+    crossSpawnMock.mockImplementation(() => ({
+      exited: Promise.resolve(1),
+      stdout: () => Promise.resolve(''),
+      stderr: () => Promise.resolve('connection reset'),
+    }));
+    const { gracefulClosePane } = await importShared();
+    const ok = await gracefulClosePane('wezterm', '5', {
+      ctrlC: ['ctrl-c'],
+      close: ['kill'],
+      acceptExitCode1: true,
+      isAlreadyClosed: () => false,
+    });
+    expect(ok).toBe(false);
   });
 
   test('returns false on exit 1 when acceptExitCode1 is false', async () => {
@@ -254,158 +297,391 @@ describe('buildShellLaunchArgs', () => {
   });
 });
 
-describe('waitForSessionReady', () => {
-  const url = 'http://127.0.0.1:7777/base';
+describe('findBinaryLogPrefix', () => {
+  test('derives [<binaryName>] for callers without an override', async () => {
+    const { findBinaryLogPrefix } = await importShared();
 
-  test('returns true immediately when the session is already ready', async () => {
-    const { waitForSessionReady } = await importShared();
-    const check = mock(async () => true);
-    const delays: number[] = [];
-    const ready = await waitForSessionReady(url, 'session-1', {
-      checkSessionReady: check,
-      delay: async (ms) => void delays.push(ms),
-    });
-    expect(ready).toBe(true);
-    expect(check).toHaveBeenCalledTimes(1);
-    expect(delays).toEqual([]);
+    // tmux/zellij/herdr/kitty pass no override, so their `findBinary` log
+    // lines stay byte-identical.
+    expect(findBinaryLogPrefix('tmux')).toBe('[tmux]');
+    expect(findBinaryLogPrefix('zellij')).toBe('[zellij]');
+    expect(findBinaryLogPrefix('herdr')).toBe('[herdr]');
+    expect(findBinaryLogPrefix('kitten')).toBe('[kitten]');
+    expect(findBinaryLogPrefix('kitty')).toBe('[kitty]');
   });
 
-  test('delayed readiness: polls until the session appears, then succeeds', async () => {
-    const { waitForSessionReady } = await importShared();
-    const seen: Array<{ url: string; sessionId: string }> = [];
-    let attempt = 0;
-    const check = mock(async (checkUrl: URL, sessionId: string) => {
-      seen.push({ url: checkUrl.href, sessionId });
-      attempt += 1;
-      return attempt >= 3;
-    });
-    const delays: number[] = [];
-    const ready = await waitForSessionReady(url, 'session-1', {
-      checkSessionReady: check,
-      delay: async (ms) => void delays.push(ms),
-    });
-    expect(ready).toBe(true);
-    expect(check).toHaveBeenCalledTimes(3);
-    expect(seen).toEqual([
-      { url: 'http://127.0.0.1:7777/session/status', sessionId: 'session-1' },
-      { url: 'http://127.0.0.1:7777/session/status', sessionId: 'session-1' },
-      { url: 'http://127.0.0.1:7777/session/status', sessionId: 'session-1' },
-    ]);
-    expect(delays).toEqual([50, 100]);
+  test('honors the cmux adapter override for both probes', async () => {
+    const { findBinaryLogPrefix } = await importShared();
+
+    // The legacy `cmux` fallback must log under `[cmux-tui]`, never `[cmux]`.
+    expect(findBinaryLogPrefix('cmux-tui', 'cmux-tui')).toBe('[cmux-tui]');
+    expect(findBinaryLogPrefix('cmux', 'cmux-tui')).toBe('[cmux-tui]');
+  });
+});
+
+describe('buildViewCommand', () => {
+  test('defaults to the resolved absolute host executable (#514)', async () => {
+    const { buildViewCommand } = await importShared();
+    const dir = mkdtempSync(join(tmpdir(), 'omos-514-'));
+    const bin = join(dir, 'opencode');
+    writeFileSync(bin, '');
+    const original = process.env.OPENCODE_BIN;
+    process.env.OPENCODE_BIN = bin;
+    try {
+      const cmd = buildViewCommand('sess', 'http://x', '/repo');
+      expect(cmd).toStartWith(`'${bin}' attach`);
+    } finally {
+      if (original === undefined) delete process.env.OPENCODE_BIN;
+      else process.env.OPENCODE_BIN = original;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  test('readiness timeout: returns false without ever succeeding', async () => {
-    const { waitForSessionReady } = await importShared();
-    const check = mock(async () => false);
-    const delays: number[] = [];
-    const ready = await waitForSessionReady(url, 'session-1', {
-      checkSessionReady: check,
-      delay: async (ms) => void delays.push(ms),
-    });
-    expect(ready).toBe(false);
-    // 8 attempts = 7 backoff delays + one final attempt
-    expect(check).toHaveBeenCalledTimes(8);
-    expect(delays).toEqual([50, 100, 200, 400, 500, 500, 250]);
+  test('falls back to bare opencode when no binary resolves (#514)', async () => {
+    const { buildViewCommand } = await importShared();
+    const original = process.env.OPENCODE_BIN;
+    delete process.env.OPENCODE_BIN;
+    try {
+      // bun's execPath/argv0 never match the opencode basename gate, so with
+      // OPENCODE_BIN unset the resolver yields null and the bare name wins.
+      expect(buildViewCommand('sess', 'http://x', '/repo')).toStartWith(
+        'opencode attach',
+      );
+    } finally {
+      if (original === undefined) delete process.env.OPENCODE_BIN;
+      else process.env.OPENCODE_BIN = original;
+    }
   });
 
-  test('a throwing probe is treated as not-ready and keeps polling', async () => {
-    const { waitForSessionReady } = await importShared();
-    let attempt = 0;
-    const check = mock(async () => {
-      attempt += 1;
-      if (attempt === 1) throw new Error('network');
-      return true;
-    });
-    const ready = await waitForSessionReady(url, 'session-1', {
-      checkSessionReady: check,
-      delay: async () => {},
-    });
-    expect(ready).toBe(true);
-    expect(check).toHaveBeenCalledTimes(2);
+  test('v1 flavor is byte-identical to the legacy attach command', async () => {
+    const { buildOpencodeAttachCommand, buildViewCommand } =
+      await importShared();
+    const legacy = buildOpencodeAttachCommand(
+      'sess',
+      'http://x',
+      '/repo',
+      'opencode',
+    );
+    expect(
+      buildViewCommand('sess', 'http://x', '/repo', { executable: 'opencode' }),
+    ).toBe(legacy);
   });
 
-  test('a hanging probe is aborted by the per-attempt timeout', async () => {
-    const { waitForSessionReady } = await importShared();
-    const check = mock(() => new Promise<boolean>(() => {}));
-    const ready = await waitForSessionReady(url, 'session-1', {
-      checkSessionReady: check,
-      delay: async () => {},
-      readinessAttemptTimeoutMs: 5,
-    });
-    expect(ready).toBe(false);
-    expect(check).toHaveBeenCalledTimes(8);
+  test('v2-shared omits URL and secret (the viewer discovers the service)', async () => {
+    const { buildViewCommand } = await importShared();
+    expect(
+      buildViewCommand('ses_abc', 'http://unused', '/repo', {
+        executable: 'opencode',
+        viewerFlavor: 'v2-shared',
+      }),
+    ).toBe("opencode --session 'ses_abc' '/repo'");
   });
 
-  test('absolute deadline bounds the total wait even with hanging probes', async () => {
-    const { waitForSessionReady } = await importShared();
-    let clock = 0;
-    const now = () => clock;
-    const check = mock(() => new Promise<boolean>(() => {}));
-    const delays: number[] = [];
-    const ready = await waitForSessionReady(url, 'session-1', {
-      checkSessionReady: check,
-      delay: async (ms) => {
-        delays.push(ms);
-        clock += ms;
-      },
-      readinessAttemptTimeoutMs: 5,
-      readinessDeadlineMs: 500,
-      now,
-    });
-    expect(ready).toBe(false);
-    // The deadline, not the 8-attempt schedule, stopped the wait.
-    expect(check.mock.calls.length).toBeLessThan(8);
-    // Cumulative delay never exceeds the deadline.
-    expect(delays.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(500);
+  test('v2-remote carries server URL, session and directory — never the secret', async () => {
+    const { buildViewCommand } = await importShared();
+    expect(
+      buildViewCommand('ses_abc', 'http://192.168.5.212:8192', '/repo', {
+        executable: 'opencode',
+        viewerFlavor: 'v2-remote',
+      }),
+    ).toBe(
+      "opencode --server 'http://192.168.5.212:8192' --session 'ses_abc' '/repo'",
+    );
   });
 
-  test('an abort signal ends the wait promptly with false', async () => {
-    const { waitForSessionReady } = await importShared();
-    const controller = new AbortController();
-    const check = mock(() => new Promise<boolean>(() => {}));
-    const readyPromise = waitForSessionReady(url, 'session-1', {
-      checkSessionReady: check,
-      delay: async () => {},
-      readinessAttemptTimeoutMs: 10_000,
-      signal: controller.signal,
-    });
-    controller.abort();
-    await expect(readyPromise).resolves.toBe(false);
+  test('v2-remote ignores a stray password option (no secret in command text)', async () => {
+    const { buildViewCommand } = await importShared();
+    const options = {
+      executable: 'opencode' as const,
+      viewerFlavor: 'v2-remote' as const,
+      viewerPassword: 'pw-123',
+    };
+    const cmd = buildViewCommand('ses_abc', 'http://x', '/repo', options);
+    expect(cmd).toBe(
+      "opencode --server 'http://x' --session 'ses_abc' '/repo'",
+    );
+    expect(cmd).not.toContain('pw-123');
+    expect(cmd).not.toContain('OPENCODE_PASSWORD');
   });
 
-  test('default probe parses the target status from /session/status', async () => {
-    const originalFetch = globalThis.fetch;
-    const requested: string[] = [];
-    globalThis.fetch = mock(async (input) => {
-      requested.push(String(input));
-      return Response.json({
-        target: { type: 'busy' },
-        other: { type: 'idle' },
+  test('viewer "mini" targets the mini interface for every flavor', async () => {
+    const { buildViewCommand } = await importShared();
+    expect(
+      buildViewCommand('sess', 'http://x', '/repo', {
+        executable: 'opencode',
+        viewerFlavor: 'v1',
+        viewerSurface: 'mini',
+      }),
+    ).toBe("opencode attach 'http://x' --session 'sess' --dir '/repo' --mini");
+    expect(
+      buildViewCommand('ses_abc', 'http://unused', '/repo', {
+        executable: 'opencode',
+        viewerFlavor: 'v2-shared',
+        viewerSurface: 'mini',
+      }),
+    ).toBe("opencode mini --session 'ses_abc'");
+    expect(
+      buildViewCommand('ses_abc', 'http://192.168.5.212:8192', '/repo', {
+        executable: 'opencode',
+        viewerFlavor: 'v2-remote',
+        viewerSurface: 'mini',
+      }),
+    ).toBe(
+      "opencode mini --server 'http://192.168.5.212:8192' --session 'ses_abc'",
+    );
+  });
+
+  test('v2 flavors quote directories, session ids and executables', async () => {
+    const { buildViewCommand } = await importShared();
+    expect(
+      buildViewCommand("s'es s", 'http://x', "/tmp/a b's", {
+        viewerFlavor: 'v2-shared',
+        executable: "/opt/King's/opencode",
+      }),
+    ).toBe(
+      "'/opt/King'\\''s/opencode' --session 's'\\''es s' '/tmp/a b'\\''s'",
+    );
+  });
+
+  test('v2-remote normalizes Windows backslash paths', async () => {
+    const original = process.platform;
+    Object.defineProperty(process, 'platform', {
+      value: 'win32',
+      configurable: true,
+    });
+    try {
+      const { buildViewCommand } = await importShared();
+      const cmd = buildViewCommand('ses', 'http://x', 'C:\\Users\\foo\\repo', {
+        viewerFlavor: 'v2-remote',
       });
-    }) as typeof fetch;
-    try {
-      const { waitForSessionReady } = await importShared();
-      expect(
-        await waitForSessionReady('http://127.0.0.1:7777/base', 'target'),
-      ).toBe(true);
-      expect(requested).toEqual(['http://127.0.0.1:7777/session/status']);
+      expect(cmd).toContain('C:/Users/foo/repo');
     } finally {
-      globalThis.fetch = originalFetch;
+      Object.defineProperty(process, 'platform', {
+        value: original,
+        configurable: true,
+      });
     }
   });
 
-  test('default probe reports false when the session is absent', async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(async () =>
-      Response.json({ other: { type: 'idle' } }),
-    ) as typeof fetch;
+  test('normalizes Windows executable backslashes in both builders', async () => {
+    const original = process.platform;
+    Object.defineProperty(process, 'platform', {
+      value: 'win32',
+      configurable: true,
+    });
     try {
-      const { waitForSessionReady } = await importShared();
+      const { buildOpencodeAttachCommand, buildViewCommand } =
+        await importShared();
+      const exe = 'C:\\Users\\foo\\opencode.exe';
       expect(
-        await waitForSessionReady('http://127.0.0.1:7777/base', 'missing'),
-      ).toBe(false);
+        buildOpencodeAttachCommand(
+          'sess',
+          'http://x',
+          'C:\\Users\\foo\\repo',
+          exe,
+        ),
+      ).toStartWith("'C:/Users/foo/opencode.exe' attach");
+      const cmd = buildViewCommand('ses', 'http://x', 'C:\\Users\\foo\\repo', {
+        viewerFlavor: 'v2-remote',
+        executable: exe,
+      });
+      expect(cmd).toStartWith("'C:/Users/foo/opencode.exe' --server");
+      expect(cmd).toContain('C:/Users/foo/repo');
     } finally {
-      globalThis.fetch = originalFetch;
+      Object.defineProperty(process, 'platform', {
+        value: original,
+        configurable: true,
+      });
     }
+  });
+});
+
+describe('isPosixShell', () => {
+  test('accepts POSIX-family shells by basename', async () => {
+    const { isPosixShell } = await importShared();
+    for (const shell of [
+      '/bin/sh',
+      '/bin/bash',
+      '/usr/bin/zsh',
+      '/usr/bin/dash',
+      '/usr/bin/ksh',
+      'bash',
+    ]) {
+      expect(isPosixShell(shell)).toBe(true);
+    }
+  });
+
+  test('rejects non-POSIX and unknown shells (fail closed)', async () => {
+    const { isPosixShell } = await importShared();
+    for (const shell of [
+      '/usr/bin/fish',
+      '/usr/bin/nu',
+      '/usr/bin/pwsh',
+      '/usr/bin/powershell',
+      'C:\\Windows\\System32\\cmd.exe',
+      '/usr/bin/elvish',
+      '/usr/bin/xonsh',
+      '',
+    ]) {
+      expect(isPosixShell(shell)).toBe(false);
+    }
+  });
+});
+
+describe('withParentEnvPassword', () => {
+  test('reads OPENCODE_PASSWORD first and falls back to OPENCODE_SERVER_PASSWORD', async () => {
+    const { withParentEnvPassword } = await importShared();
+    const script = withParentEnvPassword('opencode --server u');
+
+    expect(script).toContain(`/proc/${process.pid}/environ`);
+    expect(script).toContain('s/^OPENCODE_PASSWORD=//p');
+    expect(script).toContain('s/^OPENCODE_SERVER_PASSWORD=//p');
+    // Precedence: the primary probe runs before the fallback probe.
+    const primary = script.indexOf('OPENCODE_PASSWORD=');
+    const fallback = script.indexOf('OPENCODE_SERVER_PASSWORD=');
+    expect(primary).toBeGreaterThan(-1);
+    expect(fallback).toBeGreaterThan(primary);
+    expect(script).toContain('export OPENCODE_PASSWORD');
+    expect(script).toContain('unset _omo_pw');
+    // The wrapper takes no secret argument, so no secret can be embedded,
+    // and the original command is the last line.
+    expect(script).not.toContain('pw-');
+    expect(script.endsWith('\nopencode --server u')).toBe(true);
+  });
+
+  test('exports the primary value read from the parent environ', async () => {
+    await expectExtractedPassword(
+      'PATH=/usr/bin\0OPENCODE_PASSWORD=from-primary\0OPENCODE_SERVER_PASSWORD=from-fallback\0',
+      'from-primary',
+    );
+  });
+
+  test('falls back to OPENCODE_SERVER_PASSWORD when the primary is absent', async () => {
+    await expectExtractedPassword(
+      'PATH=/usr/bin\0OPENCODE_SERVER_PASSWORD=from-fallback\0',
+      'from-fallback',
+    );
+  });
+
+  test('runs the command with an empty value when neither is present', async () => {
+    await expectExtractedPassword('PATH=/usr/bin\0', '');
+  });
+
+  test('v1 attach viewers get only OPENCODE_SERVER_PASSWORD', async () => {
+    const { withParentEnvPassword } = await importShared();
+    const script = withParentEnvPassword(
+      'opencode attach u',
+      'OPENCODE_SERVER_PASSWORD',
+    );
+    expect(script).toContain('export OPENCODE_SERVER_PASSWORD="$_omo_pw"');
+    expect(script).not.toContain('export OPENCODE_PASSWORD');
+    // A stray v2 OPENCODE_PASSWORD must not be consulted for a v1 viewer.
+    expect(script).not.toContain('s/^OPENCODE_PASSWORD=//p');
+    expect(script.endsWith('\nopencode attach u')).toBe(true);
+  });
+
+  test('v1 export ignores OPENCODE_PASSWORD in the parent environ', async () => {
+    const { withParentEnvPassword } = await importShared();
+    const dir = `/tmp/opencode/omo-shared-v1-test-${process.pid}`;
+    mkdirSync(dir, { recursive: true });
+    const environPath = `${dir}/environ`;
+    writeFileSync(
+      environPath,
+      'OPENCODE_PASSWORD=v2-value\0OPENCODE_SERVER_PASSWORD=v1-value\0',
+    );
+    try {
+      const script = withParentEnvPassword(
+        'printf %s "$OPENCODE_SERVER_PASSWORD"',
+        'OPENCODE_SERVER_PASSWORD',
+      ).replaceAll(`/proc/${process.pid}/environ`, environPath);
+      const proc = Bun.spawn(['/bin/sh', '-c', script], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+      });
+      expect(await proc.exited).toBe(0);
+      expect(await new Response(proc.stdout).text()).toBe('v1-value');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('runs the wrapped command in a POSIX shell', async () => {
+    const { withParentEnvPassword } = await importShared();
+    const script = withParentEnvPassword('printf ok');
+    const proc = Bun.spawn(['/bin/sh', '-c', script], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+    expect(await new Response(proc.stdout).text()).toBe('ok');
+  });
+});
+
+/**
+ * Executes the generated wrapper against a fake `/proc/<pid>/environ` file
+ * (only the path is substituted) and returns the value the wrapped command
+ * observes as `OPENCODE_PASSWORD`.
+ */
+async function expectExtractedPassword(
+  environContents: string,
+  expected: string,
+): Promise<void> {
+  const { withParentEnvPassword } = await importShared();
+  const dir = `/tmp/opencode/omo-shared-test-${process.pid}`;
+  mkdirSync(dir, { recursive: true });
+  const environPath = `${dir}/environ`;
+  writeFileSync(environPath, environContents);
+  try {
+    const script = withParentEnvPassword(
+      'printf %s "$OPENCODE_PASSWORD"',
+    ).replaceAll(`/proc/${process.pid}/environ`, environPath);
+    // Clean env: a password exported in the test runner's own environment
+    // must not satisfy the "neither is present" case.
+    const proc = Bun.spawn(['/bin/sh', '-c', script], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+    });
+    expect(await proc.exited).toBe(0);
+    expect(await new Response(proc.stdout).text()).toBe(expected);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('redactViewerSecretArgs', () => {
+  test('masks viewer-secret env entries in spawn argv', async () => {
+    const { redactViewerSecretArgs } = await importShared();
+    expect(
+      redactViewerSecretArgs([
+        '-e',
+        'OPENCODE_PASSWORD=hunter2',
+        '--env',
+        'OPENCODE_SERVER_PASSWORD=hunter3',
+      ]),
+    ).toEqual([
+      '-e',
+      'OPENCODE_PASSWORD=<redacted>',
+      '--env',
+      'OPENCODE_SERVER_PASSWORD=<redacted>',
+    ]);
+  });
+
+  test('leaves unrelated entries and viewer commands untouched', async () => {
+    const { redactViewerSecretArgs } = await importShared();
+    expect(
+      redactViewerSecretArgs([
+        'env',
+        'OPENCODE_DISABLE_TERMINAL_TITLE=1',
+        'opencode --server http://127.0.0.1:1 --session ses_x /tmp/a b',
+        'OPENCODE_PASSWORDX=keep',
+      ]),
+    ).toEqual([
+      'env',
+      'OPENCODE_DISABLE_TERMINAL_TITLE=1',
+      'opencode --server http://127.0.0.1:1 --session ses_x /tmp/a b',
+      'OPENCODE_PASSWORDX=keep',
+    ]);
   });
 });

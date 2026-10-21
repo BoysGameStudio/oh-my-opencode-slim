@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { SLIM_INTERNAL_INITIATOR_MARKER } from '../../utils';
 import { createDeepworkCommandHook } from './index';
 
@@ -56,22 +58,17 @@ describe('deepwork command hook', () => {
     );
 
     expect(output.parts).toHaveLength(1);
-    expect(output.parts[0].text).toContain('Use the deepwork skill');
-    expect(output.parts[0].text).toContain(
-      'before planning, delegation, or creating state',
-    );
-    expect(output.parts[0].text).toContain('.gitignore');
-    expect(output.parts[0].text).toContain('.ignore');
-    expect(output.parts[0].text).toContain('!.slim/deepwork/');
-    expect(output.parts[0].text).toContain('!.slim/deepwork/**');
-    expect(output.parts[0].text).toContain(
-      'add only missing entries without duplicates',
-    );
-    expect(output.parts[0].text).toContain('git-local yet OpenCode-readable');
+    // Content-delivery seam: the bundled SKILL.md body itself must arrive
+    // with the command (/deepwork is self-contained — it works even when the
+    // skill is disabled). Head + tail pins prove the whole body survives; the
+    // frontmatter guard catches a strip failure (including the CRLF case).
+    expect(output.parts[0].text).toContain('# Deepwork');
+    expect(output.parts[0].text).toContain('## Completion');
+    expect(output.parts[0].text).not.toContain('name: deepwork');
     expect(output.parts[0].text).toContain('.slim/deepwork/');
-    expect(output.parts[0].text).toContain('save code/doc deliverables');
-    expect(output.parts[0].text).toContain('@oracle');
-    expect(output.parts[0].text).toContain('simplify/readability');
+    // Dynamic-input propagation seam: the pinned per-session path must carry
+    // the caller's real session ID (a hardcoded path cannot contain it).
+    expect(output.parts[0].text).toContain('.slim/deepwork/s1.md');
     expect(output.parts[0].text).toContain('refactor scheduler state');
     expect(output.parts[0].text).not.toContain(SLIM_INTERNAL_INITIATOR_MARKER);
   });
@@ -86,5 +83,40 @@ describe('deepwork command hook', () => {
     );
 
     expect(output.parts).toEqual([{ type: 'text', text: 'template' }]);
+  });
+
+  test('pins a distinct progress-file path per session', async () => {
+    // Uniqueness seam: two concurrent sessions must never resolve to the same
+    // progress file — the direct anti-clobber guarantee of #1329.
+    const hook = createDeepworkCommandHook();
+    const a = { parts: [{ type: 'text', text: 'template' }] };
+    const b = { parts: [{ type: 'text', text: 'template' }] };
+
+    await hook.handleCommandExecuteBefore(
+      { command: 'deepwork', sessionID: 's1', arguments: 'task one' },
+      a,
+    );
+    await hook.handleCommandExecuteBefore(
+      { command: 'deepwork', sessionID: 's2', arguments: 'task two' },
+      b,
+    );
+
+    expect(a.parts[0].text).toContain('.slim/deepwork/s1.md');
+    expect(b.parts[0].text).toContain('.slim/deepwork/s2.md');
+    expect(a.parts[0].text).not.toContain('s2');
+    expect(b.parts[0].text).not.toContain('s1');
+  });
+
+  test('the skill is the single contract source for deepwork state', () => {
+    // Cross-artifact machine-field seam: the session-keyed path token and the
+    // verbatim ignore-file values must stay in the skill (the authoritative
+    // contract) so they cannot drift apart silently.
+    const skill = readFileSync(
+      path.join(import.meta.dir, '../../skills/deepwork/SKILL.md'),
+      'utf-8',
+    );
+    expect(skill).toContain('.slim/deepwork/<session-id>.md');
+    expect(skill).toContain('!.slim/deepwork/**');
+    expect(skill).toContain('status: active');
   });
 });

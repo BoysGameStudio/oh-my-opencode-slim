@@ -5,13 +5,18 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   CompanionManager,
+  companionSessionIdForDirectory,
+  normalizeCompanionSessionStatus,
+  rememberKnownCompanionProject,
   resolveCompanionBinaryPath,
+  resolveKnownCompanionProject,
   stateFilePath,
 } from './manager';
 
@@ -24,9 +29,20 @@ function readState() {
   return JSON.parse(readFileSync(stateFilePath(), 'utf8'));
 }
 
+const previousXdg = process.env.XDG_DATA_HOME;
+const previousXdgConfig = process.env.XDG_CONFIG_HOME;
+const previousOpenCodeConfigDir = process.env.OPENCODE_CONFIG_DIR;
+const previousPresetEnv = process.env.OH_MY_OPENCODE_SLIM_PRESET;
+
 beforeEach(() => {
   mkdirSync(TEST_DIR, { recursive: true });
   process.env.XDG_DATA_HOME = XDG_DIR;
+  process.env.XDG_CONFIG_HOME = path.join(TEST_DIR, 'config');
+  delete process.env.OPENCODE_CONFIG_DIR;
+  delete process.env.OH_MY_OPENCODE_SLIM_PRESET;
+  const configDir = path.join(process.env.XDG_CONFIG_HOME, 'opencode');
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(path.join(configDir, 'oh-my-opencode-slim.json'), '{}');
 });
 
 afterEach(() => {
@@ -34,7 +50,20 @@ afterEach(() => {
     manager.onExit();
   }
   rmSync(TEST_DIR, { recursive: true, force: true });
-  delete process.env.XDG_DATA_HOME;
+  if (previousXdg === undefined) delete process.env.XDG_DATA_HOME;
+  else process.env.XDG_DATA_HOME = previousXdg;
+  if (previousXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = previousXdgConfig;
+  if (previousOpenCodeConfigDir === undefined) {
+    delete process.env.OPENCODE_CONFIG_DIR;
+  } else {
+    process.env.OPENCODE_CONFIG_DIR = previousOpenCodeConfigDir;
+  }
+  if (previousPresetEnv === undefined) {
+    delete process.env.OH_MY_OPENCODE_SLIM_PRESET;
+  } else {
+    process.env.OH_MY_OPENCODE_SLIM_PRESET = previousPresetEnv;
+  }
 });
 
 function make(
@@ -77,6 +106,10 @@ function companionPidFile(): string {
   return path.join(path.dirname(stateFilePath()), 'companion.pid');
 }
 
+function companionStateLock(): string {
+  return `${stateFilePath()}.lock`;
+}
+
 describe('CompanionManager', () => {
   it('writes an intro entry on load', () => {
     const m = make();
@@ -87,8 +120,702 @@ describe('CompanionManager', () => {
     expect(state.sessions[0].session_id).toBe('test-session');
     expect(state.sessions[0].cwd).toBe('/home/user/myproject');
     expect(state.sessions[0].active_agents).toEqual(['intro']);
+    expect(state.sessions[0].active_agent_details).toEqual([]);
     expect(state.sessions[0].status).toBe('idle');
     expect(state.sessions[0].pid).toBe(process.pid);
+  });
+
+  it('normalizes all terminal lifecycle forms to idle', () => {
+    expect(normalizeCompanionSessionStatus('session.idle')).toBe('idle');
+    expect(normalizeCompanionSessionStatus('session.error')).toBe('idle');
+    for (const status of ['idle', 'completed', 'stopped', 'error', 'failed']) {
+      expect(normalizeCompanionSessionStatus('session.status', status)).toBe(
+        'idle',
+      );
+    }
+  });
+
+  it('normalizes retry as active and ignores unrelated lifecycle events', () => {
+    expect(normalizeCompanionSessionStatus('session.status', 'busy')).toBe(
+      'busy',
+    );
+    expect(normalizeCompanionSessionStatus('session.status', 'retry')).toBe(
+      'busy',
+    );
+    expect(normalizeCompanionSessionStatus('session.status', 'unknown')).toBe(
+      undefined,
+    );
+    expect(normalizeCompanionSessionStatus('message.updated', 'busy')).toBe(
+      undefined,
+    );
+  });
+
+  it('derives stable distinct manager ids per project directory', () => {
+    const alpha = companionSessionIdForDirectory('/projects/alpha');
+    const alphaNormalized = companionSessionIdForDirectory(
+      path.join('/projects', 'alpha', '..', 'alpha'),
+    );
+    const beta = companionSessionIdForDirectory('/projects/beta');
+
+    expect(alpha).toBe(alphaNormalized);
+    expect(alpha).not.toBe(beta);
+    expect(alpha).toStartWith(`proc_${process.pid}_`);
+  });
+
+  it('recovers an abandoned state lock before publishing the owner session', () => {
+    const lock = companionStateLock();
+    mkdirSync(lock, { recursive: true });
+    const stale = new Date(Date.now() - 10_000);
+    utimesSync(lock, stale, stale);
+
+    const m = make('stale-state-lock');
+    m.onLoad();
+
+    expect(existsSync(lock)).toBe(false);
+    expect(readState().sessions).toContainEqual(
+      expect.objectContaining({ session_id: 'stale-state-lock' }),
+    );
+  });
+
+  it('does not age-steal a state lock from a live owner', () => {
+    const lock = companionStateLock();
+    mkdirSync(lock, { recursive: true });
+    writeFileSync(path.join(lock, 'owner'), `${process.pid}\nlive-owner`);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock, old, old);
+
+    const m = make('live-state-lock');
+    m.onLoad();
+
+    expect(existsSync(lock)).toBe(true);
+    expect(existsSync(stateFilePath())).toBe(false);
+  });
+
+  it('does not spawn native companion until owner state publication succeeds', () => {
+    const lock = companionStateLock();
+    mkdirSync(lock, { recursive: true });
+
+    const m = make('blocked-owner');
+    const internal = m as unknown as {
+      spawnIfAvailable: () => void;
+      publishAndSpawn: () => void;
+    };
+    let spawnAttempts = 0;
+    internal.spawnIfAvailable = () => {
+      spawnAttempts += 1;
+    };
+
+    m.onLoad();
+    expect(spawnAttempts).toBe(0);
+    expect(existsSync(stateFilePath())).toBe(false);
+
+    rmSync(lock, { recursive: true, force: true });
+    internal.publishAndSpawn();
+
+    expect(spawnAttempts).toBe(1);
+    expect(readState().sessions).toContainEqual(
+      expect.objectContaining({ session_id: 'blocked-owner' }),
+    );
+  });
+
+  it('publishes presets and applies a project-local preset request', () => {
+    const projectDir = path.join(TEST_DIR, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    writeFileSync(
+      projectConfigPath,
+      `{
+        // Project-local preset should remain the controlling layer.
+        "preset": "old",
+      }`,
+    );
+
+    const userConfigPath = path.join(
+      path.join(TEST_DIR, 'config'),
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        preset: 'cheap',
+        presets: {
+          old: { orchestrator: { model: 'old-model' } },
+          cheap: { orchestrator: { model: 'cheap-model' } },
+        },
+      }),
+    );
+
+    const m = make('preset-session', projectDir);
+    m.onLoad();
+    let state = readState();
+    expect(state.sessions[0].preset.current).toBe('old');
+    expect(state.sessions[0].preset.available).toEqual(['cheap', 'old']);
+
+    state.sessions.push({
+      session_id: 'other-session',
+      cwd: path.join(TEST_DIR, 'other-project'),
+      active_agents: ['intro'],
+      status: 'idle',
+      pid: process.pid,
+    });
+    state.preset_requests = [
+      {
+        request_id: 'req-1',
+        session_id: 'preset-session',
+        preset: 'cheap',
+      },
+      {
+        request_id: 'req-other',
+        session_id: 'other-session',
+        preset: 'old',
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+    (
+      m as unknown as {
+        consumePresetRequest: () => boolean;
+      }
+    ).consumePresetRequest();
+
+    state = readState();
+    expect(state.preset_requests).toEqual([
+      {
+        request_id: 'req-other',
+        session_id: 'other-session',
+        preset: 'old',
+      },
+    ]);
+    expect(state.sessions[0].preset).toMatchObject({
+      current: 'cheap',
+      last_request_id: 'req-1',
+      result_ok: true,
+    });
+    expect(readFileSync(projectConfigPath, 'utf8')).toContain(
+      '// Project-local preset should remain',
+    );
+    expect(readFileSync(projectConfigPath, 'utf8')).toContain(
+      '"preset": "cheap"',
+    );
+  });
+
+  it('does not reapply a preset after post-apply acknowledgement failure', () => {
+    const projectDir = path.join(TEST_DIR, 'preset-ack-failure');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    writeFileSync(projectConfigPath, JSON.stringify({ preset: 'old' }));
+
+    const userConfigPath = path.join(
+      TEST_DIR,
+      'config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        presets: {
+          old: { orchestrator: { model: 'old-model' } },
+          cheap: { orchestrator: { model: 'cheap-model' } },
+        },
+      }),
+    );
+
+    const m = make('preset-ack-failure-session', projectDir);
+    m.onLoad();
+    let state = readState();
+    state.preset_requests = [
+      {
+        request_id: 'req-stale-after-apply',
+        session_id: 'preset-ack-failure-session',
+        scope: 'project',
+        preset: 'cheap',
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+
+    const internal = m as unknown as {
+      acknowledgePresetRequest: (requestId: string) => boolean;
+      consumePresetRequest: () => boolean;
+    };
+    const realAcknowledge = internal.acknowledgePresetRequest.bind(m);
+    let failAcknowledgement = true;
+    internal.acknowledgePresetRequest = (requestId: string) => {
+      if (failAcknowledgement) {
+        failAcknowledgement = false;
+        return false;
+      }
+      return realAcknowledge(requestId);
+    };
+
+    internal.consumePresetRequest();
+    expect(JSON.parse(readFileSync(projectConfigPath, 'utf8')).preset).toBe(
+      'cheap',
+    );
+    state = readState();
+    expect(state.preset_requests).toHaveLength(1);
+    expect(state.sessions[0].preset.last_request_id).toBe(
+      'req-stale-after-apply',
+    );
+
+    // A later manual change must not be overwritten when the stale queue entry
+    // is observed again. The second poll only retries acknowledgement.
+    writeFileSync(projectConfigPath, JSON.stringify({ preset: 'old' }));
+    internal.consumePresetRequest();
+
+    expect(JSON.parse(readFileSync(projectConfigPath, 'utf8')).preset).toBe(
+      'old',
+    );
+    expect(readState().preset_requests).toBeUndefined();
+  });
+
+  it('restores the applied-request fence after manager restart', () => {
+    const projectDir = path.join(TEST_DIR, 'preset-restart-fence');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    // Simulate a later manual edit after the request already applied.
+    writeFileSync(projectConfigPath, JSON.stringify({ preset: 'old' }));
+
+    const userConfigPath = path.join(
+      TEST_DIR,
+      'config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        presets: {
+          old: { orchestrator: { model: 'old-model' } },
+          cheap: { orchestrator: { model: 'cheap-model' } },
+        },
+      }),
+    );
+
+    // Simulate persisted state left by a process that applied the request,
+    // published completion, then failed to remove the stale queue entry.
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    writeFileSync(
+      stateFilePath(),
+      JSON.stringify({
+        version: 1,
+        sessions: [
+          {
+            session_id: 'preset-restart-session',
+            cwd: projectDir,
+            active_agents: ['intro'],
+            active_agent_details: [],
+            status: 'idle',
+            pid: process.pid,
+            preset: {
+              available: ['cheap', 'old'],
+              project_available: ['cheap', 'old'],
+              global_available: ['cheap', 'old'],
+              last_request_id: 'req-restart-stale',
+              result_ok: true,
+              last_scope: 'project',
+            },
+          },
+        ],
+        preset_requests: [
+          {
+            request_id: 'req-restart-stale',
+            session_id: 'preset-restart-session',
+            scope: 'project',
+            preset: 'cheap',
+          },
+        ],
+      }),
+    );
+
+    const replacement = make('preset-restart-session', projectDir);
+    replacement.onLoad();
+    (
+      replacement as unknown as {
+        consumePresetRequest: () => boolean;
+      }
+    ).consumePresetRequest();
+
+    // Restored last_request_id must fence the stale request: acknowledge only,
+    // without reapplying "cheap" over the later manual "old" selection.
+    expect(JSON.parse(readFileSync(projectConfigPath, 'utf8')).preset).toBe(
+      'old',
+    );
+    expect(readState().preset_requests).toBeUndefined();
+  });
+
+  it('reports the v2 ancestor preset after an Inherit request', () => {
+    const workspace = path.join(TEST_DIR, 'workspace');
+    const worktree = path.join(workspace, 'worktrees', 'feature');
+    mkdirSync(path.join(workspace, '.opencode'), { recursive: true });
+    mkdirSync(path.join(worktree, '.opencode'), { recursive: true });
+    writeFileSync(path.join(worktree, '.git'), 'gitdir: fixture');
+    const ancestorPath = path.join(
+      workspace,
+      '.opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      ancestorPath,
+      JSON.stringify({
+        preset: 'shared',
+        presets: { shared: { fixer: { model: 'test/shared' } } },
+      }),
+    );
+    writeFileSync(
+      path.join(worktree, '.opencode', 'oh-my-opencode-slim.json'),
+      JSON.stringify({ preset: 'local' }),
+    );
+    const manager = new CompanionManager(
+      'inherit-ancestor',
+      worktree,
+      { enabled: true },
+      'v2',
+    );
+    managers.push(manager);
+    manager.onLoad();
+    const state = readState();
+    state.preset_requests = [
+      {
+        request_id: 'inherit-request',
+        session_id: 'inherit-ancestor',
+        scope: 'project',
+        inherit: true,
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+    (
+      manager as unknown as { consumePresetRequest: () => boolean }
+    ).consumePresetRequest();
+    const preset = readState().sessions.find(
+      (session: { session_id: string }) =>
+        session.session_id === 'inherit-ancestor',
+    ).preset;
+    expect(preset).toMatchObject({
+      effective: 'shared',
+      project: 'shared',
+      result_ok: true,
+    });
+    expect(preset.message).toContain('ancestor');
+    expect(JSON.parse(readFileSync(ancestorPath, 'utf-8')).preset).toBe(
+      'shared',
+    );
+  });
+
+  it('keeps per-project overrides isolated while global preset refreshes inheriting projects', () => {
+    const projectLocal = path.join(TEST_DIR, 'project-local');
+    const projectInherited = path.join(TEST_DIR, 'project-inherited');
+    mkdirSync(path.join(projectLocal, '.opencode'), { recursive: true });
+    mkdirSync(projectInherited, { recursive: true });
+    writeFileSync(
+      path.join(projectLocal, '.opencode', 'oh-my-opencode-slim.jsonc'),
+      JSON.stringify({ preset: 'local' }),
+    );
+
+    const userConfigPath = path.join(
+      TEST_DIR,
+      'config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        preset: 'global-a',
+        presets: {
+          local: { orchestrator: { model: 'local-model' } },
+          'global-a': { orchestrator: { model: 'global-a-model' } },
+          'global-b': { orchestrator: { model: 'global-b-model' } },
+        },
+      }),
+    );
+
+    const local = make('local-session', projectLocal);
+    const inherited = make('inherited-session', projectInherited);
+    local.onLoad();
+    inherited.onLoad();
+
+    let state = readState();
+    const localEntry = state.sessions.find(
+      (session: { session_id: string }) =>
+        session.session_id === 'local-session',
+    );
+    const inheritedEntry = state.sessions.find(
+      (session: { session_id: string }) =>
+        session.session_id === 'inherited-session',
+    );
+    expect(localEntry.preset).toMatchObject({
+      effective: 'local',
+      project: 'local',
+      global: 'global-a',
+      global_available: ['global-a', 'global-b', 'local'],
+    });
+    expect(inheritedEntry.preset).toMatchObject({
+      effective: 'global-a',
+      global: 'global-a',
+    });
+    expect(inheritedEntry.preset.project).toBeUndefined();
+
+    state.preset_requests = [
+      {
+        request_id: 'req-global',
+        session_id: 'inherited-session',
+        scope: 'global',
+        preset: 'global-b',
+        inherit: false,
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+    (
+      inherited as unknown as {
+        consumePresetRequest: () => boolean;
+      }
+    ).consumePresetRequest();
+
+    for (let i = 0; i < 4; i++) {
+      (
+        local as unknown as {
+          pollPresetState: () => void;
+        }
+      ).pollPresetState();
+    }
+
+    state = readState();
+    const localAfter = state.sessions.find(
+      (session: { session_id: string }) =>
+        session.session_id === 'local-session',
+    );
+    const inheritedAfter = state.sessions.find(
+      (session: { session_id: string }) =>
+        session.session_id === 'inherited-session',
+    );
+    expect(localAfter.preset).toMatchObject({
+      effective: 'local',
+      project: 'local',
+      global: 'global-b',
+    });
+    expect(inheritedAfter.preset).toMatchObject({
+      effective: 'global-b',
+      global: 'global-b',
+      last_scope: 'global',
+      result_ok: true,
+    });
+  });
+
+  it('keeps legacy unscoped Companion requests on effective semantics', () => {
+    const projectDir = path.join(TEST_DIR, 'legacy-effective-project');
+    mkdirSync(projectDir, { recursive: true });
+    const userConfigPath = path.join(
+      TEST_DIR,
+      'config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        preset: 'global-a',
+        presets: {
+          'global-a': { orchestrator: { model: 'global-a-model' } },
+          'global-b': { orchestrator: { model: 'global-b-model' } },
+        },
+      }),
+    );
+
+    const m = make('legacy-effective-session', projectDir);
+    m.onLoad();
+
+    const state = readState();
+    state.preset_requests = [
+      {
+        request_id: 'legacy-unscoped',
+        session_id: 'legacy-effective-session',
+        preset: 'global-b',
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+
+    (
+      m as unknown as {
+        consumePresetRequest: () => boolean;
+      }
+    ).consumePresetRequest();
+
+    expect(JSON.parse(readFileSync(userConfigPath, 'utf8')).preset).toBe(
+      'global-b',
+    );
+    expect(
+      existsSync(
+        path.join(projectDir, '.opencode', 'oh-my-opencode-slim.jsonc'),
+      ),
+    ).toBe(false);
+  });
+
+  it('refreshes published preset state after an external config edit', () => {
+    const projectDir = path.join(TEST_DIR, 'refresh-project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    writeFileSync(projectConfigPath, JSON.stringify({ preset: 'old' }));
+
+    const userConfigPath = path.join(
+      TEST_DIR,
+      'config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        presets: {
+          old: { orchestrator: { model: 'old-model' } },
+          cheap: { orchestrator: { model: 'cheap-model' } },
+        },
+      }),
+    );
+
+    const m = make('refresh-session', projectDir);
+    m.onLoad();
+    expect(readState().sessions[0].preset.current).toBe('old');
+
+    writeFileSync(projectConfigPath, JSON.stringify({ preset: 'cheap' }));
+    for (let i = 0; i < 4; i++) {
+      (
+        m as unknown as {
+          pollPresetState: () => void;
+        }
+      ).pollPresetState();
+    }
+
+    expect(readState().sessions[0].preset).toMatchObject({
+      current: 'cheap',
+      available: ['cheap', 'old'],
+    });
+  });
+
+  it('preserves request acknowledgement across a racing external refresh', () => {
+    const projectDir = path.join(TEST_DIR, 'ack-refresh-project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    writeFileSync(projectConfigPath, JSON.stringify({ preset: 'old' }));
+
+    const userConfigPath = path.join(
+      TEST_DIR,
+      'config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        presets: {
+          old: { orchestrator: { model: 'old-model' } },
+          cheap: { orchestrator: { model: 'cheap-model' } },
+        },
+      }),
+    );
+
+    const m = make('ack-refresh-session', projectDir);
+    m.onLoad();
+
+    let state = readState();
+    state.preset_requests = [
+      {
+        request_id: 'req-ack',
+        session_id: 'ack-refresh-session',
+        preset: 'cheap',
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+    (
+      m as unknown as {
+        consumePresetRequest: () => boolean;
+      }
+    ).consumePresetRequest();
+
+    state = readState();
+    expect(state.sessions[0].preset).toMatchObject({
+      current: 'cheap',
+      last_request_id: 'req-ack',
+      result_ok: true,
+    });
+
+    // External edit lands before the native Companion has observed req-ack.
+    writeFileSync(projectConfigPath, JSON.stringify({ preset: 'old' }));
+    for (let i = 0; i < 4; i++) {
+      (
+        m as unknown as {
+          pollPresetState: () => void;
+        }
+      ).pollPresetState();
+    }
+
+    state = readState();
+    expect(state.sessions[0].preset).toMatchObject({
+      current: 'old',
+      last_request_id: 'req-ack',
+    });
+    expect(state.sessions[0].preset.result_ok).toBeUndefined();
+  });
+
+  it('keeps the last-known preset state when an external edit is malformed', () => {
+    const projectDir = path.join(TEST_DIR, 'malformed-project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    writeFileSync(projectConfigPath, JSON.stringify({ preset: 'old' }));
+
+    const userConfigPath = path.join(
+      TEST_DIR,
+      'config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        presets: {
+          old: { orchestrator: { model: 'old-model' } },
+        },
+      }),
+    );
+
+    const m = make('malformed-session', projectDir);
+    m.onLoad();
+    expect(readState().sessions[0].preset.current).toBe('old');
+
+    writeFileSync(projectConfigPath, '{ invalid json');
+    for (let i = 0; i < 4; i++) {
+      (
+        m as unknown as {
+          pollPresetState: () => void;
+        }
+      ).pollPresetState();
+    }
+
+    expect(readState().sessions[0].preset.current).toBe('old');
   });
 
   it('shows orchestrator while orchestrator is busy with no specialists', () => {
@@ -115,6 +842,186 @@ describe('CompanionManager', () => {
     expect(readState().sessions[0].active_agents).toEqual(['oracle']);
   });
 
+  it('ignores a trailing busy for a child whose job already finished', () => {
+    const m = make();
+    m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_orch',
+      agent: 'orchestrator',
+      status: 'busy',
+    });
+    m.onSessionStatus({ sessionId: 'ses_a', agent: 'oracle', status: 'busy' });
+    m.onSessionStatus({ sessionId: 'ses_a', agent: 'oracle', status: 'idle' });
+    m.onSessionStatus({
+      sessionId: 'ses_a',
+      agent: 'oracle',
+      status: 'busy',
+      jobFinished: true,
+    });
+    expect(readState().sessions[0].active_agents).toEqual(['orchestrator']);
+  });
+
+  it('publishes live model details without changing the active agent', () => {
+    const m = make();
+    m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_a',
+      agent: 'fixer',
+      status: 'busy',
+    });
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-a',
+      variant: 'high',
+      variantObserved: true,
+    });
+
+    let state = readState();
+    expect(state.sessions[0].active_agents).toEqual(['fixer']);
+    expect(state.sessions[0].active_agent_details).toEqual([
+      {
+        session_id: 'ses_a',
+        agent: 'fixer',
+        model: 'provider/model-a',
+        variant: 'high',
+      },
+    ]);
+
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-b',
+      variant: 'medium',
+    });
+
+    state = readState();
+    expect(state.sessions[0].active_agents).toEqual(['fixer']);
+    expect(state.sessions[0].active_agent_details[0]).toMatchObject({
+      session_id: 'ses_a',
+      agent: 'fixer',
+      model: 'provider/model-b',
+      variant: 'medium',
+    });
+  });
+
+  it('publishes orchestrator model details while it is the visible agent', () => {
+    const m = make();
+    m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_orch',
+      agent: 'orchestrator',
+      status: 'busy',
+    });
+    m.onSessionModelChanged({
+      sessionId: 'ses_orch',
+      model: 'provider/orchestrator',
+      variant: 'max',
+      variantObserved: true,
+    });
+
+    expect(readState().sessions[0].active_agent_details).toEqual([
+      {
+        session_id: 'ses_orch',
+        agent: 'orchestrator',
+        model: 'provider/orchestrator',
+        variant: 'max',
+      },
+    ]);
+  });
+
+  it('preserves an observed live variant across same-model telemetry and clears it on model change', () => {
+    const m = make();
+    m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_a',
+      agent: 'fixer',
+      status: 'busy',
+    });
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-a',
+      variant: 'high',
+    });
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-a',
+    });
+
+    let detail = readState().sessions[0].active_agent_details[0];
+    expect(detail).toMatchObject({
+      model: 'provider/model-a',
+      variant: 'high',
+    });
+
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-b',
+    });
+    detail = readState().sessions[0].active_agent_details[0];
+    expect(detail.model).toBe('provider/model-b');
+    expect(detail.variant).toBeUndefined();
+  });
+
+  it('clears a previous variant when chat selection authoritatively omits it', () => {
+    const m = make();
+    m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_a',
+      agent: 'fixer',
+      status: 'busy',
+    });
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-a',
+      variant: 'high',
+      variantObserved: true,
+    });
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-a',
+      variantObserved: true,
+    });
+
+    const detail = readState().sessions[0].active_agent_details[0];
+    expect(detail.model).toBe('provider/model-a');
+    expect(detail.variant).toBeUndefined();
+  });
+
+  it('does not flush when model metadata is unchanged', () => {
+    const m = make();
+    m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_a',
+      agent: 'fixer',
+      status: 'busy',
+    });
+
+    const internal = m as unknown as {
+      flush: () => void;
+    };
+    let flushes = 0;
+    internal.flush = () => {
+      flushes += 1;
+    };
+
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-a',
+      variant: 'high',
+    });
+    expect(flushes).toBe(1);
+
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-a',
+      variant: 'high',
+    });
+    m.onSessionModelChanged({
+      sessionId: 'ses_a',
+      model: 'provider/model-a',
+    });
+    expect(flushes).toBe(1);
+  });
+
   it('shows all concurrently busy specialists', () => {
     const m = make();
     m.onLoad();
@@ -126,14 +1033,14 @@ describe('CompanionManager', () => {
     m.onSessionStatus({ sessionId: 'ses_b', agent: 'fixer', status: 'busy' });
     m.onSessionStatus({
       sessionId: 'ses_c',
-      agent: 'librarian',
+      agent: 'oracle',
       status: 'busy',
     });
     const agents = readState().sessions[0].active_agents;
     expect(agents).toHaveLength(3);
     expect(agents).toContain('explorer');
     expect(agents).toContain('fixer');
-    expect(agents).toContain('librarian');
+    expect(agents).toContain('oracle');
   });
 
   it('removes a specialist when its session goes idle', () => {
@@ -221,7 +1128,21 @@ describe('CompanionManager', () => {
     m.onSessionStatus({ sessionId: 'ses_y', agent: 'fixer', status: 'retry' });
     // ses_x is now tracked because Herdr subagents often lack
     // the agent field; the session ID is used as a fallback name.
-    expect(readState().sessions[0].active_agents).toEqual(['ses_x']);
+    expect(readState().sessions[0].active_agents).toEqual(['orchestrator']);
+  });
+
+  it('never stores a raw session ID as the agent name', () => {
+    const m = make();
+    m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_eff272862ffe2iolrAumwxISUr',
+      agent: undefined,
+      status: 'busy',
+    });
+    const agents = readState().sessions[0].active_agents;
+    expect(agents).not.toContain('ses_eff272862ffe2iolrAumwxISUr');
+    // still shown as busy, under a name the companion has an asset for
+    expect(agents).toEqual(['orchestrator']);
   });
 
   it('accepts busy sessions from agents without a known name (Herdr subagents)', () => {
@@ -233,7 +1154,7 @@ describe('CompanionManager', () => {
       agent: undefined,
       status: 'busy',
     });
-    expect(readState().sessions[0].active_agents).toEqual(['herdr_ses']);
+    expect(readState().sessions[0].active_agents).toEqual(['orchestrator']);
     // The overall status stays 'idle' — only the orchestrator drives
     // that field. Herdr subagents appear in active_agents.
     // When the session goes idle it is removed even without a known agent name
@@ -246,14 +1167,105 @@ describe('CompanionManager', () => {
     expect(readState().sessions[0].status).toBe('idle');
   });
 
-  it('shows input gif while waiting for user input', () => {
+  it('shows input gif while waiting for user input without borrowing orchestrator metadata', () => {
     const m = make();
     m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_orch',
+      agent: 'orchestrator',
+      status: 'busy',
+    });
+    m.onSessionModelChanged({
+      sessionId: 'ses_orch',
+      model: 'provider/orchestrator',
+      variant: 'high',
+    });
     m.onWaitingInput();
     expect(readState().sessions[0].active_agents).toEqual(['input']);
+    expect(readState().sessions[0].active_agent_details).toEqual([]);
     expect(readState().sessions[0].status).toBe('waiting-input');
     m.onInputResolved();
-    expect(readState().sessions[0].status).toBe('idle');
+    expect(readState().sessions[0].status).toBe('busy');
+  });
+
+  it('increments attention generation once per distinct input request id', () => {
+    const m = make();
+    m.onLoad();
+
+    m.onWaitingInput('request-1');
+    expect(readState().sessions[0].attention_seq).toBe(1);
+
+    // v2 permission asks are delivered raw + synthesized with the same id.
+    // The additive bridge copy must not create a second native notification.
+    m.onWaitingInput('request-1');
+    expect(readState().sessions[0].attention_seq).toBe(1);
+
+    // A distinct request must remain distinguishable even if a native watcher
+    // never observed an intermediate resolved state.
+    m.onInputResolved();
+    m.onWaitingInput('request-2');
+    expect(readState().sessions[0].attention_seq).toBe(2);
+  });
+
+  it('preserves attention identity across manager replacement', () => {
+    const first = make();
+    first.onLoad();
+    first.onWaitingInput('request-1');
+    expect(readState().sessions[0].attention_seq).toBe(1);
+
+    const replacement = make();
+    replacement.onLoad();
+
+    // Re-delivery of the request that was already published must remain
+    // deduplicated after the replacement manager takes ownership.
+    replacement.onWaitingInput('request-1');
+    expect(readState().sessions[0].attention_seq).toBe(1);
+
+    replacement.onInputResolved();
+    replacement.onWaitingInput('request-2');
+    expect(readState().sessions[0].attention_seq).toBe(2);
+    expect(readState().sessions[0].attention_request_id).toBe('request-2');
+  });
+
+  it('keeps waiting-input sticky across busy and idle lifecycle noise', () => {
+    const m = make();
+    m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_orch',
+      agent: 'orchestrator',
+      status: 'busy',
+    });
+    m.onWaitingInput();
+    m.onSessionStatus({
+      sessionId: 'ses_orch',
+      agent: 'orchestrator',
+      status: 'idle',
+    });
+    m.onSessionStatus({
+      sessionId: 'ses_orch',
+      agent: 'orchestrator',
+      status: 'busy',
+    });
+    expect(readState().sessions[0].status).toBe('waiting-input');
+
+    m.onInputResolved();
+    expect(readState().sessions[0].status).toBe('busy');
+  });
+
+  it('restores orchestrator busy state after input resolves', () => {
+    const m = make();
+    m.onLoad();
+    m.onSessionStatus({
+      sessionId: 'ses_orch',
+      agent: 'orchestrator',
+      status: 'busy',
+    });
+    m.onWaitingInput();
+    expect(readState().sessions[0].status).toBe('waiting-input');
+
+    m.onInputResolved();
+    expect(readState().sessions[0].status).toBe('busy');
+    expect(readState().sessions[0].active_agents).toEqual(['orchestrator']);
   });
 
   it('keeps showing busy specialists over the input gif after input resolves', () => {
@@ -291,7 +1303,7 @@ describe('CompanionManager', () => {
     expect(process.listenerCount('exit')).toBeLessThanOrEqual(baseline);
   });
 
-  it('cleans up a superseded manager for the same session on reload', () => {
+  it('hands native companion ownership to a superseding manager without restart', () => {
     const first = make('reload-session');
     first.onLoad();
     const firstChild = attachFakeChild(first);
@@ -303,11 +1315,15 @@ describe('CompanionManager', () => {
     const second = make('reload-session');
     second.onLoad();
 
-    expect(firstChild.killed()).toBe(true);
+    expect(firstChild.killed()).toBe(false);
+    expect((second as unknown as { wasSpawner: boolean }).wasSpawner).toBe(
+      true,
+    );
     expect(readState().sessions).toHaveLength(1);
     expect(readState().sessions[0].session_id).toBe('reload-session');
 
     second.onExit();
+    expect(firstChild.killed()).toBe(true);
   });
 
   it('cleans up active managers when companion is disabled on reload', () => {
@@ -355,7 +1371,7 @@ describe('CompanionManager', () => {
     });
     b.onSessionStatus({
       sessionId: 'ses_2',
-      agent: 'librarian',
+      agent: 'oracle',
       status: 'busy',
     });
     const state = readState();
@@ -366,7 +1382,52 @@ describe('CompanionManager', () => {
       (s: { session_id: string }) => s.session_id === 'b',
     );
     expect(sa.active_agents).toEqual(['designer']);
-    expect(sb.active_agents).toEqual(['librarian']);
+    expect(sb.active_agents).toEqual(['oracle']);
+  });
+
+  it('prunes dead process sessions while preserving live project sessions', () => {
+    mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+    writeFileSync(
+      stateFilePath(),
+      JSON.stringify({
+        version: 1,
+        sessions: [
+          {
+            session_id: 'dead-project',
+            cwd: '/dead',
+            active_agents: ['intro'],
+            status: 'idle',
+            pid: 999999999,
+          },
+          {
+            session_id: 'live-peer',
+            cwd: '/live-peer',
+            active_agents: ['intro'],
+            status: 'idle',
+            pid: process.pid,
+          },
+        ],
+        preset_requests: [
+          {
+            request_id: 'dead-request',
+            session_id: 'dead-project',
+            scope: 'project',
+            preset: 'one',
+          },
+        ],
+      }),
+    );
+
+    const current = make('current-project', '/current');
+    current.onLoad();
+
+    const state = readState();
+    expect(
+      state.sessions.map(
+        (session: { session_id: string }) => session.session_id,
+      ),
+    ).toEqual(['live-peer', 'current-project']);
+    expect(state.preset_requests).toBeUndefined();
   });
 
   it('is disabled by default and does not write state', () => {
@@ -720,5 +1781,202 @@ describe('CompanionManager', () => {
     // Must not propagate the kill() exception
     expect(() => m.onExit()).not.toThrow();
     expect(existsSync(pidFile)).toBe(false);
+  });
+
+  it('persists only bounded known workspaces registered by plugin managers', () => {
+    const m = make('known-root', path.join(TEST_DIR, 'known-root'));
+    m.onLoad();
+    const state = readState();
+    expect(state.known_projects).toHaveLength(1);
+    expect(state.known_projects[0].cwd).toBe(path.join(TEST_DIR, 'known-root'));
+    expect(resolveKnownCompanionProject(state, '/tmp/unregistered')).toBeNull();
+    expect(resolveKnownCompanionProject(state, '../relative')).toBeNull();
+
+    for (let index = 0; index < 80; index++) {
+      rememberKnownCompanionProject(
+        state,
+        path.join(TEST_DIR, `remembered-${index}`),
+        undefined,
+        index,
+      );
+    }
+    expect(state.known_projects).toHaveLength(64);
+    expect(state.known_projects[63].last_seen).toBe(79);
+  });
+
+  it('updates a remembered offline project without changing the relay project', () => {
+    const liveDir = path.join(TEST_DIR, 'running');
+    const closedDir = path.join(TEST_DIR, 'remembered');
+    mkdirSync(path.join(liveDir, '.opencode'), { recursive: true });
+    mkdirSync(path.join(closedDir, '.opencode'), { recursive: true });
+    const liveFile = path.join(
+      liveDir,
+      '.opencode',
+      'oh-my-opencode-slim.jsonc',
+    );
+    const closedFile = path.join(
+      closedDir,
+      '.opencode',
+      'oh-my-opencode-slim.jsonc',
+    );
+    writeFileSync(liveFile, '{ "preset": "old" }');
+    writeFileSync(
+      closedFile,
+      '{\n  // Keep the offline project comment.\n  "preset": "old",\n}',
+    );
+    const globalPath = path.join(
+      TEST_DIR,
+      'config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    writeFileSync(
+      globalPath,
+      JSON.stringify({
+        preset: 'old',
+        presets: {
+          old: { orchestrator: { model: 'old-model' } },
+          cheap: { orchestrator: { model: 'cheap-model' } },
+        },
+      }),
+    );
+
+    const relay = make('live-relay', liveDir);
+    relay.onLoad();
+    const state = readState();
+    rememberKnownCompanionProject(state, closedDir, state.sessions[0].preset);
+    state.preset_requests = [
+      {
+        request_id: 'offline-1',
+        session_id: 'live-relay',
+        target_cwd: closedDir,
+        scope: 'project',
+        preset: 'cheap',
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+    (
+      relay as unknown as { consumePresetRequest: () => boolean }
+    ).consumePresetRequest();
+
+    expect(readFileSync(closedFile, 'utf8')).toContain(
+      '// Keep the offline project',
+    );
+    expect(readFileSync(closedFile, 'utf8')).toContain('"preset": "cheap"');
+    expect(readFileSync(liveFile, 'utf8')).toContain('"preset": "old"');
+    expect(
+      readState().known_projects.find(
+        (p: { cwd: string }) => p.cwd === closedDir,
+      ).preset,
+    ).toMatchObject({
+      project: 'cheap',
+      last_request_id: 'offline-1',
+      result_ok: true,
+    });
+  });
+
+  it('rejects unregistered offline target without modifying its JSONC', () => {
+    const knownDir = path.join(TEST_DIR, 'unknown-target');
+    mkdirSync(path.join(knownDir, '.opencode'), { recursive: true });
+    const targetFile = path.join(
+      knownDir,
+      '.opencode',
+      'oh-my-opencode-slim.jsonc',
+    );
+    writeFileSync(targetFile, '{ "preset": "old" }');
+    const manager = make('reject-relay', path.join(TEST_DIR, 'relay'));
+    manager.onLoad();
+    const state = readState();
+    state.preset_requests = [
+      {
+        request_id: 'invalid-target',
+        session_id: 'reject-relay',
+        target_cwd: knownDir,
+        scope: 'project',
+        preset: 'cheap',
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+    (
+      manager as unknown as { consumePresetRequest: () => boolean }
+    ).consumePresetRequest();
+    expect(readFileSync(targetFile, 'utf8')).toBe('{ "preset": "old" }');
+    expect(readState().sessions[0].preset).toMatchObject({
+      last_request_id: 'invalid-target',
+      result_ok: false,
+    });
+  });
+
+  it('refuses to rewrite malformed offline project JSONC and reports failure', () => {
+    const projectDir = path.join(TEST_DIR, 'malformed-known');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    mkdirSync(projectConfigDir, { recursive: true });
+    const projectFile = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    const original = '{ // Invalid project JSONC\\n "preset": }';
+    writeFileSync(projectFile, original);
+    const manager = make('malformed-relay', path.join(TEST_DIR, 'relay'));
+    manager.onLoad();
+    const state = readState();
+    rememberKnownCompanionProject(state, projectDir, undefined);
+    state.preset_requests = [
+      {
+        request_id: 'malformed-request',
+        session_id: 'malformed-relay',
+        target_cwd: projectDir,
+        scope: 'project',
+        preset: 'cheap',
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+    (
+      manager as unknown as { consumePresetRequest: () => boolean }
+    ).consumePresetRequest();
+
+    expect(readFileSync(projectFile, 'utf8')).toBe(original);
+    const known = readState().known_projects.find(
+      (entry: { cwd: string }) => entry.cwd === projectDir,
+    );
+    expect(known?.preset).toMatchObject({
+      last_request_id: 'malformed-request',
+      result_ok: false,
+      message: expect.stringContaining('cannot be read or validated'),
+    });
+  });
+
+  it('reports a deleted remembered project without touching the relay', () => {
+    const missing = path.join(TEST_DIR, 'deleted-project');
+    const live = path.join(TEST_DIR, 'live');
+    mkdirSync(live, { recursive: true });
+    const manager = make('missing-relay', live);
+    manager.onLoad();
+    const state = readState();
+    rememberKnownCompanionProject(state, missing, undefined);
+    state.preset_requests = [
+      {
+        request_id: 'missing-request',
+        session_id: 'missing-relay',
+        target_cwd: missing,
+        scope: 'project',
+        preset: 'cheap',
+      },
+    ];
+    writeFileSync(stateFilePath(), JSON.stringify(state));
+    (
+      manager as unknown as { consumePresetRequest: () => boolean }
+    ).consumePresetRequest();
+    const next = readState();
+    expect(
+      next.known_projects.find(
+        (entry: { cwd: string }) => entry.cwd === missing,
+      )?.preset,
+    ).toMatchObject({
+      last_request_id: 'missing-request',
+      result_ok: false,
+      message: expect.stringContaining('not a known accessible'),
+    });
+    expect(next.sessions[0].cwd).toBe(live);
   });
 });

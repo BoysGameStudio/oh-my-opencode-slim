@@ -1,392 +1,1537 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import {
-  CliCmuxClient,
-  type CmuxClient,
-  CmuxMultiplexer,
-  type CommandRunner,
-  resetCmuxStateForTests,
-  SpawnCommandRunner,
-} from '.';
+import type { MultiplexerLayout } from '../../config/schema';
+import type { CmuxEnvironment, CommandResult, CommandRunner } from './index';
 
-function client(): CmuxClient {
-  let next = 1;
-  return {
-    version: mock(async () => '0.64.17'),
-    identify: mock(async () => ({
-      workspaceId: 'workspace-root',
-      paneId: 'pane-root',
-      surfaceId: 'surface-root',
-      socketPath: '/tmp/cmux.sock',
-    })),
-    createSurface: mock(async () => ({
-      paneId: `pane-${next}`,
-      surfaceId: `surface-${next++}`,
-    })),
-    respawnSurface: mock(async () => true),
-    closeSurface: mock(async () => 'closed' as const),
-    equalizeSplits: mock(async () => true),
-  };
+type CmuxModule = typeof import('./index');
+
+const logMock = mock(() => {});
+
+mock.module('../../utils/logger', () => ({
+  log: logMock,
+}));
+
+let importCounter = 0;
+
+async function importCmux(): Promise<CmuxModule> {
+  return import(`./index?test=${importCounter++}`);
 }
 
-function mux(api: CmuxClient): CmuxMultiplexer {
-  return new CmuxMultiplexer(api, {
-    checkSessionReady: async () => true,
-    delay: async () => {},
+const {
+  CliCmuxClient,
+  CmuxMultiplexer,
+  SpawnCommandRunner,
+  commandCarriesArgv,
+  extractArgvMarker,
+} = await importCmux();
+
+const CHILD_ID = 'ses_f41e46f05ffeoEESP7f24NJ9GdEx6';
+const CHILD_TOKEN = 'GdEx6';
+const DESCRIPTION = `omosc:4242:${CHILD_ID}`;
+const MARKER = `# ${DESCRIPTION}\n`;
+const ATTACH_COMMAND =
+  "'/opt/opencode' attach 'http://127.0.0.1:7777' " +
+  `--session '${CHILD_ID}' --dir '/repo'`;
+const BASH_PREAMBLE =
+  'shopt -s expand_aliases\n' +
+  '[[ -f ~/.bashrc ]] && source ~/.bashrc >/dev/null 2>&1 || true\n';
+const SHELL_ARGS = [
+  '/bin/bash',
+  '-l',
+  '-c',
+  `${BASH_PREAMBLE}${MARKER}${ATTACH_COMMAND}`,
+];
+
+const BASE_ENV: CmuxEnvironment = {
+  CMUX_TUI_SOCKET: '/tmp/cmux-tui.sock',
+  CMUX_TUI_TERMINAL_ID: 'term_anchor',
+};
+
+const SOCKET_ARGS = ['--socket', '/tmp/cmux-tui.sock', '--json'];
+
+/** Full argv for one cmux invocation (binary + control plane + args). */
+function cmux(args: string[]): string[] {
+  return ['/bin/cmux', ...SOCKET_ARGS, ...args];
+}
+
+function json(value: unknown): CommandResult {
+  return { exitCode: 0, stdout: JSON.stringify(value), stderr: '' };
+}
+
+function defaultResponse(argv: string[]): CommandResult {
+  if (argv.includes('ping')) return json({ alive: true });
+  if (argv.includes('process')) return json({ argv: [] });
+  if (argv.includes('list') && argv.includes('terminal')) return json([]);
+  if (argv.includes('list') && argv.includes('tab')) return json([]);
+  if (argv.includes('terminal')) {
+    return json({ id: 'term_anchor', tab_id: 'tab_anchor', tab_ids: [] });
+  }
+  if (argv.includes('tab') && argv.includes('show')) {
+    return json({
+      id: 'tab_anchor',
+      pane_id: 'pane_anchor',
+      focused: true,
+      name: 'my-tab',
+    });
+  }
+  if (argv.includes('run')) {
+    return json({ value: { tab_id: 'tab_child', terminal_id: 'term_child' } });
+  }
+  return json({ value: {} });
+}
+
+function recorder(
+  handler: (argv: string[]) => CommandResult = defaultResponse,
+) {
+  const calls: string[][] = [];
+  const runner: CommandRunner = {
+    run: mock(async (argv: string[]) => {
+      calls.push(argv);
+      return handler(argv);
+    }),
+  };
+  return { runner, calls };
+}
+
+function mux(
+  options: {
+    runner?: CommandRunner;
+    env?: CmuxEnvironment;
+    layout?: MultiplexerLayout;
+    sessionName?: string;
+  } = {},
+): CmuxMultiplexer {
+  return new CmuxMultiplexer(options.layout ?? 'main-vertical', 60, {
+    client: new CliCmuxClient(options.runner ?? recorder().runner, '/bin/cmux'),
+    env: options.env ?? BASE_ENV,
+    sessionName: options.sessionName,
     opencodeBinary: '/opt/opencode',
-    pathExists: () => true,
   });
+}
+
+function loggedText(): string {
+  return logMock.mock.calls
+    .map((call: unknown[]) => JSON.stringify(call))
+    .join('\n');
+}
+
+/** The `--name` value of the last `pane run` call recorded so far. */
+function lastName(calls: string[][]): string {
+  const run = calls.filter((argv) => argv.includes('run')).at(-1) ?? [];
+  const index = run.indexOf('--name');
+  return index === -1 ? '' : (run[index + 1] ?? '');
 }
 
 describe('CmuxMultiplexer', () => {
-  const originalFetch = globalThis.fetch;
-  beforeEach(resetCmuxStateForTests);
+  const originalShell = process.env.SHELL;
+
+  beforeEach(() => {
+    process.env.SHELL = '/bin/bash';
+    logMock.mockClear();
+  });
+
   afterEach(() => {
-    globalThis.fetch = originalFetch;
+    if (originalShell === undefined) delete process.env.SHELL;
+    else process.env.SHELL = originalShell;
   });
 
-  test('gates cmux versions', async () => {
-    const api = client();
-    api.version = mock(async () => '0.64.13');
-    expect(await mux(api).isAvailable()).toBe(false);
-    api.version = mock(async () => '0.64.14');
-    expect(await mux(api).isAvailable()).toBe(true);
-  });
+  test('spawns a named sibling tab in the parent pane and restores the active tab', async () => {
+    const { runner, calls } = recorder();
+    const instance = mux({ runner });
 
-  test('does not cache transient version failure but keeps hard old version', async () => {
-    const api = client();
-    api.version = mock(async () => null);
-    const transient = mux(api);
-    expect(await transient.isAvailable()).toBe(false);
-    api.version = mock(async () => '0.64.17');
-    expect(await transient.isAvailable()).toBe(true);
-
-    const old = client();
-    old.version = mock(async () => '0.64.13');
-    expect(
-      await mux(old).spawnPane('old', 'agent', 'http://server', '/repo'),
-    ).toEqual({ success: false, error: 'hard' });
-  });
-
-  test('waits for attachable status before creating and respawning', async () => {
-    const api = client();
-    const events: string[] = [];
-    api.createSurface = mock(async () => {
-      events.push('create');
-      return { paneId: 'pane-1', surfaceId: 'surface-1' };
-    });
-    api.respawnSurface = mock(async () => {
-      events.push('respawn');
-      return true;
-    });
-    let attempt = 0;
-    const readiness = mock(async (url: URL, sessionId: string) => {
-      events.push('status');
-      expect(url.href).toBe('https://example.test/session/status');
-      expect(sessionId).toBe('session-1');
-      attempt += 1;
-      if (attempt === 2) throw new Error('network');
-      return attempt >= 4;
-    });
-    const instance = new CmuxMultiplexer(api, {
-      checkSessionReady: readiness,
-      delay: async () => {},
-      opencodeBinary: '/opt/opencode',
-      pathExists: () => true,
-    });
     expect(
       await instance.spawnPane(
-        'session-1',
-        'agent',
-        'https://example.test/base',
+        CHILD_ID,
+        DESCRIPTION,
+        'http://127.0.0.1:7777',
+        '/repo',
+        { subagentType: 'oracle' },
+      ),
+    ).toEqual({ success: true, paneId: 'term_child' });
+
+    expect(calls).toEqual([
+      cmux(['session', 'current', 'ping']),
+      cmux(['terminal', 'term_anchor', 'show']),
+      cmux(['tab', 'tab_anchor', 'show']),
+      cmux([
+        'pane',
+        'pane_anchor',
+        'run',
+        '--on-exit',
+        'keep',
+        '--name',
+        `my-tab/oracle:${CHILD_TOKEN}`,
+        '--',
+        ...SHELL_ARGS,
+      ]),
+      cmux(['tab', 'tab_anchor', 'focus']),
+    ]);
+
+    // 1.2: `--name` precedes the argv separator and keeps its `:` verbatim.
+    const run = calls[3] ?? [];
+    const nameIndex = run.indexOf('--name');
+    expect(nameIndex).toBeGreaterThan(-1);
+    expect(run[nameIndex + 1]).toBe(`my-tab/oracle:${CHILD_TOKEN}`);
+    expect(nameIndex).toBeLessThan(run.indexOf('--'));
+
+    // 3.6: the display name never carries FR-8 sweep metadata.
+    expect(run[nameIndex + 1]).not.toContain('omosc:');
+
+    // 4.6: no `terminal.project`; 1.1: no split/move/rename anywhere.
+    expect(
+      calls.some((argv) =>
+        argv.some((arg) => /^(split|move|rename|project)$/.test(arg)),
+      ),
+    ).toBe(false);
+
+    expect(await instance.closePane('term_child')).toBe(true);
+    expect(calls[5]).toEqual(cmux(['terminal', 'term_child', 'close']));
+  });
+
+  test('bridges the v2 remote secret from the parent environ, never the command', async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', {
+      value: 'linux',
+      configurable: true,
+    });
+    try {
+      const { runner, calls } = recorder();
+      const instance = mux({ runner });
+      const runScript = (): string =>
+        calls.find((argv) => argv.includes('run'))?.at(-1) ?? '';
+
+      expect(
+        await instance.spawnPane(
+          CHILD_ID,
+          DESCRIPTION,
+          'http://127.0.0.1:7777',
+          '/repo',
+          { viewerFlavor: 'v2-remote', viewerPassword: 'pw-9-secret' },
+        ),
+      ).toEqual({ success: true, paneId: 'term_child' });
+
+      const remote = runScript();
+      expect(remote).toContain('--server');
+      expect(remote).not.toContain('attach');
+      // The secret is read from the parent process's /proc environ by the
+      // launch script: no literal value appears in the argv.
+      expect(remote).not.toContain('pw-9-secret');
+      expect(remote).toContain(`/proc/${process.pid}/environ`);
+      expect(remote).toContain('s/^OPENCODE_PASSWORD=//p');
+      expect(remote).toContain('s/^OPENCODE_SERVER_PASSWORD=//p');
+
+      // The FR-8 marker stays the first script line; the extraction runs
+      // between the marker and the viewer command.
+      const markerIndex = remote.indexOf(MARKER.trimEnd());
+      const procIndex = remote.indexOf('/proc/');
+      const commandIndex = remote.indexOf('opencode');
+      expect(markerIndex).toBeGreaterThan(-1);
+      expect(procIndex).toBeGreaterThan(markerIndex);
+      expect(commandIndex).toBeGreaterThan(procIndex);
+
+      calls.length = 0;
+      expect(
+        await instance.spawnPane(
+          CHILD_ID,
+          DESCRIPTION,
+          'http://127.0.0.1:7777',
+          '/repo',
+          { viewerFlavor: 'v2-shared' },
+        ),
+      ).toEqual({ success: true, paneId: 'term_child' });
+
+      const shared = runScript();
+      expect(shared).toContain('--session');
+      expect(shared).not.toContain('--server');
+      expect(shared).not.toContain('attach');
+      // No /proc bridge outside v2-remote.
+      expect(shared).not.toContain('/proc/');
+    } finally {
+      Object.defineProperty(process, 'platform', {
+        value: originalPlatform,
+        configurable: true,
+      });
+    }
+  });
+
+  test('viewer "mini" runs opencode mini in the pane', async () => {
+    const { runner, calls } = recorder();
+    const instance = mux({ runner });
+    const runScript = (): string =>
+      calls.find((argv) => argv.includes('run'))?.at(-1) ?? '';
+
+    expect(
+      await instance.spawnPane(
+        CHILD_ID,
+        DESCRIPTION,
+        'http://127.0.0.1:7777',
+        '/repo',
+        { viewerFlavor: 'v2-shared', viewerSurface: 'mini' },
+      ),
+    ).toEqual({ success: true, paneId: 'term_child' });
+
+    const mini = runScript();
+    expect(mini).toContain("cd '/repo' && ");
+    expect(mini).toContain(`mini --session '${CHILD_ID}'`);
+    expect(mini).not.toContain('--server');
+  });
+
+  test('v1 mini uses attach --mini without pinning the pane cwd', async () => {
+    const { runner, calls } = recorder();
+    await mux({ runner }).spawnPane(
+      CHILD_ID,
+      DESCRIPTION,
+      'http://127.0.0.1:7777',
+      '/repo',
+      { viewerSurface: 'mini' },
+    );
+    const command = calls.find((argv) => argv.includes('run'))?.at(-1) ?? '';
+    expect(command).toEndWith(`${ATTACH_COMMAND} --mini`);
+    expect(command).not.toContain("cd '/repo' && ");
+  });
+
+  test('viewer "mini" skips the cd prefix when the shell cannot use the POSIX wrapper', async () => {
+    const originalShell = process.env.SHELL;
+    process.env.SHELL = '/usr/bin/nu';
+    try {
+      const { runner, calls } = recorder();
+      const instance = mux({ runner });
+      const runScript = (): string =>
+        calls.find((argv) => argv.includes('run'))?.at(-1) ?? '';
+
+      expect(
+        await instance.spawnPane(
+          CHILD_ID,
+          DESCRIPTION,
+          'http://127.0.0.1:7777',
+          '/repo',
+          { viewerFlavor: 'v2-shared', viewerSurface: 'mini' },
+        ),
+      ).toEqual({ success: true, paneId: 'term_child' });
+
+      const mini = runScript();
+      expect(mini).not.toContain('cd ');
+      expect(mini).toContain(`mini --session '${CHILD_ID}'`);
+    } finally {
+      if (originalShell === undefined) {
+        delete process.env.SHELL;
+      } else {
+        process.env.SHELL = originalShell;
+      }
+    }
+  });
+
+  test('fails closed with one diagnostic when the shell cannot run the /proc bridge', async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', {
+      value: 'linux',
+      configurable: true,
+    });
+    process.env.SHELL = '/usr/bin/fish';
+    try {
+      const { runner, calls } = recorder();
+      const instance = mux({ runner });
+
+      const first = await instance.spawnPane(
+        CHILD_ID,
+        DESCRIPTION,
+        'http://127.0.0.1:7777',
+        '/repo',
+        { viewerFlavor: 'v2-remote', viewerPassword: 'pw' },
+      );
+      const second = await instance.spawnPane(
+        CHILD_ID,
+        DESCRIPTION,
+        'http://127.0.0.1:7777',
+        '/repo',
+        { viewerFlavor: 'v2-remote', viewerPassword: 'pw' },
+      );
+
+      expect(first).toEqual({ success: false, error: 'unavailable' });
+      expect(second).toEqual({ success: false, error: 'unavailable' });
+      // Fail closed: no `pane run` is issued.
+      expect(calls.some((argv) => argv.includes('run'))).toBe(false);
+
+      // Exactly one structured diagnostic per process, carrying the reason.
+      const diagnostics = logMock.mock.calls.filter((call: unknown[]) =>
+        JSON.stringify(call).includes('password-bridge-requires-posix-shell'),
+      );
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]?.[0]).toBe(
+        '[cmux-tui] spawnPane: viewer password bridge unavailable',
+      );
+      expect(diagnostics[0]?.[1]).toEqual({
+        stage: 'viewer-secret',
+        reason: 'password-bridge-requires-posix-shell',
+        shell: '/usr/bin/fish',
+        platform: 'linux',
+      });
+    } finally {
+      Object.defineProperty(process, 'platform', {
+        value: originalPlatform,
+        configurable: true,
+      });
+    }
+  });
+
+  test('keeps the child view when the focus restore fails (diagnostic only)', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('focus')) {
+        return { exitCode: 1, stdout: '', stderr: 'operation.failed' };
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane(
+        CHILD_ID,
+        DESCRIPTION,
+        'http://127.0.0.1:7777',
+        '/repo',
+        { subagentType: 'oracle' },
+      ),
+    ).toEqual({ success: true, paneId: 'term_child' });
+    expect(calls.at(-1)).toEqual(cmux(['tab', 'tab_anchor', 'focus']));
+
+    const failures = logMock.mock.calls.filter((call) =>
+      JSON.stringify(call).includes('focus restore failed'),
+    );
+    expect(failures).toHaveLength(1);
+  });
+
+  test('neutralizes line breaks in the argv marker description', async () => {
+    const { runner, calls } = recorder();
+    const instance = mux({ runner });
+    const description = `omosc:4242:${CHILD_ID}\necho pwned`;
+
+    expect(
+      await instance.spawnPane(
+        CHILD_ID,
+        description,
+        'http://127.0.0.1:7777',
         '/repo',
       ),
     ).toEqual(expect.objectContaining({ success: true }));
-    expect(events).toEqual([
-      'status',
-      'status',
-      'status',
-      'status',
-      'create',
-      'respawn',
+
+    const run = calls.find((argv) => argv.includes('run')) ?? [];
+    const script = run.at(-1) ?? '';
+    // The injected text stays inside the single comment line.
+    expect(script).not.toContain('\necho pwned');
+    const markerLines = script
+      .split('\n')
+      .filter((line) => line.startsWith('# '));
+    expect(markerLines).toHaveLength(1);
+    expect(markerLines[0]).toContain('echo pwned');
+  });
+
+  test('restores the pre-spawn active sibling tab when the parent tab was not focused', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('tab') && argv.includes('show')) {
+        return json({
+          id: 'tab_anchor',
+          pane_id: 'pane_anchor',
+          focused: false,
+          name: 'my-tab',
+        });
+      }
+      if (argv.includes('tab') && argv.includes('list')) {
+        return json([
+          {
+            id: 'tab_anchor',
+            pane_id: 'pane_anchor',
+            index: 0,
+            focused: false,
+            name: 'my-tab',
+          },
+          {
+            id: 'tab_sibling',
+            pane_id: 'pane_anchor',
+            index: 1,
+            focused: true,
+            name: 'logs',
+          },
+          {
+            id: 'tab_other_pane',
+            pane_id: 'pane_other',
+            index: 0,
+            focused: false,
+            name: 'x',
+          },
+        ]);
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane(
+        CHILD_ID,
+        DESCRIPTION,
+        'http://127.0.0.1:7777',
+        '/repo',
+        { subagentType: 'oracle' },
+      ),
+    ).toEqual({ success: true, paneId: 'term_child' });
+
+    expect(calls.map((argv) => argv.slice(4))).toEqual([
+      ['session', 'current', 'ping'],
+      ['terminal', 'term_anchor', 'show'],
+      ['tab', 'tab_anchor', 'show'],
+      ['tab', 'list'],
+      [
+        'pane',
+        'pane_anchor',
+        'run',
+        '--on-exit',
+        'keep',
+        '--name',
+        `my-tab/oracle:${CHILD_TOKEN}`,
+        '--',
+        ...SHELL_ARGS,
+      ],
+      ['tab', 'tab_sibling', 'focus'],
     ]);
   });
 
-  test('readiness timeout does not flash or create a pane', async () => {
-    const api = client();
-    const instance = new CmuxMultiplexer(api, {
-      checkSessionReady: async () => false,
-      delay: async () => {},
-      opencodeBinary: '/opt/opencode',
-      pathExists: () => true,
+  test('falls back to the parent tab when no focused sibling can be read', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('tab') && argv.includes('show')) {
+        return json({
+          id: 'tab_anchor',
+          pane_id: 'pane_anchor',
+          focused: false,
+          name: 'my-tab',
+        });
+      }
+      if (argv.includes('tab') && argv.includes('list')) {
+        return json([
+          {
+            id: 'tab_anchor',
+            pane_id: 'pane_anchor',
+            index: 0,
+            focused: false,
+            name: 'my-tab',
+          },
+        ]);
+      }
+      return defaultResponse(argv);
     });
-    expect(
-      await instance.spawnPane('s1', 'agent', 'http://server', '/repo'),
-    ).toEqual({ success: false, error: 'unavailable' });
-    expect(api.createSurface).not.toHaveBeenCalled();
-    expect(api.respawnSurface).not.toHaveBeenCalled();
-    expect(api.closeSurface).not.toHaveBeenCalled();
-  });
+    const instance = mux({ runner });
 
-  test('hanging readiness does not block an existing pane close', async () => {
-    const api = client();
-    const hanging = createDeferred<boolean>();
-    const instance = new CmuxMultiplexer(api, {
-      checkSessionReady: (_url, sessionId) =>
-        sessionId === 'first' ? Promise.resolve(true) : hanging.promise,
-      delay: async () => {},
-      readinessAttemptTimeoutMs: 1,
-      opencodeBinary: '/opt/opencode',
-      pathExists: () => true,
-    });
-    const first = await instance.spawnPane(
-      'first',
-      'agent',
-      'http://server',
-      '/repo',
-    );
-    const waiting = instance.spawnPane(
-      'hanging',
-      'agent',
-      'http://server',
-      '/repo',
-    );
-    expect(await instance.closePane(first.paneId ?? '')).toBe(true);
-    expect(api.closeSurface).toHaveBeenCalledWith(
-      'workspace-root',
-      'surface-1',
-      '/tmp/cmux.sock',
-    );
-    expect(await waiting).toEqual({ success: false, error: 'unavailable' });
-  });
-
-  test('default readiness parses the target status from /session/status', async () => {
-    const api = client();
-    const requested: string[] = [];
-    globalThis.fetch = mock(async (input) => {
-      requested.push(String(input));
-      return Response.json({ target: { type: 'busy' } });
-    }) as typeof fetch;
     expect(
-      await new CmuxMultiplexer(api, {
-        opencodeBinary: '/opt/opencode',
-        pathExists: () => true,
-      }).spawnPane('target', 'agent', 'http://127.0.0.1:7777/base', '/repo'),
+      await instance.spawnPane(CHILD_ID, DESCRIPTION, 'http://server', '/repo'),
     ).toEqual(expect.objectContaining({ success: true }));
-    expect(requested).toEqual(['http://127.0.0.1:7777/session/status']);
+    expect(calls.at(-1)).toEqual(cmux(['tab', 'tab_anchor', 'focus']));
   });
 
-  test('uses stable create IDs for right/down anchors and close', async () => {
-    const api = client();
-    const instance = mux(api);
-    const first = await instance.spawnPane('s1', 'one', 'http://server', '/r');
-    await instance.spawnPane('s2', 'two', 'http://server', '/r');
-    expect(api.createSurface).toHaveBeenNthCalledWith(
-      1,
-      {
-        workspaceId: 'workspace-root',
-        targetSurfaceId: 'surface-root',
-        direction: 'right',
-        focus: false,
+  test('keeps a degraded name and restores the parent tab when the tab list probe fails', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('tab') && argv.includes('show')) {
+        return json({ id: 'tab_anchor', pane_id: 'pane_anchor' });
+      }
+      if (argv.includes('tab') && argv.includes('list')) {
+        return { exitCode: 1, stdout: '', stderr: 'operation.failed' };
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane(CHILD_ID, DESCRIPTION, 'http://server', '/repo'),
+    ).toEqual({ success: true, paneId: 'term_child' });
+
+    expect(lastName(calls)).toBe(`Agent${process.pid}/subagent:${CHILD_TOKEN}`);
+    // The active tab is undeterminable: the spec mandates the parent-tab
+    // fallback rather than skipping the restore.
+    expect(calls.at(-1)).toEqual(cmux(['tab', 'tab_anchor', 'focus']));
+    expect(loggedText()).toContain('restoring the parent tab');
+  });
+
+  test('omits the argv marker when the shell has no # comments (cmd)', async () => {
+    process.env.SHELL = 'C:\\Windows\\System32\\cmd.exe';
+    const { runner, calls } = recorder();
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane(
+        CHILD_ID,
+        DESCRIPTION,
+        'http://127.0.0.1:7777',
+        '/repo',
+        { subagentType: 'oracle' },
+      ),
+    ).toEqual({ success: true, paneId: 'term_child' });
+
+    const run = calls.find((argv) => argv.includes('run')) ?? [];
+    const script = run.at(-1) ?? '';
+    expect(script).toBe(ATTACH_COMMAND);
+    expect(script).not.toContain('# omosc:');
+    // The display name contract is unaffected by the shell branch.
+    expect(lastName(calls)).toBe(`my-tab/oracle:${CHILD_TOKEN}`);
+  });
+
+  test('falls back to the first tab_ids entry when tab_id is absent', async () => {
+    const { runner, calls } = recorder((argv) =>
+      argv.includes('terminal') && !argv.includes('list')
+        ? json({ id: 'term_anchor', tab_ids: ['tab_from_list', 'tab_other'] })
+        : defaultResponse(argv),
+    );
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual(expect.objectContaining({ success: true }));
+    expect(calls[2]).toEqual(cmux(['tab', 'tab_from_list', 'show']));
+  });
+
+  test('prefers CMUX_TUI_SOCKET over the legacy CMUX_MUX_SOCKET', async () => {
+    const { runner, calls } = recorder();
+    const instance = mux({
+      runner,
+      env: {
+        CMUX_TUI_SOCKET: '/tmp/tui.sock',
+        CMUX_MUX_SOCKET: '/tmp/legacy.sock',
+        CMUX_TUI_TERMINAL_ID: 'term_anchor',
       },
-      '/tmp/cmux.sock',
-    );
-    expect(api.createSurface).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        targetSurfaceId: 'surface-1',
-        direction: 'down',
-      }),
-      '/tmp/cmux.sock',
-    );
-    await instance.closePane(first.paneId ?? '');
-    expect(api.closeSurface).toHaveBeenCalledWith(
-      'workspace-root',
-      'surface-1',
-      '/tmp/cmux.sock',
-    );
-    expect(api.equalizeSplits).toHaveBeenCalledTimes(3);
-  });
+    });
 
-  test('uses the identified socket for every operation after identify', async () => {
-    const calls: string[][] = [];
-    const runner: CommandRunner = {
-      run: mock(async (argv) => {
-        calls.push(argv);
-        if (argv.includes('--version'))
-          return { exitCode: 0, stdout: 'cmux 0.64.17', stderr: '' };
-        if (argv.includes('identify'))
-          return {
-            exitCode: 0,
-            stderr: '',
-            stdout: JSON.stringify({
-              socket_path: '/tmp/socket-a',
-              caller: {
-                workspace_id: 'w',
-                pane_id: 'p',
-                surface_id: 'root',
-              },
-            }),
-          };
-        return {
-          exitCode: 0,
-          stderr: '',
-          stdout: JSON.stringify({ pane_id: 'p2', surface_id: 's2' }),
-        };
-      }),
-    };
-    const previous = process.env.CMUX_SOCKET_PATH;
-    process.env.CMUX_SOCKET_PATH = '/tmp/socket-a';
-    const instance = mux(new CliCmuxClient(runner, '/bin/cmux'));
-    const pane = await instance.spawnPane('s', 'agent', 'http://server', '/r');
-    process.env.CMUX_SOCKET_PATH = '/tmp/socket-b';
-    await instance.closePane(pane.paneId ?? '');
-    for (const operation of [
-      'new-split',
-      'respawn-pane',
-      'rpc',
-      'close-surface',
-    ]) {
-      const call = calls.find((candidate) => candidate.includes(operation));
-      expect(call?.slice(1, 3)).toEqual(['--socket', '/tmp/socket-a']);
-    }
-    if (previous === undefined) delete process.env.CMUX_SOCKET_PATH;
-    else process.env.CMUX_SOCKET_PATH = previous;
-  });
-
-  test('keeps separate multiplexer instances on their identified sockets', async () => {
-    const first = client();
-    const second = client();
-    first.identify = mock(async () => ({
-      workspaceId: 'w1',
-      paneId: 'p1',
-      surfaceId: 'root1',
-      socketPath: '/tmp/a',
-    }));
-    second.identify = mock(async () => ({
-      workspaceId: 'w2',
-      paneId: 'p2',
-      surfaceId: 'root2',
-      socketPath: '/tmp/b',
-    }));
-    await mux(first).spawnPane('a', 'agent', 'http://server', '/repo');
-    await mux(second).spawnPane('b', 'agent', 'http://server', '/repo');
-    expect(first.createSurface).toHaveBeenCalledWith(
-      expect.any(Object),
-      '/tmp/a',
-    );
-    expect(second.createSurface).toHaveBeenCalledWith(
-      expect.any(Object),
-      '/tmp/b',
-    );
-    expect(first.respawnSurface).toHaveBeenCalledWith(
-      'w1',
-      expect.any(String),
-      expect.any(String),
-      '/tmp/a',
-    );
-    expect(second.respawnSurface).toHaveBeenCalledWith(
-      'w2',
-      expect.any(String),
-      expect.any(String),
-      '/tmp/b',
-    );
-  });
-
-  test('serializes concurrent spawns', async () => {
-    const api = client();
-    const instance = mux(api);
-    await Promise.all([
-      instance.spawnPane('s1', 'one', 'http://server', '/repo'),
-      instance.spawnPane('s2', 'two', 'http://server', '/repo'),
+    await instance.spawnPane('child', 'child', 'http://server', '/repo');
+    expect(calls[0]?.slice(0, 4)).toEqual([
+      '/bin/cmux',
+      '--socket',
+      '/tmp/tui.sock',
+      '--json',
     ]);
-    expect(api.createSurface).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({ direction: 'down' }),
-      '/tmp/cmux.sock',
-    );
   });
 
-  test('quotes attach command data safely', async () => {
-    const api = client();
-    await mux(api).spawnPane(
-      "s'$(touch /tmp/no);",
-      'one',
-      'http://host/a b;$()',
-      "/repo/a b/'quoted'",
-    );
-    expect(api.respawnSurface).toHaveBeenCalledWith(
-      'workspace-root',
-      'surface-1',
-      "'/opt/opencode' attach 'http://host/a b;$()' --session 's'\\''$(touch /tmp/no);' --dir '/repo/a b/'\\''quoted'\\'''",
-      '/tmp/cmux.sock',
-    );
-  });
-
-  test('uses the injected host opencode executable instead of pane PATH', async () => {
-    const api = client();
-    const instance = new CmuxMultiplexer(api, {
-      checkSessionReady: async () => true,
-      delay: async () => {},
-      opencodeBinary: '/Users/king/.opencode/bin/opencode',
-      pathExists: () => true,
+  test('uses the legacy socket when the TUI socket is absent', async () => {
+    const { runner, calls } = recorder();
+    const instance = mux({
+      runner,
+      env: {
+        CMUX_MUX_SOCKET: '/tmp/legacy.sock',
+        CMUX_TUI_TERMINAL_ID: 'term_anchor',
+      },
     });
-    await instance.spawnPane('s1', 'agent', 'http://server', '/repo');
-    expect(api.respawnSurface).toHaveBeenCalledWith(
-      'workspace-root',
-      'surface-1',
-      "'/Users/king/.opencode/bin/opencode' attach 'http://server' --session 's1' --dir '/repo'",
-      '/tmp/cmux.sock',
-    );
+
+    await instance.spawnPane('child', 'child', 'http://server', '/repo');
+    expect(calls[0]?.slice(0, 4)).toEqual([
+      '/bin/cmux',
+      '--socket',
+      '/tmp/legacy.sock',
+      '--json',
+    ]);
   });
 
-  test('quotes an injected host executable containing spaces', async () => {
-    const api = client();
-    const instance = new CmuxMultiplexer(api, {
-      checkSessionReady: async () => true,
-      delay: async () => {},
-      opencodeBinary: '/Applications/Open Code/opencode',
-      pathExists: () => true,
+  test('uses --session addressing when only a session name exists', async () => {
+    const { runner, calls } = recorder();
+    const instance = mux({
+      runner,
+      env: {
+        CMUX_TUI_SESSION: 'probe',
+        CMUX_TUI_TERMINAL_ID: 'term_anchor',
+      },
     });
-    await instance.spawnPane('s1', 'agent', 'http://server', '/repo');
-    const command = (api.respawnSurface as ReturnType<typeof mock>).mock
-      .calls[0]?.[2];
-    expect(command).toStartWith("'/Applications/Open Code/opencode' attach");
+
+    await instance.spawnPane('child', 'child', 'http://server', '/repo');
+    expect(calls[0]?.slice(0, 4)).toEqual([
+      '/bin/cmux',
+      '--session',
+      'probe',
+      '--json',
+    ]);
   });
 
-  test('returns an orphan handle when respawn and cleanup both fail', async () => {
-    const api = client();
-    api.respawnSurface = mock(async () => false);
-    api.closeSurface = mock(async () => 'failed' as const);
-    const result = await mux(api).spawnPane(
-      'orphan',
-      'agent',
+  test('returns not_found without commands when no socket is detected', async () => {
+    const { runner, calls } = recorder();
+    const instance = mux({
+      runner,
+      env: { CMUX_TUI_TERMINAL_ID: 'term_anchor' },
+    });
+
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'not_found' });
+    expect(calls).toEqual([]);
+  });
+
+  test('returns not_found without commands when the terminal anchor is missing', async () => {
+    const { runner, calls } = recorder();
+    const instance = mux({
+      runner,
+      env: { CMUX_TUI_SOCKET: '/tmp/cmux-tui.sock' },
+    });
+
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'not_found' });
+    expect(calls).toEqual([]);
+  });
+
+  test('rejects an old-generation command surface with a distinguishable diagnostic', async () => {
+    const { runner, calls } = recorder(() => ({
+      exitCode: 2,
+      stdout: '',
+      stderr: 'cmux: unknown resource scope "session".',
+    }));
+    const instance = mux({ runner });
+
+    expect(await instance.isAvailable()).toBe(false);
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'unavailable' });
+
+    // Only the protocol self-check ran; no mutation reached the old binary.
+    expect(calls.length).toBe(2);
+    expect(calls.every((argv) => argv.includes('ping'))).toBe(true);
+    expect(loggedText()).toContain('old-generation');
+  });
+
+  test('classifies old-generation failures on the new command surface', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('ping')) return json({ alive: true });
+      return {
+        exitCode: 2,
+        stdout: '',
+        stderr: 'cmux: usage.invalid: unknown option "--name"',
+      };
+    });
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'unavailable' });
+    expect(calls.some((argv) => argv.includes('run'))).toBe(false);
+    expect(calls.some((argv) => argv.includes('focus'))).toBe(false);
+    expect(loggedText()).toContain('old-generation');
+  });
+
+  test('distinguishes a failed read self-check from an old-generation binary', async () => {
+    const { runner } = recorder(() => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'cannot connect to session socket /run/x.sock: No such file',
+    }));
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'unavailable' });
+    expect(loggedText()).toContain('read-selfcheck-failed');
+    expect(loggedText()).not.toContain('old-generation');
+  });
+
+  test('fails closed without a run when the anchor terminal has no tab', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('ping')) return json({ alive: true });
+      if (argv.includes('terminal')) {
+        return json({ id: 'term_anchor', tab_ids: [] });
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'hard' });
+    expect(calls.some((argv) => argv.includes('run'))).toBe(false);
+    expect(calls.some((argv) => argv.includes('focus'))).toBe(false);
+  });
+
+  test('fails closed without a run when the anchor tab has no pane', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('ping')) return json({ alive: true });
+      if (argv.includes('tab') && argv.includes('show')) {
+        return json({ id: 'tab_anchor' });
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'hard' });
+    expect(calls.some((argv) => argv.includes('run'))).toBe(false);
+    expect(calls.some((argv) => argv.includes('focus'))).toBe(false);
+  });
+
+  test('returns not_found when the anchor terminal is gone', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('ping')) return json({ alive: true });
+      if (argv.includes('terminal')) {
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: JSON.stringify({
+            code: 'selector.not_found',
+            message: 'no terminal matches "term_anchor"',
+          }),
+        };
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'not_found' });
+    expect(calls.some((argv) => argv.includes('run'))).toBe(false);
+    expect(calls.some((argv) => argv.includes('focus'))).toBe(false);
+  });
+
+  test('best-effort closes only the marked terminal when the run fails', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('run')) {
+        return { exitCode: 1, stdout: '', stderr: 'operation.failed' };
+      }
+      if (argv.includes('process') && argv.includes('term_leak')) {
+        return json({ argv: ['/bin/bash', '-l', '-c', `${MARKER}attach`] });
+      }
+      if (argv.includes('process') && argv.includes('term_user')) {
+        return json({ argv: ['/bin/bash'] });
+      }
+      if (argv.includes('list') && argv.includes('terminal')) {
+        return json([{ id: 'term_leak' }, { id: 'term_user' }]);
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane(CHILD_ID, DESCRIPTION, 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'hard' });
+
+    const closes = calls.filter((argv) => argv.includes('close'));
+    expect(closes).toEqual([cmux(['terminal', 'term_leak', 'close'])]);
+    expect(calls.some((argv) => argv.includes('focus'))).toBe(false);
+  });
+
+  test('classifies a run selector.not_found as not_found and stops', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('run')) {
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: JSON.stringify({
+            code: 'selector.not_found',
+            details: { scope: 'pane', selector: 'pane_anchor' },
+            message: 'no pane matches "pane_anchor"',
+            retryable: false,
+          }),
+        };
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    expect(
+      await instance.spawnPane('child', 'child', 'http://server', '/repo'),
+    ).toEqual({ success: false, error: 'not_found' });
+    expect(calls.some((argv) => argv.includes('focus'))).toBe(false);
+    // A gone parent pane proves nothing was created: no marker scan runs.
+    expect(calls.some((argv) => argv.includes('list'))).toBe(false);
+  });
+
+  test('never derives display names from tab positions', async () => {
+    let index = 0;
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('tab') && argv.includes('show')) {
+        return json({
+          id: 'tab_anchor',
+          pane_id: 'pane_anchor',
+          index,
+          focused: false,
+          name: 'my-tab',
+        });
+      }
+      if (argv.includes('tab') && argv.includes('list')) {
+        return json([
+          {
+            id: 'tab_anchor',
+            pane_id: 'pane_anchor',
+            index,
+            focused: true,
+            name: 'my-tab',
+          },
+        ]);
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    const sessionA = 'ses_aaaaaaaaaaaaaaaaaaaaaa11abc';
+    const sessionB = 'ses_bbbbbbbbbbbbbbbbbbbbbb22xyz';
+    const spawn = (sessionId: string) =>
+      instance.spawnPane(sessionId, DESCRIPTION, 'http://server', '/repo', {
+        subagentType: 'oracle',
+      });
+
+    await spawn(sessionA);
+    const first = lastName(calls);
+    index = 4; // a user closed tabs: positions shifted
+    await spawn(sessionA);
+    const repeated = lastName(calls);
+    await spawn(sessionB);
+    const other = lastName(calls);
+
+    expect(first).toBe(`my-tab/oracle:11abc`);
+    expect(repeated).toBe(first);
+    expect(other).toBe(`my-tab/oracle:22xyz`);
+    expect(other).not.toBe(first);
+  });
+
+  const layouts: MultiplexerLayout[] = [
+    'main-vertical',
+    'main-horizontal',
+    'even-horizontal',
+    'even-vertical',
+    'tiled',
+  ];
+
+  for (const layout of layouts) {
+    test(`applyLayout(${layout}) issues no command`, async () => {
+      const { runner, calls } = recorder();
+      const instance = mux({ runner, layout });
+
+      await instance.applyLayout(layout, 60);
+      expect(calls).toEqual([]);
+    });
+  }
+
+  test('spawns identically under different layout values', async () => {
+    const first = recorder();
+    await mux({ runner: first.runner, layout: 'main-horizontal' }).spawnPane(
+      CHILD_ID,
+      DESCRIPTION,
       'http://server',
       '/repo',
+      { subagentType: 'oracle' },
     );
-    expect(result).toEqual({
-      success: false,
-      error: 'unavailable',
-      orphanPaneId: expect.stringContaining('cmux:v1:'),
-    });
-    expect(await mux(api).closePane(result.orphanPaneId ?? '')).toBe(false);
+    const second = recorder();
+    await mux({ runner: second.runner, layout: 'tiled' }).spawnPane(
+      CHILD_ID,
+      DESCRIPTION,
+      'http://server',
+      '/repo',
+      { subagentType: 'oracle' },
+    );
+    expect(first.calls).toEqual(second.calls);
   });
 
-  test('does not create a surface without an existing absolute binary', async () => {
-    const api = client();
-    const instance = new CmuxMultiplexer(api, {
-      checkSessionReady: async () => true,
-      opencodeBinary: 'opencode',
-      pathExists: () => false,
-    });
+  test('treats a close selector.not_found as already closed', async () => {
+    const { runner } = recorder(() => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: JSON.stringify({
+        code: 'selector.not_found',
+        details: { scope: 'terminal', selector: 'term_gone' },
+        message: 'no terminal matches "term_gone"',
+        retryable: false,
+      }),
+    }));
+    const instance = mux({ runner });
+
+    expect(await instance.closePane('term_gone')).toBe(true);
+  });
+
+  test('returns false when close fails for another reason', async () => {
+    const { runner } = recorder(() => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'operation.failed',
+    }));
+    const instance = mux({ runner });
+
+    expect(await instance.closePane('term_x')).toBe(false);
+  });
+
+  test('runs no command for close without a control-plane target', async () => {
+    const { runner, calls } = recorder();
+    const instance = mux({ runner, env: {} });
+
+    expect(await instance.closePane('term_x')).toBe(false);
+    expect(await instance.closePane('')).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test('detects a cmux session from either socket or a session name', () => {
     expect(
-      await instance.spawnPane('s', 'agent', 'http://server', '/repo'),
-    ).toEqual({ success: false, error: 'hard' });
-    expect(api.createSurface).not.toHaveBeenCalled();
-    expect(api.respawnSurface).not.toHaveBeenCalled();
+      mux({ env: { CMUX_TUI_SOCKET: '/tmp/a.sock' } }).isInsideSession(),
+    ).toBe(true);
+    expect(
+      mux({ env: { CMUX_MUX_SOCKET: '/tmp/a.sock' } }).isInsideSession(),
+    ).toBe(true);
+    expect(mux({ env: {}, sessionName: 'probe' }).isInsideSession()).toBe(true);
+    expect(mux({ env: {} }).isInsideSession()).toBe(false);
+  });
+
+  test('discovers sweep candidates from terminal argv markers only', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('list') && argv.includes('terminal')) {
+        return json([
+          { id: 'term_marked' },
+          { id: 'term_user' },
+          { id: 'term_malformed' },
+        ]);
+      }
+      if (argv.includes('process') && argv.includes('term_marked')) {
+        return json({
+          argv: ['/bin/bash', '-l', '-c', `${MARKER}attach`],
+        });
+      }
+      if (argv.includes('process') && argv.includes('term_user')) {
+        // The token exists but not as the plugin's comment marker.
+        return json({ argv: ['/bin/bash', '-c', `echo ${DESCRIPTION}`] });
+      }
+      if (argv.includes('process') && argv.includes('term_malformed')) {
+        return json({
+          argv: ['/bin/bash', '-l', '-c', '# omosc:not-a-pid:ses_x\nattach'],
+        });
+      }
+      return json({});
+    });
+    const instance = mux({ runner });
+
+    expect(await instance.listPanesWithTitles()).toEqual({
+      panes: [{ paneId: 'term_marked', title: DESCRIPTION }],
+      incomplete: false,
+    });
+    // `tab list` is never a scan source: it cannot see closed-view terminals.
+    expect(
+      calls.every((argv) => !(argv.includes('tab') && argv.includes('list'))),
+    ).toBe(true);
+    expect(calls.every((argv) => !argv.includes('project'))).toBe(true);
+  });
+
+  test('rejects the candidate scan when terminal list fails', async () => {
+    const { runner } = recorder((argv) => {
+      if (argv.includes('list') && argv.includes('terminal')) {
+        return { exitCode: 1, stdout: '', stderr: 'connection refused' };
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    // A failed scan must stay distinguishable from a clean empty pass so the
+    // wiring can re-arm the owed sweep.
+    await expect(instance.listPanesWithTitles()).rejects.toThrow(
+      /terminal list failed/,
+    );
+  });
+
+  test('reports an incomplete scan when a process show fails transiently', async () => {
+    const { runner } = recorder((argv) => {
+      if (argv.includes('list') && argv.includes('terminal')) {
+        return json([{ id: 'term_marked' }, { id: 'term_flaky' }]);
+      }
+      if (argv.includes('process') && argv.includes('term_flaky')) {
+        return { exitCode: 1, stdout: '', stderr: 'connection refused' };
+      }
+      if (argv.includes('process') && argv.includes('term_marked')) {
+        return json({ argv: ['/bin/bash', '-l', '-c', `${MARKER}attach`] });
+      }
+      return json({});
+    });
+    const instance = mux({ runner });
+
+    // `unavailable` means the scan could not determine whether `term_flaky`
+    // is a leftover: the pass stays retryable, but the candidate found before
+    // it is preserved instead of being discarded by an abort.
+    await expect(instance.listPanesWithTitles()).resolves.toEqual({
+      panes: [{ paneId: 'term_marked', title: DESCRIPTION }],
+      incomplete: true,
+    });
+    const messages = logMock.mock.calls.map((call: unknown[]) =>
+      String(call[0]),
+    );
+    expect(
+      messages.some(
+        (message) =>
+          message.startsWith('[cmux-tui]') &&
+          message.includes('terminal skipped'),
+      ),
+    ).toBe(true);
+  });
+
+  test('reports an incomplete scan when a process show fails hard', async () => {
+    const { runner } = recorder((argv) => {
+      if (argv.includes('list') && argv.includes('terminal')) {
+        return json([{ id: 'term_marked' }, { id: 'term_flaky' }]);
+      }
+      if (argv.includes('process') && argv.includes('term_flaky')) {
+        return { exitCode: 1, stdout: '', stderr: 'operation.failed' };
+      }
+      if (argv.includes('process') && argv.includes('term_marked')) {
+        return json({ argv: ['/bin/bash', '-l', '-c', `${MARKER}attach`] });
+      }
+      return json({});
+    });
+    const instance = mux({ runner });
+
+    await expect(instance.listPanesWithTitles()).resolves.toEqual({
+      panes: [{ paneId: 'term_marked', title: DESCRIPTION }],
+      incomplete: true,
+    });
+  });
+
+  test('skips a not_found terminal but keeps the other candidates', async () => {
+    const { runner } = recorder((argv) => {
+      if (argv.includes('list') && argv.includes('terminal')) {
+        return json([{ id: 'term_gone' }, { id: 'term_marked' }]);
+      }
+      if (argv.includes('process') && argv.includes('term_gone')) {
+        return {
+          exitCode: 1,
+          stdout: '',
+          stderr: JSON.stringify({
+            code: 'selector.not_found',
+            message: 'no terminal matches "term_gone"',
+          }),
+        };
+      }
+      if (argv.includes('process') && argv.includes('term_marked')) {
+        return json({ argv: ['/bin/bash', '-l', '-c', `${MARKER}attach`] });
+      }
+      return json({});
+    });
+    const instance = mux({ runner });
+
+    // `not_found` is a definitive answer, not a failed scan: skipping the
+    // stale terminal completes the pass. A blanket throw here would make
+    // every sweep fail once one stale terminal exists.
+    await expect(instance.listPanesWithTitles()).resolves.toEqual({
+      panes: [{ paneId: 'term_marked', title: DESCRIPTION }],
+      incomplete: false,
+    });
+    const messages = logMock.mock.calls.map((call: unknown[]) =>
+      String(call[0]),
+    );
+    expect(
+      messages.some(
+        (message) =>
+          message.startsWith('[cmux-tui]') &&
+          message.includes('terminal already gone'),
+      ),
+    ).toBe(true);
+  });
+
+  test('sweep closes only the dead-owner terminal discovered via argv markers', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('list') && argv.includes('terminal')) {
+        return json([
+          { id: 'term_1' },
+          { id: 'term_2' },
+          { id: 'term_3' },
+          { id: 'term_4' },
+        ]);
+      }
+      if (argv.includes('process')) {
+        if (argv.includes('term_1')) return json({ argv: ['/bin/bash'] });
+        if (argv.includes('term_2')) {
+          return json({
+            argv: ['/bin/bash', '-l', '-c', '# omosc:999:ses_gone\nx'],
+          });
+        }
+        if (argv.includes('term_3')) {
+          return json({
+            argv: ['/bin/bash', '-l', '-c', '# omosc:4242:ses_gone\nx'],
+          });
+        }
+        if (argv.includes('term_4')) {
+          return json({
+            argv: ['/bin/bash', '-l', '-c', '# omosc:999:ses_alive\nx'],
+          });
+        }
+      }
+      return json({ value: {} });
+    });
+    const instance = mux({ runner });
+    const { sweepLeftoverPanes } = await import('../client/sweep');
+
+    const stats = await sweepLeftoverPanes({
+      adapter: instance,
+      isProcessAlive: (pid) => pid !== 999,
+      isSessionTerminal: async (child) => child === 'ses_gone',
+    });
+
+    expect(stats.closed).toBe(1);
+    expect(stats.scanFailed).toBe(false);
+    expect(stats.scanIncomplete).toBe(false);
+    const close = calls.find((argv) => argv.includes('close'));
+    expect(close).toEqual(cmux(['terminal', 'term_2', 'close']));
+    expect(calls.every((argv) => !argv.includes('project'))).toBe(true);
+  });
+
+  test('emits only [cmux-tui] log prefixes on the adapter path', async () => {
+    const { runner } = recorder((argv) => {
+      if (argv.includes('close')) {
+        return { exitCode: 1, stdout: '', stderr: 'selector.not_found' };
+      }
+      return defaultResponse(argv);
+    });
+    const instance = mux({ runner });
+
+    await instance.spawnPane(CHILD_ID, DESCRIPTION, 'http://server', '/repo');
+    expect(await instance.closePane('term_gone')).toBe(true);
+
+    const messages = logMock.mock.calls.map((call: unknown[]) =>
+      String(call[0]),
+    );
+    expect(messages.length).toBeGreaterThan(0);
+    expect(messages.every((message) => message.startsWith('[cmux-tui]'))).toBe(
+      true,
+    );
+    expect(messages.some((message) => message.startsWith('[cmux]'))).toBe(
+      false,
+    );
   });
 });
 
 describe('CliCmuxClient', () => {
+  const target = { socketPath: '/tmp/cmux.sock' };
+
+  test('requires a live protocol read for the self-check', async () => {
+    const { runner } = recorder(() => json({ alive: true }));
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.selfCheck(target)).toEqual({ ok: true, value: true });
+  });
+
+  test('reports old-generation binaries distinctly', async () => {
+    const { runner } = recorder(() => ({
+      exitCode: 2,
+      stdout: '',
+      stderr: 'cmux: unknown resource scope "session".',
+    }));
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.selfCheck(target)).toEqual({
+      ok: false,
+      error: 'unavailable',
+      reason: 'old-generation',
+    });
+  });
+
+  test('reports a failed protocol read as read-selfcheck-failed', async () => {
+    const { runner } = recorder(() => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'connection refused',
+    }));
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.selfCheck(target)).toEqual({
+      ok: false,
+      error: 'unavailable',
+      reason: 'read-selfcheck-failed',
+    });
+  });
+
+  test('rejects a ping payload that is not alive', async () => {
+    const { runner } = recorder(() => json({ alive: false }));
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.selfCheck(target)).toEqual({
+      ok: false,
+      error: 'unavailable',
+      reason: 'read-selfcheck-failed',
+    });
+  });
+
+  test('resolves the two-hop anchor with the parent tab name and active flag', async () => {
+    const { runner, calls } = recorder((argv) => {
+      if (argv.includes('terminal')) {
+        return json({ id: 'term_1', tab_id: 'tab_1', tab_ids: ['tab_1'] });
+      }
+      if (argv.includes('tab')) {
+        return json({
+          id: 'tab_1',
+          pane_id: 'pane_1',
+          focused: true,
+          name: 'my-tab',
+        });
+      }
+      return json({});
+    });
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.resolveAnchor(target, 'term_1')).toEqual({
+      ok: true,
+      value: {
+        tabId: 'tab_1',
+        paneId: 'pane_1',
+        tabName: 'my-tab',
+        tabFocused: true,
+      },
+    });
+    expect(calls[0]).toEqual([
+      '/bin/cmux',
+      '--socket',
+      '/tmp/cmux.sock',
+      '--json',
+      'terminal',
+      'term_1',
+      'show',
+    ]);
+    expect(calls[1]).toEqual([
+      '/bin/cmux',
+      '--socket',
+      '/tmp/cmux.sock',
+      '--json',
+      'tab',
+      'tab_1',
+      'show',
+    ]);
+  });
+
+  test('classifies an unparseable anchor response as hard', async () => {
+    const { runner } = recorder((argv) =>
+      argv.includes('terminal') ? json({ id: 'term_1' }) : json({}),
+    );
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.resolveAnchor(target, 'term_1')).toEqual({
+      ok: false,
+      error: 'hard',
+      reason: 'invalid-response',
+    });
+  });
+
+  test('runs the attach argv under the display name before the separator', async () => {
+    const { runner, calls } = recorder(() =>
+      json({ value: { tab_id: 'tab_9', terminal_id: 'term_9' } }),
+    );
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(
+      await client.runInPane(
+        target,
+        'pane_1',
+        ['/bin/bash', '-l', '-c', 'attach'],
+        'my-tab/oracle:GdEx6',
+      ),
+    ).toEqual({ ok: true, value: { tabId: 'tab_9', terminalId: 'term_9' } });
+    expect(calls[0]).toEqual([
+      '/bin/cmux',
+      '--socket',
+      '/tmp/cmux.sock',
+      '--json',
+      'pane',
+      'pane_1',
+      'run',
+      '--on-exit',
+      'keep',
+      '--name',
+      'my-tab/oracle:GdEx6',
+      '--',
+      '/bin/bash',
+      '-l',
+      '-c',
+      'attach',
+    ]);
+  });
+
+  test('rejects a run response missing tab_id or terminal_id', async () => {
+    for (const payload of [
+      { tab_id: 'tab_9' },
+      { terminal_id: 'term_9' },
+      {},
+    ]) {
+      const { runner } = recorder(() => json({ value: payload }));
+      const client = new CliCmuxClient(runner, '/bin/cmux');
+
+      expect(await client.runInPane(target, 'pane_1', ['x'], 'name')).toEqual({
+        ok: false,
+        error: 'hard',
+        reason: 'invalid-response',
+      });
+    }
+  });
+
+  test('classifies old-generation failures for every new command', async () => {
+    const oldGeneration = () => ({
+      exitCode: 2,
+      stdout: '',
+      stderr: 'cmux: unknown command "pane"',
+    });
+
+    const run = new CliCmuxClient(recorder(oldGeneration).runner, '/bin/cmux');
+    expect(await run.runInPane(target, 'pane_1', ['x'], 'name')).toEqual({
+      ok: false,
+      error: 'unavailable',
+      reason: 'old-generation',
+    });
+
+    const focus = new CliCmuxClient(
+      recorder(oldGeneration).runner,
+      '/bin/cmux',
+    );
+    expect(await focus.focusTab(target, 'tab_1')).toEqual({
+      ok: false,
+      error: 'unavailable',
+      reason: 'old-generation',
+    });
+
+    const close = new CliCmuxClient(
+      recorder(oldGeneration).runner,
+      '/bin/cmux',
+    );
+    expect(await close.closeTerminal(target, 'term_1')).toBe('failed');
+
+    const show = new CliCmuxClient(recorder(oldGeneration).runner, '/bin/cmux');
+    expect(await show.processShow(target, 'term_1')).toEqual({
+      ok: false,
+      error: 'unavailable',
+      reason: 'old-generation',
+    });
+  });
+
+  test('focuses a tab with the exact argv', async () => {
+    const { runner, calls } = recorder(() => json({ value: {} }));
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.focusTab(target, 'tab_1')).toEqual({
+      ok: true,
+      value: true,
+    });
+    expect(calls[0]).toEqual([
+      '/bin/cmux',
+      '--socket',
+      '/tmp/cmux.sock',
+      '--json',
+      'tab',
+      'tab_1',
+      'focus',
+    ]);
+  });
+
+  test('closes a terminal with the exact argv', async () => {
+    const { runner, calls } = recorder(() => json({ value: {} }));
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.closeTerminal(target, 'term_1')).toBe('closed');
+    expect(calls[0]).toEqual([
+      '/bin/cmux',
+      '--socket',
+      '/tmp/cmux.sock',
+      '--json',
+      'terminal',
+      'term_1',
+      'close',
+    ]);
+  });
+
+  test('treats a terminal close selector.not_found as already closed', async () => {
+    const { runner } = recorder(() => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: JSON.stringify({
+        code: 'selector.not_found',
+        details: { scope: 'terminal', selector: 'term_gone' },
+        message: 'no terminal matches "term_gone"',
+        retryable: false,
+      }),
+    }));
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.closeTerminal(target, 'term_gone')).toBe('not_found');
+  });
+
+  test('reports a terminal close failure for other errors', async () => {
+    const { runner } = recorder(() => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'operation.failed',
+    }));
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.closeTerminal(target, 'term_1')).toBe('failed');
+  });
+
+  test('reads the verbatim argv from process show', async () => {
+    const { runner, calls } = recorder(() =>
+      json({ argv: ['/bin/bash', '-l', '-c', `${MARKER}attach`], pid: 42 }),
+    );
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.processShow(target, 'term_1')).toEqual({
+      ok: true,
+      value: { argv: ['/bin/bash', '-l', '-c', `${MARKER}attach`] },
+    });
+    expect(calls[0]).toEqual([
+      '/bin/cmux',
+      '--socket',
+      '/tmp/cmux.sock',
+      '--json',
+      'terminal',
+      'term_1',
+      'process',
+      'show',
+    ]);
+  });
+
+  test('rejects a process show response without argv', async () => {
+    const { runner } = recorder(() => json({ pid: 42 }));
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.processShow(target, 'term_1')).toEqual({
+      ok: false,
+      error: 'hard',
+      reason: 'invalid-response',
+    });
+  });
+
+  test('lists tabs with pane and focus fields', async () => {
+    const { runner } = recorder(() =>
+      json([
+        { id: 'tab_1', pane_id: 'pane_1', focused: true, name: 'my-tab' },
+        { id: 'tab_2', pane_id: 'pane_1', focused: false, name: null },
+        { id: 'tab_3', focused: false },
+      ]),
+    );
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.listTabs(target)).toEqual({
+      ok: true,
+      value: [
+        { tabId: 'tab_1', paneId: 'pane_1', focused: true },
+        { tabId: 'tab_2', paneId: 'pane_1', focused: false },
+      ],
+    });
+  });
+
+  test('lists terminal ids for sweep discovery', async () => {
+    const { runner } = recorder(() =>
+      json([
+        { id: 'term_1', running: true, tab_ids: [] },
+        { id: 'term_2', running: false, tab_ids: ['tab_2'] },
+        { running: true },
+      ]),
+    );
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    expect(await client.listTerminals(target)).toEqual({
+      ok: true,
+      value: [{ terminalId: 'term_1' }, { terminalId: 'term_2' }],
+    });
+  });
+
+  test('redacts stderr on argv-carrying command failures', async () => {
+    const { runner } = recorder((argv) => {
+      if (argv.includes('ping')) return json({ alive: true });
+      return {
+        exitCode: 1,
+        stdout: '',
+        stderr: 'failed to spawn /bin/bash -c "secret attach payload"',
+      };
+    });
+    const client = new CliCmuxClient(runner, '/bin/cmux');
+
+    await client.runInPane(target, 'pane_1', ['secret'], 'name');
+    expect(loggedText()).toContain('[redacted: may contain attach command]');
+    expect(loggedText()).not.toContain('secret attach payload');
+  });
+
   test('bounds a hanging spawned command', async () => {
     const kill = mock(() => true);
     const runner = new SpawnCommandRunner(5, (() => ({
@@ -394,156 +1539,140 @@ describe('CliCmuxClient', () => {
       stdout: async () => '',
       stderr: async () => '',
       kill,
-    })) as any);
+    })) as never);
+
     const result = await runner.run(['/bin/cmux', '--version']);
     expect(result.exitCode).toBe(124);
     expect(result.stderr).toContain('unavailable');
     expect(kill).toHaveBeenCalledWith('SIGTERM');
   });
+});
 
-  test('uses the 0.64.14 UUID CLI contract', async () => {
-    const calls: string[][] = [];
-    const runner: CommandRunner = {
-      run: mock(async (argv) => {
-        calls.push(argv);
-        return {
-          exitCode: 0,
-          stderr: '',
-          stdout: argv.includes('identify')
-            ? JSON.stringify({
-                socket_path: '/tmp/cmux.sock',
-                caller: {
-                  workspace_id: 'w',
-                  pane_id: 'p',
-                  surface_id: 's',
-                },
-              })
-            : JSON.stringify({ pane_id: 'p2', surface_id: 's2' }),
-        };
+describe('cmux binary resolution', () => {
+  test('prefers an explicit binary over PATH probing', async () => {
+    const probes: string[] = [];
+    const { runner, calls } = recorder();
+    const instance = new CmuxMultiplexer('main-vertical', 60, {
+      client: new CliCmuxClient(runner, '/opt/cmux-tui', async (name) => {
+        probes.push(name);
+        return null;
       }),
-    };
-    const cli = new CliCmuxClient(runner, '/bin/cmux');
-    expect(await cli.identify()).toEqual({
-      workspaceId: 'w',
-      paneId: 'p',
-      surfaceId: 's',
-      socketPath: '/tmp/cmux.sock',
+      env: BASE_ENV,
     });
-    await cli.createSurface({
-      workspaceId: 'w',
-      targetSurfaceId: 's',
-      direction: 'right',
-      focus: false,
-    });
-    expect(calls[1]).toEqual([
-      '/bin/cmux',
-      '--json',
-      '--id-format',
-      'uuids',
-      'new-split',
-      'right',
-      '--workspace',
-      'w',
-      '--surface',
-      's',
-      '--focus',
-      'false',
-    ]);
+
+    expect(await instance.isAvailable()).toBe(true);
+    expect(probes).toEqual([]);
+    expect(calls[0]?.[0]).toBe('/opt/cmux-tui');
   });
 
-  test('covers respawn close equalize and resets create error classification', async () => {
-    const calls: string[][] = [];
-    let splitAttempt = 0;
-    const runner: CommandRunner = {
-      run: mock(async (argv) => {
-        calls.push(argv);
-        if (argv.includes('new-split')) {
-          splitAttempt += 1;
-          return splitAttempt === 1
-            ? { exitCode: 1, stdout: '', stderr: 'invalid_state' }
-            : { exitCode: 1, stdout: '', stderr: 'bad configuration' };
-        }
-        if (argv.includes('close-surface')) {
-          return { exitCode: 1, stdout: '', stderr: 'not_found' };
-        }
-        return { exitCode: 0, stdout: '', stderr: '' };
-      }),
-    };
-    const cli = new CliCmuxClient(runner, '/bin/cmux');
-    const input = {
-      workspaceId: 'w',
-      targetSurfaceId: 's',
-      direction: 'right' as const,
-      focus: false as const,
-    };
-    expect(await cli.createSurface(input)).toBeNull();
-    expect(cli.getCreateError()).toBe('invalid_state');
-    expect(await cli.createSurface(input)).toBeNull();
-    expect(cli.getCreateError()).toBe('hard');
-    expect(await cli.respawnSurface('w', 's', 'safe command')).toBe(true);
-    expect(await cli.closeSurface('w', 's')).toBe('not_found');
-    expect(
-      await cli.equalizeSplits({ workspace_id: 'w', orientation: 'vertical' }),
-    ).toBe(true);
-    expect(calls.at(-2)).toEqual([
-      '/bin/cmux',
-      'close-surface',
-      '--workspace',
-      'w',
-      '--surface',
-      's',
-    ]);
+  test('probes cmux-tui before the legacy cmux name', async () => {
+    const probes: string[] = [];
+    const { runner, calls } = recorder();
+    const client = new CliCmuxClient(runner, undefined, async (name) => {
+      probes.push(name);
+      return name === 'cmux-tui' ? '/usr/bin/cmux-tui' : '/usr/bin/cmux';
+    });
+    const instance = new CmuxMultiplexer('main-vertical', 60, {
+      client,
+      env: BASE_ENV,
+    });
+
+    expect(await instance.isAvailable()).toBe(true);
+    expect(probes).toEqual(['cmux-tui']);
+    expect(calls[0]?.[0]).toBe('/usr/bin/cmux-tui');
   });
 
-  test('classifies runner throws as transient and recovers without stale errors', async () => {
-    let calls = 0;
-    const runner: CommandRunner = {
-      run: mock(async (argv) => {
-        calls += 1;
-        if (calls <= 3) throw new Error('socket closed');
-        if (argv.includes('--version')) {
-          return { exitCode: 0, stdout: 'cmux 0.64.17', stderr: '' };
-        }
-        if (argv.includes('identify')) {
-          return {
-            exitCode: 0,
-            stderr: '',
-            stdout: JSON.stringify({
-              socket_path: '/tmp/cmux.sock',
-              caller: { workspace_id: 'w', pane_id: 'p', surface_id: 's' },
-            }),
-          };
-        }
-        return {
-          exitCode: 0,
-          stderr: '',
-          stdout: JSON.stringify({ pane_id: 'p2', surface_id: 's2' }),
-        };
-      }),
-    };
-    const cli = new CliCmuxClient(runner, '/bin/cmux');
-    expect(await cli.version()).toBeNull();
-    expect(cli.getVersionError()).toBe('unavailable');
-    expect(await cli.identify()).toBeNull();
-    expect(cli.getIdentifyError()).toBe('unavailable');
-    expect(
-      await cli.createSurface({
-        workspaceId: 'w',
-        targetSurfaceId: 's',
-        direction: 'right',
-        focus: false,
-      }),
-    ).toBeNull();
-    expect(cli.getCreateError()).toBe('unavailable');
-    expect(await cli.version()).toBe('0.64.17');
-    expect(await cli.identify()).not.toBeNull();
+  test('falls back to the legacy cmux name when cmux-tui is absent', async () => {
+    const probes: string[] = [];
+    const { runner, calls } = recorder();
+    const client = new CliCmuxClient(runner, undefined, async (name) => {
+      probes.push(name);
+      return name === 'cmux' ? '/usr/bin/cmux' : null;
+    });
+    const instance = new CmuxMultiplexer('main-vertical', 60, {
+      client,
+      env: BASE_ENV,
+    });
+
+    expect(await instance.isAvailable()).toBe(true);
+    expect(probes).toEqual(['cmux-tui', 'cmux']);
+    expect(calls[0]?.[0]).toBe('/usr/bin/cmux');
+  });
+
+  test('resolves the binary once across commands', async () => {
+    const probes: string[] = [];
+    const { runner } = recorder();
+    const client = new CliCmuxClient(runner, undefined, async (name) => {
+      probes.push(name);
+      return name === 'cmux-tui' ? '/usr/bin/cmux-tui' : null;
+    });
+    const instance = new CmuxMultiplexer('main-vertical', 60, {
+      client,
+      env: BASE_ENV,
+    });
+
+    await instance.isAvailable();
+    await instance.isAvailable();
+    expect(probes).toEqual(['cmux-tui']);
+  });
+
+  test('passes the cmux-tui log prefix to both probes', async () => {
+    const probes: Array<{ name: string; logPrefix?: string }> = [];
+    const { runner } = recorder();
+    const client = new CliCmuxClient(
+      runner,
+      undefined,
+      async (name, logPrefix) => {
+        probes.push({ name, logPrefix });
+        return name === 'cmux' ? '/usr/bin/cmux' : null;
+      },
+    );
+    const instance = new CmuxMultiplexer('main-vertical', 60, {
+      client,
+      env: BASE_ENV,
+    });
+
+    expect(await instance.isAvailable()).toBe(true);
+    // The legacy `cmux` fallback must not emit a `[cmux]` log prefix.
+    expect(probes).toEqual([
+      { name: 'cmux-tui', logPrefix: 'cmux-tui' },
+      { name: 'cmux', logPrefix: 'cmux-tui' },
+    ]);
   });
 });
 
-function createDeferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
-    resolve = res;
+describe('argv marker helpers', () => {
+  test('extracts the omosc token only from the comment marker line', () => {
+    expect(
+      extractArgvMarker(['/bin/bash', '-l', '-c', `${MARKER}attach`]),
+    ).toBe(DESCRIPTION);
+    expect(extractArgvMarker(['/bin/bash', '-c', 'attach'])).toBeNull();
+    expect(
+      extractArgvMarker(['/bin/bash', '-c', `echo ${DESCRIPTION}`]),
+    ).toBeNull();
+    expect(
+      extractArgvMarker(['/bin/bash', '-c', '# omosc:not-a-pid:ses_x\nx']),
+    ).toBeNull();
   });
-  return { promise, resolve };
-}
+
+  test('flags every command that carries an argv payload', () => {
+    expect(
+      commandCarriesArgv([
+        'pane',
+        'pane_1',
+        'run',
+        '--on-exit',
+        'keep',
+        '--name',
+        'n',
+        '--',
+        '/bin/bash',
+      ]),
+    ).toBe(true);
+    // A hypothetical non-`run` surface carrying argv is covered too.
+    expect(commandCarriesArgv(['pane', 'pane_1', 'spawn', '--', 'x'])).toBe(
+      true,
+    );
+    expect(commandCarriesArgv(['tab', 'tab_1', 'show'])).toBe(false);
+  });
+});

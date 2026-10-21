@@ -27,11 +27,16 @@ import {
   isInternalInitiatorPart,
 } from '../utils/internal-initiator';
 import { log } from '../utils/logger';
+import { withTimeout } from '../utils/session';
 import {
   createInternalSyntheticMessageID,
   recordInternalAdmission,
 } from './internal-admissions';
 import type { V2Context } from './types';
+
+const HISTORY_PAGE_SIZE = 100;
+const MAX_HISTORY_PAGES = 10;
+const HISTORY_READ_TIMEOUT_MS = 4_000;
 
 /** v2 model reference accepted by `ctx.generate.text`. */
 export interface V2GenerateModelRef {
@@ -43,11 +48,16 @@ export interface V2GenerateModelRef {
 /** Optional v2 capabilities threaded into the v1 PluginInput. Absent
  * capabilities must leave the input object unchanged (v1 parity). */
 export interface ExperimentalV2 {
-  /** One-shot generation (`ctx.generate.text`); no session involved. */
-  generateText?: (
-    prompt: string,
-    model?: V2GenerateModelRef,
-  ) => Promise<{ text: string }>;
+  /** Queued prompts preserve caller-chosen message IDs in session.context. */
+  queuedPromptIdentity?: true;
+  /** Real host wait; not a snapshot, and not abortable by the 2.0.5 adapter. */
+  waitForSessionIdle?: (sessionID: string) => Promise<void>;
+  /** Live host model registry (`ctx.model`): `list()` resolves the full
+   * catalog ⊕ config view with per-model capabilities. Absent on hosts
+   * without the domain. */
+  readonly modelDomain?: {
+    readonly list?: (input?: unknown) => Promise<unknown>;
+  };
 }
 
 /** Directory from the host-reported location; cwd on hosts without
@@ -111,13 +121,58 @@ function filesFromBody(
 }
 
 /** v2 transcript message (content parts) → v1 SDK message view
- * (`{info: {id, role}, parts}`) expected by the v1 pipeline. */
+ * (`{info: {id, role}, parts}`) expected by the v1 pipeline.
+ *
+ * Terminal metadata is preserved, not reduced: `session.context` returns
+ * full `SessionMessage.Info` entries (schema-verified upstream), where
+ * assistant entries carry `time.completed` (set when the turn
+ * finalizes), `finish`, and `error`, and tool parts carry `state.status`
+ * in the v1 vocabulary. The old `{id, role}`-only reduction degraded
+ * every downstream classification — completion times were unreadable
+ * (eternal "pending") and finish/error states were invisible — which
+ * starved the terminal gate's transcript publish path on v2 hosts
+ * (live-verified 2.0.8 incident).
+ *
+ * The 2.0.8 `idle` marker (`{type: 'idle', time, outcome}`) trails every
+ * finished session. It is a lifecycle boundary, never content, and has
+ * no v1 transcript equivalent, so it maps to the v1 `system` role — the
+ * role transcript consumers already skip when scanning for the trailing
+ * turn. Every other entry keeps its v2 role name. */
+function messageTime(time: unknown): Record<string, unknown> | undefined {
+  if (typeof time === 'number' && Number.isFinite(time))
+    return { created: time };
+  if (!isRecord(time)) return undefined;
+  return time;
+}
+
 function toV1Message(m: Record<string, unknown>) {
+  const sourceType = typeof m.type === 'string' ? m.type : undefined;
+  const role = sourceType === 'idle' ? 'system' : (sourceType ?? m.role);
+  const time = messageTime(m.time);
+  const contentParts = Array.isArray(m.content)
+    ? (m.content as Array<Record<string, unknown>>).map((part) => ({ ...part }))
+    : [];
+  const text =
+    contentParts.length === 0 && typeof m.text === 'string'
+      ? m.text
+      : contentParts.length === 0 &&
+          isRecord(m.payload) &&
+          typeof m.payload.text === 'string'
+        ? m.payload.text
+        : undefined;
   return {
-    info: { id: m.id, role: m.role ?? m.type },
-    parts: Array.isArray(m.content)
-      ? (m.content as Array<Record<string, unknown>>).map((p) => ({ ...p }))
-      : [],
+    info: {
+      id: m.id,
+      role,
+      ...(typeof sourceType === 'string' ? { sourceType } : {}),
+      ...(typeof m.agent === 'string' ? { agent: m.agent } : {}),
+      ...(typeof m.parentID === 'string' ? { parentID: m.parentID } : {}),
+      ...(typeof m.outcome === 'string' ? { outcome: m.outcome } : {}),
+      ...(time ? { time } : {}),
+      ...(m.finish !== undefined ? { finish: m.finish } : {}),
+      ...(m.error !== undefined ? { error: m.error } : {}),
+    },
+    parts: text === undefined ? contentParts : [{ type: 'text', text }],
   };
 }
 
@@ -126,28 +181,51 @@ function toV1Message(m: Record<string, unknown>) {
  * domain does not expose. Verified against the upstream promise-plugin
  * adapter (`packages/plugin/src/promise/{session,adapter}.ts`): the
  * domain is built with exactly create/get/switchAgent/switchModel/
- * prompt/generate/command/synthetic/interrupt/rename/move/wait/context —
+ * prompt/generate/command/synthetic/interrupt/update/move/wait/context —
  * NO `list` and NO `remove`. On such hosts the `list` shim used to
  * return the empty page silently (children enumeration quietly fell
  * back to event tracking) and `delete` logged a no-op notice per call.
- * Both now emit ONE deterministic warning per plugin process
- * (module-level guard; fixed text, no timestamps or per-call ids) so a
- * missing host capability is observable in the plugin log without
- * per-poll noise.
+ * Both now emit ONE deterministic warning per setup generation
+ * (module-level latch, rearmed by resetClientShimGenerationWarnings —
+ * `opencode reload` reuses the process, so a new generation must not
+ * inherit the previous one's silence; fixed text, no timestamps or
+ * per-call ids) so a missing host capability stays observable in the
+ * plugin log without per-poll noise.
  */
 let warnedListUnavailable = false;
 let warnedRemoveUnavailable = false;
 
+/** Rearm the one-time degradation notices for a new setup generation.
+ *  Called by resetV2GenerationWarnings at setup entry (and directly by
+ *  tests): module state survives instance disposal inside one process. */
+export function resetClientShimGenerationWarnings(): void {
+  warnedListUnavailable = false;
+  warnedRemoveUnavailable = false;
+}
+
 /** v1 body model (`{providerID, modelID}`) → v2 model ref
  * (`{id, providerID}`). */
 function modelRefFromBody(body: {
-  model?: { id?: string; modelID?: string; providerID?: string };
-}): { id: string; providerID: string } | undefined {
+  model?: {
+    id?: string;
+    modelID?: string;
+    providerID?: string;
+    variant?: string;
+  };
+}): V2GenerateModelRef | undefined {
   const model = body.model;
   if (!model) return undefined;
   const id = model.id ?? model.modelID ?? '';
   const providerID = model.providerID ?? '';
-  return id && providerID ? { id, providerID } : undefined;
+  return id && providerID
+    ? {
+        id,
+        providerID,
+        ...(typeof model.variant === 'string'
+          ? { variant: model.variant }
+          : {}),
+      }
+    : undefined;
 }
 
 /**
@@ -238,7 +316,7 @@ function toV1SessionInfo(
  * `null` normalized to it) — and wraps the mapped page in the v1
  * `{data}` envelope. Hosts without `session.list` keep the v1-parity
  * empty page (honest absence, not a fake success) after a one-time
- * process-level warning — stock v2 hosts match this path because the
+ * per-generation warning — stock v2 hosts match this path because the
  * plugin session domain does not expose `list` (see the notice above).
  */
 export function createSessionListShim(
@@ -279,10 +357,8 @@ export function createSessionListShim(
   };
 }
 
-/** Build a v1-compatible PluginInput from the v2 context. The optional
- * `extras` threads probed v2 capabilities (e.g. one-shot generation)
- * through as `experimental_v2`; when absent no `experimental_v2` key is
- * added so the v1 pipeline stays byte-identical. */
+/** Build a v1-compatible input. Optional host idle-wait and one-shot generation
+ * share experimental_v2; absent capabilities are never replaced with stubs. */
 export function buildPluginInput(
   ctx: V2Context,
   extras?: ExperimentalV2,
@@ -290,11 +366,19 @@ export function buildPluginInput(
   // Null-safe: reduced hosts may load the factory without a session domain;
   // every method then degrades honestly instead of crashing construction.
   const s = (ctx.session ?? {}) as V2Context['session'];
+  // Hosts may expose a form domain on the plugin session (pinned v2.0.26
+  // does not). Forwarded capability-probed so task_reply's form-reply
+  // detection reads THIS client truthfully. The V2Context mirror type is
+  // intentionally not widened (mirror-conformance): cast, don't retype.
+  const sessionForm = (
+    s as { form?: { reply?: (a: Record<string, unknown>) => Promise<unknown> } }
+  ).form;
+  const sessionFormReply = sessionForm?.reply;
   const client = {
     session: {
       // `get` is exposed only when the host provides session.get — callers
-      // like task-result probe method presence as the capability signal,
-      // so a degraded stub here would fake verification ability.
+      // like the result-mode probe use method presence as the capability
+      // signal, so a degraded stub here would fake verification ability.
       ...(s.get
         ? {
             get: async (args: Record<string, unknown>) => ({
@@ -304,24 +388,153 @@ export function buildPluginInput(
         : {}),
       abort: s.interrupt
         ? async (args: Record<string, unknown>) =>
-            s.interrupt?.({ sessionID: sessionIDOf(args), continue: false })
+            s.interrupt?.({ sessionID: sessionIDOf(args), resume: false })
         : async (args: Record<string, unknown>) => {
             log('[v2][shim] session.interrupt unavailable', {
               id: sessionIDOf(args),
             });
           },
-      messages: s.context
-        ? async (args: Record<string, unknown>) => ({
-            data: (
-              (await s.context?.({ sessionID: sessionIDOf(args) })) ?? []
-            ).map(toV1Message),
-          })
-        : async (args: Record<string, unknown>) => {
-            log('[v2][shim] session.context unavailable', {
-              id: sessionIDOf(args),
-            });
-            return { data: [] };
-          },
+      // `messages` is exposed only when the host provides
+      // session.context — the terminal gate's transcriptSourceAbsent
+      // predicate methods-presence as the capability signal, and a
+      // fake-empty `{data: []}` stub here would read as "source present
+      // but empty" (classifier verdict `absent` → a baseline-less child
+      // STOPPED_WITHOUT_TERMINAL_RESULT) instead of honest capability
+      // absence (same no-fake-success doctrine as the `get` omission
+      // above).
+      ...(s.context
+        ? {
+            messages: async (args: Record<string, unknown>) => {
+              const context = s.context;
+              if (!context) {
+                throw new Error('[v2] session.context is unavailable');
+              }
+              const query = isRecord(args?.query) ? args.query : undefined;
+              const limit = query?.limit;
+              // Bounded tail read (foreground-fallback replay): the v2
+              // messages route paginates natively, so `limit` maps to the
+              // LAST N projected messages newest-first, reversed back to
+              // the v1 ascending shape. Hosts without the route keep the
+              // full context read.
+              if (
+                typeof limit === 'number' &&
+                Number.isFinite(limit) &&
+                limit > 0 &&
+                typeof s.messages === 'function'
+              ) {
+                const page = await s.messages({
+                  sessionID: sessionIDOf(args),
+                  limit,
+                  order: 'desc',
+                });
+                if (!isRecord(page) || !Array.isArray(page.data)) {
+                  throw new Error(
+                    '[v2] session.messages did not return a page',
+                  );
+                }
+                const preserved: Record<string, unknown> = {
+                  data: page.data
+                    .slice()
+                    .reverse()
+                    .map((message) =>
+                      toV1Message(
+                        isRecord(message) ? message : { type: 'unknown' },
+                      ),
+                    ),
+                };
+                if ('cursor' in page) preserved.cursor = page.cursor;
+                if ('next' in page) preserved.next = page.next;
+                return preserved;
+              }
+              const raw = await context({
+                sessionID: sessionIDOf(args),
+              });
+              if (!Array.isArray(raw) || !raw.every(isRecord)) {
+                throw new Error('[v2] session.context did not return an array');
+              }
+              const cut = raw.some(
+                (message) =>
+                  message.type === 'compaction' &&
+                  message.status === 'completed',
+              );
+              // Compaction removes continuation baselines from context. Keep
+              // the terminal gate's identity fence by reading persisted history
+              // instead of attributing the newest answer without its baseline.
+              if (
+                cut &&
+                typeof args.historyBoundary === 'string' &&
+                args.historyBoundary.length > 0 &&
+                !raw.some((message) => message.id === args.historyBoundary) &&
+                typeof s.messages === 'function'
+              ) {
+                const history: Record<string, unknown>[] = [];
+                const cursors = new Set<string>();
+                const deadline = performance.now() + HISTORY_READ_TIMEOUT_MS;
+                const budgetError =
+                  '[v2] session.messages history read budget exceeded';
+                let pages = 0;
+                let cursor: string | undefined;
+                do {
+                  const remainingMs = deadline - performance.now();
+                  if (pages >= MAX_HISTORY_PAGES || remainingMs <= 0) {
+                    throw new Error(budgetError);
+                  }
+                  pages++;
+                  const page = await withTimeout(
+                    s.messages({
+                      sessionID: sessionIDOf(args),
+                      limit: HISTORY_PAGE_SIZE,
+                      order: 'desc',
+                      ...(cursor ? { cursor } : {}),
+                    }),
+                    remainingMs,
+                    budgetError,
+                  );
+                  if (performance.now() >= deadline) {
+                    throw new Error(budgetError);
+                  }
+                  if (
+                    !isRecord(page) ||
+                    !Array.isArray(page.data) ||
+                    page.data.length > HISTORY_PAGE_SIZE ||
+                    !page.data.every(isRecord)
+                  ) {
+                    throw new Error(
+                      '[v2] session.messages did not return a valid history page',
+                    );
+                  }
+                  history.push(...page.data);
+                  cursor =
+                    page.data.length > 0 &&
+                    isRecord(page.cursor) &&
+                    typeof page.cursor.next === 'string' &&
+                    page.cursor.next.length > 0
+                      ? page.cursor.next
+                      : undefined;
+                  if (
+                    page.data.some(
+                      (message) => message.id === args.historyBoundary,
+                    )
+                  ) {
+                    break;
+                  }
+                  if (cursor && cursors.has(cursor)) {
+                    throw new Error('[v2] session.messages repeated a cursor');
+                  }
+                  if (cursor) cursors.add(cursor);
+                } while (cursor);
+                return {
+                  data: history.reverse().map(toV1Message),
+                  page: { source: 'session.messages', complete: !cursor },
+                };
+              }
+              return {
+                data: raw.map(toV1Message),
+                page: { source: 'session.context', complete: !cut },
+              };
+            },
+          }
+        : {}),
       // `status` is intentionally OMITTED: v2 has no equivalent of the v1
       // live session-status map, and a stub returning `{data: {}}` would be
       // an empty-but-valid map. getRuntimeSessionStatusSnapshot treats
@@ -333,11 +546,34 @@ export function buildPluginInput(
       list: createSessionListShim(s),
       prompt: s.prompt
         ? async (args: Record<string, unknown>) => {
+            const body = isRecord(args.body) ? args.body : {};
+            if (
+              ['agent', 'model', 'variant'].some(
+                (key) => body[key] !== undefined,
+              )
+            ) {
+              throw new Error(
+                '[v2] session.prompt cannot represent selection overrides (agent/model/variant); inherit the persisted session selection',
+              );
+            }
             const files = filesFromBody(args);
+            // `delivery` decides the inbox consumption boundary
+            // (idle queue vs next supported step of the current run)
+            // while `resume` decides waking; both are independent.
+            // An explicit body.delivery of 'steer' opts a noReply
+            // write into steering; anything else stays queued.
             return s.prompt?.({
               sessionID: sessionIDOf(args),
               text: textFromBody(args),
-              delivery: 'steer',
+              ...(body.noReply === true
+                ? ({
+                    delivery:
+                      (body as { delivery?: unknown }).delivery === 'steer'
+                        ? 'steer'
+                        : 'queue',
+                    resume: false,
+                  } as const)
+                : ({ delivery: 'steer' } as const)),
               ...(files.length > 0 ? { files } : {}),
             });
           }
@@ -370,7 +606,10 @@ export function buildPluginInput(
         const delivery = args?.delivery === 'queue' ? 'queue' : 'steer';
         const body = (args?.body ?? {}) as Parameters<
           typeof modelRefFromBody
-        >[0] & { parts?: Array<{ type?: string; text?: string }> };
+        >[0] & {
+          messageID?: string;
+          parts?: Array<{ type?: string; text?: string }>;
+        };
         const metadata = internalInitiatorMetadataFromBody(args);
         // Internal-initiator injections (orchestrator-wake nudges, interview
         // continuation) must not be persisted as user input on v2: the flat
@@ -410,10 +649,9 @@ export function buildPluginInput(
           args?.modelSelection === 'inherit' &&
           args?.modelSwitch !== 'required';
         if (ref && !inheritPersistedSelection) {
-          // `modelVariant` is the v2-only channel for the wake model's
-          // reasoning-effort variant (v1 prompt bodies carry no variant
-          // slot). A non-empty string overrides the ref's variant so
-          // switchModel does not reset it to the host default.
+          // `modelVariant` carries the variant for v2; `body.variant` is
+          // the v1 channel. A non-empty string overrides the ref's variant
+          // so switchModel does not reset it to the host default.
           const explicitVariant =
             typeof args?.modelVariant === 'string' && args.modelVariant
               ? args.modelVariant
@@ -513,6 +751,7 @@ export function buildPluginInput(
         // otherwise and internalViaSynthetic returned early).
         const result = await s.prompt?.({
           sessionID: sessionIDOf(args),
+          ...(body.messageID ? { id: body.messageID } : {}),
           text: textFromBody(args),
           delivery,
           ...(files.length > 0 ? { files } : {}),
@@ -525,27 +764,25 @@ export function buildPluginInput(
         // the result are unaffected.
         return isRecord(result) ? { ...result, switched } : { switched };
       },
-      update: s.rename
+      update: s.update
         ? async (args: Record<string, unknown>) => {
             const body = (args?.body ?? {}) as { title?: string };
-            return s.rename?.({
+            return s.update?.({
               sessionID: sessionIDOf(args),
               ...(typeof body.title === 'string' ? { title: body.title } : {}),
             });
           }
         : async (args: Record<string, unknown>) => {
-            log('[v2][shim] session.rename unavailable', {
+            log('[v2][shim] session.update unavailable', {
               id: sessionIDOf(args),
             });
           },
       // v2 removed the delete endpoint in name only: `session.remove` is
       // the same DELETE /api/session/:id. Capability-probed like `get`
-      // above — smartfetch's secondary-model cleanup (the real caller)
-      // relies on this to not leak temp sessions on v2. Hosts without
-      // `remove` (the stock v2 plugin session domain — see the one-time
-      // notice block near the top of this file) degrade to a no-op with
-      // a single process-level warning (no fake success, no per-call
-      // noise).
+      // above. Hosts without `remove` (the stock v2 plugin session domain
+      // — see the one-time notice block near the top of this file) degrade
+      // to a no-op with a single per-generation warning (no fake success,
+      // no per-call noise).
       delete: s.remove
         ? async (args: Record<string, unknown>) => {
             await s.remove?.({ sessionID: sessionIDOf(args) });
@@ -558,7 +795,42 @@ export function buildPluginInput(
               );
             }
           },
+      // `form` is forwarded only when the host session domain carries it
+      // (pinned v2.0.26 does not — see the one-time notice block near the
+      // top of this file). task_reply's form-reply capability probe reads
+      // THIS client, so forwarding here is what makes that probe truthful:
+      // absent host domain → absent here → probe stays false (honest
+      // failure); a host that exposes session.form.reply lights the probe
+      // up through this forward. Same data-envelope convention as `get`.
+      ...(sessionFormReply
+        ? {
+            form: {
+              reply: async (args: Record<string, unknown>) => ({
+                data: await sessionFormReply(args),
+              }),
+            },
+          }
+        : {}),
     },
+    ...(typeof ctx.permission?.reply === 'function'
+      ? {
+          permission: {
+            reply: async (args: Record<string, unknown>) =>
+              ctx.permission?.reply({
+                sessionID: sessionIDOf(args),
+                requestID:
+                  typeof args.requestID === 'string' ? args.requestID : '',
+                decision:
+                  args.reply === 'always' || args.reply === 'reject'
+                    ? args.reply
+                    : 'once',
+                ...(typeof args.message === 'string'
+                  ? { message: args.message }
+                  : {}),
+              }),
+          },
+        }
+      : {}),
     app: {
       log: async (args?: Record<string, unknown>) => {
         const body = (args?.body ?? args) as
@@ -576,12 +848,10 @@ export function buildPluginInput(
         });
       },
     },
-    // Misc methods the plugin may touch; all graceful no-ops.
-    model: { list: async () => ({ data: [] }) },
-    provider: { list: async () => ({ data: [] }) },
   };
 
   const directory = resolveV2Directory(ctx);
+  const wait = typeof s.wait === 'function' ? s.wait.bind(s) : undefined;
   return {
     client,
     hostFlavor: 'v2',
@@ -593,8 +863,19 @@ export function buildPluginInput(
     worktree: directory,
     experimental_workspace: { register() {} },
     $: typeof Bun !== 'undefined' ? Bun.$ : undefined,
-    ...(extras?.generateText
-      ? { experimental_v2: { generateText: extras.generateText } }
+    ...(extras?.modelDomain || wait || (s.prompt && s.context)
+      ? {
+          experimental_v2: {
+            ...(s.prompt && s.context ? { queuedPromptIdentity: true } : {}),
+            ...(extras?.modelDomain ? { modelDomain: extras.modelDomain } : {}),
+            ...(wait
+              ? {
+                  waitForSessionIdle: (sessionID: string) =>
+                    wait({ sessionID }),
+                }
+              : {}),
+          },
+        }
       : {}),
   };
 }

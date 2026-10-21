@@ -12,7 +12,10 @@ import {
   recordTuiAgentModel,
   recordTuiAgentModels,
   recordTuiSessionParent,
-  resolveTuiSessionRoot,
+  resolveTuiSnapshotRoot,
+  snapshotSectionsEqual,
+  TUI_SESSION_PARENTS_MAX,
+  updateSnapshot,
   updateTuiSessionDetails,
 } from './tui-state';
 
@@ -35,8 +38,8 @@ afterEach(() => {
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-const LUNA = { agentName: 'explorer', model: 'openai/gpt-5.6-luna' } as const;
-const GPT = { agentName: 'explorer', model: 'openai/gpt-5.6' } as const;
+const LUNA = { agentName: 'explorer', model: 'openai/gpt-6-luna' } as const;
+const GPT = { agentName: 'explorer', model: 'openai/gpt-6' } as const;
 
 function recordLuna(): void {
   recordTuiAgentModel(LUNA, tempDir);
@@ -82,8 +85,8 @@ describe('tui-state persistence', () => {
     recordTuiAgentModels(
       {
         agentModels: {
-          explorer: 'openai/gpt-5.6-luna',
-          fixer: 'openai/gpt-5.6-luna',
+          explorer: 'openai/gpt-6-luna',
+          fixer: 'openai/gpt-6-luna',
         },
         agentVariants: {
           explorer: 'low',
@@ -96,12 +99,37 @@ describe('tui-state persistence', () => {
     const snapshot = readTuiSnapshot(tempDir);
 
     expect(snapshot.agentModels).toEqual({
-      explorer: 'openai/gpt-5.6-luna',
-      fixer: 'openai/gpt-5.6-luna',
+      explorer: 'openai/gpt-6-luna',
+      fixer: 'openai/gpt-6-luna',
     });
     expect(snapshot.agentVariants).toEqual({
       explorer: 'low',
       fixer: 'high',
+    });
+  });
+
+  test('persists canonical-to-display names and keeps them on model-only writes', () => {
+    recordTuiAgentModels(
+      {
+        agentModels: { arbiter: 'openai/gpt-6' },
+        agentDisplayNames: { arbiter: 'reviewer' },
+      },
+      tempDir,
+    );
+
+    expect(readTuiSnapshot(tempDir).agentDisplayNames).toEqual({
+      arbiter: 'reviewer',
+    });
+
+    // A writer that only carries models must not wipe the label map.
+    recordTuiAgentModels(
+      {
+        agentModels: { arbiter: 'openai/gpt-6', paladin: 'openai/gpt-6' },
+      },
+      tempDir,
+    );
+    expect(readTuiSnapshot(tempDir).agentDisplayNames).toEqual({
+      arbiter: 'reviewer',
     });
   });
 
@@ -110,7 +138,7 @@ describe('tui-state persistence', () => {
       {
         agentModels: {
           orchestrator: 'default',
-          explorer: 'openai/gpt-5.6-luna',
+          explorer: 'openai/gpt-6-luna',
         },
       },
       tempDir,
@@ -119,14 +147,14 @@ describe('tui-state persistence', () => {
     recordTuiAgentModel(
       {
         agentName: 'orchestrator',
-        model: 'openai/gpt-5.6',
+        model: 'openai/gpt-6',
       },
       tempDir,
     );
 
     expect(readTuiSnapshot(tempDir).agentModels).toEqual({
-      orchestrator: 'openai/gpt-5.6',
-      explorer: 'openai/gpt-5.6-luna',
+      orchestrator: 'openai/gpt-6',
+      explorer: 'openai/gpt-6-luna',
     });
   });
 
@@ -135,7 +163,7 @@ describe('tui-state persistence', () => {
       {
         agentModels: {
           orchestrator: 'default',
-          explorer: 'openai/gpt-5.6-luna',
+          explorer: 'openai/gpt-6-luna',
         },
         agentVariants: {
           explorer: 'low',
@@ -147,7 +175,7 @@ describe('tui-state persistence', () => {
     recordTuiAgentModel(
       {
         agentName: 'orchestrator',
-        model: 'openai/gpt-5.6',
+        model: 'openai/gpt-6',
         variant: 'high',
       },
       tempDir,
@@ -300,13 +328,26 @@ describe('tui-state persistence', () => {
     fs.utimesSync(lockPath, staleTime, staleTime);
 
     recordTuiAgentModel(
-      { agentName: 'explorer', model: 'openai/gpt-5.6-luna' },
+      { agentName: 'explorer', model: 'openai/gpt-6-luna' },
       tempDir,
     );
 
     expect(readTuiSnapshot(tempDir).agentModels.explorer).toBe(
-      'openai/gpt-5.6-luna',
+      'openai/gpt-6-luna',
     );
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  test('recovers an aged state lock whose recorded PID is alive', () => {
+    const lockPath = `${getTuiStatePath(tempDir)}.lock`;
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid }));
+    const staleTime = new Date('2000-01-01T00:00:00Z');
+    fs.utimesSync(lockPath, staleTime, staleTime);
+
+    recordLuna();
+
+    expect(readTuiSnapshot(tempDir).agentModels.explorer).toBe(LUNA.model);
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
@@ -324,21 +365,77 @@ describe('tui-state persistence', () => {
 
     // Roots resolve through the persistent index; render compares both
     // sides against it, so conv-2's subagents stay out of conv-1 (#1147).
-    expect(resolveTuiSessionRoot('child-a', tempDir)).toBe('conv-1');
-    expect(resolveTuiSessionRoot('child-b', tempDir)).toBe('conv-2');
+    expect(resolveTuiSnapshotRoot(readTuiSnapshot(tempDir), 'child-a')).toBe(
+      'conv-1',
+    );
+    expect(resolveTuiSnapshotRoot(readTuiSnapshot(tempDir), 'child-b')).toBe(
+      'conv-2',
+    );
     expect(readTuiSnapshot(tempDir).activeSessions).toEqual({
       'child-a': 'oracle',
       'child-b': 'fixer',
     });
   });
 
+  function seedSessionParents(count: number): void {
+    const statePath = getTuiStatePath(tempDir);
+    fs.mkdirSync(path.dirname(statePath), { recursive: true });
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        ...readTuiSnapshot(tempDir),
+        sessionParents: Object.fromEntries(
+          Array.from({ length: count }, (_, i) => [
+            `ses_${i}`,
+            i ? `ses_${i - 1}` : 'root',
+          ]),
+        ),
+      }),
+    );
+  }
+
+  test('caps session parents on any write, refreshing re-registered links', () => {
+    seedSessionParents(TUI_SESSION_PARENTS_MAX + 2);
+
+    recordLuna();
+    expect(readTuiSnapshot(tempDir).sessionParents.ses_1).toBeUndefined();
+    recordTuiSessionParent('ses_2', 'root', tempDir);
+    recordTuiSessionParent('ses_new', 'root', tempDir);
+
+    const { sessionParents } = readTuiSnapshot(tempDir);
+    expect(Object.keys(sessionParents)).toHaveLength(TUI_SESSION_PARENTS_MAX);
+    expect(sessionParents.ses_2).toBe('root');
+    expect(sessionParents.ses_3).toBeUndefined();
+    expect(sessionParents.ses_new).toBe('root');
+  });
+
+  test('keeps the ancestry of an active session past the cap', () => {
+    seedSessionParents(TUI_SESSION_PARENTS_MAX + 1);
+    recordTuiAgentActivity(
+      { sessionID: 'ses_1', agentName: 'explorer', active: true },
+      tempDir,
+    );
+
+    recordTuiSessionParent('ses_new', 'root', tempDir);
+
+    expect(resolveTuiSnapshotRoot(readTuiSnapshot(tempDir), 'ses_1')).toBe(
+      'root',
+    );
+  });
+
   test('resolves multi-level ancestry through the index', () => {
     recordTuiSessionParent('grandchild', 'child', tempDir);
     recordTuiSessionParent('child', 'root', tempDir);
 
-    expect(resolveTuiSessionRoot('grandchild', tempDir)).toBe('root');
-    expect(resolveTuiSessionRoot('child', tempDir)).toBe('root');
-    expect(resolveTuiSessionRoot('root', tempDir)).toBe('root');
+    expect(resolveTuiSnapshotRoot(readTuiSnapshot(tempDir), 'grandchild')).toBe(
+      'root',
+    );
+    expect(resolveTuiSnapshotRoot(readTuiSnapshot(tempDir), 'child')).toBe(
+      'root',
+    );
+    expect(resolveTuiSnapshotRoot(readTuiSnapshot(tempDir), 'root')).toBe(
+      'root',
+    );
   });
 
   test('re-roots a live activity when ancestry is discovered late', () => {
@@ -347,12 +444,16 @@ describe('tui-state persistence', () => {
       { sessionID: 'child-a', agentName: 'oracle', active: true },
       tempDir,
     );
-    expect(resolveTuiSessionRoot('child-a', tempDir)).toBe('child-a');
+    expect(resolveTuiSnapshotRoot(readTuiSnapshot(tempDir), 'child-a')).toBe(
+      'child-a',
+    );
 
     recordTuiSessionParent('child-a', 'root-a', tempDir);
 
     expect(readTuiSnapshot(tempDir).sessionParents['child-a']).toBe('root-a');
-    expect(resolveTuiSessionRoot('child-a', tempDir)).toBe('root-a');
+    expect(resolveTuiSnapshotRoot(readTuiSnapshot(tempDir), 'child-a')).toBe(
+      'root-a',
+    );
   });
 
   test('startup sweep keeps live foreign activities and drops dead residue', async () => {
@@ -393,7 +494,7 @@ describe('tui-state persistence', () => {
 
   test('startup sweep keeps live own-PID activity and still drops dead residue', () => {
     recordTuiAgentModels(
-      { agentModels: { explorer: 'openai/gpt-5.6-luna' } },
+      { agentModels: { explorer: 'openai/gpt-6-luna' } },
       tempDir,
     );
     recordTuiAgentActivity(
@@ -412,7 +513,7 @@ describe('tui-state persistence', () => {
     expect(snapshot.activeSessions).toEqual({ 'explorer-a': 'explorer' });
     expect(snapshot.sessionDetails['explorer-a']?.alias).toBe('exp-1');
     expect(snapshot.agentModels).toEqual({
-      explorer: 'openai/gpt-5.6-luna',
+      explorer: 'openai/gpt-6-luna',
     });
   });
 
@@ -424,7 +525,7 @@ describe('tui-state persistence', () => {
       JSON.stringify({
         version: 1,
         updatedAt: Date.now(),
-        agentModels: { explorer: 'openai/gpt-5.6-luna' },
+        agentModels: { explorer: 'openai/gpt-6-luna' },
         configInvalid: true,
         configInvalidByProject: { old: true },
       }),
@@ -432,10 +533,163 @@ describe('tui-state persistence', () => {
 
     const snapshot = readTuiSnapshot(tempDir);
     expect(snapshot.agentModels).toEqual({
-      explorer: 'openai/gpt-5.6-luna',
+      explorer: 'openai/gpt-6-luna',
     });
     expect(snapshot.agentVariants).toEqual({});
     expect(snapshot.activeSessions).toEqual({});
+  });
+
+  test('parseSnapshot tolerates a snapshot without reusableByAgent (defaults {})', () => {
+    const filePath = getTuiStatePath(tempDir);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: Date.now(),
+        agentModels: { explorer: 'openai/gpt-6-luna' },
+        // Pre-dot snapshot: no reusableByAgent key at all.
+      }),
+    );
+
+    const snapshot = readTuiSnapshot(tempDir);
+    expect(snapshot.reusableByAgent).toEqual({});
+    // Sibling sections still parse.
+    expect(snapshot.agentModels.explorer).toBe('openai/gpt-6-luna');
+  });
+
+  test('parseSnapshot restores a well-formed reusableByAgent section', () => {
+    const filePath = getTuiStatePath(tempDir);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: Date.now(),
+        reusableByAgent: {
+          'parent-1': {
+            oracle: [
+              {
+                taskID: 'ses_1',
+                alias: 'ora-1',
+                terminalState: 'completed',
+                completedAt: 200,
+                lastUsedAt: 300,
+              },
+              {
+                taskID: 'ses_2',
+                alias: 'ora-2',
+                terminalState: 'stopped',
+                lastUsedAt: 400,
+              },
+              {
+                taskID: 'ses_invalid',
+                alias: 'ora-3',
+                terminalState: 'unknown',
+                lastUsedAt: 500,
+              },
+              {
+                taskID: 'ses_no_timestamp',
+                alias: 'ora-4',
+                terminalState: 'stopped',
+              },
+            ],
+          },
+        },
+      }),
+    );
+
+    const snapshot = readTuiSnapshot(tempDir);
+    expect(snapshot.reusableByAgent['parent-1']?.oracle).toEqual([
+      {
+        taskID: 'ses_1',
+        alias: 'ora-1',
+        terminalState: 'completed',
+        completedAt: 200,
+        lastUsedAt: 300,
+      },
+      {
+        taskID: 'ses_2',
+        alias: 'ora-2',
+        terminalState: 'stopped',
+        lastUsedAt: 400,
+      },
+    ]);
+  });
+
+  test('parseSnapshot drops malformed reusableByAgent entries', () => {
+    const filePath = getTuiStatePath(tempDir);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        updatedAt: Date.now(),
+        reusableByAgent: {
+          'parent-1': {
+            oracle: { taskID: 'ses_1' }, // missing alias/lastUsedAt
+            fixer: null,
+          },
+          'parent-2': 'not-an-object',
+        },
+      }),
+    );
+
+    const snapshot = readTuiSnapshot(tempDir);
+    expect(snapshot.reusableByAgent).toEqual({});
+  });
+
+  test('snapshotSectionsEqual includes reusableByAgent', () => {
+    const base = readTuiSnapshot(tempDir);
+    const sameAgentModels = readTuiSnapshot(tempDir);
+    sameAgentModels.reusableByAgent['parent-1'] = {
+      oracle: [
+        {
+          taskID: 'ses_1',
+          alias: 'ora-1',
+          terminalState: 'completed',
+          lastUsedAt: 300,
+        },
+      ],
+    };
+    // A reusableByAgent-only difference must break equality…
+    expect(snapshotSectionsEqual(base, sameAgentModels)).toBe(false);
+
+    // …and identical sections (both empty) stay equal.
+    const alsoEmpty = readTuiSnapshot(tempDir);
+    expect(snapshotSectionsEqual(base, alsoEmpty)).toBe(true);
+  });
+
+  test('memoized updates deep-clone nested reusableByAgent arrays', () => {
+    const entry = (taskID: string) => ({
+      taskID,
+      alias: taskID,
+      terminalState: 'completed' as const,
+      lastUsedAt: 1,
+    });
+    // First write seeds the in-memory memo with a nested entry array.
+    expect(
+      updateSnapshot(tempDir, (snapshot) => {
+        snapshot.reusableByAgent['parent-1'] = { oracle: [entry('ses_1')] };
+      }),
+    ).toBe(true);
+    // An in-place push on the memo-backed candidate must not leak into the
+    // memo: a shared array would make the update look like a no-op and
+    // silently skip the disk write.
+    expect(
+      updateSnapshot(tempDir, (snapshot) => {
+        snapshot.reusableByAgent['parent-1']?.oracle?.push(entry('ses_2'));
+      }),
+    ).toBe(true);
+
+    const onDisk = JSON.parse(
+      fs.readFileSync(getTuiStatePath(tempDir), 'utf8'),
+    ) as { reusableByAgent: Record<string, Record<string, unknown[]>> };
+    expect(
+      onDisk.reusableByAgent['parent-1']?.oracle?.map(
+        (item) => (item as { taskID: string }).taskID,
+      ),
+    ).toEqual(['ses_1', 'ses_2']);
   });
 
   test('cross-project isolation — different directories write independent state files', () => {
@@ -555,9 +809,9 @@ describe('tui-state persistence', () => {
 
     // In-place rewrite (same inode, same length): mtime restored via
     // utimes. ctime cannot be restored by userspace, so the memo must
-    // invalidate and re-record the value from the real file. The stat seam
-    // makes the ctime change deterministic across filesystems whose clock
-    // resolution lets the rewrite and mtime restoration share one tick.
+    // invalidate and re-record the value from the real file.
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(sleeper, 0, 0, 10);
     const external = readTuiSnapshot(tempDir);
     external.agentModels.explorer = 'model-y';
     const fd = fs.openSync(filePath, 'w');
@@ -568,17 +822,7 @@ describe('tui-state persistence', () => {
     expect(statAfter.ino).toBe(statBefore.ino);
     expect(statAfter.mtimeMs).toBe(statBefore.mtimeMs);
 
-    const originalStatSync = fs.statSync;
-    const statSpy = spyOn(fs, 'statSync').mockImplementation((...args) => {
-      const stat = originalStatSync(...args);
-      if (String(args[0]) !== filePath) return stat;
-      return Object.assign(stat, { ctimeMs: statBefore.ctimeMs + 1 });
-    });
-    try {
-      recordTuiAgentModel({ agentName: 'explorer', model: 'model-x' }, tempDir);
-    } finally {
-      statSpy.mockRestore();
-    }
+    recordTuiAgentModel({ agentName: 'explorer', model: 'model-x' }, tempDir);
     expect(readTuiSnapshot(tempDir).agentModels.explorer).toBe('model-x');
   });
 
@@ -611,7 +855,7 @@ describe('tui-state persistence', () => {
 
   test('keeps the final file intact when the atomic rename fails', async () => {
     recordTuiAgentModel(
-      { agentName: 'explorer', model: 'openai/gpt-5.6-luna' },
+      { agentName: 'explorer', model: 'openai/gpt-6-luna' },
       tempDir,
     );
 
@@ -622,7 +866,7 @@ describe('tui-state persistence', () => {
 
     try {
       recordTuiAgentModel(
-        { agentName: 'explorer', model: 'openai/gpt-5.6' },
+        { agentName: 'explorer', model: 'openai/gpt-6' },
         tempDir,
       );
     } finally {
@@ -631,7 +875,7 @@ describe('tui-state persistence', () => {
 
     // The previously written state must still be readable in full.
     expect(readTuiSnapshot(tempDir).agentModels).toEqual({
-      explorer: 'openai/gpt-5.6-luna',
+      explorer: 'openai/gpt-6-luna',
     });
 
     const stateDir = path.dirname(getTuiStatePath(tempDir));
@@ -642,7 +886,7 @@ describe('tui-state persistence', () => {
 
   test('leaves no temp files behind on the happy path', () => {
     recordTuiAgentModel(
-      { agentName: 'explorer', model: 'openai/gpt-5.6-luna' },
+      { agentName: 'explorer', model: 'openai/gpt-6-luna' },
       tempDir,
     );
 
@@ -654,18 +898,18 @@ describe('tui-state persistence', () => {
 });
 
 describe('sessionDetails (clickable sidebar projection)', () => {
-  test('activation with details round-trips alias/model/status', () => {
+  test('activation with details round-trips alias/status', () => {
     recordTuiAgentActivity(
       {
         sessionID: 'ora-1-ses',
         agentName: 'oracle',
         active: true,
-        details: { alias: 'ora-1', model: 'openai/gpt-5.6', status: 'busy' },
+        details: { alias: 'ora-1', status: 'busy' },
       },
       tempDir,
     );
     expect(readTuiSnapshot(tempDir).sessionDetails).toEqual({
-      'ora-1-ses': { alias: 'ora-1', model: 'openai/gpt-5.6', status: 'busy' },
+      'ora-1-ses': { alias: 'ora-1', status: 'busy' },
     });
   });
 
@@ -697,25 +941,25 @@ describe('sessionDetails (clickable sidebar projection)', () => {
       tempDir,
     );
     updateTuiSessionDetails('live', { alias: 'ora-1' }, tempDir);
-    updateTuiSessionDetails('live', { model: 'openai/gpt-5.6' }, tempDir);
+    updateTuiSessionDetails('live', { status: 'retry' }, tempDir);
     expect(readTuiSnapshot(tempDir).sessionDetails).toEqual({
-      live: { alias: 'ora-1', model: 'openai/gpt-5.6' },
+      live: { alias: 'ora-1', status: 'retry' },
     });
   });
 
-  test('clearTuiSessionAlias retracts only the alias, keeping model/status', () => {
+  test('clearTuiSessionAlias retracts only the alias, keeping status', () => {
     recordTuiAgentActivity(
       {
         sessionID: 'live',
         agentName: 'oracle',
         active: true,
-        details: { alias: 'ora-1', model: 'openai/gpt-5.6', status: 'busy' },
+        details: { alias: 'ora-1', status: 'busy' },
       },
       tempDir,
     );
     clearTuiSessionAlias('live', tempDir);
     expect(readTuiSnapshot(tempDir).sessionDetails).toEqual({
-      live: { model: 'openai/gpt-5.6', status: 'busy' },
+      live: { status: 'busy' },
     });
     // Alias-less entry with no other fields is removed entirely.
     recordTuiAgentActivity(
@@ -767,7 +1011,8 @@ describe('sessionDetails (clickable sidebar projection)', () => {
         version: 1,
         updatedAt: 1,
         sessionDetails: {
-          good: { alias: 'ora-1', status: 'busy' },
+          good: { alias: 'ora-1', model: 'openai/gpt-6', status: 'busy' },
+          oldModelOnly: { model: 'openai/gpt-6' },
           badStatus: { alias: 'ora-2', status: 'weird' },
           nonObject: 'nope',
           nullEntry: null,
@@ -790,11 +1035,11 @@ describe('sessionDetails (clickable sidebar projection)', () => {
       `${JSON.stringify({
         version: 1,
         updatedAt: 1,
-        agentModels: { oracle: 'openai/gpt-5.6' },
+        agentModels: { oracle: 'openai/gpt-6' },
       })}\n`,
     );
     const parsed = readTuiSnapshot(tempDir);
     expect(parsed.sessionDetails).toEqual({});
-    expect(parsed.agentModels).toEqual({ oracle: 'openai/gpt-5.6' });
+    expect(parsed.agentModels).toEqual({ oracle: 'openai/gpt-6' });
   });
 });

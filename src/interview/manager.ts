@@ -3,6 +3,7 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import type { InterviewConfig, PluginConfig } from '../config';
 import { DEFAULT_DASHBOARD_PORT } from './dashboard';
 import { createDashboardManager } from './dashboard-manager';
+import type { createInterviewService } from './service';
 import { createPerSessionInterviewServer } from './session-server';
 
 /**
@@ -30,14 +31,13 @@ export function createInterviewManager(
   options: {
     /** Already-listening server for the dashboard role to adopt. */
     server?: Server;
-    /** Timer seams for isolating the dashboard session fallback poller. */
-    timers?: {
-      setInterval: typeof setInterval;
-      clearInterval: typeof clearInterval;
-    };
   } = {},
 ): {
-  registerCommand: (config: Record<string, unknown>) => void;
+  service: ReturnType<typeof createInterviewService>;
+  registerCommand: (
+    config: Record<string, unknown>,
+    enabled?: { interview?: boolean; implement?: boolean },
+  ) => void;
   handleCommandExecuteBefore: (
     input: { command: string; sessionID: string; arguments: string },
     output: { parts: Array<{ type: string; text?: string }> },
@@ -57,11 +57,8 @@ export function createInterviewManager(
   }
 
   // ─── Dashboard mode ─────────────────────────────────────────────
-  return createDashboardManager(
-    ctx,
-    config,
-    dashboardPort,
-    outputFolder,
-    options,
-  );
+  return createDashboardManager(ctx, config, dashboardPort, outputFolder, {
+    ...options,
+    hostFlavor: (ctx as PluginInput & { hostFlavor?: string }).hostFlavor,
+  });
 }

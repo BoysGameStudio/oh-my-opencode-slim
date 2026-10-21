@@ -10,6 +10,11 @@ import {
 
 const z = tool.schema;
 
+const ACP_CANCEL_FLUSH_MS = 250;
+const ACP_GRACEFUL_EXIT_MS = 1_000;
+const ACP_TERMINATE_EXIT_MS = 1_000;
+const ACP_KILL_EXIT_MS = 500;
+
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 interface RpcResponse {
@@ -47,15 +52,22 @@ export function createAcpInitializeParams() {
 
 class AcpClient {
   private child: ChildProcessWithoutNullStreams;
+  private exitPromise: Promise<void>;
+  private closePromise: Promise<void> | undefined;
+  private closing = new AbortController();
+  private childTerminated = false;
   private next = 1;
   private pending = new Map<number, Pending>();
   private chunks: string[] = [];
   private errors: string[] = [];
+  private progress = new Map<string, string>();
   private sessionId: string | undefined;
   private lastUpdate = Date.now();
   private authMethods: Array<Record<string, unknown>> = [];
   private active = false;
   private activeRequests = 0;
+  /** True once run() returned or the client was closed: late session/update arrivals are ignored. */
+  private settled = false;
 
   constructor(
     private name: string,
@@ -65,11 +77,30 @@ class AcpClient {
       title: string,
       metadata: Record<string, unknown>,
     ) => Promise<void>,
+    /**
+     * Live progress sink (tool part metadata). Called on every tool_call,
+     * tool_call_update, and plan session/update so the parent TUI can show
+     * what the external agent is doing while it works.
+     */
+    private report?: (title: string, metadata: Record<string, unknown>) => void,
   ) {
     this.child = spawn(config.command, config.args, {
       cwd,
       env: { ...process.env, ...config.env },
       stdio: 'pipe',
+      // Console-subsystem agents would otherwise show a console window for
+      // the whole agent run on GUI hosts.
+      windowsHide: true,
+    });
+    this.exitPromise = new Promise((resolve) => {
+      const settle = () => {
+        this.child.off('exit', settle);
+        this.child.off('close', settle);
+        this.childTerminated = true;
+        resolve();
+      };
+      this.child.once('exit', settle);
+      this.child.once('close', settle);
     });
     this.child.stderr.on('data', (chunk) => {
       this.errors.push(String(chunk));
@@ -97,12 +128,27 @@ class AcpClient {
     });
   }
 
-  async run(prompt: string): Promise<string> {
+  async run(prompt: string, model?: string): Promise<string> {
     const init = await this.request('initialize', createAcpInitializeParams());
     this.authMethods = readAuthMethods(init);
     const created = await this.newSession();
     const sessionId = readSessionId(created);
     this.sessionId = sessionId;
+    if (model !== undefined) {
+      const option = readModelConfigOption(created);
+      if (!supportsModelValue(option.options, model)) {
+        throw new Error(`ACP model config option does not support '${model}'`);
+      }
+      const updated = await this.request('session/set_config_option', {
+        sessionId,
+        configId: option.id,
+        value: model,
+      });
+      const confirmed = readModelConfigOption(updated);
+      if (confirmed.id !== option.id || confirmed.currentValue !== model) {
+        throw new Error(`ACP model selection was not confirmed as '${model}'`);
+      }
+    }
     this.active = true;
     await this.request('session/prompt', {
       sessionId,
@@ -110,9 +156,9 @@ class AcpClient {
     });
     await this.drain();
     this.active = false;
+    this.settled = true;
     return this.output();
   }
-
   private async newSession(): Promise<Json | undefined> {
     try {
       return await this.request('session/new', {
@@ -130,18 +176,72 @@ class AcpClient {
       });
     }
   }
+  close(): Promise<void> {
+    this.settled = true;
+    this.closing.abort();
+    this.closePromise ??= this.shutdown();
+    return this.closePromise;
+  }
 
-  close(): void {
-    if (this.active && this.sessionId && !this.child.killed) {
-      this.notify('session/cancel', { sessionId: this.sessionId });
+  private async shutdown(): Promise<void> {
+    if (this.hasExited()) return;
+
+    if (this.active && this.sessionId) {
+      await this.withTimeout(
+        this.notify('session/cancel', { sessionId: this.sessionId }),
+        ACP_CANCEL_FLUSH_MS,
+      );
     }
-    if (!this.child.killed) this.child.kill('SIGTERM');
+
+    if (!this.hasExited()) this.child.stdin.end();
+    if (await this.waitForExit(ACP_GRACEFUL_EXIT_MS)) return;
+
+    this.child.kill('SIGTERM');
+    if (await this.waitForExit(ACP_TERMINATE_EXIT_MS)) return;
+
+    this.child.kill('SIGKILL');
+    await this.waitForExit(ACP_KILL_EXIT_MS);
+  }
+
+  private hasExited(): boolean {
+    return (
+      this.childTerminated ||
+      this.child.exitCode !== null ||
+      this.child.signalCode !== null
+    );
+  }
+
+  private async waitForExit(timeoutMs: number): Promise<boolean> {
+    if (this.hasExited()) return true;
+    return await this.withTimeout(this.exitPromise, timeoutMs);
+  }
+
+  private async withTimeout(
+    promise: Promise<void>,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } catch {
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private request(
     method: string,
     params: Record<string, unknown>,
   ): Promise<Json | undefined> {
+    if (this.closing.signal.aborted) {
+      return Promise.reject(new Error(`ACP agent '${this.name}' closed`));
+    }
     const id = this.next++;
     const payload = { jsonrpc: '2.0', id, method, params };
     return new Promise((resolve, reject) => {
@@ -154,10 +254,16 @@ class AcpClient {
     });
   }
 
-  private notify(method: string, params: Record<string, unknown>): void {
-    this.child.stdin.write(
-      `${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`,
-    );
+  private notify(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.child.stdin.write(
+        `${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
   }
 
   private async drain(): Promise<void> {
@@ -178,7 +284,7 @@ class AcpClient {
       );
       this.errors.push(error.message);
       this.rejectPending(error);
-      this.close();
+      void this.close();
       return;
     }
     if ('id' in message && ('result' in message || 'error' in message)) {
@@ -215,7 +321,11 @@ class AcpClient {
       const title = readPermissionTitle(message.params);
       try {
         if (this.config.permissionMode === 'ask') {
-          await this.ask(title, message.params ?? {});
+          const answered = await this.askBeforeClose(
+            title,
+            message.params ?? {},
+          );
+          if (!answered) return;
         }
         const optionId = selectPermissionOption(
           message.params,
@@ -244,12 +354,42 @@ class AcpClient {
     );
   }
 
+  private async askBeforeClose(
+    title: string,
+    metadata: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (this.closing.signal.aborted) return false;
+    return await new Promise<boolean>((resolve, reject) => {
+      const onAbort = () => {
+        this.closing.signal.removeEventListener('abort', onAbort);
+        resolve(false);
+      };
+      this.closing.signal.addEventListener('abort', onAbort, { once: true });
+      this.ask(title, metadata).then(
+        () => {
+          this.closing.signal.removeEventListener('abort', onAbort);
+          resolve(true);
+        },
+        (error) => {
+          this.closing.signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
   private handleNotification(message: RpcNotification): void {
-    if (message.method !== 'session/update') return;
+    if (message.method !== 'session/update' || this.settled) return;
     this.lastUpdate = Date.now();
     const update = message.params?.update;
     if (!isRecord(update)) return;
     collectText(update, this.chunks);
+    const rendered = trackProgress(update, this.progress);
+    if (!rendered) return;
+    try {
+      this.report?.(rendered.title, { progress: rendered.progress });
+    } catch {
+      // A host-side metadata failure must not poison the ACP loop.
+    }
   }
 
   private reply(id: number, result: Json): void {
@@ -274,13 +414,35 @@ class AcpClient {
   }
 }
 
-export function createAcpRunTool(agents: AcpAgentsConfig = {}): ToolDefinition {
+/** Timer seam so tests can drive the invocation timeout deterministically. */
+export interface AcpRunTimers {
+  setTimeout: (callback: () => void, ms: number) => unknown;
+  clearTimeout: (handle: unknown) => void;
+}
+
+const DEFAULT_TIMERS: AcpRunTimers = {
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (handle) =>
+    clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+export function createAcpRunTool(
+  agents: AcpAgentsConfig = {},
+  timers: AcpRunTimers = DEFAULT_TIMERS,
+): ToolDefinition {
   return tool({
     description:
       'Run a configured external ACP-compatible coding agent and return its streamed result. Use for configured ACP agents such as Claude Code ACP, Gemini ACP, or custom ACP servers.',
     args: {
       agent: z.string().describe('Configured ACP agent name'),
       prompt: z.string().describe('Task or question to send to the ACP agent'),
+      model: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          'Optional exact ACP-advertised inner model selector for this invocation only, not an OpenCode provider/model or the outer wrapper model. Omit only when no inner model was requested; omission uses the external agent default.',
+        ),
       cwd: z
         .string()
         .optional()
@@ -309,6 +471,12 @@ export function createAcpRunTool(agents: AcpAgentsConfig = {}): ToolDefinition {
       }
       const cwd = args.cwd ?? config.cwd ?? ctx.directory;
       if (!cwd) throw new Error('acp_run requires a working directory');
+      if (
+        args.model !== undefined &&
+        (typeof args.model !== 'string' || args.model.length === 0)
+      ) {
+        throw new Error('acp_run model must be a nonempty ACP selector');
+      }
 
       await ctx.ask({
         permission: 'acp_run',
@@ -322,48 +490,105 @@ export function createAcpRunTool(agents: AcpAgentsConfig = {}): ToolDefinition {
         },
       });
 
-      const client = new AcpClient(
-        args.agent,
-        config,
-        cwd,
-        async (title, metadata) => {
-          if (config.permissionMode === 'reject') return;
-          await ctx.ask({
-            permission: 'acp_run',
-            patterns: [`acp:${args.agent}:${title}`],
-            always: [],
-            metadata,
-          });
-        },
-      );
+      let client: AcpClient | undefined;
+      const requestedModel = args.model;
       const timeoutMs = args.timeout_ms ?? config.timeoutMs;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timeout =
-        timeoutMs > 0
-          ? new Promise<string>(
-              (_, reject) =>
-                (timer = setTimeout(
-                  () =>
-                    reject(
-                      new Error(
-                        `ACP agent '${args.agent}' timed out after ${timeoutMs}ms`,
-                      ),
-                    ),
-                  timeoutMs,
-                )),
-            )
-          : undefined;
-      const abort = () => client.close();
-      ctx.abort.addEventListener('abort', abort, { once: true });
+      let timer: unknown;
+      let stop!: (error: Error) => void;
+      const interruption = new Promise<never>((_, reject) => {
+        stop = reject;
+      });
+      const aborted = () => new Error(`ACP agent '${args.agent}' aborted`);
+      const abort = () => {
+        stop(aborted());
+        void client?.close();
+      };
       try {
-        const run = client.run(args.prompt);
-        return timeout ? await Promise.race([run, timeout]) : await run;
+        // One budget covers ACP startup, selection, and prompt, after permission.
+        if (timeoutMs > 0) {
+          timer = timers.setTimeout(
+            () =>
+              stop(
+                new Error(
+                  `ACP agent '${args.agent}' timed out after ${timeoutMs}ms`,
+                ),
+              ),
+            timeoutMs,
+          );
+        }
+        ctx.abort.addEventListener('abort', abort, { once: true });
+        const run = async () => {
+          if (ctx.abort.aborted) throw aborted();
+          client = new AcpClient(
+            args.agent,
+            config,
+            cwd,
+            async (title, metadata) => {
+              if (config.permissionMode === 'reject') return;
+              await ctx.ask({
+                permission: 'acp_run',
+                patterns: [`acp:${args.agent}:${title}`],
+                always: [],
+                metadata,
+              });
+            },
+            (title, metadata) => ctx.metadata({ title, metadata }),
+          );
+          return await client.run(args.prompt, requestedModel);
+        };
+        const output = await Promise.race([run(), interruption]);
+        if (requestedModel !== undefined) {
+          try {
+            ctx.metadata?.({
+              metadata: { requestedModel, acpModel: requestedModel },
+            });
+          } catch {
+            // A host-side metadata failure must not discard successful output.
+          }
+        }
+        return output;
       } finally {
-        if (timer) clearTimeout(timer);
+        if (timer !== undefined) timers.clearTimeout(timer);
         ctx.abort.removeEventListener('abort', abort);
-        client.close();
+        await client?.close();
       }
     },
+  });
+}
+
+function readModelConfigOption(value: unknown): Record<string, unknown> {
+  const options = isRecord(value) ? value.configOptions : undefined;
+  const models = Array.isArray(options)
+    ? options
+        .filter(isRecord)
+        .filter(
+          (option) => option.id === 'model' || option.category === 'model',
+        )
+    : [];
+  const model = models[0];
+  if (
+    models.length !== 1 ||
+    typeof model.id !== 'string' ||
+    !model.id ||
+    model.type !== 'select'
+  ) {
+    throw new Error(
+      'ACP response must contain exactly one model config option',
+    );
+  }
+  return model;
+}
+
+function supportsModelValue(options: unknown, value: string): boolean {
+  if (!Array.isArray(options)) return false;
+  return options.filter(isRecord).some((option) => {
+    // ACP select options may be flat values or groups of values.
+    if (Array.isArray(option.options)) {
+      return option.options
+        .filter(isRecord)
+        .some((item) => item.value === value);
+    }
+    return option.value === value;
   });
 }
 
@@ -437,6 +662,80 @@ function collectText(update: Record<string, unknown>, chunks: string[]): void {
   if (update.sessionUpdate !== 'agent_message_chunk') return;
   const text = readText(update.delta) ?? readText(update.content);
   if (text) chunks.push(text);
+}
+
+const PROGRESS_GLYPHS: Record<string, string> = {
+  pending: '○',
+  in_progress: '▸',
+  completed: '✓',
+  failed: '✗',
+};
+/** Rolling progress cap: drop the oldest tracked call beyond this. */
+const PROGRESS_CAP = 40;
+/** How many recent progress lines the TUI metadata carries. */
+const PROGRESS_TAIL = 20;
+
+/**
+ * Fold one ACP session/update into the rolling progress log and render the
+ * latest view. tool_call/tool_call_update are keyed by toolCallId (later
+ * updates replace earlier state); plan replaces as a block. Returns the
+ * tail for the TUI plus its last line as a compact title.
+ */
+export function trackProgress(
+  update: Record<string, unknown>,
+  progress: Map<string, string>,
+): { title: string; progress: string } | undefined {
+  const kind = update.sessionUpdate;
+  let key: string | undefined;
+  let line: string | undefined;
+  if (kind === 'tool_call' || kind === 'tool_call_update') {
+    if (typeof update.toolCallId !== 'string') return undefined;
+    key = update.toolCallId;
+    const status = typeof update.status === 'string' ? update.status : '';
+    const glyph = PROGRESS_GLYPHS[status] ?? '·';
+    // tool_call_update may omit title (status-only): keep the human-readable
+    // label already rendered for this toolCallId instead of degrading to the
+    // opaque id.
+    const previousLine = progress.get(key);
+    const previousTitle = previousLine?.slice(previousLine.indexOf(' ') + 1);
+    const title =
+      typeof update.title === 'string' ? update.title : (previousTitle ?? key);
+    line = `${glyph} ${title}`;
+  } else if (kind === 'plan') {
+    const entries = Array.isArray(update.entries) ? update.entries : [];
+    const lines = entries
+      .filter(
+        (entry): entry is Record<string, unknown> & { content: string } =>
+          isRecord(entry) &&
+          typeof entry.content === 'string' &&
+          entry.content.length > 0,
+      )
+      .map((entry) => {
+        const status = typeof entry.status === 'string' ? entry.status : '';
+        const glyph = PROGRESS_GLYPHS[status] ?? '·';
+        return `${glyph} ${entry.content}`.trimEnd();
+      });
+    if (lines.length === 0) return undefined;
+    key = 'plan';
+    line = lines.join('\n');
+  }
+  if (!key || !line) return undefined;
+  if (!progress.has(key) && progress.size >= PROGRESS_CAP) {
+    const oldest = progress.keys().next().value;
+    if (oldest !== undefined) progress.delete(oldest);
+  }
+  // Re-set so an updated call lands at the newest tail position; otherwise
+  // a late completion of an old call stays outside the visible tail.
+  progress.delete(key);
+  progress.set(key, line);
+  const tail = [...progress.values()]
+    .join('\n')
+    .split('\n')
+    .slice(-PROGRESS_TAIL)
+    .join('\n');
+  const lastBreak = tail.lastIndexOf('\n');
+  const title = lastBreak === -1 ? tail : tail.slice(lastBreak + 1);
+  return { title, progress: tail };
 }
 
 function readText(value: unknown): string | undefined {

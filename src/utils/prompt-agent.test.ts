@@ -4,7 +4,6 @@ import * as path from 'node:path';
 import {
   FALLBACK_TOP_LEVEL_AGENT,
   normalizeAgentHint,
-  resolveHelperSessionAgent,
   resolveSessionAgent,
   SYSTEM_AGENTS,
   withAgent,
@@ -80,52 +79,29 @@ describe('normalizeAgentHint', () => {
   });
 });
 
-describe('resolveHelperSessionAgent', () => {
-  test('selects the first available registered helper agent', () => {
-    expect(
-      resolveHelperSessionAgent(['orchestrator', 'explorer', 'councillor']),
-    ).toBe('explorer');
-  });
-
-  test('selects another registered agent when earlier ones are absent', () => {
-    expect(
-      resolveHelperSessionAgent(['orchestrator', 'librarian', 'councillor']),
-    ).toBe('librarian');
-  });
-
-  test('skips registered agents disabled in the final host config', () => {
-    expect(
-      resolveHelperSessionAgent(['orchestrator', 'explorer', 'librarian'], {
-        explorer: { disable: true },
-      }),
-    ).toBe('librarian');
-  });
-
-  test('skips the disabled build agent for v1 helper sessions', () => {
-    expect(
-      resolveHelperSessionAgent(['orchestrator', 'build', 'explorer'], {
-        build: { disable: true },
-      }),
-    ).toBe('explorer');
-  });
-
-  test('returns no helper when every registered agent is disabled', () => {
-    expect(
-      resolveHelperSessionAgent(['orchestrator', 'explorer', 'librarian'], {
-        explorer: { disable: true },
-        librarian: { disable: true },
-      }),
-    ).toBeUndefined();
-  });
-
-  test('returns no helper when every registered agent is unsafe', () => {
-    expect(
-      resolveHelperSessionAgent(['orchestrator', 'compaction', 'summary']),
-    ).toBeUndefined();
-  });
-});
-
 describe('resolveSessionAgent', () => {
+  test('bounds message probes to a directory-scoped transcript tail', async () => {
+    const get = mock(async () => ({
+      data: { id: 'bounded', parentID: 'parent' },
+    }));
+    const messages = mock(async () => ({
+      data: [{ info: { role: 'user', agent: 'explorer' } }],
+    }));
+    expect(
+      await resolveSessionAgent(createClient({ get, messages }), 'bounded', {
+        directory: '/project',
+      }),
+    ).toBe('explorer');
+    expect(get).toHaveBeenCalledWith({
+      path: { id: 'bounded' },
+      query: { directory: '/project' },
+    });
+    expect(messages).toHaveBeenCalledWith({
+      path: { id: 'bounded' },
+      query: { directory: '/project', limit: 50 },
+    });
+  });
+
   test('prefers the caller hint without any SDK round trip', async () => {
     const get = mock(async () => ({ data: { agent: 'build' } }));
     const client = createClient({ get });
@@ -427,12 +403,20 @@ const PASS_THROUGH_WRAPPERS = new Map<string, string>([
  */
 const V2_FLAT_HOST_PROMPTS = new Map<string, string>([
   [
+    'v2/interview-bridge.ts',
+    'v2 flat prompts select their agent through session.switchAgent',
+  ],
+  [
+    'v2/preset-manager.ts',
+    'UI dialog.prompt collects preset text; it does not prompt a session',
+  ],
+  [
     'v2/session-submit.ts',
     'v2 flat host PromptInput ({ sessionID, text }) has no agent field; v2 agent selection goes through session.switchAgent',
   ],
   [
     'v2/client-shim.ts',
-    'adapter that translates v1 SDK calls into the v2 flat host API: its `s.prompt({ sessionID, text, delivery })` calls target v2 PromptInput, which has no agent field. FOLLOW-UP (docs/opencode-v2-compatibility.md): the shim currently DROPS body.agent when adapting v1 prompt/promptAsync and should call s.switchAgent when one is present.',
+    'adapter that translates v1 SDK calls into v2 flat PromptInput; existing v2 sessions retain their admitted agent without a per-prompt agent field',
   ],
 ]);
 

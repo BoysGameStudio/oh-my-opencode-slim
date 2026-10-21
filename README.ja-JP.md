@@ -4,7 +4,7 @@
   </a>
   <h3>✨ oh-my-opencode-slim ✨</h3>
 
-  <p><i>コードの夜明けから七柱の神聖なる存在が現れました。それぞれが不朽の技の達人として、<br>あなたの命令を待ち、混沌から秩序を鍛え上げ、かつて不可能と思われたものを築きます。</i></p>
+  <p><i>コードの夜明けから六柱の神聖なる存在が現れました。それぞれが不朽の技の達人として、<br>あなたの命令を待ち、混沌から秩序を鍛え上げ、かつて不可能と思われたものを築きます。</i></p>
 
   <p><b>Opencode マルチエージェントスイート</b> · 任意のモデルを組み合わせ · タスクを自動委譲</p>
   <p><sub>by <b>Boring Dystopia Development</b></sub></p>
@@ -15,7 +15,12 @@
   </p>
 
   <p>
-    <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <b>日本語</b> | <a href="README.ko-KR.md">한국어</a>
+    <a href="https://svgdiagram.ai"><img src="img/svgdiagram-logo.svg" alt="svgdiagram.ai" width="40" height="28" align="absmiddle"></a>&nbsp;
+    <a href="https://svgdiagram.ai"><b>svgdiagram.ai</b></a> <sub>· メモを、きれいで編集できる SVG 図に</sub>
+  </p>
+
+  <p>
+    <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <b>日本語</b> | <a href="README.ko-KR.md">한국어</a> | <a href="README.fa-IR.md">فارسی</a>
   </p>
 
   <p><sub>✦ ✦ ✦</sub></p>
@@ -30,17 +35,17 @@ oh-my-opencode-slim は OpenCode 向けのエージェントオーケストレ�
 
 ### ✨ ハイライト
 
-- **[7 つの専門エージェント](#meet-the-pantheon)** - Orchestrator、Explorer、Oracle、Council、Librarian、Designer、Fixer。各作業に最適なエージェントを割り当て、プロバイダーを問わず任意のモデルを組み合わせられます。
+- **[6つの専門エージェント](#meet-the-pantheon)** - Orchestrator、Explorer、Oracle、Council、Designer、Fixer。各作業に最適なエージェントを割り当て、プロバイダーを問わず任意のモデルを組み合わせられます。
 - **[バックグラウンドオーケストレーション](docs/background-orchestration.md)** - Orchestrator が専門家をバックグラウンドタスクとして派遣・追跡し、続行前に結果を統合します。並列作業がデフォルトです。
 - **[同梱スキル](#skills)** - `deepwork`、`codemap`、`verification-planning`、`reflect` などのプロンプトベースのワークフローを、エージェントごとに割り当てます。
 - **[Council](docs/council.md)** - `@council` で同じ質問を複数モデルに並列で投げ、1 つの回答に統合します。
 - **[Companion](docs/companion.md)** - 並列のバックグラウンド専門家を含む、稼働中のエージェントを表示する任意のフローティングデスクトップウィンドウです。
-- **[マルチプレクサー統合](docs/multiplexer-integration.md)** - Tmux、Zellij、Herdr、cmux、kitty のペインでエージェントの作業をライブ表示します。
+- **[マルチプレクサー統合](docs/multiplexer-integration.md)** - Tmux、Zellij、Herdr、cmux、kitty、WezTerm のペインでエージェントの作業をライブ表示します。
 - **[プリセット切り替え](docs/preset-switching.md)** - `/preset` でチーム全体のモデルを実行時に切り替えます。
 - **[コードインテリジェンスツール](docs/tools.md)** - 25 言語対応の LSP、AST 対応検索、ドキュメント・GitHub コード検索用の組み込み MCP を提供します。
 - **[完全にカスタマイズ可能](docs/configuration.md)** - カスタムエージェント、プロンプト上書き、エージェントごとのスキル/MCP 権限、[プロジェクトローカルのカスタマイズ](docs/project-local-customization.md)に対応します。
 
-### OpenAI GPT-5.6
+### OpenAI GPT-6
 
 <p align="center">
   <img src="img/openai-gpt-5-6-pantheon.jpeg" alt="OpenAI GPT-5.6 パンテオン：Terra、Sol、Luna" width="100%">
@@ -143,7 +148,7 @@ bun run build
 > バックグラウンドオーケストレーションの仕組みを理解しておくことを**推奨**します。**[Orchestrator のプロンプト](https://github.com/alvinunreal/oh-my-opencode-slim/blob/master/src/agents/orchestrator.ts#L28)** には、スケジューラーのルール、専門エージェントへのルーティングロジック、作業をバックグラウンドエージェントへ割り当てるしきい値が記述されています。`@agentName <task>` のようにサブエージェントを呼び出すことで、いつでも手動で委譲できます。
 
 > [!TIP]
-> バックグラウンドエージェントが現在のデフォルトワークフローになっているため、**[Multiplexer Integration](docs/multiplexer-integration.md)** を有効化して設定することを**強く推奨**します。各エージェントが専用の Tmux、Zellij、Herdr、cmux、または kitty ペインで自動的に開かれるため、Orchestrator がセッションを調整し続けている間も、専門エージェントの作業をリアルタイムで追えます。
+> バックグラウンドエージェントが現在のデフォルトワークフローになっているため、**[Multiplexer Integration](docs/multiplexer-integration.md)** を有効化して設定することを**強く推奨**します。各エージェントが専用の Tmux、Zellij、Herdr、cmux、kitty、または WezTerm ペインで自動的に開かれるため、Orchestrator がセッションを調整し続けている間も、専門エージェントの作業をリアルタイムで追えます。
 
 デフォルトで生成される設定には `openai` と `opencode-go` の両方のプリセットが含まれます。
 
@@ -153,17 +158,15 @@ bun run build
   "preset": "openai",
   "presets": {
     "openai": {
-      "orchestrator": { "model": "openai/gpt-5.6-terra", "variant": "high", "skills": ["*"], "mcps": ["*", "!context7"] },
-      "oracle": { "model": "openai/gpt-5.6-sol", "variant": "high", "skills": ["simplify"], "mcps": [] },
-      "librarian": { "model": "openai/gpt-5.6-luna", "variant": "low", "skills": [], "mcps": ["context7", "gh_grep"] },
-      "explorer": { "model": "openai/gpt-5.6-luna", "variant": "low", "skills": [], "mcps": [] },
-      "designer": { "model": "openai/gpt-5.6-luna", "variant": "medium", "skills": [], "mcps": [] },
-      "fixer": { "model": "openai/gpt-5.6-luna", "variant": "high", "skills": [], "mcps": [] }
+      "orchestrator": { "model": "openai/gpt-6.1-sol", "variant": "medium", "skills": ["*"] },
+      "oracle": { "model": "openai/gpt-6.1-sol", "variant": "high", "skills": ["simplify"] },
+      "explorer": { "model": "openai/gpt-6-luna", "variant": "low", "skills": [] },
+      "designer": { "model": "openai/gpt-6-luna", "variant": "medium", "skills": [] },
+      "fixer": { "model": "openai/gpt-6.1-sol", "variant": "low", "skills": [] }
     },
     "opencode-go": {
       "orchestrator": { "model": "opencode-go/minimax-m3", "variant": "thinking" },
       "oracle": { "model": "opencode-go/qwen3.7-max", "variant": "max" },
-      "librarian": { "model": "opencode-go/deepseek-v4-flash", "variant": "high" },
       "explorer": { "model": "opencode-go/deepseek-v4-flash", "variant": "high" },
       "designer": { "model": "opencode-go/kimi-k2.7-code" },
       "fixer": { "model": "opencode-go/deepseek-v4-flash", "variant": "high" },
@@ -179,7 +182,6 @@ bun run build
 - **[OpenCode Go プリセット](docs/opencode-go-preset.md)** — エージェントを OpenCode Go モデルで実行します。Orchestrator モデルがマルチモーダルでないため、視覚分析用に Observer エージェントを有効化します。
 - **[作者のプリセット](docs/authors-preset.md)** — 作者が日常的に使う、サードパーティスキルを含む正確な設定です。
 - **[$30 プリセット](docs/thirty-dollars-preset.md)** — Codex Plus と GitHub Copilot Pro を中心とした、月額約 $30 の混合プロバイダー構成です。
-- **[OpenCode Zen Free プリセット](docs/opencode-zen-free-preset.md)** — すべてのエージェントを opencode の無料モデルで実行し、利用コストはかかりません。
 
 ### 他のプロバイダーを利用する場合
 
@@ -237,12 +239,12 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-terra (medium)</code>
+      <b>Default Model:</b> <code>openai/gpt-6.1-sol (medium)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>openai/gpt-5.6-terra (medium)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8</code>
+      <b>Recommended Models:</b> <code>openai/gpt-6-sol (medium)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8</code>
     </td>
   </tr>
   <tr>
@@ -268,7 +270,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Role:</b> <code>Codebase reconnaissance</code>
+      <b>Role:</b> <code>Codebase reconnaissance and external research</code>
     </td>
   </tr>
   <tr>
@@ -278,7 +280,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
+      <b>Default Model:</b> <code>openai/gpt-6-luna</code>
     </td>
   </tr>
   <tr>
@@ -319,12 +321,12 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-sol (high)</code>
+      <b>Default Model:</b> <code>openai/gpt-6.1-sol (high)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>openai/gpt-5.6-sol (xhigh)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8 (xhigh)</code>
+      <b>Recommended Models:</b> <code>openai/gpt-6-astra (xhigh)</code> <code>anthropic/claude-fable-5</code> <code>anthropic/claude-opus-4-8 (xhigh)</code>
     </td>
   </tr>
   <tr>
@@ -339,7 +341,7 @@ ping all agents
 ### 04. Council: 知性の合唱
 
 > [!NOTE]
-> **なぜ Orchestrator は Council をもっと頻繁に自動呼び出ししないのか？** これは意図的な設計です。Council は複数のモデルを同時に動かすため、システム内で最もコストの高い経路となることが多く、自動委譲は厳しく制限されています。実際の運用では、Council は必要なときに手動で呼び出すことを想定しています。例: <code>@council compare these two architectures</code>。
+> **なぜ Orchestrator は Council をもっと頻繁に自動呼び出ししないのか？** これは意図的な設計です。Council は複数のモデルを同時に動かすため、システム内で最もコストの高い経路となることが多く、自動委譲は厳しく制限されています。実際の運用では、`council`、`@council`、`consensus`、`共识` などのトリガーワードをメッセージに含めると、そのセッションの最初のトリガーワードで一度だけ Council Mode の手順が注入され（以降のトリガーワードでは再注入されません）、Orchestrator がすべての councillor シートを並行してディスパッチします。例: <code>run a council on these two architectures</code>。手順全体が静的に保持されることはなく、Council を要求しないセッションはそのためにトークンを支払いません。注入は <code>disabled_hooks: ["council-inject"]</code> で完全に無効化できます。
 
 <table>
   <tr>
@@ -385,48 +387,7 @@ ping all agents
 
 ---
 
-### 05. Librarian: 知識の織り手
-
-<table>
-  <tr>
-    <td width="30%" align="center" valign="top">
-      <img src="img/librarian.jpg" width="240" style="border-radius: 10px;">
-      <br><sub><i>理解を編み上げる者。</i></sub>
-    </td>
-    <td width="70%" valign="top">
-      Librarian は、ひとつの知性だけではあらゆる知識を抱えきれないと人類が悟ったときに鍛え上げられました。バラバラに散らばった情報の糸を、ひとつの理解のタペストリーへと織り上げる存在です。人類の知の無限の書庫を巡り、あらゆる片隅から洞察を集め、単なる事実を超えた回答へと束ねます。彼らが返すのは情報ではなく、理解そのものです。
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Role:</b> <code>External knowledge retrieval</code>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Prompt:</b> <a href="src/agents/librarian.ts"><code>librarian.ts</code></a>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Recommended Models:</b> <code>openai/gpt-5.3-codex</code> <code>cerebras/zai-glm-4.7</code> <code>fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo</code>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Model Guidance:</b> 高速・低コストなモデルを選びましょう。Librarian は調査やドキュメント参照を担うため、通常は最強の推論モデルを使うよりも速度と効率の方が重要です。
-    </td>
-  </tr>
-</table>
-
----
-
-### 06. Designer: 美の守護者
+### 05. Designer: 美の守護者
 
 <table>
   <tr>
@@ -450,7 +411,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
+      <b>Default Model:</b> <code>openai/gpt-6-luna</code>
     </td>
   </tr>
   <tr>
@@ -467,7 +428,7 @@ ping all agents
 
 ---
 
-### 07. Fixer: 最後の建造者
+### 06. Fixer: 最後の建造者
 
 <table>
   <tr>
@@ -491,12 +452,12 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna (medium)</code>
+      <b>Default Model:</b> <code>openai/gpt-6.1-sol (low)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>openai/gpt-5.6-luna (medium)</code> <code>anthropic/claude-sonnet-4-6</code>
+      <b>Recommended Models:</b> <code>openai/gpt-6-luna (medium)</code> <code>anthropic/claude-sonnet-4-6</code>
     </td>
   </tr>
   <tr>
@@ -538,7 +499,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code> - <i>有効化するにはビジョン対応モデルを設定してください</i>
+      <b>Default Model:</b> <code>openai/gpt-6-luna</code> - <i>有効化するにはビジョン対応モデルを設定してください</i>
     </td>
   </tr>
   <tr>
@@ -577,6 +538,8 @@ ping all agents
 
 ## 🖥️ Companion
 
+ネイティブのソースとリリースは **[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion)** に移りました。インストーラー、更新、状態連携はプラグインに残り、既存のコマンドと設定は変わりません。
+
 任意の Companion は、ライブのエージェント活動を表示するフローティングデスクトップステータスウィンドウです。現在のセッション状態と稼働中のエージェントを表示するため、バックグラウンド作業を一目で追いやすくなります。
 
 <div align="center">
@@ -587,7 +550,7 @@ ping all agents
 対話式インストールでは、インストーラーが Companion を有効にするか尋ね、デフォルトは `no` です。自動化では明示的に有効化できます:
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
 
 設定、位置、サイズ、インストール詳細は **[Companion](docs/companion.md)** を参照してください。
@@ -607,7 +570,7 @@ bunx oh-my-opencode-slim@latest install --companion=yes
 | **[Council](docs/council.md)** | 複数のモデルを並列実行し、`@council` で 1 つの回答に統合します |
 | **[Custom Agents](docs/configuration.md#custom-agents)** | カスタムプロンプト、モデル、MCP アクセス、Orchestrator の委譲ルールを備えた独自の専門エージェントを定義します |
 | **[ACP Agents](docs/acp-agents.md)** | Claude Code ACP や Gemini ACP などの外部 ACP 互換エージェントを委譲可能なサブエージェントとして接続します |
-| **[Multiplexer Integration](docs/multiplexer-integration.md)** | エージェントの動作を Tmux、Zellij、Herdr、cmux、や kitty のペインでライブ表示します |
+| **[Multiplexer Integration](docs/multiplexer-integration.md)** | エージェントの動作を Tmux、Zellij、Herdr、cmux、kitty、や WezTerm のペインでライブ表示します |
 | **[Codemap](docs/codemap.md)** | 階層的なコードマップを生成し、大規模コードベースを迅速に理解します |
 | **[Clonedeps](docs/clonedeps.md)** | 選択した依存関係のソースを ignore 済みのローカルワークスペースにクローンし、調査できるようにします |
 | **[Worktrees](docs/worktrees.md)** | `.slim/worktrees/` lane を使い、隔離された並列または高リスクなコーディング作業を行います |

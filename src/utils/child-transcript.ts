@@ -24,30 +24,12 @@ import type { PluginInput } from '@opencode-ai/plugin';
 
 import { isRecord } from './guards';
 
-interface ChildTranscriptOptions {
-  /** Only consider messages after this baseline message id (revive flow). */
-  baselineMessageID?: string;
-  /** Require `info.time.completed` on the trailing assistant (v1 hosts
-   * always provide it once the turn finalizes). Defaults to true; v2
-   * shim shapes pass false because the flat mapping drops `time` —
-   * terminality there is confirmed via the host outcome gate before
-   * this extractor runs. */
-  requireCompletionTime?: boolean;
-  /** When the ABSOLUTE trailing message is not an assistant, scan
-   * backward for the last assistant and classify that message instead.
-   * v2 sessions can carry structurally valid non-assistant tails
-   * (synthetic/system/skill); the default (false) keeps the strict
-   * trailing-message semantics the revive probe relies on. */
-  scanBackToLastAssistant?: boolean;
-}
-
 export type ChildTerminalEvidence =
   | { kind: 'ready'; text: string }
   | { kind: 'textless' }
   | { kind: 'pending' }
   | { kind: 'error'; errorText: string }
-  | { kind: 'no-assistant' }
-  | { kind: 'no-new-messages' };
+  | { kind: 'no-assistant' };
 
 /**
  * Fetch a child session's transcript via `client.session.messages`.
@@ -58,11 +40,21 @@ export type ChildTerminalEvidence =
  * caller. A `response.error` payload is surfaced as a normalized `Error`
  * whose message is `stringifyError(response.error)`, matching the
  * error-surfacing style previously duplicated at the call sites.
+ *
+ * `limit` asks the host for only the newest N messages (still oldest-first);
+ * a host that ignores it returns the whole transcript, so callers must
+ * tolerate either.
+ * `historyBoundary` is a plugin-local identity hint for terminal evidence:
+ * after compaction, the V2 shim reads persisted history back to that message
+ * without changing ordinary context reads. V1 clients ignore the hint.
  */
 export async function fetchChildTranscript(
   client: PluginInput['client'],
   sessionID: string,
   directory: string,
+  limit?: number,
+  signal?: AbortSignal,
+  historyBoundary?: string,
 ): Promise<unknown> {
   const session = client.session;
   const messages =
@@ -72,7 +64,9 @@ export async function fetchChildTranscript(
   if (typeof messages !== 'function') return undefined;
   const response = await messages({
     path: { id: sessionID },
-    query: { directory },
+    query: { directory, limit },
+    ...(historyBoundary ? { historyBoundary } : {}),
+    ...(signal ? { signal } : {}),
   });
   const error = responseError(response);
   if (error !== undefined) throw new Error(stringifyError(error));
@@ -90,67 +84,251 @@ export function responseError(response: unknown): unknown {
 
 /** Normalize an unknown error payload to a displayable message string. */
 export function stringifyError(error: unknown): string {
-  if (error instanceof Error) return error.message;
+  if (error instanceof Error && error.message) return error.message;
   if (typeof error === 'string') return error;
   try {
-    return JSON.stringify(error);
+    if (error instanceof Error)
+      return JSON.stringify({ name: error.name, ...(error as object) });
+    const serialized = JSON.stringify(error);
+    return serialized ?? String(error);
   } catch {
     return String(error);
   }
+}
+
+/**
+ * Extract a human-readable message from a serialized session error.
+ *
+ * The core publishes session errors through NamedError.toObject(), whose
+ * wire shape is `{ name: string; data: ... }` — the message lives in
+ * `data.message` (APIError, ProviderAuthError, ...), not at the top
+ * level. Reading only `error.message` yields undefined for every
+ * serialized NamedError and the board fell back to the generic
+ * "Session error" even when the detail existed two levels down (#1200
+ * diagnostics). Plain `{ message }` shapes are still honored for
+ * non-NamedError payloads.
+ */
+export function structuredErrorMessage(error: unknown): string | undefined {
+  if (!isRecord(error)) return undefined;
+  const data = error.data;
+  if (isRecord(data)) {
+    const inner = data.message;
+    // Whitespace-only strings must not bypass the generic fallback
+    // (an empty board summary is worse than "Session error").
+    if (typeof inner === 'string' && inner.trim().length > 0) return inner;
+  }
+  const direct = error.message;
+  if (typeof direct === 'string' && direct.trim().length > 0) return direct;
+  return undefined;
 }
 
 interface LooseMessage {
   info?: {
     id?: unknown;
     role?: unknown;
+    parentID?: unknown;
+    agent?: unknown;
+    sourceType?: unknown;
+    outcome?: unknown;
     error?: unknown;
     finish?: unknown;
-    time?: { completed?: unknown };
+    summary?: unknown;
+    time?: { created?: unknown; completed?: unknown };
   };
   parts?: unknown[];
 }
 
-export function extractChildTerminalEvidence(
+export type TranscriptMessage = LooseMessage;
+
+/** A v1 compaction round (its `compaction` trigger and the `summary: true`
+ * reply) is host maintenance, not the specialist's work. */
+function isCompactionRound(message: TranscriptMessage): boolean {
+  return (
+    message.info?.summary === true ||
+    (message.parts ?? []).some(
+      (part) => isRecord(part) && part.type === 'compaction',
+    )
+  );
+}
+
+export type TerminalEvidenceVerdict =
+  | { verdict: 'completed'; text: string }
+  | { verdict: 'error'; text: string }
+  | { verdict: 'absent' }
+  | { verdict: 'retry'; reason: string };
+
+function verdictFromEvidence(
+  evidence: ChildTerminalEvidence,
+): TerminalEvidenceVerdict {
+  switch (evidence.kind) {
+    case 'ready':
+      return { verdict: 'completed', text: evidence.text };
+    case 'error':
+      return { verdict: 'error', text: evidence.errorText };
+    case 'pending':
+      return { verdict: 'retry', reason: 'pending' };
+    case 'textless':
+      return { verdict: 'retry', reason: 'textless' };
+    default:
+      return { verdict: 'retry', reason: 'unrecognized segment shape' };
+  }
+}
+
+/** Host-ordered entries of a v1-style messages response, or why they are
+ * unusable. */
+function transcriptEntries(
   response: unknown,
-  options: ChildTranscriptOptions = {},
-): ChildTerminalEvidence {
-  const data =
-    isRecord(response) && Array.isArray(response.data)
-      ? (response.data as unknown[])
-      : [];
-  const messages = data.filter(isRecord) as LooseMessage[];
-  if (messages.length === 0) return { kind: 'no-assistant' };
-
-  const baselineIndex = options.baselineMessageID
-    ? messages.findIndex((m) => m.info?.id === options.baselineMessageID)
-    : -1;
-  if (options.baselineMessageID && baselineIndex < 0) {
-    return { kind: 'no-new-messages' };
-  }
-  const lastIndex = messages.length - 1;
-  if (baselineIndex >= 0 && lastIndex <= baselineIndex) {
-    return { kind: 'no-new-messages' };
-  }
-
-  let targetIndex = lastIndex;
-  if (
-    options.scanBackToLastAssistant &&
-    messages[targetIndex].info?.role !== 'assistant'
-  ) {
-    targetIndex = -1;
-    for (let i = lastIndex; i >= 0; i -= 1) {
-      if (messages[i].info?.role === 'assistant') {
-        targetIndex = i;
-        break;
-      }
+): TranscriptMessage[] | { reason: string } {
+  if (response === undefined)
+    return { reason: 'transcript source unavailable' };
+  if (responseError(response) !== undefined)
+    return { reason: 'transcript read failed' };
+  if (!isRecord(response) || !Array.isArray(response.data))
+    return { reason: 'malformed transcript response' };
+  for (const entry of response.data) {
+    if (
+      !isRecord(entry) ||
+      !isRecord(entry.info) ||
+      (!['assistant', 'user', 'system'].includes(String(entry.info.role)) &&
+        typeof entry.info.id !== 'string')
+    ) {
+      return { reason: 'malformed transcript entries' };
     }
-    if (targetIndex < 0) return { kind: 'no-assistant' };
+    if (
+      entry.parts !== undefined &&
+      (!Array.isArray(entry.parts) ||
+        entry.parts.some(
+          (part) => !isRecord(part) || typeof part.type !== 'string',
+        ))
+    )
+      return { reason: 'malformed transcript parts' };
+  }
+  return response.data;
+}
+
+/** A valid absence is not unknown evidence. Never scan through a user prompt
+ * or pending assistant placeholder to recover the previous attempt's answer. */
+export function classifyTerminalEvidence(
+  response: unknown,
+  options: {
+    baselineMessageID?: string;
+    /** An admitted queued user input, not a pre-send history watermark. */
+    promptMessageID?: string;
+    runStartedAt?: number;
+    terminalOutcomeConfirmed?: boolean;
+  } = {},
+): TerminalEvidenceVerdict {
+  const all = transcriptEntries(response);
+  if (!Array.isArray(all)) return { verdict: 'retry', reason: all.reason };
+  if (options.promptMessageID) {
+    const prompt = all.findIndex(
+      (message) =>
+        message.info?.id === options.promptMessageID &&
+        message.info?.role === 'user',
+    );
+    if (prompt < 0)
+      return { verdict: 'retry', reason: 'queued prompt not delivered' };
+    const nextPrompt = all.findIndex(
+      (message, index) => index > prompt && message.info?.role === 'user',
+    );
+    const turn = all.slice(prompt, nextPrompt < 0 ? undefined : nextPrompt);
+    let target = turn.length - 1;
+    while (target > 0 && turn[target].info?.role !== 'assistant') target--;
+    if (target === 0)
+      return { verdict: 'retry', reason: 'queued prompt has no answer yet' };
+    return verdictFromEvidence(
+      classifyAssistantTurnEvidence(turn, target, 0, true),
+    );
+  }
+  if (options.baselineMessageID) {
+    const baseline = all.findIndex(
+      (message) => message.info?.id === options.baselineMessageID,
+    );
+    if (baseline < 0)
+      return { verdict: 'retry', reason: 'baseline message missing' };
+    const segment = all.slice(baseline + 1);
+    let target = segment.length - 1;
+    // Compaction rounds are skipped in place: the anchor and indices hold.
+    while (target >= 0) {
+      const role = segment[target].info?.role;
+      if (
+        !isCompactionRound(segment[target]) &&
+        (typeof role !== 'string' || role === 'assistant' || role === 'user')
+      )
+        break;
+      target -= 1;
+    }
+    if (target < 0) return { verdict: 'absent' };
+    if (segment[target].info?.role === 'user') {
+      return segment.some((message) => message.info?.role === 'assistant')
+        ? { verdict: 'retry', reason: 'user message after last assistant' }
+        : { verdict: 'absent' };
+    }
+    return verdictFromEvidence(
+      classifyAssistantTurnEvidence(
+        all,
+        baseline + 1 + target,
+        baseline,
+        !options.terminalOutcomeConfirmed,
+      ),
+    );
+  }
+  let target = all.length - 1;
+  while (
+    target >= 0 &&
+    (all[target].info?.role === 'system' || isCompactionRound(all[target]))
+  )
+    target--;
+  const trailing = all[target];
+  if (!trailing || trailing.info?.role === 'user') return { verdict: 'absent' };
+  if (trailing.info?.role !== 'assistant')
+    return {
+      verdict: 'retry',
+      reason: 'no baseline; cannot attribute a historical assistant turn',
+    };
+  const completedAt = trailing.info?.time?.completed;
+  if (
+    options.runStartedAt !== undefined &&
+    typeof completedAt === 'number' &&
+    completedAt < options.runStartedAt
+  )
+    return { verdict: 'absent' };
+  return verdictFromEvidence(
+    classifyAssistantTurnEvidence(
+      all,
+      target,
+      -1,
+      !options.terminalOutcomeConfirmed,
+    ),
+  );
+}
+
+/**
+ * Single source of truth for classifying ONE assistant turn as the
+ * terminal evidence of a run: pending finish states, completion time,
+ * segment-wide pending tool calls, terminal error precedence, and
+ * usable text. Both the revived-run tracker probe and the stop gate's
+ * evidence classifier delegate here so their terminality contracts
+ * cannot diverge (a second independent classifier had already dropped
+ * the pending-tool rule).
+ */
+export function classifyAssistantTurnEvidence(
+  messages: TranscriptMessage[],
+  targetIndex: number,
+  baselineIndex: number,
+  requireCompletionTime = true,
+): ChildTerminalEvidence {
+  const last = messages[targetIndex];
+  if (last?.info?.role !== 'assistant') return { kind: 'no-assistant' };
+
+  // Terminal error precedence: an assistant turn that carries a
+  // terminal error is an error EVEN when a residual `finish` value
+  // (e.g. 'tool-calls'/'unknown') survived the failure — the error is
+  // the outcome, the finish flag is leftover state.
+  if (last.info?.error !== undefined && last.info?.error !== null) {
+    return { kind: 'error', errorText: stringifyError(last.info.error) };
   }
 
-  const last = messages[targetIndex];
-  if (last.info?.role !== 'assistant') return { kind: 'no-assistant' };
-
-  const requireCompletionTime = options.requireCompletionTime ?? true;
   const finish = last.info?.finish;
   if (finish === 'tool-calls' || finish === 'unknown') {
     return { kind: 'pending' };
@@ -176,10 +354,6 @@ export function extractChildTerminalEvidence(
   );
   if (hasPendingToolCall) return { kind: 'pending' };
 
-  if (last.info?.error !== undefined && last.info?.error !== null) {
-    return { kind: 'error', errorText: stringifyError(last.info.error) };
-  }
-
   const text = (Array.isArray(last.parts) ? last.parts : [])
     .filter(
       (part) =>
@@ -192,4 +366,197 @@ export function extractChildTerminalEvidence(
     .join('\n\n')
     .trim();
   return text.length > 0 ? { kind: 'ready', text } : { kind: 'textless' };
+}
+
+export interface CurrentRoundClassification {
+  verdict: 'completed' | 'error' | 'interrupted' | 'incomplete' | 'unreadable';
+  text?: string;
+  reason?: string;
+  /** Timestamp of the latest delivered user message, when the host provided one. */
+  startedAt?: number;
+  /** Assistant completion time for this round, when the host provided one. */
+  completedAt?: number;
+}
+
+export function transcriptOrderKey(
+  message: TranscriptMessage,
+): number | undefined {
+  const time = message.info?.time;
+  if (!isRecord(time)) return undefined;
+  if (typeof time.created === 'number' && Number.isFinite(time.created)) {
+    return time.created;
+  }
+  if (typeof time.completed === 'number' && Number.isFinite(time.completed)) {
+    return time.completed;
+  }
+  return undefined;
+}
+
+function assistantCompletedAt(message: TranscriptMessage): number | undefined {
+  const time = message.info?.time;
+  if (!isRecord(time)) return undefined;
+  return typeof time.completed === 'number' && Number.isFinite(time.completed)
+    ? time.completed
+    : undefined;
+}
+
+function isInterruptSignal(message: TranscriptMessage): boolean {
+  const finish = message.info?.finish;
+  if (finish === 'abort' || finish === 'aborted') return true;
+  const error = message.info?.error;
+  if (error === undefined || error === null) return false;
+  const text = stringifyError(error).toLowerCase();
+  return text.includes('abort') || text.includes('interrupted');
+}
+
+function messageIdentity(message: TranscriptMessage): string | undefined {
+  const id = message.info?.id;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
+}
+
+function messageParentIdentity(message: TranscriptMessage): string | undefined {
+  const parentID = message.info?.parentID;
+  return typeof parentID === 'string' && parentID.length > 0
+    ? parentID
+    : undefined;
+}
+
+/**
+ * Classify only the latest delivered user round.
+ *
+ * Pending tool parts from an older round do not block a later completed
+ * round, and an older assistant answer is not reused once a newer user
+ * message exists.
+ */
+export function classifyCurrentDeliveredRound(
+  response: unknown,
+): CurrentRoundClassification {
+  const entries = transcriptEntries(response);
+  if (!Array.isArray(entries)) {
+    return { verdict: 'unreadable', reason: entries.reason };
+  }
+  const messages = entries.filter((message) => !isCompactionRound(message));
+
+  let latestUser = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.info?.role === 'user') {
+      latestUser = index;
+      break;
+    }
+  }
+  if (latestUser < 0) {
+    return { verdict: 'unreadable', reason: 'no delivered user round' };
+  }
+  const startedAt = transcriptOrderKey(
+    messages[latestUser] as TranscriptMessage,
+  );
+
+  let assistant = -1;
+  for (let index = messages.length - 1; index > latestUser; index -= 1) {
+    if (messages[index]?.info?.role === 'assistant') {
+      assistant = index;
+      break;
+    }
+  }
+  if (assistant < 0) return { verdict: 'incomplete', startedAt };
+
+  const turn = messages[assistant] as TranscriptMessage;
+  const declaredParent = messageParentIdentity(turn);
+  const latestUserID = messageIdentity(
+    messages[latestUser] as TranscriptMessage,
+  );
+  if (declaredParent && declaredParent !== latestUserID) {
+    return latestUserID
+      ? { verdict: 'incomplete', startedAt }
+      : {
+          verdict: 'unreadable',
+          reason: 'assistant parent is not the latest user',
+        };
+  }
+  if (isInterruptSignal(turn)) {
+    return {
+      verdict: 'interrupted',
+      startedAt,
+      completedAt: assistantCompletedAt(turn),
+    };
+  }
+  const evidence = classifyAssistantTurnEvidence(
+    messages,
+    assistant,
+    latestUser,
+    true,
+  );
+  const completedAt = assistantCompletedAt(turn);
+  switch (evidence.kind) {
+    case 'ready':
+      return {
+        verdict: 'completed',
+        text: evidence.text,
+        startedAt,
+        completedAt,
+      };
+    case 'error':
+      return {
+        verdict: 'error',
+        text: evidence.errorText,
+        startedAt,
+        completedAt,
+      };
+    default:
+      return { verdict: 'incomplete', startedAt };
+  }
+}
+
+function sourceTypeOf(message: TranscriptMessage): string | undefined {
+  const source = message.info?.sourceType ?? message.info?.role;
+  return typeof source === 'string' ? source : undefined;
+}
+
+function textOf(message: TranscriptMessage): string {
+  const parts = Array.isArray(message.parts) ? message.parts : [];
+  return parts
+    .filter(
+      (part) =>
+        isRecord(part) && part.type === 'text' && typeof part.text === 'string',
+    )
+    .map((part) => (part as { text: string }).text.trim())
+    .filter((text) => text.length > 0)
+    .join('\n');
+}
+
+/** Latest delivered user/synthetic input timestamp in a host transcript. */
+export function latestInputAtOf(transcript: unknown): number | undefined {
+  if (!isRecord(transcript) || !Array.isArray(transcript.data))
+    return undefined;
+  for (let index = transcript.data.length - 1; index >= 0; index -= 1) {
+    const entry = transcript.data[index];
+    if (!isRecord(entry) || !isRecord(entry.info)) continue;
+    const source = sourceTypeOf(entry);
+    if (source === 'user' || source === 'synthetic') {
+      return transcriptOrderKey(entry);
+    }
+  }
+  return undefined;
+}
+
+/** Text of the latest assistant entry after the latest user/synthetic input. */
+export function terminalTextOf(transcript: unknown): string | undefined {
+  if (!isRecord(transcript) || !Array.isArray(transcript.data))
+    return undefined;
+  let boundary = -1;
+  for (let index = transcript.data.length - 1; index >= 0; index -= 1) {
+    const entry = transcript.data[index];
+    if (!isRecord(entry) || !isRecord(entry.info)) continue;
+    const source = sourceTypeOf(entry);
+    if (source === 'user' || source === 'synthetic') {
+      boundary = index;
+      break;
+    }
+  }
+  for (let index = transcript.data.length - 1; index > boundary; index -= 1) {
+    const entry = transcript.data[index];
+    if (!isRecord(entry) || !isRecord(entry.info)) continue;
+    if (sourceTypeOf(entry) === 'assistant') return textOf(entry);
+  }
+  return undefined;
 }

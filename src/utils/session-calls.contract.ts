@@ -49,10 +49,10 @@ const client = {
 // abort (foreground-fallback, cancel-task, index.ts)
 client.session.abort({ path: { id: 'ses_x' } });
 
-// messages (foreground-fallback, session.ts extractSessionResult)
+// messages (foreground-fallback tail, child-transcript fetchChildTranscript)
 client.session.messages({
   path: { id: 'ses_x' },
-  query: { directory: '/d' },
+  query: { directory: '/d', limit: 1 },
 });
 
 // message (chat-headers)
@@ -64,30 +64,17 @@ client.session.get({ path: { id: 'ses_x' }, query: { directory: '/d' } });
 // status (cancel-task getSessionStatus, orchestrator-wake)
 client.session.status({ query: { directory: '/d' } });
 
-// delete (cancel-task, secondary-model)
+// delete (cancel-task)
 client.session.delete({
   path: { id: 'ses_x' },
   query: { directory: '/d' },
 });
 
-// create (secondary-model)
-client.session.create({
-  query: { directory: '/d' },
-  body: { title: 'secondary' },
-});
-
-// prompt (secondary-model, session.ts promptWithTimeout)
-// `agent` is mandatory in practice, not by type: an agent-less body makes the
-// runtime resolve its default primary and durably rewrite the session's agent
-// (see src/utils/prompt-agent.ts and
-// docs/agents/build-agent-empty-input-diagnosis.md, probe A2). The type
-// contract only pins the shape; the repo-wide scan in
-// src/utils/prompt-agent.test.ts enforces the field.
+// prompt (interview, v2 session-submit)
 client.session.prompt({
   path: { id: 'ses_x' },
   query: { directory: '/d' },
   body: {
-    agent: 'build',
     model: { providerID: 'p', modelID: 'm' },
     system: 's',
     tools: { read: false },
@@ -124,9 +111,6 @@ client.session.children({
   path: { id: 'ses_x' },
   query: { directory: '/d' },
 });
-
-// tool.ids (secondary-model)
-client.tool.ids({ query: { directory: '/d' } });
 
 // ---------------------------------------------------------------------------
 // Rejected: the v2-flat shapes the migration shipped. Each must be a type

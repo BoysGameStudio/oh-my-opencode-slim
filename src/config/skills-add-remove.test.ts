@@ -85,6 +85,23 @@ describe('skills_add / skills_remove directives', () => {
     ).toEqual(['a', 'c']);
   });
 
+  test('resolveEffectiveSkills: supplied marketplace defaults are preserved', () => {
+    expect(
+      resolveEffectiveSkills('market-agent', undefined, ['extra'], undefined, [
+        'package-default',
+      ]),
+    ).toEqual(['package-default', 'extra']);
+    expect(
+      resolveEffectiveSkills(
+        'market-agent',
+        ['explicit'],
+        ['extra'],
+        undefined,
+        ['package-default'],
+      ),
+    ).toEqual(['explicit', 'extra']);
+  });
+
   test('resolveEffectiveSkills: dedupes within base and across add', () => {
     expect(
       resolveEffectiveSkills('oracle', ['a', 'a', 'b'], ['b', 'c'], undefined),
@@ -118,9 +135,7 @@ describe('skills_add / skills_remove directives', () => {
   test('resolveEffectiveSkills: removal only, other agents start from default grants', () => {
     expect(
       resolveEffectiveSkills('explorer', undefined, undefined, ['codemap']),
-    ).toEqual(
-      getDefaultGrantedSkillNames('explorer').filter((n) => n !== 'codemap'),
-    );
+    ).toEqual([]);
   });
 
   test('resolveEffectiveSkills: removing an ungranted name without wildcard is a no-op', () => {
@@ -294,9 +309,7 @@ describe('skills_add / skills_remove directives', () => {
     expect(orchestrator.skills).toEqual(['*', '!foo']);
     expectNoDirectiveKeys(orchestrator);
     const oracle = effectiveAgent(loaded);
-    expect(oracle.skills).toEqual(
-      getDefaultGrantedSkillNames('oracle').filter((n) => n !== 'codemap'),
-    );
+    expect(oracle.skills).toEqual(['simplify', 'requesting-code-review']);
     expectNoDirectiveKeys(oracle);
   });
 

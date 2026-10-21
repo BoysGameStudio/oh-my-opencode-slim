@@ -180,6 +180,15 @@ OpenCode logs
 - Old reflections can be pruned by age or count (configurable)
 - Skill instructions guide the LLM through the full workflow
 
+## Amendment 2026-10: SQLite-direct discovery (issue #1475)
+
+The log-grep discovery and `client.session.messages()` flow above were
+superseded: the skill queries `opencode.db` directly. OpenCode v2 hosts keep
+live data in `session_v2`/`session_message`, v1 hosts in `session`/`message`;
+discovery probes `sqlite_master` for `session_v2` and selects the matching
+pair together. Queries run from a temp script file so the SQL survives Windows
+PowerShell quoting. Section 4's last-N-sessions-total scope is unchanged.
+
 ## Consequences
 
 - No code changes needed - purely skill instruction updates

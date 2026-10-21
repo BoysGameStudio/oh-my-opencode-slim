@@ -62,7 +62,9 @@ describe('search-path-guard hook', () => {
 
     const hook = createHook(tempRoot);
 
-    await runHook(hook, 'grep', { path: filePath });
+    await expect(
+      runHook(hook, 'grep', { path: filePath }),
+    ).resolves.toBeUndefined();
   });
 
   test('allows an existing relative directory', async () => {
@@ -70,31 +72,41 @@ describe('search-path-guard hook', () => {
 
     const hook = createHook(tempRoot);
 
-    await runHook(hook, 'glob', { path: 'subdir' });
+    await expect(
+      runHook(hook, 'glob', { path: 'subdir' }),
+    ).resolves.toBeUndefined();
   });
 
   test('never blocks a relative path when directory is falsy', async () => {
     const hook = createHook('');
 
-    await runHook(hook, 'grep', { path: 'definitely-missing-relative' });
+    await expect(
+      runHook(hook, 'grep', { path: 'definitely-missing-relative' }),
+    ).resolves.toBeUndefined();
   });
 
   test('ignores tools other than grep and glob', async () => {
     const hook = createHook(tempRoot);
     const missing = path.join(tempRoot, 'does-not-exist');
 
-    await runHook(hook, 'read', { path: missing });
-    await runHook(hook, 'bash', { path: missing });
+    await expect(
+      runHook(hook, 'read', { path: missing }),
+    ).resolves.toBeUndefined();
+    await expect(
+      runHook(hook, 'bash', { path: missing }),
+    ).resolves.toBeUndefined();
   });
 
   test('ignores absent, non-string, or empty path values', async () => {
     const hook = createHook(tempRoot);
 
-    await runHook(hook, 'grep', undefined);
-    await runHook(hook, 'grep', {});
-    await runHook(hook, 'glob', { path: 42 });
-    await runHook(hook, 'glob', { path: null });
-    await runHook(hook, 'grep', { path: '' });
+    await expect(runHook(hook, 'grep', undefined)).resolves.toBeUndefined();
+    await expect(runHook(hook, 'grep', {})).resolves.toBeUndefined();
+    await expect(runHook(hook, 'glob', { path: 42 })).resolves.toBeUndefined();
+    await expect(
+      runHook(hook, 'glob', { path: null }),
+    ).resolves.toBeUndefined();
+    await expect(runHook(hook, 'grep', { path: '' })).resolves.toBeUndefined();
   });
 
   test('blocks literal undefined/null strings like the host would resolve them', async () => {
@@ -124,7 +136,9 @@ describe('search-path-guard hook', () => {
 
     const hook = createHook(tempRoot);
 
-    await runHook(hook, 'glob', { path: 'spaced dir ' });
+    await expect(
+      runHook(hook, 'glob', { path: 'spaced dir ' }),
+    ).resolves.toBeUndefined();
   });
 
   test('rejects an ENOTDIR path with an actionable error', async () => {
@@ -157,19 +171,20 @@ describe('search-path-guard hook', () => {
     );
   });
 
-  test('preserves native Windows drive-relative host semantics', async () => {
-    if (process.platform !== 'win32') return;
+  test.skipIf(process.platform !== 'win32')(
+    'preserves native Windows drive-relative host semantics',
+    async () => {
+      const raw = 'C:missing-search-path';
+      const hook = createHook(tempRoot);
 
-    const raw = 'C:missing-search-path';
-    const hook = createHook(tempRoot);
-
-    await expect(runHook(hook, 'grep', { path: raw })).rejects.toThrow(
-      path.join(tempRoot, raw),
-    );
-    await expect(runHook(hook, 'glob', { path: raw })).rejects.toThrow(
-      path.resolve(tempRoot, raw),
-    );
-  });
+      await expect(runHook(hook, 'grep', { path: raw })).rejects.toThrow(
+        path.join(tempRoot, raw),
+      );
+      await expect(runHook(hook, 'glob', { path: raw })).rejects.toThrow(
+        path.resolve(tempRoot, raw),
+      );
+    },
+  );
 
   test('v2 grep resolves drive-relative paths with win32 resolve semantics', () => {
     const directory = 'D:\\workspace';
@@ -189,6 +204,8 @@ describe('search-path-guard hook', () => {
 
     const hook = createHook(tempRoot);
 
-    await runHook(hook, 'grep', { path: filePath });
+    await expect(
+      runHook(hook, 'grep', { path: filePath }),
+    ).resolves.toBeUndefined();
   });
 });

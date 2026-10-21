@@ -5,7 +5,8 @@
  * herdr, etc.) to spawn and manage panes for child agent sessions.
  */
 
-import type { MultiplexerLayout } from '../config/schema';
+import type { MultiplexerLayout, MultiplexerViewer } from '../config/schema';
+import type { ViewerFlavor } from './shared';
 
 export interface PaneResult {
   success: boolean;
@@ -17,15 +18,41 @@ export interface PaneResult {
 export interface PaneSpawnOptions {
   /** Root/parent OpenCode session that requested this child pane. */
   parentSessionId?: string;
+  /**
+   * Subagent type of the child session (the host session's `agent` field,
+   * e.g. `oracle` / `explorer`). Adapters that build human-readable display
+   * names (cmux) consume it; every other adapter ignores it.
+   */
+  subagentType?: string;
+  /**
+   * Viewer command flavor the adapter must build (FR-2 command matrix);
+   * defaults to `v1` (the attach form) when absent.
+   */
+  viewerFlavor?: ViewerFlavor;
+  /**
+   * `v2-remote` only: password injected into the viewer's environment at
+   * pane creation. It is forwarded in-process from the wiring's own
+   * environment and must never enter command text or argv; adapters use
+   * their native spawn-time env mechanism, or a `/proc`-based bridge where
+   * none exists.
+   */
+  viewerPassword?: string;
+  /**
+   * Which opencode TUI surface the viewer command opens: the full `tui`
+   * (default) or the `mini` interface. Distinct from `viewerFlavor`, which
+   * selects the host attachment form; `viewerSurface` selects the opencode
+   * TUI that renders the session.
+   */
+  viewerSurface?: MultiplexerViewer;
 }
 
 /**
  * Core multiplexer interface
  * Implementations: TmuxMultiplexer, ZellijMultiplexer, HerdrMultiplexer,
- * CmuxMultiplexer, KittyMultiplexer
+ * CmuxMultiplexer, KittyMultiplexer, WeztermMultiplexer
  */
 export interface Multiplexer {
-  readonly type: 'tmux' | 'zellij' | 'herdr' | 'cmux' | 'kitty';
+  readonly type: 'tmux' | 'zellij' | 'herdr' | 'cmux-tui' | 'kitty' | 'wezterm';
 
   /**
    * Check if the multiplexer binary is available on the system
@@ -53,8 +80,12 @@ export interface Multiplexer {
   ): Promise<PaneResult>;
 
   /**
-   * Close a pane by its ID
-   * @param paneId - The pane ID returned by spawnPane
+   * Close a pane by its adapter-local opaque handle.
+   *
+   * The handle is only meaningful to the adapter that produced it: cmux
+   * returns a terminal id, tmux/zellij/herdr/kitty return their native pane
+   * id. Callers must pass it back unmodified and never interpret it.
+   * @param paneId - The adapter-local opaque handle returned by spawnPane
    * @returns true if successfully closed
    */
   closePane(paneId: string): Promise<boolean>;
@@ -65,39 +96,4 @@ export interface Multiplexer {
    * @param mainPaneSize - Percentage for main pane (for main-* layouts)
    */
   applyLayout(layout: MultiplexerLayout, mainPaneSize: number): Promise<void>;
-}
-
-/**
- * Server health check utility (shared across implementations)
- */
-export async function isServerRunning(
-  serverUrl: string,
-  timeoutMs = 3000,
-  maxAttempts = 2,
-): Promise<boolean> {
-  const healthUrl = new URL('/health', serverUrl).toString();
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-    let response: Response | null = null;
-    try {
-      response = await fetch(healthUrl, { signal: controller.signal }).catch(
-        () => null,
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    if (response?.ok) {
-      return true;
-    }
-
-    if (attempt < maxAttempts) {
-      await new Promise((r) => setTimeout(r, 250));
-    }
-  }
-
-  return false;
 }

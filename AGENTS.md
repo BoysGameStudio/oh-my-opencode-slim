@@ -56,6 +56,19 @@ bun test -t "test-name-pattern"
 - Let errors propagate appropriately rather than catching silently
 - Use Zod for runtime validation (already a dependency)
 
+### Test Time
+- Tests never bind to real time (`ts-no-test-timers`): no `Bun.sleep()`,
+  guessed `setTimeout` waits, or duration-based settling.
+- Drive timer code deterministically with `src/utils/test-timers.ts`
+  (`createTimerHarness`, `tick`). Scheduling components accept injected
+  `setTimeout`/`clearTimeout` seams (see `BackgroundJobSupervisor`,
+  `createBackgroundJobTerminalGate`); wire the harness there, not via
+  global spies.
+- Keep observation-time (`now`) seams separate from scheduling when event
+  timestamps are the subject of the test.
+- Integration tests that exercise real platform timing may keep a real
+  delay: keep rare and comment why deterministic control will not work.
+
 ### Git Integration
 - Biome integrates with git (VCS enabled)
 - Commits should pass `bun run check:ci` before pushing
@@ -173,7 +186,9 @@ Log files are named with timestamps (e.g., 2025-01-09T123456.log) and the most r
 You can set the log level with the --log-level command-line option to get more detailed debug information. For example, opencode --log-level DEBUG.
 
 ### Plugin
-~/.local/share/opencode/log/oh-my-opencode-slim.<timestamp>.log
+~/.local/share/opencode/log/oh-my-opencode-slim.<timestamp>-<pid>.log
+One file per process (the pid suffix disambiguates processes that start in the
+same second); TUI client processes use the `tui-` prefix.
 
 ## Cloned Dependency Source
 
@@ -200,4 +215,4 @@ submissions use the `community-preset` label (see `docs/maintainers.md`).
 
 ### Domain docs
 
-Single-context repo: `CONTEXT.md` and `docs/adr/` at the root, plus `codemap.md`. See `docs/agents/domain.md`.
+Single glossary at the root: `GLOSSARY.md`, plus `docs/adr/` and `codemap.md`. See `docs/agents/domain.md`.

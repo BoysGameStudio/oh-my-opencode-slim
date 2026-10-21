@@ -15,14 +15,36 @@ export function ensureCouncilCompactionException(prompt: string): string {
   return `${prompt}\n\n${COUNCIL_COMPACTION_EXCEPTION}`;
 }
 
-const COUNCIL_SYNTHESIS_REINFORCEMENT = `\n\n---\n\nYou MUST follow the Synthesis Process steps before producing output: review each councillor response individually by name, then produce the required output with a synthesized Council Response, a Per-Councillor Details section using each councillor's exact seat name (e.g. "alpha", not the model label), and a Council Summary with Consensus Level (unanimous|majority|split), Agreed Points, Disagreements + resolution, Remaining Uncertainty, and Recommended Action. ${COUNCIL_COMPACTION_EXCEPTION}`;
+// The synthesis reinforcement must survive a custom prompt override: an
+// override that dropped the report format gets the compact fallback, which
+// carries the required structure itself. The compaction exception has triple
+// coverage — embedded in the base prompt, embedded in the fallback, and
+// re-applied idempotently by ensureCouncilCompactionException at all three
+// merge sites (createAgents' final-prompt pass, the registry's
+// effective-config pass, and its visible-projection pass) — so no path drops
+// it and no path doubles it.
+const COUNCIL_SYNTHESIS_FALLBACK = `\n\n---\n\nYou MUST produce: ## Council Response (the best synthesized answer), ## Per-Councillor Details (each councillor by exact seat name, e.g. "alpha", not the model label; note failed or timed-out seats instead of omitting them), and ## Council Summary (Consensus Level: unanimous|majority|split; Agreed Points; Disagreements + resolution; Remaining Uncertainty; Recommended Action). ${COUNCIL_COMPACTION_EXCEPTION}`;
+
+/** Idempotent single-track synthesis reinforcement. Applied to the FINAL
+ * effective council prompt (after `resolvePrompt` and the host-agent merge
+ * can replace the generated content) so a custom override cannot drop the
+ * required output structure. A prompt that already carries the report format
+ * — the base prompt's own sections, or a previous fallback append — is left
+ * byte-identical; otherwise the compact fallback is appended. */
+export function ensureCouncilSynthesisReinforcement(prompt: string): string {
+  // Idempotence, verbatim disjunct: our own fallback marker.
+  if (prompt.includes('You MUST produce: ## Council Response')) return prompt;
+  // A prompt that keeps its own report format needs no reinforcement.
+  if (prompt.includes('## Council Response')) return prompt;
+  return prompt + COUNCIL_SYNTHESIS_FALLBACK;
+}
 
 const COUNCIL_AGENT_PROMPT = `You are the Council agent - a \
 synthesizer for multi-model consensus.
 
-**Role**: You receive raw responses from multiple councillors (different models) and synthesize them into a structured council report. You do NOT dispatch councillors yourself - the orchestrator handles dispatch and provides the councillor results.
+**Role**: You receive raw responses from multiple councillors (different models) and synthesize them into a structured council report. The orchestrator handles dispatch and provides the councillor results.
 
-**Tools**: You have NO tools. You synthesize purely from the councillor responses provided in your context. Do not read, glob, grep, or run shell commands.
+You synthesize purely from the councillor responses provided in your context.
 
 **Synthesis Process** (MANDATORY - follow in order):
 1. Read the original user prompt (provided in the context)
@@ -75,19 +97,22 @@ export function createCouncilAgent(
   customPrompt?: string,
   customAppendPrompt?: string,
 ): AgentDefinition {
-  const prompt =
-    resolvePrompt(
-      'council',
-      customPrompt,
-      undefined,
-      COUNCIL_AGENT_PROMPT,
-      customAppendPrompt,
-    ) + COUNCIL_SYNTHESIS_REINFORCEMENT;
+  // Base only: the synthesis reinforcement is applied at the assembly layer
+  // (agents/index.ts + registry.ts) to the FINAL effective prompt, because
+  // `resolvePrompt` and the host-agent merge replace the factory output
+  // after this returns.
+  const prompt = resolvePrompt(
+    'council',
+    customPrompt,
+    undefined,
+    COUNCIL_AGENT_PROMPT,
+    customAppendPrompt,
+  );
 
   return {
     name: 'council',
     description:
-      'Multi-model consensus agent that synthesizes viewpoints from council members to make informed decisions with higher confidence than single models',
+      'Multi-model consensus agent that synthesizes viewpoints from council members',
     config: {
       model,
       prompt,

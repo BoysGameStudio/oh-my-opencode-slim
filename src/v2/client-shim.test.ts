@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -44,6 +44,16 @@ function makeCtx(overrides?: Partial<V2Context['session']>): V2Context {
   } as never;
 }
 
+function makeCtxWithPermission(options: {
+  session?: Partial<V2Context['session']>;
+  permission?: Partial<NonNullable<V2Context['permission']>>;
+}): V2Context {
+  return {
+    ...makeCtx(options.session),
+    permission: options.permission,
+  } as never;
+}
+
 describe('v2 client shim delegation', () => {
   test('messages maps session.context to v1 {data} with info/parts', async () => {
     const calls: unknown[] = [];
@@ -75,6 +85,387 @@ describe('v2 client shim delegation', () => {
         parts: [{ type: 'text', text: 'hello' }],
       },
     ]);
+  });
+
+  test('exposes pinned v2 permission.reply through the v1-shaped client when supported', async () => {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtxWithPermission({
+        permission: {
+          reply: async (args) => {
+            calls.push(args);
+            return { data: true };
+          },
+        },
+      }),
+    );
+
+    await (
+      input.client as {
+        permission: { reply: (args: unknown) => Promise<unknown> };
+      }
+    ).permission.reply({
+      path: { id: 'ses_child1' },
+      requestID: 'per_1',
+      reply: 'always',
+    });
+
+    expect(calls).toEqual([
+      { sessionID: 'ses_child1', requestID: 'per_1', decision: 'always' },
+    ]);
+  });
+
+  test('does not invent unsupported v2 question/form reply domains', () => {
+    const input = buildPluginInput(makeCtx());
+
+    expect(
+      (input.client as { question?: unknown; form?: unknown }).question,
+    ).toBeUndefined();
+    expect((input.client as { form?: unknown }).form).toBeUndefined();
+  });
+
+  test('messages forwards query.limit as a bounded v2 page in ascending order', async () => {
+    // The bounded tail read (foreground-fallback replay) must hit the
+    // paginated v2 route, not the full context read, or long-lived v2
+    // sessions keep the latency this path exists to avoid.
+    const contextCalls: unknown[] = [];
+    const messageCalls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        context: async (i: { sessionID: string }) => {
+          contextCalls.push(i);
+          return [];
+        },
+        messages: async (i: {
+          sessionID: string;
+          limit?: number;
+          order?: string;
+        }) => {
+          messageCalls.push(i);
+          return {
+            data: [
+              {
+                id: 'm2',
+                role: 'user',
+                content: [{ type: 'text', text: 'newest' }],
+              },
+              {
+                id: 'm1',
+                role: 'user',
+                content: [{ type: 'text', text: 'older' }],
+              },
+            ],
+          };
+        },
+      } as never),
+    );
+    const res = await (
+      input.client as {
+        session: {
+          messages: (a: unknown) => Promise<{ data: unknown[] }>;
+        };
+      }
+    ).session.messages({ path: { id: 'ses_1' }, query: { limit: 50 } });
+    expect(messageCalls).toEqual([
+      { sessionID: 'ses_1', limit: 50, order: 'desc' },
+    ]);
+    expect(contextCalls).toEqual([]);
+    expect(
+      res.data.map((m) => (m as { info: { id: string } }).info.id),
+    ).toEqual(['m1', 'm2']);
+  });
+
+  test('messages without query.limit keeps the full context read', async () => {
+    const messageCalls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        context: async () => [
+          {
+            id: 'm1',
+            role: 'user',
+            content: [{ type: 'text', text: 'hello' }],
+          },
+        ],
+        messages: async (i: unknown) => {
+          messageCalls.push(i);
+          return { data: [] };
+        },
+      } as never),
+    );
+    const res = await (
+      input.client as {
+        session: {
+          messages: (a: unknown) => Promise<{ data: unknown[] }>;
+        };
+      }
+    ).session.messages({ path: { id: 'ses_1' } });
+    expect(messageCalls).toEqual([]);
+    expect(res.data).toHaveLength(1);
+  });
+
+  test('compacted transcript restores ordered persisted history across pages', async () => {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        context: async () => [
+          { id: 'compact', type: 'compaction', status: 'completed' },
+          { id: 'answer', type: 'assistant' },
+        ],
+        messages: async (args) => {
+          calls.push(args);
+          return args.cursor
+            ? {
+                data: [{ id: 'baseline', type: 'user' }],
+                cursor: { next: 'even-older' },
+              }
+            : {
+                data: [
+                  { id: 'answer', type: 'assistant' },
+                  { id: 'compact', type: 'compaction', status: 'completed' },
+                ],
+                cursor: { next: 'older' },
+              };
+        },
+      }),
+    );
+    const result = await (
+      input.client as {
+        session: { messages: (args: unknown) => Promise<unknown> };
+      }
+    ).session.messages({
+      path: { id: 'ses_1' },
+      historyBoundary: 'baseline',
+    });
+    expect(result).toMatchObject({
+      data: [
+        { info: { id: 'baseline' } },
+        { info: { id: 'compact' } },
+        { info: { id: 'answer' } },
+      ],
+      page: { source: 'session.messages', complete: false },
+    });
+    expect(calls).toEqual([
+      { sessionID: 'ses_1', limit: 100, order: 'desc' },
+      { sessionID: 'ses_1', limit: 100, order: 'desc', cursor: 'older' },
+    ]);
+  });
+
+  test.each(['unavailable', 'malformed', 'repeated-cursor', 'empty'])(
+    'compacted history handles %s pages without trusting partial results',
+    async (scenario) => {
+      let calls = 0;
+      const input = buildPluginInput(
+        makeCtx({
+          context: async () => [
+            { id: 'compact', type: 'compaction', status: 'completed' },
+          ],
+          messages: async () => {
+            calls++;
+            if (calls === 1) {
+              return {
+                data: [{ id: 'answer', type: 'assistant' }],
+                cursor: { next: 'older' },
+              };
+            }
+            if (scenario === 'unavailable') throw new Error('history failed');
+            if (scenario === 'malformed') return { data: [null] };
+            return {
+              data: scenario === 'empty' ? [] : [{ id: 'old', type: 'user' }],
+              cursor: { next: 'older' },
+            };
+          },
+        }),
+      );
+      const pending = (
+        input.client as {
+          session: { messages: (args: unknown) => Promise<unknown> };
+        }
+      ).session.messages({
+        path: { id: 'ses_1' },
+        historyBoundary: 'baseline',
+      });
+      if (scenario === 'empty') {
+        expect(await pending).toMatchObject({
+          data: [{ info: { id: 'answer' } }],
+          page: { source: 'session.messages', complete: true },
+        });
+      } else {
+        await expect(pending).rejects.toThrow();
+      }
+      expect(calls).toBe(2);
+    },
+  );
+
+  test('compacted context remains incomplete on hosts without persisted messages', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        context: async () => [
+          { id: 'compact', type: 'compaction', status: 'completed' },
+        ],
+      }),
+    );
+    expect(
+      await (
+        input.client as {
+          session: { messages: (args: unknown) => Promise<unknown> };
+        }
+      ).session.messages({
+        path: { id: 'ses_1' },
+        historyBoundary: 'baseline',
+      }),
+    ).toMatchObject({
+      page: { source: 'session.context', complete: false },
+    });
+  });
+
+  test.each(['missing', 'last-page', 'too-far', 'oversized'])(
+    'compacted history enforces its total page budget for %s boundaries',
+    async (scenario) => {
+      let calls = 0;
+      const input = buildPluginInput(
+        makeCtx({
+          context: async () => [
+            { id: 'compact', type: 'compaction', status: 'completed' },
+          ],
+          messages: async () => {
+            calls++;
+            const found =
+              (scenario === 'last-page' && calls === 10) ||
+              (scenario === 'too-far' && calls === 11);
+            return {
+              data:
+                scenario === 'oversized'
+                  ? Array.from({ length: 101 }, (_, i) => ({ id: `msg_${i}` }))
+                  : [{ id: found ? 'baseline' : `msg_${calls}`, type: 'user' }],
+              cursor: { next: `cursor_${calls}` },
+            };
+          },
+        }),
+      );
+      const pending = (
+        input.client as {
+          session: { messages: (args: unknown) => Promise<unknown> };
+        }
+      ).session.messages({
+        path: { id: 'ses_1' },
+        historyBoundary: 'baseline',
+      });
+      if (scenario === 'last-page') {
+        const result = (await pending) as { data: unknown[] };
+        expect(result.data[0]).toMatchObject({ info: { id: 'baseline' } });
+      } else {
+        await expect(pending).rejects.toThrow();
+      }
+      expect(calls).toBe(scenario === 'oversized' ? 1 : 10);
+    },
+  );
+
+  test('compacted history has one time budget shared across all pages', async () => {
+    let now = 0;
+    let calls = 0;
+    const clock = spyOn(performance, 'now').mockImplementation(() => now);
+    try {
+      const input = buildPluginInput(
+        makeCtx({
+          context: async () => [
+            { id: 'compact', type: 'compaction', status: 'completed' },
+          ],
+          messages: async () => {
+            calls++;
+            now += 2500;
+            return {
+              data: [{ id: calls === 2 ? 'baseline' : 'msg_1', type: 'user' }],
+              cursor: { next: `cursor_${calls}` },
+            };
+          },
+        }),
+      );
+      await expect(
+        (
+          input.client as {
+            session: { messages: (args: unknown) => Promise<unknown> };
+          }
+        ).session.messages({
+          path: { id: 'ses_1' },
+          historyBoundary: 'baseline',
+        }),
+      ).rejects.toThrow('history read budget exceeded');
+      expect(calls).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('a held history page times out and cannot resume scanning when it resolves', async () => {
+    let calls = 0;
+    let release!: (page: unknown) => void;
+    try {
+      const input = buildPluginInput(
+        makeCtx({
+          context: async () => [
+            { id: 'compact', type: 'compaction', status: 'completed' },
+          ],
+          messages: async () => {
+            calls++;
+            return new Promise((resolve) => {
+              release = resolve;
+            });
+          },
+        }),
+      );
+      const pending = (
+        input.client as {
+          session: { messages: (args: unknown) => Promise<unknown> };
+        }
+      ).session.messages({
+        path: { id: 'ses_1' },
+        historyBoundary: 'baseline',
+      });
+      const rejected = expect(pending).rejects.toThrow(
+        'history read budget exceeded',
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      await rejected;
+      release({
+        data: [{ id: 'old', type: 'user' }],
+        cursor: { next: 'older' },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(calls).toBe(1);
+    } finally {
+      release?.({ data: [] });
+    }
+  });
+
+  test('compacted context with its identity boundary does not read history', async () => {
+    let historyCalls = 0;
+    const input = buildPluginInput(
+      makeCtx({
+        context: async () => [
+          { id: 'compact', type: 'compaction', status: 'completed' },
+          { id: 'baseline', type: 'user' },
+        ],
+        messages: async () => {
+          historyCalls++;
+          return { data: [] };
+        },
+      }),
+    );
+    const result = await (
+      input.client as {
+        session: { messages: (args: unknown) => Promise<unknown> };
+      }
+    ).session.messages({
+      path: { id: 'ses_1' },
+      historyBoundary: 'baseline',
+    });
+    expect(result).toMatchObject({
+      page: { source: 'session.context', complete: false },
+    });
+    expect(historyCalls).toBe(0);
   });
 
   test('promptAsync switches model then steers when body.model present', async () => {
@@ -451,13 +842,12 @@ describe('v2 client shim delegation', () => {
     expect((seq[0].i as { files: unknown[] }).files).toHaveLength(1);
   });
 
-  test('abort delegates to interrupt', async () => {
-    const calls: unknown[] = [];
+  test('abort sends interrupt with resume:false', async () => {
+    const calls: Array<Record<string, unknown>> = [];
     const input = buildPluginInput(
       makeCtx({
-        interrupt: async (i: unknown) => {
+        interrupt: async (i: Record<string, unknown>) => {
           calls.push(i);
-          return { interrupted: true };
         },
       } as never),
     );
@@ -466,7 +856,7 @@ describe('v2 client shim delegation', () => {
         session: { abort: (a: unknown) => Promise<unknown> };
       }
     ).session.abort({ path: { id: 'ses_1' } });
-    expect(calls).toEqual([{ sessionID: 'ses_1', continue: false }]);
+    expect(calls).toEqual([{ sessionID: 'ses_1', resume: false }]);
   });
 
   test('get delegates to session.get and wraps into {data}', async () => {
@@ -490,6 +880,26 @@ describe('v2 client shim delegation', () => {
     expect(res.data).toEqual({ id: 'ses_1', parentID: 'ses_0', title: 't' });
   });
 
+  test('session.update maps v1 rename body to v2 session.update', async () => {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        update: async (i: unknown) => {
+          calls.push(i);
+        },
+      } as never),
+    );
+    await (
+      input.client as {
+        session: { update: (a: unknown) => Promise<unknown> };
+      }
+    ).session.update({
+      path: { id: 'ses_1' },
+      body: { title: 'New title' },
+    });
+    expect(calls).toEqual([{ sessionID: 'ses_1', title: 'New title' }]);
+  });
+
   test('delete delegates to session.remove with the flat {sessionID}', async () => {
     const calls: unknown[] = [];
     const input = buildPluginInput(
@@ -504,8 +914,7 @@ describe('v2 client shim delegation', () => {
         session: { delete: (a: unknown) => Promise<unknown> };
       }
     ).session.delete({ path: { id: 'ses_tmp' }, query: { directory: '/d' } });
-    // The smartfetch secondary-model cleanup shape (path.id) must resolve
-    // to the flat v2 {sessionID} — no temp-session leak.
+    // The v1 call shape (path.id) must resolve to the flat v2 {sessionID}.
     expect(calls).toEqual([{ sessionID: 'ses_tmp' }]);
   });
 
@@ -701,20 +1110,6 @@ describe('v2 client shim delegation', () => {
       id: 'global',
       directory: process.cwd(),
     });
-  });
-
-  test('preserves the Phase 1 generateText channel', async () => {
-    const generateText = async (prompt: string) => ({ text: prompt });
-    const input = buildPluginInput(makeCtx({}), { generateText });
-    const channel = (
-      input as {
-        experimental_v2?: {
-          generateText?: (p: string) => Promise<{ text: string }>;
-        };
-      }
-    ).experimental_v2?.generateText;
-    expect(typeof channel).toBe('function');
-    expect(await channel?.('ping')).toEqual({ text: 'ping' });
   });
 
   test('omits experimental_v2 entirely without extras', () => {
@@ -1191,19 +1586,27 @@ describe('v2 client shim foreground-fallback integration', () => {
             'The previous model request failed and is being retried.',
           ),
         ],
-        model: { providerID: 'anthropic', modelID: 'claude-fallback' },
+        model: {
+          providerID: 'anthropic',
+          modelID: 'claude-fallback',
+          variant: 'high',
+        },
         agent: 'orchestrator',
       },
     });
 
-    // v2 semantics: switchModel first (v1 {providerID, modelID} → v2
-    // {id, providerID}), then a non-blocking steer prompt carrying both the
+    // v2 semantics: switchModel first (v1 {providerID, modelID, variant} →
+    // v2 {id, providerID, variant}), then a non-blocking steer prompt carrying both the
     // original user text and the synthetic reminder.
     expect(seq[0]).toMatchObject({
       m: 'switchModel',
       i: {
         sessionID: 'ses_1',
-        model: { id: 'claude-fallback', providerID: 'anthropic' },
+        model: {
+          id: 'claude-fallback',
+          providerID: 'anthropic',
+          variant: 'high',
+        },
       },
     });
     expect(seq[1]).toMatchObject({
@@ -1217,11 +1620,11 @@ describe('v2 client shim foreground-fallback integration', () => {
       'The previous model request failed',
     );
 
-    // Step 3: abort maps to interrupt with continue:false.
+    // Step 3: abort maps to interrupt with resume:false.
     await session.abort({ path: { id: 'ses_1' } });
     expect(seq[2]).toEqual({
       m: 'interrupt',
-      i: { sessionID: 'ses_1', continue: false },
+      i: { sessionID: 'ses_1', resume: false },
     });
   });
 
@@ -1263,6 +1666,146 @@ describe('v2 client shim foreground-fallback integration', () => {
       { type: 'text', text: 'hello' },
       { type: 'reasoning', text: 'inner' },
     ]);
+  });
+
+  // ── Task 4 live gap: terminal metadata must survive the mapping ──
+  //
+  // Live 2.0.8 incident: `session.context` returns full
+  // `SessionMessage.Info` entries (assistant turns carry
+  // `time.completed`, `finish`, `error`; tool parts carry
+  // `state.status`), but the mapping reduced `info` to `{id, role}` —
+  // every downstream classification degraded to pending/unknown and the
+  // terminal gate starved. The 2.0.8 `idle` marker that trails every
+  // finished session must map to the skippable v1 `system` role.
+
+  test('messages preserves v2 terminal metadata through the v1 mapping', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        context: async () => [
+          {
+            // Live 2.0.8 durable shape: flat user entry (text, no content).
+            id: 'msg_user',
+            type: 'user',
+            time: { created: 1789774955129 },
+            text: 'probe',
+          },
+          {
+            // Assistant turn carrying terminal metadata.
+            id: 'msg_turn',
+            type: 'assistant',
+            time: {
+              created: 1789774964894,
+              streamed: 1789774973110,
+              completed: 1789774973280,
+            },
+            finish: 'stop',
+            content: [
+              {
+                type: 'tool',
+                id: 'call_1',
+                name: 'glob',
+                state: {
+                  status: 'completed',
+                  input: { pattern: 'src/utils/*.ts' },
+                  content: [{ type: 'text', text: 'a.ts' }],
+                },
+                time: { created: 1789774971426 },
+              },
+              { type: 'text', text: 'PROBE-OK: 55' },
+            ],
+          },
+          {
+            // The 2.0.8 trailing idle lifecycle marker.
+            id: 'msg_idle',
+            type: 'idle',
+            time: { created: 1789774973283 },
+            outcome: 'succeeded',
+          },
+        ],
+      } as never),
+    );
+    const result = await (
+      input.client as {
+        session: {
+          messages: (a: unknown) => Promise<{ data: unknown[] }>;
+        };
+      }
+    ).session.messages({ sessionID: 'ses_1' });
+
+    expect(result.data).toHaveLength(3);
+    const [user, assistant, idle] = result.data as Array<{
+      info: Record<string, unknown>;
+      parts: Array<Record<string, unknown>>;
+    }>;
+    // User: flat entry, no content → empty parts; created time preserved.
+    expect(user.info).toMatchObject({
+      id: 'msg_user',
+      role: 'user',
+      time: { created: 1789774955129 },
+    });
+    expect(user.parts).toEqual([{ type: 'text', text: 'probe' }]);
+    expect(user.info.sourceType).toBe('user');
+    expect(idle.info).toMatchObject({
+      sourceType: 'idle',
+      outcome: 'succeeded',
+    });
+    // Assistant: time/finish preserved; tool state passes through in the
+    // v1 vocabulary the transcript classifier reads.
+    expect(assistant.info).toMatchObject({
+      id: 'msg_turn',
+      role: 'assistant',
+      time: {
+        created: 1789774964894,
+        completed: 1789774973280,
+      },
+      finish: 'stop',
+    });
+    expect(assistant.parts[0]).toMatchObject({
+      type: 'tool',
+      state: { status: 'completed' },
+    });
+    expect(assistant.parts[1]).toEqual({ type: 'text', text: 'PROBE-OK: 55' });
+    // Idle marker: lifecycle boundary, mapped to the skippable system
+    // role (never user/assistant content).
+    expect(idle.info).toMatchObject({
+      id: 'msg_idle',
+      role: 'system',
+      time: { created: 1789774973283 },
+    });
+    expect(idle.parts).toEqual([]);
+  });
+
+  test('messages preserves assistant error and finish state for failed turns', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        context: async () => [
+          {
+            id: 'msg_fail',
+            type: 'assistant',
+            time: { created: 1, completed: 2 },
+            finish: 'error',
+            error: { type: 'provider', message: 'detonated' },
+            content: [],
+          },
+        ],
+      } as never),
+    );
+    const result = await (
+      input.client as {
+        session: {
+          messages: (a: unknown) => Promise<{ data: unknown[] }>;
+        };
+      }
+    ).session.messages({ sessionID: 'ses_1' });
+    expect(result.data[0]).toMatchObject({
+      info: {
+        id: 'msg_fail',
+        role: 'assistant',
+        finish: 'error',
+        error: { type: 'provider', message: 'detonated' },
+      },
+      parts: [],
+    });
   });
 });
 
@@ -1378,8 +1921,8 @@ describe('v2 client shim degradation notices (one-time per process)', () => {
       const { initLogger, flushLoggerForTesting } = await import(
         process.env.LOGGER_MODULE_URL
       );
-      const { readFileSync } = await import('node:fs');
-      initLogger('client-shim-degradation');
+      const { readdirSync, readFileSync } = await import('node:fs');
+      initLogger();
       // Stock v2 plugin session domain: no list, no remove.
       const input = buildPluginInput({ session: {} });
       const session = input.client.session;
@@ -1388,7 +1931,16 @@ describe('v2 client shim degradation notices (one-time per process)', () => {
         await session.delete({ path: { id: 'ses_tmp' } });
       }
       await flushLoggerForTesting();
-      const contents = readFileSync(process.env.LOG_FILE_PATH, 'utf8');
+      const contents = readFileSync(
+        process.env.OPENCODE_LOG_DIR +
+          '/' +
+          readdirSync(process.env.OPENCODE_LOG_DIR).find(
+            (entry) =>
+              entry.startsWith('oh-my-opencode-slim.') &&
+              entry.endsWith('-' + process.pid + '.log'),
+          ),
+        'utf8',
+      );
       const lines = contents.split('\\n');
       console.log(
         JSON.stringify({
@@ -1437,5 +1989,95 @@ describe('v2 client shim degradation notices (one-time per process)', () => {
     // Three calls each, exactly one deterministic notice per capability.
     expect(counts.listWarnings).toBe(1);
     expect(counts.removeWarnings).toBe(1);
+  });
+});
+
+describe('v2 client shim prompt noReply delivery', () => {
+  async function promptThroughShim(body: Record<string, unknown>) {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        prompt: async (i: unknown) => {
+          calls.push(i);
+          return {};
+        },
+      } as never),
+    );
+    await (
+      input.client as {
+        session: { prompt: (a: unknown) => Promise<unknown> };
+      }
+    ).session.prompt({ path: { id: 'ses_1' }, body });
+    return calls[0] as Record<string, unknown>;
+  }
+
+  test('noReply without delivery queues without waking', async () => {
+    const call = await promptThroughShim({
+      noReply: true,
+      parts: [{ type: 'text', text: 'Update' }],
+    });
+    expect(call).toMatchObject({
+      sessionID: 'ses_1',
+      delivery: 'queue',
+      resume: false,
+    });
+  });
+
+  test('noReply with explicit steer steers without waking', async () => {
+    const call = await promptThroughShim({
+      noReply: true,
+      delivery: 'steer',
+      parts: [{ type: 'text', text: 'Update' }],
+    });
+    expect(call).toMatchObject({
+      sessionID: 'ses_1',
+      delivery: 'steer',
+      resume: false,
+    });
+  });
+
+  test('noReply with garbage delivery falls back to queue', async () => {
+    const call = await promptThroughShim({
+      noReply: true,
+      delivery: 'push',
+      parts: [{ type: 'text', text: 'Update' }],
+    });
+    expect(call).toMatchObject({
+      sessionID: 'ses_1',
+      delivery: 'queue',
+      resume: false,
+    });
+  });
+
+  test('prompt without noReply steers', async () => {
+    const call = await promptThroughShim({
+      parts: [{ type: 'text', text: 'Update' }],
+    });
+    expect(call).toMatchObject({ sessionID: 'ses_1', delivery: 'steer' });
+    expect(call).not.toHaveProperty('resume');
+  });
+});
+
+describe('experimental_v2 model domain threading', () => {
+  test('extras.modelDomain lands in experimental_v2', () => {
+    const list = async () => ({ data: [] });
+    const input = buildPluginInput(
+      { app: { name: 't', version: '0' } } as never,
+      { modelDomain: { list } },
+    );
+    expect(
+      (input as { experimental_v2?: { modelDomain?: unknown } }).experimental_v2
+        ?.modelDomain,
+    ).toBeInstanceOf(Object);
+  });
+
+  test('absent extras leave no modelDomain key', () => {
+    const input = buildPluginInput({
+      app: { name: 't', version: '0' },
+    } as never);
+    expect(
+      (input as { experimental_v2?: { modelDomain?: unknown } }).experimental_v2
+        ?.modelDomain,
+    ).toBeUndefined();
   });
 });

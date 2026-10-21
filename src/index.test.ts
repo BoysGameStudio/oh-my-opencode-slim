@@ -1,28 +1,77 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  jest,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test';
+import { readdirSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import * as os from 'node:os';
 import path from 'node:path';
-import type { MultiplexerConfig } from './config';
-import pluginModuleDefault, {
-  OhMyOpenCodeLite as plugin,
-  sessionManagerMultiplexerConfig,
-  shouldEnableMultiplexer,
-} from './index';
-import { CACHE } from './tools/smartfetch/cache';
-import { readTuiSnapshot, snapshotSectionsEqual } from './tui-state';
+import type { RegistryFactoryBridge } from './agents/registry-bridge';
+import {
+  companionSessionIdForDirectory,
+  stateFilePath,
+} from './companion/manager';
+import { RuntimeConfig } from './config/runtime';
+import * as wakeHooks from './hooks';
+import { isTaggedPart, stripTaggedContent } from './hooks/cache-safe-injection';
+import { JSON_ERROR_REMINDER } from './hooks/json-error-recovery/hook';
+import {
+  getWakeProgress,
+  resetOrchestratorWakeGateForTests,
+} from './hooks/orchestrator-wake/wake-gate';
+import { PHASE_REMINDER_METADATA_KEY } from './hooks/phase-reminder';
+import { BACKGROUND_JOB_BOARD_METADATA_KEY } from './hooks/task-session-manager';
+import {
+  clearChildInputWaitsForSession,
+  listChildInputWaits,
+  noteChildInputWait,
+  resetChildInputWaitForTests,
+} from './hooks/task-session-manager/child-input-wait';
+import * as trackerModule from './hooks/task-session-manager/revived-run-tracker';
+import { LOOP_GUARD_WARNING } from './hooks/tool-loop-guard/hook';
+import type { MessageWithParts } from './hooks/types';
+import pluginModuleDefault, { OhMyOpenCodeLite as plugin } from './index';
+import { MarketplaceStore } from './marketplace/store';
+import { createBuiltinMcps } from './mcp';
+import {
+  getTuiStatePath,
+  readTuiSnapshot,
+  snapshotSectionsEqual,
+  updateSnapshot,
+} from './tui-state';
+import type {
+  BackgroundJobEvictedSession,
+  BackgroundJobBoard as ProductionBoard,
+} from './utils/background-job-board';
+import { BackgroundJobCoordinator } from './utils/background-job-coordinator';
+import { BackgroundJobBoard } from './utils/background-job-fixture';
+import { resetLiveDirectoriesForTests } from './utils/event-directory-scope';
 import { createInternalAgentTextPart } from './utils/internal-initiator';
+import * as loggerModule from './utils/logger';
+import { pendingSessionPrune } from './utils/pending-session-prunes';
 
 function createPluginClient(
   noop: () => Promise<unknown>,
   abort?: (input: { path: { id: string } }) => Promise<unknown>,
+  sessionOverrides: Record<string, unknown> = {},
 ) {
-  const session = new Proxy(abort ? { abort } : {}, {
-    get(target, property) {
-      if (property in target) {
-        return target[property as keyof typeof target];
-      }
-      return noop;
+  const session = new Proxy(
+    { ...sessionOverrides, ...(abort ? { abort } : {}) },
+    {
+      get(target, property) {
+        if (property in target) {
+          return target[property as keyof typeof target];
+        }
+        return noop;
+      },
     },
-  }) as Record<string, unknown>;
+  ) as Record<string, unknown>;
   return new Proxy(
     { app: { log: noop }, session },
     {
@@ -96,25 +145,40 @@ describe('plugin env disable', () => {
 });
 
 describe('plugin tool registration', () => {
-  let originalEnv: typeof process.env;
+  const ENV_KEYS = [
+    'OH_MY_OPENCODE_SLIM_DISABLE',
+    'OPENCODE_CONFIG_DIR',
+    'XDG_CONFIG_HOME',
+    'XDG_DATA_HOME',
+    'XDG_CACHE_HOME',
+    'OPENCODE_LOG_DIR',
+  ] as const;
+  const originalEnv: Partial<
+    Record<(typeof ENV_KEYS)[number], string | undefined>
+  > = {};
 
   beforeEach(() => {
-    originalEnv = { ...process.env };
+    for (const key of ENV_KEYS) {
+      originalEnv[key] = process.env[key];
+    }
     delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
-    process.env.OPENCODE_CONFIG_DIR =
-      '/private/tmp/oh-my-opencode-slim-hitl-empty-config';
-    process.env.XDG_CONFIG_HOME =
-      '/private/tmp/oh-my-opencode-slim-hitl-empty-xdg';
-    process.env.XDG_DATA_HOME =
-      '/private/tmp/oh-my-opencode-slim-hitl-empty-data';
-    process.env.XDG_CACHE_HOME =
-      '/private/tmp/oh-my-opencode-slim-hitl-empty-cache';
-    process.env.OPENCODE_LOG_DIR =
-      '/private/tmp/oh-my-opencode-slim-hitl-empty-logs';
+    const base = path.join(os.tmpdir(), 'oh-my-opencode-slim-hitl-empty');
+    process.env.OPENCODE_CONFIG_DIR = `${base}-config`;
+    process.env.XDG_CONFIG_HOME = `${base}-xdg`;
+    process.env.XDG_DATA_HOME = `${base}-data`;
+    process.env.XDG_CACHE_HOME = `${base}-cache`;
+    process.env.OPENCODE_LOG_DIR = `${base}-logs`;
   });
 
   afterEach(() => {
-    process.env = originalEnv;
+    for (const key of ENV_KEYS) {
+      const orig = originalEnv[key];
+      if (orig === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = orig;
+      }
+    }
   });
 
   test('registers wait_for_user and recovers a stale orchestrator session mapping', async () => {
@@ -143,17 +207,57 @@ describe('plugin tool registration', () => {
     } as never);
 
     expect(hooks.tool?.task_status).toBeDefined();
-    expect(hooks.tool?.task_result).toBeDefined();
     expect(hooks.tool?.task_message).toBeDefined();
     expect(hooks.tool?.task_cancel).toBeDefined();
     expect(hooks.tool?.task_revive).toBeDefined();
     expect(hooks.tool?.wait_for_user).toBeDefined();
+    expect(hooks.tool?.marketplace_inspect).toBeDefined();
+    expect(hooks.tool?.marketplace_manage).toBeDefined();
     await expect(
       hooks.tool?.wait_for_user?.execute(
         { reason: 'Complete the external approval.' },
         { sessionID: 'parent-after-reload', agent: 'orchestrator' } as never,
       ),
     ).resolves.toContain('state: waiting_for_user');
+  });
+
+  test('v2 host leaves wait_for_user unregistered', async () => {
+    const projectDir = await mkdtemp('/tmp/oh-my-opencode-slim-wfu-gate-');
+    const noop = async () => ({});
+    const session = new Proxy({}, { get: () => noop }) as Record<
+      string,
+      unknown
+    >;
+    const client = new Proxy(
+      { app: { log: noop }, session },
+      {
+        get(target, property) {
+          if (property in target) {
+            return target[property as keyof typeof target];
+          }
+          return new Proxy({}, { get: () => noop });
+        },
+      },
+    );
+    const baseInput = {
+      client,
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+      hostFlavor: 'v2',
+    } as never;
+
+    try {
+      // v2 never registers wait_for_user: the native `question` tool
+      // covers the blocking boundary there. The rest of the surface is
+      // intact.
+      const hooks = await plugin(baseInput);
+      expect(hooks.tool?.task_status).toBeDefined();
+      expect(hooks.tool?.wait_for_user).toBeUndefined();
+      await hooks.dispose?.();
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
   });
 
   test('does not retain loop-guard state when search-path validation rejects', async () => {
@@ -237,6 +341,769 @@ describe('plugin tool registration', () => {
     expect(hooks.dispose).toBeFunction();
     await hooks.dispose?.();
     await hooks.dispose?.();
+  });
+
+  test('activates only marketplace packages selected by the resolved preset at first host finalization', async () => {
+    const originalEnv = { ...process.env };
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), 'oh-my-opencode-slim-marketplace-finalize-'),
+    );
+    const configDir = path.join(root, 'config');
+    const dataDir = path.join(root, 'data');
+    await mkdir(configDir, { recursive: true });
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_DATA_HOME: dataDir,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    const packageManifest = (id: string, agentName: string) => ({
+      schemaVersion: 2,
+      id,
+      version: '1.0.0',
+      displayName: agentName,
+      description: 'Selected package agent',
+      agentName,
+      prompt: 'Package prompt',
+      skills: [],
+      mcps: [],
+      tools: ['read'],
+      author: { name: 'Test author' },
+      tags: [],
+      license: 'MIT',
+      compatibility: { plugin: '>=1.0.0' },
+      model: {
+        source: 'explicit',
+        candidates: ['provider/package', 'provider/package-fallback'],
+      },
+      routing: {
+        description: 'Package lane',
+        when: 'Package task',
+        keywords: ['package'],
+      },
+    });
+    const store = new MarketplaceStore({ pluginVersion: '2.2.25' });
+    store.install({
+      manifest: packageManifest('team/selected', 'selected-agent') as never,
+    });
+    store.install({
+      manifest: packageManifest('team/unselected', 'unselected-agent') as never,
+    });
+    await Bun.write(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        preset: 'active',
+        fallback: { enabled: true, maxRetries: 0 },
+        agents: {
+          'selected-agent': {
+            displayName: 'SelectedVisible',
+            model: 'owner/selected',
+          },
+        },
+        presets: {
+          active: { marketplace: { agents: ['team/selected'] } },
+        },
+      }),
+    );
+    const fallbackPrompts: unknown[] = [];
+    const hooks = await plugin({
+      client: createPluginClient(async () => ({}), undefined, {
+        messages: async () => ({
+          data: [
+            {
+              info: { role: 'user' },
+              parts: [{ type: 'text', text: 'Please use the package agent.' }],
+            },
+          ],
+        }),
+        promptAsync: async (input: unknown) => {
+          fallbackPrompts.push(input);
+          return {};
+        },
+      }),
+      directory: root,
+      worktree: root,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+    const hostConfig = {
+      agent: {
+        orchestrator: { displayName: 'Lead' },
+        Lead: { prompt: 'Visible host orchestrator prompt' },
+        'selected-agent': {
+          model: 'provider/host-selected',
+          variant: 'host-variant',
+        },
+      },
+    };
+    try {
+      await expect(
+        hooks.tool?.marketplace_inspect?.execute({ action: 'status' }, {
+          agent: 'Lead',
+        } as never),
+      ).rejects.toThrow('until the agent registry is finalized');
+      await hooks.config?.(hostConfig);
+      const registryBridge = (
+        hooks as unknown as {
+          registryBridge: RegistryFactoryBridge;
+        }
+      ).registryBridge;
+      const initialStatus = registryBridge.marketplaceService.status();
+      expect(initialStatus.liveAvailable).toBe(true);
+      expect(initialStatus.reloadRequired).toBe(false);
+      await hooks.config?.(hostConfig);
+      const replayStatus = registryBridge.marketplaceService.status();
+      expect(replayStatus.reloadRequired).toBe(false);
+      expect(replayStatus.diagnostics).not.toContain(
+        'The current host agent snapshot is not trustworthy for desired marketplace status',
+      );
+      registryBridge.finalize(structuredClone(hostConfig) as never, {});
+      expect(registryBridge.marketplaceService.status().reloadRequired).toBe(
+        false,
+      );
+      await expect(
+        hooks.tool?.marketplace_inspect?.execute({ action: 'status' }, {
+          agent: 'Lead',
+        } as never),
+      ).resolves.toContain('"liveAvailable": true');
+      await hooks.tool?.marketplace_manage?.execute(
+        { action: 'enable', target: 'team/unselected' },
+        { agent: 'orchestrator' } as never,
+      );
+      const persistedActivation = readFileSync(
+        path.join(root, '.opencode', 'oh-my-opencode-slim.jsonc'),
+        'utf8',
+      );
+      expect(persistedActivation).toContain('team/unselected');
+      expect(
+        readFileSync(path.join(configDir, 'oh-my-opencode-slim.json'), 'utf8'),
+      ).not.toContain('team/unselected');
+      expect(hostConfig.agent).not.toHaveProperty('unselected-agent');
+
+      const localSkillDir = path.join(
+        root,
+        '.opencode',
+        'skills',
+        'local-skill',
+      );
+      await mkdir(localSkillDir, { recursive: true });
+      await Bun.write(
+        path.join(localSkillDir, 'SKILL.md'),
+        '---\nname: local-skill\ndescription: Local skill fixture\n---\n',
+      );
+      await Bun.write(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        JSON.stringify({
+          preset: 'active',
+          fallback: { enabled: true, maxRetries: 0 },
+          agents: {
+            'selected-agent': {
+              prompt: 'Changed prompt',
+              displayName: 'ChangedVisible',
+              model: 'owner/changed',
+              permission: { read: 'deny' },
+              skills: ['base-skill', 'removed-skill'],
+              skills_add: ['added-skill'],
+              skills_remove: ['removed-skill'],
+              skills_include_local: true,
+            },
+          },
+          presets: {
+            active: { marketplace: { agents: ['team/selected'] } },
+          },
+        }),
+      );
+      expect(registryBridge.marketplaceService.status().reloadRequired).toBe(
+        true,
+      );
+      await hooks.config?.({
+        agent: {
+          explorer: { model: 'provider/inherited-model-drift' },
+          'selected-agent': {
+            model: 'provider/host-override-drift',
+            prompt: 'Host override drift',
+            displayName: 'HostSelected',
+          },
+        },
+      });
+      expect(registryBridge.marketplaceService.status().reloadRequired).toBe(
+        true,
+      );
+      expect(hostConfig.agent).toHaveProperty('selected-agent');
+      expect(hostConfig.agent).not.toHaveProperty('unselected-agent');
+      expect(hostConfig.agent).not.toHaveProperty('changed_baseline');
+      const visiblePrompt = (
+        hostConfig.agent as Record<string, { prompt?: string }>
+      ).Lead?.prompt;
+      expect(visiblePrompt).toContain('Visible host orchestrator prompt');
+      expect(visiblePrompt).toContain('@SelectedVisible');
+      expect(visiblePrompt).not.toContain('@unselected-agent');
+      expect(visiblePrompt?.match(/<Marketplace agents>/g)).toHaveLength(1);
+      await hooks['chat.message']?.(
+        {
+          sessionID: 'marketplace-system-transform',
+          agent: 'orchestrator',
+          model: { providerID: 'provider', modelID: 'main' },
+        } as never,
+        {} as never,
+      );
+      const system = [
+        [
+          'You are powered by the model named provider/main.',
+          '<env>',
+          '  Working directory: /tmp',
+          '</env>',
+        ].join('\n'),
+      ];
+      await hooks['experimental.chat.system.transform']?.(
+        { sessionID: 'marketplace-system-transform' } as never,
+        { system } as never,
+      );
+      expect(system.join('\n')).toContain('Visible host orchestrator prompt');
+      expect(system.join('\n')).toContain('@SelectedVisible');
+      expect(system.join('\n')).not.toContain('@unselected-agent');
+      await hooks.event?.({
+        event: {
+          type: 'subagent.session.created',
+          properties: {
+            sessionID: 'marketplace-fallback',
+            agentName: 'SelectedVisible',
+          },
+        },
+      } as never);
+      await hooks.event?.({
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: {
+              sessionID: 'marketplace-fallback',
+              providerID: 'provider',
+              modelID: 'host-selected',
+              role: 'assistant',
+              agent: 'SelectedVisible',
+            },
+          },
+        },
+      } as never);
+      await hooks.event?.({
+        event: {
+          type: 'session.error',
+          properties: {
+            sessionID: 'marketplace-fallback',
+            error: { message: 'rate limit exceeded' },
+          },
+        },
+      } as never);
+      expect(fallbackPrompts).toHaveLength(1);
+      expect(JSON.stringify(fallbackPrompts[0])).toContain(
+        '"modelID":"package"',
+      );
+      await hooks.event?.({
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: {
+              sessionID: 'marketplace-fallback',
+              providerID: 'provider',
+              modelID: 'package',
+              role: 'assistant',
+              agent: 'SelectedVisible',
+            },
+          },
+        },
+      } as never);
+      await hooks.event?.({
+        event: {
+          type: 'session.error',
+          properties: {
+            sessionID: 'marketplace-fallback',
+            error: { message: 'rate limit exceeded again' },
+          },
+        },
+      } as never);
+      expect(fallbackPrompts).toHaveLength(2);
+      expect(JSON.stringify(fallbackPrompts[1])).toContain('package-fallback');
+
+      const generationB = await plugin({
+        client: createPluginClient(async () => ({})),
+        directory: root,
+        worktree: root,
+        serverUrl: new URL('http://127.0.0.1:4096'),
+      } as never);
+      await generationB.config?.({ agent: {} });
+      const bridgeB = (
+        generationB as unknown as {
+          registryBridge: RegistryFactoryBridge;
+        }
+      ).registryBridge;
+      expect(bridgeB.marketplaceService.status().reloadRequired).toBe(false);
+      await generationB.dispose?.();
+    } finally {
+      await hooks.dispose?.();
+      process.env = originalEnv;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('v1 config hook rejects selected packages with MCPs absent from an MCP-less host config', async () => {
+    const originalEnv = { ...process.env };
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), 'oh-my-opencode-slim-marketplace-mcp-'),
+    );
+    const configDir = path.join(root, 'config');
+    await mkdir(configDir, { recursive: true });
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_DATA_HOME: path.join(root, 'data'),
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    const store = new MarketplaceStore({ pluginVersion: '2.2.25' });
+    store.install({
+      manifest: {
+        schemaVersion: 2,
+        id: 'team/requires-mcp',
+        version: '1.0.0',
+        displayName: 'Requires MCP',
+        description: 'MCP requirement fixture',
+        agentName: 'requires-mcp-agent',
+        prompt: 'Use the required MCP.',
+        skills: [],
+        mcps: ['missing-mcp'],
+        tools: ['read'],
+        author: { name: 'Test author' },
+        tags: [],
+        license: 'MIT',
+        compatibility: { plugin: '>=1.0.0' },
+        model: { source: 'explicit', candidates: ['provider/package'] },
+        routing: {
+          description: 'MCP fixture',
+          when: 'An MCP test is needed.',
+          keywords: ['mcp'],
+        },
+      } as never,
+    });
+    await Bun.write(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        preset: 'active',
+        presets: { active: { marketplace: { agents: ['team/requires-mcp'] } } },
+      }),
+    );
+    const hooks = await plugin({
+      client: createPluginClient(async () => ({})),
+      directory: root,
+      worktree: root,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+    try {
+      await expect(hooks.config?.({ agent: {} })).rejects.toThrow(
+        'missing-required-dependency',
+      );
+    } finally {
+      await hooks.dispose?.();
+      process.env = originalEnv;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('fresh desired projection uses newly enabled builtin MCPs', async () => {
+    const originalEnv = { ...process.env };
+    const root = await mkdtemp(
+      '/tmp/oh-my-opencode-slim-marketplace-fresh-mcp-',
+    );
+    const configDir = path.join(root, 'config');
+    await mkdir(configDir, { recursive: true });
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_DATA_HOME: path.join(root, 'data'),
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    const store = new MarketplaceStore({ pluginVersion: '2.2.25' });
+    store.install({
+      manifest: {
+        schemaVersion: 2,
+        id: 'team/requires-context7',
+        version: '1.0.0',
+        displayName: 'Requires Context7',
+        description: 'Fresh MCP config fixture',
+        agentName: 'requires-context7-agent',
+        prompt: 'Use Context7.',
+        skills: [],
+        mcps: ['context7'],
+        tools: ['read'],
+        author: { name: 'Test author' },
+        tags: [],
+        license: 'MIT',
+        compatibility: { plugin: '>=1.0.0' },
+        model: { source: 'explicit', candidates: ['provider/package'] },
+        routing: {
+          description: 'MCP fixture',
+          when: 'A Context7 test is needed.',
+          keywords: ['context7'],
+        },
+      } as never,
+    });
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    await Bun.write(
+      configPath,
+      JSON.stringify({
+        preset: 'inactive',
+        disabled_mcps: ['context7'],
+        presets: {
+          inactive: { marketplace: { agents: [] } },
+          active: {
+            marketplace: { agents: ['team/requires-context7'] },
+          },
+        },
+      }),
+    );
+    const hooks = await plugin({
+      client: createPluginClient(async () => ({})),
+      directory: root,
+      worktree: root,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+    try {
+      await hooks.config?.({ agent: {}, mcp: {} });
+      const registryBridge = (
+        hooks as unknown as { registryBridge: RegistryFactoryBridge }
+      ).registryBridge;
+      await Bun.write(
+        configPath,
+        JSON.stringify({
+          preset: 'active',
+          disabled_mcps: [],
+          presets: {
+            inactive: { marketplace: { agents: [] } },
+            active: {
+              marketplace: { agents: ['team/requires-context7'] },
+            },
+          },
+        }),
+      );
+
+      const status = registryBridge.marketplaceService.status();
+      expect(status.reloadRequired).toBe(true);
+      expect(status.diagnostics).toEqual([]);
+    } finally {
+      await hooks.dispose?.();
+      process.env = originalEnv;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('user-defined MCP override wins and reconciles back when removed', async () => {
+    const originalEnv = { ...process.env };
+    const root = await mkdtemp('/tmp/oh-my-opencode-slim-mcp-override-');
+    const configDir = path.join(root, 'config');
+    await mkdir(configDir, { recursive: true });
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_DATA_HOME: path.join(root, 'data'),
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await Bun.write(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        preset: 'active',
+        presets: { active: { marketplace: { agents: [] } } },
+      }),
+    );
+    const hooks = await plugin({
+      client: createPluginClient(async () => ({})),
+      directory: root,
+      worktree: root,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+    try {
+      // 1. The host config overrides a built-in key (issue #1290).
+      const userGhGrep = {
+        type: 'remote',
+        url: 'https://user.example.com/mcp',
+      };
+      const hostConfig: Record<string, unknown> = {
+        mcp: { gh_grep: userGhGrep },
+      };
+      await hooks.config?.(hostConfig);
+      const merged = hostConfig.mcp as Record<string, unknown>;
+      expect(merged.gh_grep).toEqual(userGhGrep);
+      expect(merged.context7).toBeDefined();
+
+      // 2. The live export drops the overridden built-in, keeps the rest.
+      const exported = (hooks as unknown as { mcp: Record<string, unknown> })
+        .mcp;
+      expect(exported).not.toHaveProperty('gh_grep');
+      expect(exported).toHaveProperty('context7');
+
+      // 3. User removes the override in the same process: both the merged
+      // config and the export must regain the built-in gh_grep. Delete-only
+      // reconciliation left the export pruned forever here.
+      const secondConfig: Record<string, unknown> = { mcp: {} };
+      await hooks.config?.(secondConfig);
+      const rebuilt = secondConfig.mcp as Record<string, unknown>;
+      expect(rebuilt.gh_grep).toEqual(createBuiltinMcps().gh_grep);
+      expect(rebuilt.gh_grep).not.toEqual(userGhGrep);
+      expect(rebuilt.context7).toBeDefined();
+      expect(exported).toHaveProperty('gh_grep');
+      expect(exported.gh_grep).toEqual(createBuiltinMcps().gh_grep);
+    } finally {
+      await hooks.dispose?.();
+      process.env = originalEnv;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('config re-invocation with the same mutated object keeps built-ins', async () => {
+    const originalEnv = { ...process.env };
+    const root = await mkdtemp('/tmp/oh-my-opencode-slim-mcp-reinvoke-');
+    const configDir = path.join(root, 'config');
+    await mkdir(configDir, { recursive: true });
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_DATA_HOME: path.join(root, 'data'),
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await Bun.write(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        preset: 'active',
+        presets: { active: { marketplace: { agents: [] } } },
+      }),
+    );
+    const hooks = await plugin({
+      client: createPluginClient(async () => ({})),
+      directory: root,
+      worktree: root,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+    try {
+      const userGhGrep = {
+        type: 'remote',
+        url: 'https://user.example.com/mcp',
+      };
+      const hostConfig: Record<string, unknown> = {
+        mcp: { gh_grep: userGhGrep },
+      };
+      await hooks.config?.(hostConfig);
+      const exportRef = (hooks as unknown as { mcp: Record<string, unknown> })
+        .mcp;
+      expect(exportRef).toHaveProperty('context7');
+      expect(exportRef).not.toHaveProperty('gh_grep');
+
+      // The host hands back the very object the first call mutated (its
+      // `mcp` now holds the plugin-injected built-ins). Those must not be
+      // re-read as user-defined entries and pruned from the live export.
+      await hooks.config?.(hostConfig);
+      const merged = hostConfig.mcp as Record<string, unknown>;
+      expect(merged.context7).toBeDefined();
+      expect(merged.gh_grep).toEqual(userGhGrep);
+      expect((hooks as unknown as { mcp: Record<string, unknown> }).mcp).toBe(
+        exportRef,
+      );
+      expect(exportRef).toHaveProperty('context7');
+      expect(exportRef).not.toHaveProperty('gh_grep');
+      expect(exportRef.context7).toEqual(createBuiltinMcps().context7);
+    } finally {
+      await hooks.dispose?.();
+      process.env = originalEnv;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('marketplace status follows the active runtime preset over disk and environment selection', async () => {
+    const originalEnv = { ...process.env };
+    const root = await mkdtemp(
+      '/tmp/oh-my-opencode-slim-marketplace-runtime-preset-',
+    );
+    const configDir = path.join(root, 'config');
+    const dataDir = path.join(root, 'data');
+    await mkdir(configDir, { recursive: true });
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_DATA_HOME: dataDir,
+      OH_MY_OPENCODE_SLIM_PRESET: 'disk',
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    const packageManifest = (id: string, agentName: string) => ({
+      schemaVersion: 2,
+      id,
+      version: '1.0.0',
+      displayName: agentName,
+      description: 'Preset selection fixture',
+      agentName,
+      prompt: 'Preset fixture prompt',
+      skills: [],
+      mcps: [],
+      tools: ['read'],
+      author: { name: 'Test author' },
+      tags: [],
+      license: 'MIT',
+      compatibility: { plugin: '>=1.0.0' },
+      model: { source: 'explicit', candidates: ['provider/package'] },
+      routing: {
+        description: 'Preset package',
+        when: 'A preset package is needed.',
+        keywords: ['preset'],
+      },
+    });
+    const pluginConfig = {
+      preset: 'disk',
+      presets: {
+        disk: { marketplace: { agents: ['team/disk-preset'] } },
+        runtime: { marketplace: { agents: ['team/runtime-preset'] } },
+      },
+    } as Parameters<typeof RuntimeConfig.init>[1];
+    RuntimeConfig.reset(root);
+    RuntimeConfig.init(root, pluginConfig).setRuntimePreset('runtime');
+    const store = new MarketplaceStore({ pluginVersion: '2.2.25' });
+    store.install({
+      manifest: packageManifest('team/disk-preset', 'disk-agent') as never,
+    });
+    store.install({
+      manifest: packageManifest(
+        'team/runtime-preset',
+        'runtime-agent',
+      ) as never,
+    });
+    await Bun.write(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify(pluginConfig),
+    );
+    const hooks = await plugin({
+      client: createPluginClient(async () => ({})),
+      directory: root,
+      worktree: root,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+    try {
+      await hooks.config?.({ agent: {}, mcp: {} });
+      const marketplaceService = (
+        hooks as unknown as { registryBridge: RegistryFactoryBridge }
+      ).registryBridge.marketplaceService;
+      const status = marketplaceService.status();
+      expect(status.desiredPackageIds).toEqual(['team/runtime-preset']);
+      expect(status.livePackages?.map(({ id }) => id)).toEqual([
+        'team/runtime-preset',
+      ]);
+      expect(status.reloadRequired).toBe(false);
+      expect(marketplaceService.requestReload().reloadRequired).toBe(false);
+
+      await Bun.write(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        JSON.stringify({
+          preset: 'disk',
+          presets: {
+            disk: { marketplace: { agents: ['team/disk-preset'] } },
+          },
+        }),
+      );
+      const deletedOverrideStatus = marketplaceService.status();
+      expect(deletedOverrideStatus.desiredPackageIds).toEqual([
+        'team/disk-preset',
+      ]);
+      expect(deletedOverrideStatus.livePackages?.map(({ id }) => id)).toEqual([
+        'team/runtime-preset',
+      ]);
+      expect(deletedOverrideStatus.reloadRequired).toBe(true);
+      expect(marketplaceService.requestReload().reloadRequired).toBe(true);
+    } finally {
+      await hooks.dispose?.();
+      RuntimeConfig.reset(root);
+      process.env = originalEnv;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('broken selected preset inheritance falls back to baseline agents at startup', async () => {
+    const originalEnv = { ...process.env };
+    const invalidPresetCases = [
+      {
+        selected: 'broken',
+        presets: {
+          broken: {
+            extends: 'missing-parent',
+            marketplace: { agents: ['team/selected'] },
+          },
+        },
+      },
+      {
+        selected: 'first',
+        presets: {
+          first: {
+            extends: 'second',
+            marketplace: { agents: ['team/selected'] },
+          },
+          second: { extends: 'first' },
+        },
+      },
+    ];
+    const packageManifest = {
+      schemaVersion: 2,
+      id: 'team/selected',
+      version: '1.0.0',
+      displayName: 'Selected package',
+      description: 'Must not activate from an invalid preset chain',
+      agentName: 'selected-agent',
+      prompt: 'Package prompt',
+      skills: [],
+      mcps: [],
+      tools: ['read'],
+      author: { name: 'Test author' },
+      tags: [],
+      license: 'MIT',
+      compatibility: { plugin: '>=1.0.0' },
+      model: { source: 'explicit', candidates: ['provider/package'] },
+      routing: {
+        description: 'Package lane',
+        when: 'Package task',
+        keywords: ['package'],
+      },
+    };
+    try {
+      for (const invalidPreset of invalidPresetCases) {
+        const root = await mkdtemp(
+          '/tmp/oh-my-opencode-slim-invalid-marketplace-preset-',
+        );
+        const configDir = path.join(root, 'config');
+        await mkdir(configDir, { recursive: true });
+        process.env = {
+          ...originalEnv,
+          OPENCODE_CONFIG_DIR: configDir,
+          XDG_DATA_HOME: path.join(root, 'data'),
+        };
+        delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+        const store = new MarketplaceStore({ pluginVersion: '2.2.25' });
+        store.install({ manifest: packageManifest as never });
+        await Bun.write(
+          path.join(configDir, 'oh-my-opencode-slim.json'),
+          JSON.stringify({
+            preset: invalidPreset.selected,
+            presets: invalidPreset.presets,
+          }),
+        );
+        const hooks = await plugin({
+          client: createPluginClient(async () => ({})),
+          directory: root,
+          worktree: root,
+          serverUrl: new URL('http://127.0.0.1:4096'),
+        } as never);
+        try {
+          const hostConfig = { agent: {} as Record<string, unknown> };
+          await hooks.config?.(hostConfig);
+          expect(hostConfig.agent).toHaveProperty('explorer');
+          expect(hostConfig.agent).not.toHaveProperty('selected-agent');
+        } finally {
+          await hooks.dispose?.();
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      process.env = originalEnv;
+    }
   });
 
   test('disposes generation one timers and fresh generation two supervises launches', async () => {
@@ -341,6 +1208,1155 @@ describe('plugin tool registration', () => {
       Date.now = originalNow;
       await rm(configDir, { recursive: true, force: true });
     }
+  });
+
+  test('disposing a plugin generation retracts its board spinner before same-PID re-init', async () => {
+    const originalEnv = { ...process.env };
+    const projectDir = await mkdtemp('/tmp/oh-my-opencode-slim-generation-');
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: projectDir,
+      XDG_DATA_HOME: `${projectDir}/data`,
+      XDG_CACHE_HOME: `${projectDir}/cache`,
+      OPENCODE_LOG_DIR: `${projectDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({ companion: { enabled: false } }),
+    );
+    const createHooks = () =>
+      plugin({
+        client: createPluginClient(async () => ({})),
+        directory: projectDir,
+        worktree: projectDir,
+        serverUrl: new URL('http://127.0.0.1:4096'),
+      } as never);
+    let first: Awaited<ReturnType<typeof plugin>> | undefined;
+    let second: Awaited<ReturnType<typeof plugin>> | undefined;
+    try {
+      first = await createHooks();
+      await first['tool.execute.before']?.(
+        { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
+        {
+          args: {
+            subagent_type: 'explorer',
+            background: true,
+            description: 'generation one child',
+          },
+        },
+      );
+      await first['tool.execute.after']?.(
+        { tool: 'task', sessionID: 'parent-1', callID: 'call-1' },
+        { output: 'task_id: child-generation-1\nstate: running' },
+      );
+      expect(
+        readTuiSnapshot(projectDir).reusableByAgent['parent-1']?.explorer?.[0]
+          ?.taskID,
+      ).toBe('child-generation-1');
+
+      await first.dispose?.();
+      second = await createHooks();
+      expect(
+        readTuiSnapshot(projectDir).reusableByAgent['parent-1'],
+      ).toBeUndefined();
+    } finally {
+      await second?.dispose?.();
+      await first?.dispose?.();
+      process.env = originalEnv;
+      await rm(projectDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('plugin built-in agent disabling', () => {
+  let originalEnv: typeof process.env;
+  let projectDir: string;
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    projectDir = await mkdtemp('/tmp/oh-my-opencode-slim-builtin-agents-');
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: projectDir,
+      XDG_DATA_HOME: `${projectDir}/data`,
+      XDG_CACHE_HOME: `${projectDir}/cache`,
+      OPENCODE_LOG_DIR: `${projectDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({ companion: { enabled: false } }),
+    );
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  const createHooks = () =>
+    plugin({
+      client: createPluginClient(async () => ({})),
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+
+  test('#1582 disables built-in subagents and stays idempotent on replay', async () => {
+    const hooks = await createHooks();
+    try {
+      const hostConfig: Record<string, unknown> = { agent: {} };
+      await hooks.config?.(hostConfig);
+      const agent = hostConfig.agent as Record<string, unknown>;
+      expect(agent.general).toEqual({ disable: true });
+      expect(agent.explore).toEqual({ disable: true });
+
+      // Re-invocation hands back the object the first call mutated: our
+      // exact injected shape is re-asserted, not treated as user-owned.
+      await hooks.config?.(hostConfig);
+      const replayed = hostConfig.agent as Record<string, unknown>;
+      expect(replayed.general).toEqual({ disable: true });
+      expect(replayed.explore).toEqual({ disable: true });
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('#1582 leaves a user-declared built-in entry untouched', async () => {
+    const hooks = await createHooks();
+    try {
+      const hostConfig: Record<string, unknown> = {
+        agent: { general: { model: 'p/m' } },
+      };
+      await hooks.config?.(hostConfig);
+      const agent = hostConfig.agent as Record<string, unknown>;
+      expect(agent.general).toEqual({ model: 'p/m' });
+      expect(agent.general).not.toHaveProperty('disable');
+      expect(agent.explore).toEqual({ disable: true });
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('#1582 overrides an injected disable shape after a user edits the entry', async () => {
+    const hooks = await createHooks();
+    try {
+      const hostConfig: Record<string, unknown> = { agent: {} };
+      await hooks.config?.(hostConfig);
+      // User edits the entry mid-session; the host hands the mutated object
+      // back. Our shape must not out-stare the user's declaration.
+      const agent = hostConfig.agent as Record<string, unknown>;
+      agent.general = { model: 'p/new' };
+      await hooks.config?.(hostConfig);
+      expect(agent.general).toEqual({ model: 'p/new' });
+      expect(agent.general).not.toHaveProperty('disable');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('#1582 disables the host explore entry even with the plugin alias present', async () => {
+    const hooks = await createHooks();
+    try {
+      // AGENT_ALIASES maps explore → explorer; the alias must never shadow
+      // the host built-in's own key.
+      const hostConfig: Record<string, unknown> = { agent: {} };
+      await hooks.config?.(hostConfig);
+      const agent = hostConfig.agent as Record<string, unknown>;
+      expect(agent.explore).toEqual({ disable: true });
+      expect(agent.explorer).not.toHaveProperty('disable');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+});
+
+describe('plugin reload generation cleanup', () => {
+  let originalEnv: typeof process.env;
+  let projectDir: string;
+
+  const createHooks = (pluginConfig: Record<string, unknown> = {}) =>
+    plugin({
+      client: createPluginClient(async () => ({})),
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+      ...pluginConfig,
+    } as never);
+
+  const reminderFixture = (
+    sessionID: string,
+  ): { messages: MessageWithParts[] } => ({
+    messages: [
+      {
+        info: {
+          id: `user-${sessionID}`,
+          role: 'user',
+          agent: 'orchestrator',
+          sessionID,
+        },
+        parts: [{ type: 'text', text: 'Continue the task.' }],
+      },
+      {
+        info: {
+          id: `assistant-${sessionID}`,
+          role: 'assistant',
+          agent: 'orchestrator',
+          sessionID,
+        },
+        parts: [{ type: 'text', text: 'Working on it.' }],
+      },
+      {
+        info: {
+          id: `user-followup-${sessionID}`,
+          role: 'user',
+          agent: 'orchestrator',
+          sessionID,
+        },
+        parts: [{ type: 'text', text: 'Take the next step.' }],
+      },
+    ],
+  });
+
+  const registerOrchestrator = async (
+    hooks: Awaited<ReturnType<typeof plugin>>,
+    sessionID: string,
+  ) => {
+    await hooks['chat.message']?.(
+      { sessionID, agent: 'orchestrator' } as never,
+      {} as never,
+    );
+  };
+
+  const transform = async (
+    hooks: Awaited<ReturnType<typeof plugin>>,
+    fixture: { messages: MessageWithParts[] },
+  ) => {
+    const output = structuredClone(fixture);
+    await hooks['experimental.chat.messages.transform']?.(
+      {} as never,
+      output as never,
+    );
+    return output;
+  };
+
+  const readPluginLog = (): string => {
+    try {
+      return readdirSync(`${projectDir}/logs`)
+        .filter(
+          (f) => f.startsWith('oh-my-opencode-slim.') && f.endsWith('.log'),
+        )
+        .map((f) => readFileSync(`${projectDir}/logs/${f}`, 'utf8'))
+        .join('');
+    } catch {
+      return '';
+    }
+  };
+
+  /** Three-request sequence whose third entry is the field signature of a
+   * mid-session prompt-cache bust: a previously cache-hitting session
+   * reports zero cached tokens on a sizeable request. */
+  const feedCacheBustSequence = async (
+    hooks: Awaited<ReturnType<typeof plugin>>,
+    sessionID: string,
+  ) => {
+    const bustEvent = (
+      messageID: string,
+      input: number,
+      cacheRead: number,
+    ) => ({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            role: 'assistant',
+            sessionID,
+            id: messageID,
+            time: { completed: 1_700_000_000 },
+            tokens: {
+              input,
+              output: 100,
+              reasoning: 0,
+              cache: { read: cacheRead, write: 0 },
+            },
+          },
+        },
+      },
+    });
+    await hooks.event?.(bustEvent('m1', 8000, 0) as never);
+    await hooks.event?.(bustEvent('m2', 500, 9000) as never);
+    await hooks.event?.(bustEvent('m3', 12000, 0) as never);
+  };
+
+  const taggedParts = (messages: MessageWithParts[], key: string) =>
+    messages.flatMap((message) =>
+      message.parts.filter((part) => isTaggedPart(part, key)),
+    );
+  const reminderParts = (messages: MessageWithParts[]) =>
+    taggedParts(messages, PHASE_REMINDER_METADATA_KEY);
+  const boardParts = (messages: MessageWithParts[]) =>
+    taggedParts(messages, BACKGROUND_JOB_BOARD_METADATA_KEY);
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    projectDir = await mkdtemp('/tmp/oh-my-opencode-slim-gens-');
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: projectDir,
+      XDG_DATA_HOME: `${projectDir}/data`,
+      XDG_CACHE_HOME: `${projectDir}/cache`,
+      OPENCODE_LOG_DIR: `${projectDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({ companion: { enabled: false } }),
+    );
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  test('file read leaves the composed reminder payload byte-identical', async () => {
+    const hooks = await createHooks();
+    const sessionID = 'read-reminder-session';
+    const fixture = {
+      messages: [
+        {
+          info: {
+            id: 'user-1',
+            role: 'user',
+            agent: 'orchestrator',
+            sessionID,
+          },
+          parts: [{ type: 'text', text: 'Read the project files.' }],
+        },
+      ],
+    };
+
+    try {
+      await hooks['chat.message']?.(
+        { sessionID, agent: 'orchestrator' } as never,
+        {} as never,
+      );
+      const before = structuredClone(fixture);
+      await hooks['experimental.chat.messages.transform']?.(
+        {} as never,
+        before as never,
+      );
+
+      await hooks['tool.execute.after']?.(
+        { tool: 'read', sessionID } as never,
+        { output: 'file contents' } as never,
+      );
+      const after = structuredClone(fixture);
+      await hooks['experimental.chat.messages.transform']?.(
+        {} as never,
+        after as never,
+      );
+
+      expect(JSON.stringify(after)).toBe(JSON.stringify(before));
+      expect(
+        after.messages
+          .at(-1)
+          ?.parts.filter(
+            (part) =>
+              'metadata' in part &&
+              (part as { metadata?: Record<string, unknown> }).metadata?.[
+                PHASE_REMINDER_METADATA_KEY
+              ] === true,
+          ),
+      ).toHaveLength(1);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('messages transform leaves advertised skill text byte-identical', async () => {
+    const hooks = await createHooks();
+    const fixture = {
+      messages: [
+        {
+          info: {
+            id: 'skills-user-message',
+            role: 'user',
+            agent: 'explorer',
+            sessionID: 'skills-advertisement-session',
+          },
+          parts: [
+            {
+              type: 'text',
+              text: [
+                'Please inspect these available skills.',
+                '<available_skills>',
+                '<skill><name>review-tools</name></skill>',
+                '<skill><name>private-skill</name></skill>',
+                '</available_skills>',
+              ].join('\n'),
+            },
+          ],
+        },
+      ],
+    };
+
+    try {
+      const before = JSON.stringify(fixture);
+      const output = structuredClone(fixture);
+      await hooks['experimental.chat.messages.transform']?.(
+        { agent: 'explorer' } as never,
+        output as never,
+      );
+      expect(JSON.stringify(output)).toBe(before);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('disabled_hooks phase-reminder leaves the payload untouched', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        disabled_hooks: ['phase-reminder'],
+      }),
+    );
+    const hooks = await createHooks();
+    const sessionID = 'disabled-reminder-session';
+    try {
+      await registerOrchestrator(hooks, sessionID);
+      const output = await transform(hooks, reminderFixture(sessionID));
+      expect(reminderParts(output.messages)).toHaveLength(0);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('disabled_hooks chat-headers keeps the hook unregistered', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        disabled_hooks: ['chat-headers'],
+      }),
+    );
+    const disabled = await createHooks();
+    try {
+      expect(disabled['chat.headers']).toBeUndefined();
+    } finally {
+      await disabled.dispose?.();
+    }
+
+    // Control: the default config still registers the hook, so the
+    // absence above is the gate and not a dead registration path.
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({ companion: { enabled: false } }),
+    );
+    const enabled = await createHooks();
+    try {
+      expect(typeof enabled['chat.headers']).toBe('function');
+    } finally {
+      await enabled.dispose?.();
+    }
+  });
+
+  test('cache-monitor logs a bust warning on the default config', async () => {
+    const hooks = await createHooks();
+    try {
+      await feedCacheBustSequence(hooks, 'control');
+      await loggerModule.flushLoggerForTesting();
+      expect(readPluginLog()).toContain('prompt-cache bust');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('disabled_hooks cache-monitor stops the cache-bust watchdog', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        disabled_hooks: ['cache-monitor'],
+      }),
+    );
+    const hooks = await createHooks();
+    try {
+      await feedCacheBustSequence(hooks, 'gated');
+      await loggerModule.flushLoggerForTesting();
+      expect(readPluginLog()).not.toContain('prompt-cache bust');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('disabled_hooks tool guards stop intercepting tool calls entirely', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        disabled_hooks: [
+          'json-error-recovery',
+          'tool-loop-guard',
+          'search-path-guard',
+          'absolute-path-rescue',
+          'apply-patch',
+        ],
+      }),
+    );
+    await Bun.write(`${projectDir}/sample.txt`, 'alpha\nbeta\ngamma\n');
+    await mkdir(`${projectDir}/src`, { recursive: true });
+    await Bun.write(`${projectDir}/src/app.ts`, 'export {};\n');
+    const hooks = await createHooks();
+    try {
+      // apply-patch: the unrecoverable patch passes through untouched.
+      const patchText =
+        '*** Begin Patch\n*** Update File: sample.txt\n@@\n-missing\n+omega\n*** End Patch';
+      const patchOutput = { args: { patchText } };
+      await hooks['tool.execute.before']?.(
+        {
+          tool: 'apply_patch',
+          sessionID: 'guards-off',
+          callID: 'g-1',
+        } as never,
+        patchOutput as never,
+      );
+      expect(patchOutput.args.patchText).toBe(patchText);
+
+      // absolute-path-rescue: the guessed path is left as written.
+      const guessed = `/${path.basename(projectDir)}/src/app.ts`;
+      const rescueOutput = { args: { filePath: guessed } };
+      await hooks['tool.execute.before']?.(
+        { tool: 'read', sessionID: 'guards-off', callID: 'g-2' } as never,
+        rescueOutput as never,
+      );
+      expect(rescueOutput.args.filePath).toBe(guessed);
+
+      // search-path-guard: grep on a missing path resolves instead of
+      // rejecting.
+      await expect(
+        hooks['tool.execute.before']?.(
+          { tool: 'grep', sessionID: 'guards-off', callID: 'g-3' } as never,
+          {
+            args: { path: `${projectDir}/does-not-exist/missing.txt` },
+          } as never,
+        ),
+      ).resolves.toBeUndefined();
+
+      // tool-loop-guard: three identical calls never append the warning.
+      for (const callID of ['g-4', 'g-5', 'g-6']) {
+        await hooks['tool.execute.before']?.(
+          { tool: 'read', sessionID: 'loop-off', callID } as never,
+          { args: { filePath: 'a.ts' } } as never,
+        );
+        const output = { output: '...file contents...', metadata: {} };
+        await hooks['tool.execute.after']?.(
+          { tool: 'read', sessionID: 'loop-off', callID } as never,
+          output as never,
+        );
+        expect(output.output).toBe('...file contents...');
+      }
+
+      // json-error-recovery: the malformed output surfaces raw.
+      const jsonOutput = {
+        title: 'Tool Error',
+        output: "JSON parse error: expected '}' in JSON body",
+        metadata: {},
+      };
+      await hooks['tool.execute.after']?.(
+        { tool: 'Edit', sessionID: 'guards-off', callID: 'g-7' } as never,
+        jsonOutput as never,
+      );
+      expect(jsonOutput.output).toBe(
+        "JSON parse error: expected '}' in JSON body",
+      );
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('tool guards act on the default config (positive control)', async () => {
+    await Bun.write(`${projectDir}/sample.txt`, 'alpha\nbeta\ngamma\n');
+    await mkdir(`${projectDir}/src`, { recursive: true });
+    await Bun.write(`${projectDir}/src/app.ts`, 'export {};\n');
+    const hooks = await createHooks();
+    try {
+      // apply-patch rejects the unrecoverable patch.
+      const patchText =
+        '*** Begin Patch\n*** Update File: sample.txt\n@@\n-missing\n+omega\n*** End Patch';
+      await expect(
+        hooks['tool.execute.before']?.(
+          {
+            tool: 'apply_patch',
+            sessionID: 'guards-on',
+            callID: 'c-1',
+          } as never,
+          { args: { patchText } } as never,
+        ),
+      ).rejects.toThrow('apply_patch verification failed');
+
+      // absolute-path-rescue rewrites the guessed path to the existing
+      // suffix.
+      const rescueOutput = {
+        args: { filePath: `/${path.basename(projectDir)}/src/app.ts` },
+      };
+      await hooks['tool.execute.before']?.(
+        { tool: 'read', sessionID: 'guards-on', callID: 'c-2' } as never,
+        rescueOutput as never,
+      );
+      expect(rescueOutput.args.filePath).toBe(`${projectDir}/src/app.ts`);
+
+      // search-path-guard rejects grep on a missing path.
+      await expect(
+        hooks['tool.execute.before']?.(
+          { tool: 'grep', sessionID: 'guards-on', callID: 'c-3' } as never,
+          {
+            args: { path: `${projectDir}/does-not-exist/missing.txt` },
+          } as never,
+        ),
+      ).rejects.toThrow('Search path does not exist');
+
+      // tool-loop-guard warns on the third identical call.
+      let thirdOutput: { output: unknown } | undefined;
+      for (const callID of ['c-4', 'c-5', 'c-6']) {
+        await hooks['tool.execute.before']?.(
+          { tool: 'read', sessionID: 'loop-on', callID } as never,
+          { args: { filePath: 'a.ts' } } as never,
+        );
+        thirdOutput = { output: '...file contents...', metadata: {} };
+        await hooks['tool.execute.after']?.(
+          { tool: 'read', sessionID: 'loop-on', callID } as never,
+          thirdOutput as never,
+        );
+      }
+      expect(String(thirdOutput?.output)).toContain(LOOP_GUARD_WARNING);
+
+      // json-error-recovery appends the reminder.
+      const jsonOutput = {
+        title: 'Tool Error',
+        output: "JSON parse error: expected '}' in JSON body",
+        metadata: {},
+      };
+      await hooks['tool.execute.after']?.(
+        { tool: 'Edit', sessionID: 'guards-on', callID: 'c-7' } as never,
+        jsonOutput as never,
+      );
+      expect(String(jsonOutput.output)).toContain(JSON_ERROR_REMINDER);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 compaction strips only phase reminders, preserving the job board and other content', async () => {
+    const hooks = await createHooks();
+    const sessionID = 'compact-board-session';
+    try {
+      await registerOrchestrator(hooks, sessionID);
+      await hooks['tool.execute.before']?.(
+        { tool: 'task', sessionID, callID: 'launch-1' } as never,
+        {
+          args: {
+            subagent_type: 'explorer',
+            background: true,
+            description: 'Check the job board',
+          },
+        } as never,
+      );
+      await hooks['tool.execute.after']?.(
+        { tool: 'task', sessionID, callID: 'launch-1' } as never,
+        { output: 'task_id: child-compact-1\nstate: running' } as never,
+      );
+      const fixture = reminderFixture(sessionID);
+      fixture.messages[0]?.parts.push({
+        type: 'text',
+        text: 'Preserved synthetic content',
+        synthetic: true,
+      });
+      const control = await transform(hooks, fixture);
+      expect(reminderParts(control.messages)).toHaveLength(1);
+      expect(boardParts(control.messages)).toHaveLength(1);
+
+      await hooks['experimental.session.compacting']?.(
+        { sessionID },
+        { context: [] },
+      );
+      const compacted = await transform(hooks, fixture);
+      const expected = structuredClone(control);
+      stripTaggedContent(expected.messages, PHASE_REMINDER_METADATA_KEY);
+      expect(compacted).toEqual(expected);
+      expect(reminderParts(compacted.messages)).toHaveLength(0);
+      expect(boardParts(compacted.messages)).toEqual(
+        boardParts(control.messages),
+      );
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 compaction mark is consumed once; the following turn equals an unmarked control', async () => {
+    const hooks = await createHooks();
+    const sessionID = 'compact-once-session';
+    try {
+      await registerOrchestrator(hooks, sessionID);
+      const fixture = reminderFixture(sessionID);
+      const control = await transform(hooks, fixture);
+      await hooks['experimental.session.compacting']?.(
+        { sessionID },
+        { context: [] },
+      );
+      const compacted = await transform(hooks, fixture);
+      expect(reminderParts(compacted.messages)).toHaveLength(0);
+
+      const nextTurn = await transform(hooks, fixture);
+      expect(JSON.stringify(nextTurn)).toBe(JSON.stringify(control));
+      expect(reminderParts(nextTurn.messages)).toHaveLength(1);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 compaction mark does not affect another session', async () => {
+    const hooks = await createHooks();
+    const markedID = 'marked-session';
+    const otherID = 'other-session';
+    try {
+      await registerOrchestrator(hooks, markedID);
+      await registerOrchestrator(hooks, otherID);
+      await hooks['experimental.session.compacting']?.(
+        { sessionID: markedID },
+        { context: [] },
+      );
+
+      const other = await transform(hooks, reminderFixture(otherID));
+      expect(reminderParts(other.messages)).toHaveLength(1);
+      const marked = await transform(hooks, reminderFixture(markedID));
+      expect(reminderParts(marked.messages)).toHaveLength(0);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 compaction without user messages consumes the session mark', async () => {
+    const hooks = await createHooks();
+    const sessionID = 'assistant-only-compaction';
+    try {
+      await registerOrchestrator(hooks, sessionID);
+      await hooks['experimental.session.compacting']?.(
+        { sessionID },
+        { context: [] },
+      );
+      await transform(hooks, {
+        messages: [
+          {
+            info: { id: 'assistant-only', role: 'assistant', sessionID },
+            parts: [{ type: 'text', text: 'Compaction context.' }],
+          },
+        ],
+      });
+      const resumed = await transform(hooks, reminderFixture(sessionID));
+      expect(reminderParts(resumed.messages)).toHaveLength(1);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('a stale compaction mark cleared by the next user message leaves reminders intact', async () => {
+    const hooks = await createHooks();
+    const sessionID = 'stale-mark-session';
+    try {
+      await registerOrchestrator(hooks, sessionID);
+      await hooks['experimental.session.compacting']?.(
+        { sessionID },
+        { context: [] },
+      );
+      // The compaction dies before its transform; the next ordinary user
+      // turn arrives and must not lose its reminders.
+      await hooks['chat.message']?.(
+        { sessionID, agent: 'orchestrator' } as never,
+        {} as never,
+      );
+      const after = await transform(hooks, reminderFixture(sessionID));
+      expect(reminderParts(after.messages)).toHaveLength(1);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 dispose clears the process-global wake gate progress', async () => {
+    resetOrchestratorWakeGateForTests();
+    resetLiveDirectoriesForTests();
+    try {
+      const hooks = await createHooks();
+
+      // Simulate a generation-one session that already hit the two-wake
+      // no-progress cap. The wake gate is process-global (globalThis +
+      // Symbol.for), so without explicit disposal cleanup a reloaded
+      // generation would inherit the cap and never wake this session.
+      const progress = getWakeProgress('wake-generation-session');
+      progress.unchangedWakeCount = 2;
+      progress.stopped = true;
+      progress.expectingWakeBusy = true;
+
+      await hooks.dispose?.();
+
+      expect(getWakeProgress('wake-generation-session')).toEqual({
+        unchangedWakeCount: 0,
+        lastFingerprint: undefined,
+        stopped: false,
+        expectingWakeBusy: false,
+        observedModel: undefined,
+      });
+    } finally {
+      resetOrchestratorWakeGateForTests();
+    }
+  });
+
+  test.each([
+    { hostFlavor: 'v2', periodic: false },
+    { hostFlavor: 'v1', periodic: true },
+  ] as const)(
+    '$hostFlavor wake scheduler periodic gate is structural (periodic=$periodic)',
+    async ({ hostFlavor, periodic }) => {
+      const createScheduler = wakeHooks.createOrchestratorWakeScheduler;
+      const scheduler = spyOn(
+        wakeHooks,
+        'createOrchestratorWakeScheduler',
+      ).mockImplementation((...args: Parameters<typeof createScheduler>) =>
+        createScheduler(...args),
+      );
+      try {
+        await createHooks({ hostFlavor });
+        const options = scheduler.mock.calls[0]?.[1] as {
+          config: { periodicWakeEnabled?: boolean };
+        };
+        expect(options.config.periodicWakeEnabled).toBe(periodic);
+      } finally {
+        scheduler.mockRestore();
+      }
+    },
+  );
+
+  test.each(['provisional', 'promoted', 'preserveRun', 'attributed'])(
+    'stopped recovery listener respects explicit provenance: %s',
+    async (kind) => {
+      const wake = mock(() => {});
+      const createScheduler = wakeHooks.createOrchestratorWakeScheduler;
+      const scheduler = spyOn(
+        wakeHooks,
+        'createOrchestratorWakeScheduler',
+      ).mockImplementation((...args) => ({
+        ...createScheduler(...args),
+        triggerStoppedJobRecovery: wake,
+      }));
+      const subscriptions = spyOn(
+        BackgroundJobCoordinator.prototype,
+        'addTerminalOutcomeListener',
+      );
+      let hooks: Awaited<ReturnType<typeof plugin>> | undefined;
+      try {
+        hooks = await createHooks();
+        const board = new BackgroundJobBoard();
+        const launch = {
+          taskID: 'child-1',
+          parentSessionID: 'parent-1',
+          agent: 'unknown',
+          description: 'unattributed unknown task',
+          now: 100,
+        };
+        const initial = board.registerLaunch({
+          ...launch,
+          ...(kind === 'attributed' ? {} : { provisional: true as const }),
+        });
+        if (kind === 'attributed')
+          expect(initial).not.toHaveProperty('provisional');
+        if (kind === 'promoted' || kind === 'preserveRun')
+          board.registerLaunch({
+            ...launch,
+            preserveRun: kind === 'preserveRun',
+          });
+        const stopped = board.markStopped(launch.taskID, 'no outcome', 200);
+        if (!stopped) throw new Error('missing stopped record');
+        expect(stopped).toMatchObject({
+          state: 'stopped',
+          terminalUnreconciled: true,
+        });
+        // Invoke the real subscriptions installed by the plugin composition.
+        for (const [listener] of subscriptions.mock.calls) listener(stopped);
+        expect(wake).toHaveBeenCalledTimes(kind === 'provisional' ? 0 : 1);
+        if (kind !== 'provisional') {
+          expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
+          expect(board.formatForPrompt('parent-1')).toContain(launch.taskID);
+        }
+      } finally {
+        await hooks?.dispose?.();
+        scheduler.mockRestore();
+        subscriptions.mockRestore();
+      }
+    },
+  );
+
+  // ── C3 host-attributed double-delivery gate ─────────────────────────────
+  // A stop the host itself reported (`Host reported outcome:
+  // interrupted|cancelled.`) is delivered to the parent by the host's
+  // native notifier on a tool-launched generation: the omos recovery wake
+  // beside it would queue a second admission for one stop. The skip
+  // requires BOTH views of the same fact — host-attributed summary AND
+  // the revived-run tracker not owning this generation's delivery. Tracker
+  // with no record for the (taskID, generation) reads false, so the
+  // fallback skips exactly the host-attributed stops; every other stop
+  // keeps its wake. v1 stop shapes (no host-attributed summary is ever
+  // committed on a v1 host — the terminal gate reads the v2-only Session
+  // Info `outcome`) are byte-for-byte unchanged.
+
+  const HOST_INTERRUPTED_SUMMARY = 'Host reported outcome: interrupted.';
+
+  /** Drive the real stopped-recovery listener chain with a fixture record
+   * and capture the wake trigger plus the skip log. Installs every spy
+   * BEFORE plugin setup, mirroring the provenance test above. */
+  async function emitStoppedRecovery(record: {
+    resultSummary: string;
+    pluginConfig?: Record<string, unknown>;
+    forceWillNotifyParent?: boolean;
+    /** Simulate a direct (non-tool) prompt re-running the child after its
+     * first terminal publication: the board record goes back to running
+     * (terminalRevision bumps, generation unchanged — no recordLaunch, no
+     * fresh native observer) and the next stop publishes a later
+     * revision. */
+    republishAfterDirectPrompt?: boolean;
+  }) {
+    const wake = mock(() => {});
+    const createScheduler = wakeHooks.createOrchestratorWakeScheduler;
+    const scheduler = spyOn(
+      wakeHooks,
+      'createOrchestratorWakeScheduler',
+    ).mockImplementation((...args: Parameters<typeof createScheduler>) => ({
+      ...createScheduler(...args),
+      triggerStoppedJobRecovery: wake,
+    }));
+    const subscriptions = spyOn(
+      BackgroundJobCoordinator.prototype,
+      'addTerminalOutcomeListener',
+    );
+    const realCreateTracker = trackerModule.createRevivedRunTracker;
+    const trackerSpy = record.forceWillNotifyParent
+      ? spyOn(trackerModule, 'createRevivedRunTracker').mockImplementation(
+          (...args: Parameters<typeof realCreateTracker>) => ({
+            ...realCreateTracker(...args),
+            willNotifyParent: () => true,
+          }),
+        )
+      : undefined;
+    const logSpy = spyOn(loggerModule, 'log').mockImplementation(() => {});
+    let hooks: Awaited<ReturnType<typeof plugin>> | undefined;
+    try {
+      hooks = await createHooks(record.pluginConfig ?? {});
+      const board = new BackgroundJobBoard();
+      const launch = {
+        taskID: 'child-host-stop',
+        parentSessionID: 'parent-1',
+        agent: 'fixer',
+        description: 'host-attributed stop probe',
+        now: 100,
+      };
+      board.registerLaunch(launch);
+      const stopped = board.markStopped(
+        launch.taskID,
+        record.resultSummary,
+        200,
+      );
+      if (!stopped) throw new Error('missing stopped record');
+      expect(stopped).toMatchObject({
+        state: 'stopped',
+        terminalUnreconciled: true,
+      });
+      let terminal = stopped;
+      if (record.republishAfterDirectPrompt) {
+        // Observed revision must match the record's current revision for the
+        // live-busy observation to restart the record (the undefined
+        // default reads as a stale observation and only bumps lastLiveBusyAt).
+        const rerunning = board.markRunningFromLiveSession(
+          launch.taskID,
+          300,
+          undefined,
+          stopped.terminalRevision,
+        );
+        expect(rerunning?.state).toBe('running');
+        const restopped = board.markStopped(
+          launch.taskID,
+          record.resultSummary,
+          400,
+        );
+        if (!restopped) throw new Error('missing restopped record');
+        expect(restopped.terminalRevision).toBeGreaterThan(1);
+        terminal = restopped;
+      }
+      for (const [listener] of subscriptions.mock.calls) listener(terminal);
+      const skipLogs = logSpy.mock.calls.filter(
+        ([message]) =>
+          message === '[orchestrator-wake] stopped-job recovery wake skipped',
+      );
+      return { wake, skipLogs };
+    } finally {
+      await hooks?.dispose?.();
+      scheduler.mockRestore();
+      subscriptions.mockRestore();
+      trackerSpy?.mockRestore();
+      logSpy.mockRestore();
+    }
+  }
+
+  test('C3: tool-launched host-attributed stop suppresses the recovery wake (native delivers once)', async () => {
+    const { wake, skipLogs } = await emitStoppedRecovery({
+      resultSummary: HOST_INTERRUPTED_SUMMARY,
+      pluginConfig: { hostFlavor: 'v2' },
+    });
+
+    expect(wake).not.toHaveBeenCalled();
+    expect(skipLogs).toHaveLength(1);
+    expect(skipLogs[0]?.[1]).toMatchObject({
+      verdict: 'skipped',
+      reason: 'native-delivers-host-attributed-stop',
+      taskID: 'child-host-stop',
+    });
+  });
+
+  test('C3: revived generation (tracker owns delivery) still wakes beside its host-attributed stop', async () => {
+    const { wake, skipLogs } = await emitStoppedRecovery({
+      resultSummary: HOST_INTERRUPTED_SUMMARY,
+      pluginConfig: { hostFlavor: 'v2' },
+      forceWillNotifyParent: true,
+    });
+
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
+    expect(String(wake.mock.calls[0]?.[1])).toContain('<stopped-job>');
+    expect(skipLogs).toHaveLength(0);
+  });
+
+  test('C3: tracker with no record falls back to skipping ONLY host-attributed stops (v2)', async () => {
+    const { wake, skipLogs } = await emitStoppedRecovery({
+      resultSummary: 'no outcome',
+      pluginConfig: { hostFlavor: 'v2' },
+    });
+
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
+    const delta = String(wake.mock.calls[0]?.[1]);
+    expect(delta).toContain('<stopped-job>');
+    expect(delta).toContain('stopped without a terminal result');
+    expect(skipLogs).toHaveLength(0);
+  });
+
+  test('C3: later publication after a direct prompt keeps its recovery wake (no native observer for the re-run)', async () => {
+    const { wake, skipLogs } = await emitStoppedRecovery({
+      resultSummary: HOST_INTERRUPTED_SUMMARY,
+      pluginConfig: { hostFlavor: 'v2' },
+      republishAfterDirectPrompt: true,
+    });
+
+    // rev > 1: the child ran again WITHOUT a tool launch, so no native
+    // observer covers the re-run's stop — this recovery wake is the only
+    // notification the parent gets and must not be skipped.
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
+    expect(String(wake.mock.calls[0]?.[1])).toContain('<stopped-job>');
+    expect(skipLogs).toHaveLength(0);
+  });
+
+  test('C3: v1 host stop behavior is unchanged — the wake fires with its original delta', async () => {
+    const { wake, skipLogs } = await emitStoppedRecovery({
+      resultSummary: 'no outcome',
+    });
+
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
+    expect(String(wake.mock.calls[0]?.[1])).toBe(
+      '<stopped-job>\nalias: fix-1\ntask: child-host-stop\nstate: stopped\nreason: stopped without a terminal result\n</stopped-job>',
+    );
+    expect(String(wake.mock.calls[0]?.[2])).toBe('child-host-stop:1');
+    expect(skipLogs).toHaveLength(0);
+  });
+
+  // ── C2 writer-lane predicate wiring ────────────────────────────────────
+  // The scheduler's `isWriterLaneTask` is built from the board record's
+  // agent graded through the role write-permission data; a missing record
+  // (or unknown agent) fails safe to writer so the verification sentence
+  // is attached rather than omitted.
+
+  test('C2: isWriterLaneTask grades the board record agent and fails safe to writer', async () => {
+    const createScheduler = wakeHooks.createOrchestratorWakeScheduler;
+    let captured:
+      | { isWriterLaneTask?: (taskID: string) => boolean }
+      | undefined;
+    const scheduler = spyOn(
+      wakeHooks,
+      'createOrchestratorWakeScheduler',
+    ).mockImplementation((...args: Parameters<typeof createScheduler>) => {
+      captured = args[1] as unknown as typeof captured;
+      return createScheduler(...args);
+    });
+    const getSpy = spyOn(BackgroundJobCoordinator.prototype, 'get');
+    let hooks: Awaited<ReturnType<typeof plugin>> | undefined;
+    try {
+      hooks = await createHooks();
+      const predicate = captured?.isWriterLaneTask;
+      expect(typeof predicate).toBe('function');
+
+      getSpy.mockReturnValue({ agent: 'explorer' } as never);
+      expect(predicate?.('any-task')).toBe(false);
+      getSpy.mockReturnValue({ agent: 'oracle' } as never);
+      expect(predicate?.('any-task')).toBe(false);
+      getSpy.mockReturnValue({ agent: 'designer' } as never);
+      expect(predicate?.('any-task')).toBe(true);
+      getSpy.mockReturnValue({ agent: 'fixer' } as never);
+      expect(predicate?.('any-task')).toBe(true);
+      // Unknown agent / missing record / missing agent → writer (fail-safe).
+      getSpy.mockReturnValue({ agent: 'custom-unknown' } as never);
+      expect(predicate?.('any-task')).toBe(true);
+      getSpy.mockReturnValue(undefined as never);
+      expect(predicate?.('missing-task')).toBe(true);
+      getSpy.mockReturnValue({ agent: undefined } as never);
+      expect(predicate?.('agentless-task')).toBe(true);
+    } finally {
+      await hooks?.dispose?.();
+      scheduler.mockRestore();
+      getSpy.mockRestore();
+    }
+  });
+
+  test('v1 dispose releases this generation companion manager', async () => {
+    // Enabled with a custom (missing) binaryPath: registration and state
+    // writes run, but neither the updater nor spawnIfAvailable touches
+    // the network or spawns a child.
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: {
+          enabled: true,
+          binaryPath: `${projectDir}/missing-companion-bin`,
+        },
+      }),
+    );
+    const hooks = await createHooks();
+    const readSessionIds = (): string[] => {
+      const state = JSON.parse(readFileSync(stateFilePath(), 'utf8')) as {
+        sessions: Array<{ session_id: string }>;
+      };
+      return state.sessions.map((s) => s.session_id);
+    };
+
+    const companionSessionId = companionSessionIdForDirectory(projectDir);
+
+    // onLoad registered this generation's project-scoped manager in the state file.
+    expect(readSessionIds()).toContain(companionSessionId);
+
+    await hooks.dispose?.();
+
+    // dispose must call companionManager.onExit(): the session entry is
+    // withdrawn even if the next generation fails before its own onLoad.
+    expect(readSessionIds()).not.toContain(companionSessionId);
   });
 });
 
@@ -540,6 +2556,56 @@ describe('plugin TUI agent activity', () => {
     }
   });
 
+  test('rehydrates a lost child-parent link without requerying the confirmed root', async () => {
+    const childResponse = Promise.withResolvers<{
+      data: { parentID: string };
+    }>();
+    const rootResponse = Promise.withResolvers<{
+      data: { parentID?: string };
+    }>();
+    const get = mock((input: { path: { id: string } }) =>
+      input.path.id === 'child' ? childResponse.promise : rootResponse.promise,
+    );
+    await hooks?.dispose?.();
+    hooks = await plugin({
+      client: { session: { get } },
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+
+    await hooks?.['chat.message']?.(
+      { sessionID: 'child', agent: 'fixer' } as never,
+      {} as never,
+    );
+    await busy('child');
+    // Hydration awaits these same promises before the test, so its
+    // continuations finish before each corresponding test continuation.
+    childResponse.resolve({ data: { parentID: 'root' } });
+    await childResponse.promise;
+    rootResponse.resolve({ data: {} });
+    await rootResponse.promise;
+    expect(readTuiSnapshot(projectDir).sessionParents.child).toBe('root');
+
+    expect(
+      updateSnapshot(projectDir, (snapshot) => {
+        delete snapshot.sessionParents.child;
+      }),
+    ).toBe(true);
+    expect(readTuiSnapshot(projectDir).sessionParents.child).toBeUndefined();
+
+    await busy('child');
+    await childResponse.promise;
+
+    expect(
+      get.mock.calls.filter(([input]) => input.path.id === 'child'),
+    ).toHaveLength(2);
+    expect(readTuiSnapshot(projectDir).sessionParents.child).toBe('root');
+    expect(
+      get.mock.calls.filter(([input]) => input.path.id === 'root'),
+    ).toHaveLength(1);
+  });
+
   test('does not cache an errored host lookup as a confirmed root', async () => {
     let attempts = 0;
     const sessionApi = {
@@ -658,16 +2724,16 @@ describe('plugin TUI agent activity', () => {
       {} as never,
     );
     await hooks?.['chat.message']?.(
-      { sessionID: 'lib-child', agent: 'librarian' } as never,
+      { sessionID: 'research-child', agent: 'explorer' } as never,
       {} as never,
     );
 
     expect(readTuiSnapshot(projectDir).activeSessions).toEqual({});
 
-    await busy('lib-child');
+    await busy('research-child');
 
     expect(readTuiSnapshot(projectDir).activeSessions).toEqual({
-      'lib-child': 'librarian',
+      'research-child': 'explorer',
     });
   });
 
@@ -730,7 +2796,7 @@ describe('plugin TUI agent activity', () => {
     });
   });
 
-  test('message.part.delta does not write TUI activity or session model', async () => {
+  test('message.part.delta does not write TUI activity or agent model', async () => {
     await hooks?.['chat.message']?.(
       {
         sessionID: 'stream-1',
@@ -760,64 +2826,34 @@ describe('plugin TUI agent activity', () => {
     expect(snapshotSectionsEqual(after, before)).toBe(true);
   });
 
-  test('chat.message model is published to sessionDetails when the session is already busy', async () => {
-    await busy('ora-child');
-    await hooks?.['chat.message']?.(
-      {
-        sessionID: 'ora-child',
-        agent: 'oracle',
-        model: { providerID: 'openai', modelID: 'gpt-5.6' },
-      } as never,
-      {} as never,
-    );
+  test('observed models never enter raw per-session TUI details', async () => {
+    const chat = (modelID: string) =>
+      hooks?.['chat.message']?.(
+        {
+          sessionID: 'ora-m',
+          agent: 'oracle',
+          model: { providerID: 'openai', modelID },
+        } as never,
+        {} as never,
+      );
+    await chat('gpt-6');
+    await busy('ora-m');
+    await chat('gpt-6-luna');
+    await hooks?.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            sessionID: 'ora-m',
+            providerID: 'openai',
+            modelID: 'gpt-6-sol',
+          },
+        },
+      },
+    } as never);
 
-    expect(readTuiSnapshot(projectDir).sessionDetails['ora-child']).toEqual({
-      model: 'openai/gpt-5.6',
-      status: 'busy',
-    });
-  });
-
-  test('model observed before busy is recovered on activation (v2 order)', async () => {
-    await hooks?.['chat.message']?.(
-      {
-        sessionID: 'ora-early',
-        agent: 'oracle',
-        model: { providerID: 'openai', modelID: 'gpt-5.6' },
-      } as never,
-      {} as never,
-    );
-    expect(readTuiSnapshot(projectDir).sessionDetails).toEqual({});
-
-    await busy('ora-early');
-    expect(readTuiSnapshot(projectDir).sessionDetails['ora-early']).toEqual({
-      model: 'openai/gpt-5.6',
-      status: 'busy',
-    });
-  });
-
-  test('two same-agent sessions keep distinct models in sessionDetails', async () => {
-    await hooks?.['chat.message']?.(
-      {
-        sessionID: 'ora-a',
-        agent: 'oracle',
-        model: { providerID: 'openai', modelID: 'gpt-5.6' },
-      } as never,
-      {} as never,
-    );
-    await hooks?.['chat.message']?.(
-      {
-        sessionID: 'ora-b',
-        agent: 'oracle',
-        model: { providerID: 'anthropic', modelID: 'claude-opus' },
-      } as never,
-      {} as never,
-    );
-    await busy('ora-a');
-    await busy('ora-b');
-
-    const details = readTuiSnapshot(projectDir).sessionDetails;
-    expect(details['ora-a']?.model).toBe('openai/gpt-5.6');
-    expect(details['ora-b']?.model).toBe('anthropic/claude-opus');
+    const raw = JSON.parse(readFileSync(getTuiStatePath(projectDir), 'utf8'));
+    expect(raw.sessionDetails['ora-m']).toEqual({ status: 'busy' });
   });
 
   test('chat.message model after idle does not resurrect sessionDetails', async () => {
@@ -825,7 +2861,7 @@ describe('plugin TUI agent activity', () => {
       {
         sessionID: 'ora-idle',
         agent: 'oracle',
-        model: { providerID: 'openai', modelID: 'gpt-5.6' },
+        model: { providerID: 'openai', modelID: 'gpt-6' },
       } as never,
       {} as never,
     );
@@ -841,7 +2877,7 @@ describe('plugin TUI agent activity', () => {
       {
         sessionID: 'ora-idle',
         agent: 'oracle',
-        model: { providerID: 'openai', modelID: 'gpt-5.6' },
+        model: { providerID: 'openai', modelID: 'gpt-6' },
       } as never,
       {} as never,
     );
@@ -894,8 +2930,8 @@ describe('plugin TUI agent activity', () => {
 
     const snapshot = readTuiSnapshot(projectDir);
     expect(snapshot.sessionParents['child-launch-first']).toBe('parent-1');
-    expect(snapshot.sessionDetails['child-launch-first']?.alias).toMatch(
-      /^ora-\d+$/,
+    expect(snapshot.sessionDetails['child-launch-first']?.alias).toBe(
+      'child-launch-first',
     );
     expect(snapshot.activeSessions['child-launch-first']).toBe('oracle');
   });
@@ -918,9 +2954,176 @@ describe('plugin TUI agent activity', () => {
 
     const snapshot = readTuiSnapshot(projectDir);
     expect(snapshot.sessionParents['child-busy-first']).toBe('parent-2');
-    expect(snapshot.sessionDetails['child-busy-first']?.alias).toMatch(
-      /^ora-\d+$/,
+    expect(snapshot.sessionDetails['child-busy-first']?.alias).toBe(
+      'child-busy-first',
     );
+  });
+
+  test('terminal subagent output clears active session in TUI snapshot', async () => {
+    await hooks?.['chat.message']?.(
+      { sessionID: 'parent-3', agent: 'orchestrator' } as never,
+      {} as never,
+    );
+    await hooks?.['tool.execute.before']?.(
+      { tool: 'task', sessionID: 'parent-3', callID: 'call-fg-1' } as never,
+      {
+        args: {
+          background: false,
+          subagent_type: 'oracle',
+          description: 'foreground child',
+        },
+      } as never,
+    );
+    await hooks?.['chat.message']?.(
+      { sessionID: 'child-fg-1', agent: 'oracle' } as never,
+      {} as never,
+    );
+    await busy('child-fg-1');
+
+    expect(readTuiSnapshot(projectDir).activeSessions['child-fg-1']).toBe(
+      'oracle',
+    );
+
+    await hooks?.['tool.execute.after']?.(
+      { tool: 'task', sessionID: 'parent-3', callID: 'call-fg-1' } as never,
+      {
+        output: [
+          'task_id: child-fg-1',
+          'state: completed',
+          '',
+          '<task_result>',
+          'Analysis finished.',
+          '</task_result>',
+        ].join('\n'),
+      } as never,
+    );
+
+    // #1215: a callID-confirmed foreground native terminal return is itself
+    // terminal evidence, so the active session clears immediately.
+    const snapshot = readTuiSnapshot(projectDir);
+    expect(snapshot.activeSessions['child-fg-1']).toBeUndefined();
+    expect(snapshot.sessionDetails['child-fg-1']).toBeUndefined();
+  });
+
+  test('unattributed terminal output defers until idle evidence clears it', async () => {
+    await hooks?.['chat.message']?.(
+      { sessionID: 'parent-4', agent: 'orchestrator' } as never,
+      {} as never,
+    );
+    // The pending call is registered under a different callID than the
+    // returning output, so attribution is text-parsed, never
+    // callID-confirmed: the #1215 fast path must not fire. The child's
+    // session.created early-registers the pending for this task ID, so
+    // the mismatched return still resolves identity — unconfirmed.
+    await hooks?.['tool.execute.before']?.(
+      { tool: 'task', sessionID: 'parent-4', callID: 'call-fg-2a' } as never,
+      {
+        args: {
+          background: false,
+          subagent_type: 'oracle',
+          description: 'foreground child',
+        },
+      } as never,
+    );
+    await hooks?.event?.({
+      event: {
+        type: 'session.created',
+        properties: {
+          info: { id: 'child-fg-2', parentID: 'parent-4', agent: 'oracle' },
+        },
+      },
+    } as never);
+    await hooks?.['chat.message']?.(
+      { sessionID: 'child-fg-2', agent: 'oracle' } as never,
+      {} as never,
+    );
+    await busy('child-fg-2');
+
+    expect(readTuiSnapshot(projectDir).activeSessions['child-fg-2']).toBe(
+      'oracle',
+    );
+
+    await hooks?.['tool.execute.after']?.(
+      { tool: 'task', sessionID: 'parent-4', callID: 'call-fg-2b' } as never,
+      {
+        output: [
+          'task_id: child-fg-2',
+          'state: completed',
+          '',
+          '<task_result>',
+          'Analysis finished.',
+          '</task_result>',
+        ].join('\n'),
+      } as never,
+    );
+
+    // Unconfirmed attribution keeps the full runtime discipline: the
+    // terminal text alone must not clear the active session yet.
+    expect(readTuiSnapshot(projectDir).activeSessions['child-fg-2']).toBe(
+      'oracle',
+    );
+
+    // Idle runtime evidence is what publishes the terminal state.
+    await hooks?.event?.({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'child-fg-2', status: { type: 'idle' } },
+      },
+    } as never);
+    for (let i = 0; i < 3; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const snapshot = readTuiSnapshot(projectDir);
+    expect(snapshot.activeSessions['child-fg-2']).toBeUndefined();
+    expect(snapshot.sessionDetails['child-fg-2']).toBeUndefined();
+  });
+
+  test('string status idle clears active sessions', async () => {
+    await hooks?.['chat.message']?.(
+      { sessionID: 'fixer-str', agent: 'fixer' } as never,
+      {} as never,
+    );
+    await busy('fixer-str');
+    expect(readTuiSnapshot(projectDir).activeSessions['fixer-str']).toBe(
+      'fixer',
+    );
+
+    await hooks?.event?.({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'fixer-str', status: 'idle' },
+      },
+    } as never);
+
+    expect(
+      readTuiSnapshot(projectDir).activeSessions['fixer-str'],
+    ).toBeUndefined();
+  });
+
+  test('session.error clears active sessions', async () => {
+    await hooks?.['chat.message']?.(
+      { sessionID: 'oracle-err', agent: 'oracle' } as never,
+      {} as never,
+    );
+    await busy('oracle-err');
+    expect(readTuiSnapshot(projectDir).activeSessions['oracle-err']).toBe(
+      'oracle',
+    );
+
+    await hooks?.event?.({
+      event: {
+        type: 'session.error',
+        properties: {
+          sessionID: 'oracle-err',
+          error: { message: 'Task failed' },
+        },
+      },
+    } as never);
+
+    expect(
+      readTuiSnapshot(projectDir).activeSessions['oracle-err'],
+    ).toBeUndefined();
   });
 });
 
@@ -939,7 +3142,9 @@ describe('background task admission model resolution', () => {
 
   beforeEach(async () => {
     originalEnv = { ...process.env };
-    projectDir = await mkdtemp('/tmp/oh-my-opencode-slim-concurrency-');
+    projectDir = await mkdtemp(
+      path.join(os.tmpdir(), 'oh-my-opencode-slim-concurrency-'),
+    );
     process.env = {
       ...originalEnv,
       OPENCODE_CONFIG_DIR: projectDir,
@@ -1023,6 +3228,61 @@ describe('background task admission model resolution', () => {
     );
 
     await expectSecondTaskQueued('orchestrator-1');
+  });
+
+  test('v1 retry-primary continuation restores the last external model', async () => {
+    const sessionID = 'orchestrator-fallback';
+    await hooks?.['chat.message']?.(
+      {
+        sessionID,
+        agent: 'orchestrator',
+        model: { providerID: 'openai', modelID: 'gpt-6-luna' },
+      } as never,
+      {} as never,
+    );
+
+    const output = {
+      message: {
+        id: 'msg-native-completion',
+        role: 'user',
+        sessionID,
+        agent: 'orchestrator',
+        model: {
+          providerID: 'openrouter',
+          modelID: 'openrouter/auto',
+          variant: 'low',
+        },
+      },
+      parts: [
+        {
+          type: 'text',
+          synthetic: true,
+          text: [
+            '<task id="ses_child" state="completed">',
+            '<summary>Background task completed: availability check</summary>',
+            '<task_result>',
+            'OPERATOR_OK',
+            '</task_result>',
+            '</task>',
+          ].join('\n'),
+        },
+      ],
+    };
+
+    await hooks?.['chat.message']?.(
+      {
+        sessionID,
+        agent: 'orchestrator',
+        messageID: 'msg-native-completion',
+      } as never,
+      output as never,
+    );
+
+    expect(output.message.model).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-6-luna',
+    });
+    await expectSecondTaskQueued(sessionID);
   });
 
   test('internal initiator chat.message does not overwrite the tracked session model', async () => {
@@ -1166,10 +3426,30 @@ describe('background task admission model resolution', () => {
 describe('plugin config model inheritance', () => {
   let originalEnv: typeof process.env;
   const configDirs: string[] = [];
+  // Directory of the most recent loadConfiguredPlugin() call, for tests
+  // that need the RuntimeConfig singleton the plugin initialized.
+  let lastConfigDir: string | undefined;
+  let client: ReturnType<typeof createPluginClient>;
+  const hostChildren = new Map<
+    string,
+    { parentID: string; prompted: boolean }
+  >();
+  const transcripts = new Map<string, unknown[]>();
+  const primary = { providerID: 'openrouter', modelID: 'openrouter/auto' };
+  const fallback = { providerID: 'openai', modelID: 'gpt-6-luna' };
+  const delegatedChain = ['openrouter/openrouter/auto', 'openai/gpt-6-luna'];
+  const delegatedFallbackConfig = {
+    agents: {
+      orchestrator: { model: delegatedChain },
+      operator: { model: delegatedChain },
+    },
+  };
 
   beforeEach(() => {
     originalEnv = { ...process.env };
     delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    hostChildren.clear();
+    transcripts.clear();
   });
 
   afterEach(async () => {
@@ -1182,9 +3462,16 @@ describe('plugin config model inheritance', () => {
     }
   });
 
-  async function loadConfiguredPlugin(config: Record<string, unknown>) {
-    const configDir = await mkdtemp('/tmp/oh-my-opencode-inheritance-');
-    configDirs.push(configDir);
+  async function loadConfiguredPlugin(
+    config: Record<string, unknown>,
+    existingDirectory?: string,
+    hostFlavor?: 'v2',
+  ) {
+    const configDir =
+      existingDirectory ??
+      (await mkdtemp(path.join(os.tmpdir(), 'oh-my-opencode-inheritance-')));
+    if (!existingDirectory) configDirs.push(configDir);
+    lastConfigDir = configDir;
     await Bun.write(
       `${configDir}/oh-my-opencode-slim.json`,
       JSON.stringify(config),
@@ -1197,13 +3484,101 @@ describe('plugin config model inheritance', () => {
       OPENCODE_LOG_DIR: `${configDir}/logs`,
     };
 
-    const client = createPluginClient(async () => ({}));
+    client = createPluginClient(async () => ({}));
+    client.session.status = async () => ({ data: {} });
+    client.session.get = async ({ path }: { path: { id: string } }) => {
+      const child = hostChildren.get(path.id);
+      return child ? { data: { parentID: child.parentID } } : {};
+    };
+    client.session.messages = async ({ path }: { path: { id: string } }) => ({
+      data:
+        hostChildren.get(path.id)?.prompted === false
+          ? []
+          : (transcripts.get(path.id) ?? [
+              {
+                info: {
+                  role: 'assistant',
+                  time: { completed: Date.now() },
+                  finish: 'stop',
+                },
+                parts: [{ type: 'text', text: 'done' }],
+              },
+            ]),
+    });
     return plugin({
       client,
       directory: configDir,
       worktree: configDir,
       serverUrl: new URL('http://127.0.0.1:4096'),
+      hostFlavor,
     } as never);
+  }
+
+  async function selectParent(
+    hooks: Awaited<ReturnType<typeof loadConfiguredPlugin>>,
+    model: { providerID: string; modelID: string },
+    sessionID = 'parent',
+  ) {
+    await hooks.config?.({ agent: {} });
+    await hooks['chat.message']?.(
+      { sessionID, agent: 'orchestrator', model } as never,
+      {} as never,
+    );
+  }
+
+  async function fallbackParent(
+    hooks: Awaited<ReturnType<typeof loadConfiguredPlugin>>,
+    sessionID: string,
+    failure: 'provider' | 'content-filter' = 'provider',
+  ) {
+    transcripts.set(sessionID, [
+      {
+        info: { id: `msg-original-${sessionID}`, role: 'user', sessionID },
+        parts: [{ type: 'text', text: 'delegate this work' }],
+      },
+    ]);
+    await selectParent(hooks, primary, sessionID);
+    const promptAsync = client.session.promptAsync as (
+      input: unknown,
+    ) => Promise<unknown>;
+    const replay = mock(promptAsync);
+    client.session.promptAsync = replay;
+    try {
+      await hooks.event?.({
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: {
+              id: `msg-primary-error-${sessionID}`,
+              sessionID,
+              role: 'assistant',
+              agent: 'orchestrator',
+              ...primary,
+              ...(failure === 'content-filter'
+                ? { finish: 'content-filter', time: { completed: Date.now() } }
+                : {}),
+            },
+          },
+        },
+      } as never);
+      if (failure === 'provider') {
+        await hooks.event?.({
+          event: {
+            type: 'session.error',
+            properties: {
+              sessionID,
+              error: { statusCode: 403, message: 'Key limit exceeded' },
+            },
+          },
+        } as never);
+      }
+      expect(replay.mock.calls.at(-1)?.[0]).toMatchObject({
+        path: { id: sessionID },
+        body: { model: fallback },
+      });
+    } finally {
+      client.session.promptAsync = promptAsync;
+    }
   }
 
   async function assertAdmissionUsesFinalModel(
@@ -1279,10 +3654,110 @@ describe('plugin config model inheritance', () => {
     }
   }
 
+  /** Prompt before session.created reaches the plugin; persist after the hook. */
+  async function delegateV1Child(
+    hooks: Awaited<ReturnType<typeof loadConfiguredPlugin>>,
+    parentSessionID: string,
+    callID: string,
+    primary: { providerID: string; modelID: string },
+    options: { background?: boolean; task_id?: string; agent?: string } = {},
+  ) {
+    const { agent = 'operator', ...taskOptions } = options;
+    const output = {
+      args: {
+        subagent_type: agent,
+        description: 'verify fallback routing',
+        prompt: 'return ok',
+        ...taskOptions,
+      },
+    };
+    const task = { tool: 'task', sessionID: parentSessionID, callID };
+    await hooks['tool.execute.before']?.(task as never, output as never);
+    if (options.background) {
+      // A background task returns before its child's first prompt.
+      await hooks['tool.execute.after']?.(
+        { ...task, args: output.args } as never,
+        { title: '', output: 'started', metadata: {} } as never,
+      );
+    }
+    const childID = options.task_id ?? `ses_child_${callID}`;
+    if (!hostChildren.has(childID)) {
+      hostChildren.set(childID, { parentID: parentSessionID, prompted: false });
+    }
+    const childOutput = {
+      message: {
+        id: `msg-${childID}`,
+        role: 'user',
+        sessionID: childID,
+        agent,
+        model: { ...primary },
+      },
+      parts: [{ type: 'text', text: 'return ok' }],
+    };
+    await hooks['chat.message']?.(
+      { sessionID: childID, agent, model: primary } as never,
+      childOutput as never,
+    );
+    hostChildren.set(childID, { parentID: parentSessionID, prompted: true });
+    return {
+      subagentType: output.args.subagent_type,
+      childModel: childOutput.message.model,
+      childOutput,
+    };
+  }
+
+  test('v2 provider fallback routes to the first healthy child entry with its variant', async () => {
+    const hooks = await loadConfiguredPlugin(
+      {
+        fallback: { maxRetries: 0 },
+        agents: {
+          orchestrator: { model: ['provider/primary', 'backup/parent'] },
+          operator: {
+            model: ['provider/child', { id: 'backup/child', variant: 'max' }],
+          },
+        },
+      },
+      undefined,
+      'v2',
+    );
+    try {
+      await selectParent(hooks, { providerID: 'provider', modelID: 'primary' });
+      expect(
+        (hooks as any)['v2.resolveDelegatedModel']({
+          agentType: 'operator',
+          parentSessionID: 'parent',
+        }),
+      ).toBeUndefined();
+      const switchModel = mock(async () => ({}));
+      await hooks['v2.session.retry']?.(
+        {
+          sessionID: 'parent',
+          agent: 'orchestrator',
+          model: { providerID: 'provider', id: 'primary' },
+          error: { type: 'provider.rate-limit', message: 'rate limit' },
+          decision: { retry: true },
+        } as never,
+        switchModel as never,
+      );
+      expect(switchModel).toHaveBeenCalledWith('parent', {
+        providerID: 'backup',
+        id: 'parent',
+      });
+      expect(
+        (hooks as any)['v2.resolveDelegatedModel']({
+          agentType: 'operator',
+          parentSessionID: 'parent',
+        }),
+      ).toBe('backup/child#max');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
   test('session inheritance removes a stale host model in the final config', async () => {
     const hooks = await loadConfiguredPlugin({
       agents: {
-        librarian: { model: 'local/librarian' },
+        explorer: { model: 'local/explorer' },
         fixer: { inheritModelFrom: 'session' },
       },
     });
@@ -1307,16 +3782,16 @@ describe('plugin config model inheritance', () => {
     }
   });
 
-  test('orchestrator inheritance uses the host orchestrator model in the final config', async () => {
+  test('session inheritance removes stale visible alias models and variants', async () => {
     const hooks = await loadConfiguredPlugin({
       agents: {
-        librarian: { inheritModelFrom: 'orchestrator' },
+        explorer: { displayName: 'Scout', inheritModelFrom: 'session' },
       },
     });
     const hostConfig: Record<string, unknown> = {
       agent: {
-        orchestrator: { model: 'host/orchestrator' },
-        librarian: { model: 'host/stale-librarian' },
+        explorer: { model: 'host/canonical', variant: 'canonical-v' },
+        Scout: { model: 'host/visible', variant: 'visible-v' },
       },
     };
 
@@ -1327,11 +3802,392 @@ describe('plugin config model inheritance', () => {
         string,
         Record<string, unknown>
       >;
-      expect(agents.librarian?.model).toBe('host/orchestrator');
+      for (const name of ['explorer', 'Scout']) {
+        expect(agents[name]).not.toHaveProperty('model');
+        expect(agents[name]).not.toHaveProperty('variant');
+      }
     } finally {
       await hooks.dispose?.();
     }
   });
+
+  test('orchestrator inheritance leaves the child model-less for live parent selection', async () => {
+    const hooks = await loadConfiguredPlugin({
+      agents: {
+        oracle: { inheritModelFrom: 'orchestrator' },
+      },
+    });
+    const hostConfig: Record<string, unknown> = {
+      agent: {
+        orchestrator: { model: 'host/orchestrator' },
+        oracle: { model: 'host/stale-oracle' },
+      },
+    };
+
+    try {
+      await hooks.config?.(hostConfig);
+
+      const agents = hostConfig.agent as Record<
+        string,
+        Record<string, unknown>
+      >;
+      expect(agents.oracle?.model).toBeUndefined();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 content-filter fallback leaves an independent child on its primary', async () => {
+    const hooks = await loadConfiguredPlugin(delegatedFallbackConfig);
+    try {
+      await fallbackParent(hooks, 'parent', 'content-filter');
+      const routed = await delegateV1Child(hooks, 'parent', 'policy', primary);
+      expect(routed.childModel).toEqual(primary);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 provider fallback moves only children whose primary provider is down', async () => {
+    const google = { providerID: 'google', modelID: 'gemini-2.5-pro' };
+    const hooks = await loadConfiguredPlugin({
+      agents: {
+        ...delegatedFallbackConfig.agents,
+        explorer: { model: ['google/gemini-2.5-pro', 'openai/gpt-6-luna'] },
+      },
+    });
+    try {
+      await fallbackParent(hooks, 'parent');
+      const operator = await delegateV1Child(hooks, 'parent', 'down', primary);
+      const explorer = await delegateV1Child(
+        hooks,
+        'parent',
+        'healthy',
+        google,
+        {
+          agent: 'explorer',
+        },
+      );
+      expect(operator.subagentType).toBe('operator');
+      expect(operator.childModel).toEqual(fallback);
+      expect(explorer.childModel).toEqual(google);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 background child claims only its new prompt, not other parents or later prompts; failed lookups abort both reads', async () => {
+    let hooks = await loadConfiguredPlugin(delegatedFallbackConfig);
+    try {
+      await fallbackParent(hooks, 'parent');
+      const { childOutput, childModel } = await delegateV1Child(
+        hooks,
+        'parent',
+        'background',
+        primary,
+        { background: true },
+      );
+      expect(childModel).toEqual(fallback);
+
+      // Lose generation-local metadata, but retain the host's persisted prompt.
+      await hooks.dispose?.();
+      hooks = await loadConfiguredPlugin(
+        delegatedFallbackConfig,
+        lastConfigDir,
+      );
+      await fallbackParent(hooks, 'parent');
+      await hooks['tool.execute.before']?.(
+        { tool: 'task', sessionID: 'parent', callID: 'leaked' } as never,
+        { args: { subagent_type: 'operator', background: true } } as never,
+      );
+      const sessionID = childOutput.message.sessionID;
+      const other = await delegateV1Child(hooks, 'other', 'other', primary);
+      expect(other.childModel).toEqual(primary);
+      childOutput.message.model = primary;
+      await hooks['chat.message']?.(
+        { sessionID, agent: 'operator', model: primary } as never,
+        childOutput as never,
+      );
+      expect(childOutput.message.model).toEqual(primary);
+      const signals: (AbortSignal | undefined)[] = [];
+      const read = ({ signal }: { signal?: AbortSignal }) =>
+        new Promise((_, reject) => {
+          if (signals.push(signal) > 1) reject(new Error('host down'));
+        });
+      client.session.get = client.session.messages = read;
+      await hooks['chat.message']?.(
+        { sessionID: 'failed', agent: 'operator' } as never,
+        {} as never,
+      );
+      expect(signals.map((signal) => signal?.aborted)).toEqual([true, true]);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  async function assertInheritedRevive(
+    operator: Record<string, unknown>,
+    parentFallsBack = true,
+  ) {
+    const hooks = await loadConfiguredPlugin({
+      agents: { orchestrator: { model: delegatedChain }, operator },
+    });
+    try {
+      await selectParent(hooks, primary);
+      const { childOutput } = await delegateV1Child(
+        hooks,
+        'parent',
+        'inherited',
+        primary,
+      );
+      const sessionID = childOutput.message.sessionID;
+      await hooks['tool.execute.after']?.(
+        { tool: 'task', sessionID: 'parent', callID: 'inherited' } as never,
+        {
+          output: `task_id: ${sessionID}\nstate: completed\nresult: done`,
+        } as never,
+      );
+      if (parentFallsBack) await fallbackParent(hooks, 'parent');
+      else await selectParent(hooks, fallback);
+      client.session.promptAsync = async () => {
+        await hooks['chat.message']?.(
+          { sessionID, agent: 'operator' } as never,
+          childOutput as never,
+        );
+        return {};
+      };
+      await hooks.tool?.task_revive.execute(
+        { task_id: sessionID, prompt: 'continue' },
+        { sessionID: 'parent', agent: 'orchestrator' } as never,
+      );
+      expect(childOutput.message.model).toEqual(fallback);
+    } finally {
+      await hooks.dispose?.();
+    }
+  }
+
+  test('v1 inherited revive follows the live parent outside the child chain', async () => {
+    await assertInheritedRevive({ inheritModelFrom: 'orchestrator' });
+  });
+
+  test('v1 inherited revive follows a manual parent selection', async () => {
+    await assertInheritedRevive(
+      {
+        inheritModelFrom: 'session',
+        model: ['other/primary', 'openrouter/openrouter/auto'],
+      },
+      false,
+    );
+  });
+
+  test('v1 revive retry leaves one route for the child', async () => {
+    const hooks = await loadConfiguredPlugin(delegatedFallbackConfig);
+    try {
+      await selectParent(hooks, primary);
+      const { childOutput } = await delegateV1Child(
+        hooks,
+        'parent',
+        'retry',
+        primary,
+      );
+      const { sessionID } = childOutput.message;
+      await hooks['tool.execute.after']?.(
+        { tool: 'task', sessionID: 'parent', callID: 'retry' } as never,
+        {
+          output: `task_id: ${sessionID}\nstate: completed\nresult: done`,
+        } as never,
+      );
+      await fallbackParent(hooks, 'parent');
+      const models: unknown[] = [];
+      const prompt = async () => {
+        childOutput.message.model = { ...primary };
+        await hooks['chat.message']?.(
+          { sessionID, agent: 'operator' } as never,
+          childOutput as never,
+        );
+        models.push(childOutput.message.model);
+      };
+      for (const refused of [true, false]) {
+        client.session.promptAsync = async ({ path }: any) => {
+          if (refused) throw new Error('host refused');
+          if (path.id === sessionID) await prompt();
+          return {};
+        };
+        await hooks.tool?.task_revive
+          .execute({ task_id: sessionID, prompt: 'continue' }, {
+            sessionID: 'parent',
+            agent: 'orchestrator',
+          } as never)
+          .catch(() => {});
+      }
+      await prompt();
+      expect(models).toEqual([fallback, primary]);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 new inherited child uses the host model without routing reads', async () => {
+    const hooks = await loadConfiguredPlugin({
+      agents: {
+        orchestrator: { model: delegatedChain },
+        operator: { inheritModelFrom: 'session', model: delegatedChain },
+      },
+    });
+    try {
+      await fallbackParent(hooks, 'parent');
+      const get = mock(client.session.get as any);
+      client.session.get = get;
+      const routed = await delegateV1Child(hooks, 'parent', 'new', fallback);
+      expect(routed.childModel).toEqual(fallback);
+      expect(get).not.toHaveBeenCalled();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 task_id routes the next prompt of a resumed child', async () => {
+    const hooks = await loadConfiguredPlugin(delegatedFallbackConfig);
+    try {
+      await fallbackParent(hooks, 'parent');
+      await delegateV1Child(hooks, 'parent', 'initial', primary);
+      await hooks['tool.execute.after']?.(
+        { tool: 'task', sessionID: 'parent', callID: 'initial' } as never,
+        {
+          output: 'task_id: ses_child_initial\nstate: completed\nresult: done',
+        } as never,
+      );
+      const transcript = {
+        messages: [
+          {
+            info: { sessionID: 'parent', role: 'user' },
+            parts: [{ type: 'text', text: 'continue' }],
+          },
+        ],
+      };
+      await hooks['experimental.chat.messages.transform']?.(
+        {},
+        transcript as never,
+      );
+      transcript.messages.push({
+        info: { sessionID: 'parent', role: 'assistant' },
+        parts: [{ type: 'text', text: 'completion acknowledged' }],
+      });
+      await hooks['experimental.chat.messages.transform']?.(
+        {},
+        transcript as never,
+      );
+      const routed = await delegateV1Child(hooks, 'parent', 'resume', primary, {
+        task_id: 'ses_child_initial',
+      });
+      expect(routed.childModel).toEqual(fallback);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v1 delegation uses the fallback replay model instead of the last external selection', async () => {
+    const hooks = await loadConfiguredPlugin(delegatedFallbackConfig);
+    const sessionID = 'orchestrator-live-fallback';
+    const fallbackMessageID = 'msg-fallback-replay';
+
+    try {
+      await fallbackParent(hooks, sessionID);
+      // A synthetic admission may report another model in the same session;
+      // it must not displace the confirmed fallback used for delegation.
+      await hooks['chat.message']?.(
+        {
+          sessionID,
+          agent: 'orchestrator',
+          model: { providerID: 'anthropic', modelID: 'claude' },
+          messageID: fallbackMessageID,
+          parts: [createInternalAgentTextPart('background completion')],
+        } as never,
+        {} as never,
+      );
+      await hooks.event?.({
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: {
+              id: fallbackMessageID,
+              sessionID,
+              role: 'user',
+              agent: 'orchestrator',
+              providerID: 'anthropic',
+              modelID: 'claude',
+            },
+          },
+        },
+      } as never);
+
+      const routed = await delegateV1Child(
+        hooks,
+        sessionID,
+        'call-live-fallback',
+        primary,
+      );
+      expect(routed.subagentType).toBe('operator');
+      expect(routed.childModel).toEqual(fallback);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test.each([
+    ['retry-primary', 'openrouter', 'openrouter/auto'],
+    ['stick-to-fallback', 'openai', 'gpt-6-luna'],
+  ] as const)(
+    'v1 %s policy selects the completion model after a confirmed fallback',
+    async (continuationPolicy, expectedProvider, expectedModel) => {
+      const hooks = await loadConfiguredPlugin({
+        ...delegatedFallbackConfig,
+        fallback: { maxRetries: 0, continuationPolicy },
+      });
+      const sessionID = `continuation-${continuationPolicy}`;
+
+      try {
+        await fallbackParent(hooks, sessionID);
+
+        const output = {
+          message: {
+            id: `msg-completion-${continuationPolicy}`,
+            role: 'user',
+            sessionID,
+            agent: 'orchestrator',
+            model: { ...primary },
+          },
+          parts: [createInternalAgentTextPart('background task completed')],
+        };
+        await hooks['chat.message']?.(
+          {
+            sessionID,
+            agent: 'orchestrator',
+            messageID: output.message.id,
+          } as never,
+          output as never,
+        );
+
+        expect(output.message.model).toEqual({
+          providerID: expectedProvider,
+          modelID: expectedModel,
+        });
+
+        const routed = await delegateV1Child(
+          hooks,
+          sessionID,
+          `call-continuation-${continuationPolicy}`,
+          primary,
+        );
+        expect(routed.subagentType).toBe('operator');
+        expect(routed.childModel).toEqual(
+          continuationPolicy === 'retry-primary' ? primary : fallback,
+        );
+      } finally {
+        await hooks.dispose?.();
+      }
+    },
+  );
 
   test('preset inheritance clears a stale host model in the final config', async () => {
     const hooks = await loadConfiguredPlugin({
@@ -1359,6 +4215,128 @@ describe('plugin config model inheritance', () => {
       >;
       expect(agents.fixer?.model).toBeUndefined();
       expect(agents.fixer?.temperature).toBe(0.4);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('combined inherit + chain keeps the final config on the session model', async () => {
+    // Array model + inheritModelFrom: the chain head must not be pinned as
+    // the launch model by the array-resolution pass — the agent follows the
+    // session model and keeps the array purely as the fallback chain.
+    const hooks = await loadConfiguredPlugin({
+      agents: {
+        fixer: {
+          model: ['chain/primary', 'chain/backup'],
+          inheritModelFrom: 'session',
+        },
+      },
+    });
+    const hostConfig: Record<string, unknown> = {
+      agent: {
+        orchestrator: { model: 'host/orchestrator' },
+        fixer: { model: 'host/stale-fixer', temperature: 0.3 },
+      },
+    };
+
+    try {
+      await hooks.config?.(hostConfig);
+
+      const agents = hostConfig.agent as Record<
+        string,
+        Record<string, unknown>
+      >;
+      expect(agents.fixer?.model).toBeUndefined();
+      expect(agents.fixer?.temperature).toBe(0.3);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('combined inherit + chain clears the chain head inline variant from the final config', async () => {
+    // Greptile review repro: the array pass stamps the chain head model AND
+    // its inline variant into the host entry; inheritance clears the model
+    // and must take the stale variant with it — the followed session model
+    // must not run with a fallback model's variant.
+    const hooks = await loadConfiguredPlugin({
+      agents: {
+        fixer: {
+          model: [{ id: 'chain/primary', variant: 'high' }, 'chain/backup'],
+          inheritModelFrom: 'session',
+        },
+      },
+    });
+    const hostConfig: Record<string, unknown> = {
+      agent: {
+        orchestrator: { model: 'host/orchestrator' },
+      },
+    };
+
+    try {
+      await hooks.config?.(hostConfig);
+
+      const agents = hostConfig.agent as Record<
+        string,
+        Record<string, unknown>
+      >;
+      expect(agents.fixer?.model).toBeUndefined();
+      expect(agents.fixer?.variant).toBeUndefined();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('/model pick on a combined agent does not mark it model-switched', async () => {
+    // A host-persisted /model pick is the combined agent's follow target;
+    // it must not trip everModelSwitched (which disables the fallback
+    // chain for static-chain agents).
+    const hooks = await loadConfiguredPlugin({
+      agents: {
+        fixer: {
+          model: ['chain/primary', 'chain/backup'],
+          inheritModelFrom: 'session',
+        },
+      },
+    });
+    const hostConfig: Record<string, unknown> = {
+      agent: {
+        orchestrator: { model: 'host/orchestrator' },
+        fixer: { model: 'user/live-pick' },
+      },
+    };
+
+    try {
+      await hooks.config?.(hostConfig);
+      const runtime = RuntimeConfig.get(lastConfigDir as string);
+
+      expect(runtime.hasModelSwitched('fixer')).toBe(false);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('/model pick away from the chain primary still marks static-chain agents', async () => {
+    // Control for the exemption above: without inheritModelFrom, a /model
+    // pick differing from the chain primary keeps disabling the chain.
+    const hooks = await loadConfiguredPlugin({
+      agents: {
+        fixer: {
+          model: ['chain/primary', 'chain/backup'],
+        },
+      },
+    });
+    const hostConfig: Record<string, unknown> = {
+      agent: {
+        orchestrator: { model: 'host/orchestrator' },
+        fixer: { model: 'user/other-pick' },
+      },
+    };
+
+    try {
+      await hooks.config?.(hostConfig);
+      const runtime = RuntimeConfig.get(lastConfigDir as string);
+
+      expect(runtime.hasModelSwitched('fixer')).toBe(true);
     } finally {
       await hooks.dispose?.();
     }
@@ -1436,6 +4414,157 @@ describe('plugin config model inheritance', () => {
     }
   });
 
+  test('visible host MCP permission denial overrides canonical allow', async () => {
+    const hooks = await loadConfiguredPlugin({
+      agents: {
+        orchestrator: { displayName: 'EngineeringLead', mcps: ['context7'] },
+      },
+    });
+    const hostConfig: Record<string, unknown> = {
+      agent: {
+        orchestrator: { permission: { 'context7_*': 'allow' } },
+        EngineeringLead: { permission: { 'context7_*': 'deny' } },
+      },
+    };
+
+    try {
+      await hooks.config?.(hostConfig);
+      const agents = hostConfig.agent as Record<
+        string,
+        Record<string, unknown>
+      >;
+      expect(
+        ((agents.orchestrator?.permission ?? {}) as Record<string, unknown>)[
+          'context7_*'
+        ],
+      ).toBe('allow');
+      expect(
+        ((agents.EngineeringLead?.permission ?? {}) as Record<string, unknown>)[
+          'context7_*'
+        ],
+      ).toBe('deny');
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('repeated config hooks reproject the first owned registry snapshot', async () => {
+    const hooks = await loadConfiguredPlugin({
+      agents: { explorer: { model: ['plugin/first', 'plugin/next'] } },
+    });
+    const hostConfig: Record<string, unknown> = {
+      agent: {
+        explorer: {
+          model: 'host/selected',
+          prompt: 'host prompt',
+          options: { nested: { stable: true } },
+          permission: { read: 'allow', first_tool: 'allow' },
+        },
+      },
+      mcp: { host_remote: { type: 'remote' } },
+    };
+
+    try {
+      await hooks.config?.(hostConfig);
+      const firstProjection = structuredClone(hostConfig);
+      const changedAgents = hostConfig.agent as Record<string, unknown>;
+      changedAgents.foreign_agent = { model: 'foreign/current' };
+      const changedExplorer = changedAgents.explorer as Record<string, unknown>;
+      changedExplorer.model = 'host/replay';
+      changedExplorer.permission = {
+        read: 'deny',
+        replay_tool: 'allow',
+      };
+      const changedMcps = hostConfig.mcp as Record<string, unknown>;
+      changedMcps.foreign_current = { type: 'remote' };
+      await hooks.config?.(hostConfig);
+      const agents = hostConfig.agent as Record<
+        string,
+        Record<string, unknown>
+      >;
+      expect(agents.foreign_agent).toEqual({ model: 'foreign/current' });
+      expect(agents.explorer).toMatchObject({
+        model: 'host/selected',
+        prompt: 'host prompt',
+        options: { nested: { stable: true } },
+        permission: {
+          read: 'allow',
+          first_tool: 'allow',
+          'host_remote_*': 'deny',
+        },
+      });
+      expect(agents.explorer?.permission).not.toHaveProperty('replay_tool');
+      expect(agents.explorer).toEqual(
+        (firstProjection.agent as Record<string, unknown>).explorer,
+      );
+      expect(hostConfig.mcp).toMatchObject({
+        host_remote: { type: 'remote' },
+        foreign_current: { type: 'remote' },
+      });
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('sticky model-switch fallback survives a fresh plugin generation', async () => {
+    const config = {
+      agents: { explorer: { model: ['provider/first', 'provider/next'] } },
+    };
+    const disableChain = spyOn(
+      wakeHooks.ForegroundFallbackManager.prototype,
+      'disableChain',
+    );
+    let hooks = await loadConfiguredPlugin(config);
+    const directory = lastConfigDir as string;
+    try {
+      await hooks.config?.({
+        agent: { explorer: { model: 'provider/selected' } },
+      });
+      expect(RuntimeConfig.get(directory).hasModelSwitched('explorer')).toBe(
+        true,
+      );
+      await hooks.dispose?.();
+
+      hooks = await loadConfiguredPlugin(config, directory);
+      await hooks.config?.({
+        agent: { explorer: { model: 'provider/first' } },
+      });
+      expect(
+        disableChain.mock.calls.filter(([agent]) => agent === 'explorer'),
+      ).toHaveLength(2);
+    } finally {
+      await hooks.dispose?.();
+      disableChain.mockRestore();
+    }
+  });
+
+  test('combined inheritance never disables its fallback chain for a model pick', async () => {
+    const hooks = await loadConfiguredPlugin({
+      agents: {
+        explorer: {
+          model: ['provider/first', 'provider/next'],
+          inheritModelFrom: 'session',
+        },
+      },
+    });
+    const disableChain = spyOn(
+      wakeHooks.ForegroundFallbackManager.prototype,
+      'disableChain',
+    );
+    try {
+      await hooks.config?.({
+        agent: { explorer: { model: 'provider/selected' } },
+      });
+      expect(disableChain).not.toHaveBeenCalledWith('explorer');
+      expect(
+        RuntimeConfig.get(lastConfigDir as string).hasModelSwitched('explorer'),
+      ).toBe(false);
+    } finally {
+      await hooks.dispose?.();
+      disableChain.mockRestore();
+    }
+  });
+
   test('admission uses a direct host override from final agent config', async () => {
     await assertAdmissionUsesFinalModel(
       'fixer',
@@ -1467,6 +4596,27 @@ describe('plugin config model inheritance', () => {
         },
       },
       { researcher: { model: 'host/researcher' } },
+    );
+  });
+
+  test('admission uses the visible host model when canonical and visible entries differ', async () => {
+    await assertAdmissionUsesFinalModel(
+      'researcher',
+      {
+        backgroundJobs: {
+          concurrency: {
+            defaultConcurrency: 0,
+            providerConcurrency: { host: 1 },
+          },
+        },
+        agents: {
+          explorer: { model: 'plugin/explorer', displayName: 'researcher' },
+        },
+      },
+      {
+        explorer: { model: 'canonical/capacity' },
+        researcher: { model: 'host/visible' },
+      },
     );
   });
 
@@ -1503,312 +4653,6 @@ describe('plugin config model inheritance', () => {
   });
 });
 
-describe('plugin event ordering', () => {
-  let originalEnv: typeof process.env;
-
-  beforeEach(() => {
-    originalEnv = { ...process.env };
-    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
-  });
-
-  afterEach(() => {
-    process.env = originalEnv;
-  });
-
-  test('resolves foreground fallback before task error bookkeeping', async () => {
-    const projectDir = await mkdtemp('/tmp/oh-my-opencode-ordering-');
-    const events: string[] = [];
-    const getQueries: unknown[] = [];
-    const messageQueries: unknown[] = [];
-    const promptQueries: unknown[] = [];
-    const noop = async () => ({});
-    const sessionApi = {
-      get: async (args: { path: { id: string }; query?: unknown }) => {
-        getQueries.push(args.query);
-        return {
-          data: {
-            id: args.path.id,
-            ...(args.path.id === 'fallback-child'
-              ? { parentID: 'orchestrator-parent' }
-              : {}),
-          },
-        };
-      },
-      messages: async (args: { path: { id: string }; query?: unknown }) => {
-        messageQueries.push(args.query);
-        return {
-          data: [
-            {
-              info: { role: 'user', agent: 'fixer' },
-              parts: [{ type: 'text', text: 'Continue the task.' }],
-            },
-          ],
-        };
-      },
-      promptAsync: async (args: { query?: unknown }) => {
-        promptQueries.push(args.query);
-        events.push('fallback');
-        await hooks?.event?.({
-          event: {
-            type: 'session.status',
-            properties: {
-              sessionID: 'fallback-child',
-              status: { type: 'busy' },
-            },
-          },
-        } as never);
-        return {};
-      },
-    };
-    let hooks: Awaited<ReturnType<typeof plugin>> | undefined;
-    const session = new Proxy(sessionApi, {
-      get(target, property) {
-        return property in target
-          ? target[property as keyof typeof target]
-          : noop;
-      },
-    });
-    const client = new Proxy(
-      { app: { log: noop }, session },
-      {
-        get(target, property) {
-          return property in target
-            ? target[property as keyof typeof target]
-            : new Proxy({}, { get: () => noop });
-        },
-      },
-    );
-
-    await Bun.write(
-      path.join(projectDir, 'oh-my-opencode-slim.json'),
-      JSON.stringify({
-        fallback: { enabled: true },
-        agents: { fixer: { model: ['provider/primary', 'provider/fallback'] } },
-        companion: { enabled: false },
-      }),
-    );
-    process.env = {
-      ...originalEnv,
-      OPENCODE_CONFIG_DIR: projectDir,
-      XDG_DATA_HOME: path.join(projectDir, 'data'),
-      XDG_CACHE_HOME: path.join(projectDir, 'cache'),
-      OPENCODE_LOG_DIR: path.join(projectDir, 'logs'),
-    };
-
-    hooks = await plugin({
-      client,
-      directory: projectDir,
-      worktree: projectDir,
-      serverUrl: new URL('http://127.0.0.1:4096'),
-    } as never);
-
-    try {
-      await hooks['chat.message']?.(
-        { sessionID: 'orchestrator-parent', agent: 'orchestrator' } as never,
-        {} as never,
-      );
-      await hooks['tool.execute.before']?.(
-        {
-          tool: 'task',
-          sessionID: 'orchestrator-parent',
-          callID: 'fallback-ordering-call',
-        } as never,
-        {
-          args: {
-            background: false,
-            subagent_type: 'fixer',
-            description: 'ordering regression',
-          },
-        } as never,
-      );
-      await hooks['tool.execute.after']?.(
-        {
-          tool: 'task',
-          sessionID: 'orchestrator-parent',
-          callID: 'fallback-ordering-call',
-        } as never,
-        { output: 'task_id: fallback-child\nstate: running' } as never,
-      );
-
-      await hooks.event?.({
-        event: {
-          type: 'session.error',
-          properties: {
-            sessionID: 'fallback-child',
-            error: { statusCode: 401, message: 'unauthorized' },
-          },
-        },
-      } as never);
-
-      expect(events).toEqual(['fallback']);
-      expect(getQueries).toEqual([{ directory: projectDir }]);
-      expect(messageQueries).toEqual([
-        { directory: projectDir },
-        { directory: projectDir },
-      ]);
-      expect(promptQueries).toEqual([{ directory: projectDir }]);
-      const status = await hooks.tool?.task_status?.execute(
-        { task_id: 'fallback-child' },
-        { sessionID: 'orchestrator-parent', agent: 'orchestrator' } as never,
-      );
-      expect(String(status)).toContain('state: running');
-    } finally {
-      await hooks.dispose?.();
-      await rm(projectDir, { recursive: true, force: true });
-    }
-  });
-});
-
-describe('SmartFetch helper agent config-hook selection', () => {
-  let originalEnv: typeof process.env;
-  let originalFetch: typeof globalThis.fetch;
-  const configDirs: string[] = [];
-
-  beforeEach(() => {
-    originalEnv = { ...process.env };
-    originalFetch = globalThis.fetch;
-    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
-  });
-
-  afterEach(async () => {
-    globalThis.fetch = originalFetch;
-    CACHE.clear();
-    process.env = originalEnv;
-    while (configDirs.length > 0) {
-      const configDir = configDirs.pop();
-      if (configDir) {
-        await rm(configDir, { recursive: true, force: true });
-      }
-    }
-  });
-
-  async function loadSmartfetchPlugin() {
-    const configDir = await mkdtemp('/tmp/oh-my-opencode-smartfetch-agent-');
-    configDirs.push(configDir);
-    process.env = {
-      ...originalEnv,
-      OPENCODE_CONFIG_DIR: configDir,
-      XDG_DATA_HOME: `${configDir}/data`,
-      XDG_CACHE_HOME: `${configDir}/cache`,
-      OPENCODE_LOG_DIR: `${configDir}/logs`,
-    };
-    await Bun.write(
-      `${configDir}/oh-my-opencode-slim.json`,
-      JSON.stringify({
-        companion: { enabled: false },
-        webfetch: { model: 'provider/smartfetch-helper' },
-      }),
-    );
-
-    const session = {
-      create: mock(async () => ({ data: { id: 'smartfetch-secondary' } })),
-      prompt: mock(async () => ({
-        data: { parts: [{ type: 'text', text: 'secondary answer' }] },
-      })),
-      delete: mock(async () => ({ data: true })),
-      abort: mock(async () => ({ data: true })),
-    };
-    const client = {
-      app: { log: mock(async () => ({})) },
-      session,
-      tool: { ids: mock(async () => ({ data: ['read'] })) },
-    };
-    const hooks = await plugin({
-      client,
-      directory: configDir,
-      worktree: configDir,
-      serverUrl: new URL('http://127.0.0.1:4096'),
-    } as never);
-    return { client, configDir, hooks };
-  }
-
-  function installFetchedArticle(): void {
-    globalThis.fetch = mock(
-      async () =>
-        new Response(
-          'SmartFetch retrieves documentation and can summarize the fetched page with a configured secondary model. This article contains enough words to pass the content quality guard used by the tool.',
-          { status: 200, headers: { 'content-type': 'text/plain' } },
-        ),
-    ) as unknown as typeof fetch;
-  }
-
-  async function executeSmartfetch(
-    hooks: Awaited<ReturnType<typeof plugin>>,
-    url: string,
-  ) {
-    const webfetch = hooks.tool?.webfetch;
-    expect(webfetch).toBeDefined();
-    return webfetch?.execute(
-      {
-        url,
-        format: 'markdown',
-        extract_main: true,
-        prefer_llms_txt: 'never',
-        include_metadata: true,
-        save_binary: false,
-        prompt: 'Summarize the article',
-      },
-      {
-        ask: async () => undefined,
-        metadata: () => undefined,
-        abort: new AbortController().signal,
-        directory: '/tmp/smartfetch-agent-test',
-      } as never,
-    );
-  }
-
-  test('skips a host-disabled first helper candidate after the config hook', async () => {
-    installFetchedArticle();
-    const { client, configDir, hooks } = await loadSmartfetchPlugin();
-
-    try {
-      await hooks.config?.({ agent: { explorer: { disable: true } } });
-      await executeSmartfetch(
-        hooks,
-        `https://smartfetch.example/disabled-first-${configDir.slice(-6)}`,
-      );
-
-      const body = client.session.prompt.mock.calls[0]?.[0] as {
-        body?: { agent?: string };
-      };
-      expect(body.body?.agent).toBe('librarian');
-    } finally {
-      await hooks.dispose?.();
-    }
-  });
-
-  test('uses no helper when every registered helper is host-disabled', async () => {
-    installFetchedArticle();
-    const { client, hooks } = await loadSmartfetchPlugin();
-    const disabledHelpers = [
-      'explorer',
-      'librarian',
-      'oracle',
-      'designer',
-      'fixer',
-      'councillor',
-    ];
-
-    try {
-      await hooks.config?.({
-        agent: Object.fromEntries(
-          disabledHelpers.map((name) => [name, { disable: true }]),
-        ),
-      });
-      const result = await executeSmartfetch(
-        hooks,
-        'https://smartfetch.example/all-disabled',
-      );
-
-      expect(result).toContain('secondary_model_skipped_reason');
-      expect(result).toContain('no_helper_agent_available');
-      expect(client.session.create).not.toHaveBeenCalled();
-    } finally {
-      await hooks.dispose?.();
-    }
-  });
-});
-
 describe('system.transform orchestrator injection', () => {
   let originalEnv: typeof process.env;
   const configDirs: string[] = [];
@@ -1830,7 +4674,9 @@ describe('system.transform orchestrator injection', () => {
   async function loadPluginWithOrchestratorSession(
     config: Record<string, unknown> = {},
   ) {
-    const configDir = await mkdtemp('/tmp/oh-my-system-transform-');
+    const configDir = await mkdtemp(
+      path.join(os.tmpdir(), 'oh-my-system-transform-'),
+    );
     configDirs.push(configDir);
     await Bun.write(
       `${configDir}/oh-my-opencode-slim.json`,
@@ -1839,6 +4685,7 @@ describe('system.transform orchestrator injection', () => {
     process.env = {
       ...originalEnv,
       OPENCODE_CONFIG_DIR: configDir,
+      XDG_CONFIG_HOME: configDir,
       XDG_DATA_HOME: `${configDir}/data`,
       XDG_CACHE_HOME: `${configDir}/cache`,
       OPENCODE_LOG_DIR: `${configDir}/logs`,
@@ -1926,6 +4773,32 @@ describe('system.transform orchestrator injection', () => {
     }
   });
 
+  test('collapses the v2.0.5 identity part spliced at system[1] after the orchestrator prompt', async () => {
+    // OpenCode v2.0.5 core splices a "# Your Model" identity part at
+    // system[1] (packages/core/src/plugin/identity.ts). The transform
+    // must keep appending the orchestrator prompt to system[0] and
+    // collapse deterministically regardless.
+    const hooks = await loadPluginWithOrchestratorSession();
+    try {
+      const system = [
+        'You are an agent powered by OpenCode.\n<env>Working directory: /tmp</env>',
+        '# Your Model\n- Name: GLM\n- Provider ID: zhipuai\n- Model ID: glm-5.3',
+      ];
+      await hooks['experimental.chat.system.transform']?.(
+        { sessionID: 'ses-orc', agent: 'orchestrator' } as never,
+        { system } as never,
+      );
+      expect(system).toHaveLength(1);
+      expect(system[0]).toContain('# Your Model');
+      const identityAt = (system[0] as string).indexOf('# Your Model');
+      const orchestratorAt = (system[0] as string).indexOf('<Role>');
+      expect(orchestratorAt).toBeGreaterThan(-1);
+      expect(identityAt).toBeGreaterThan(orchestratorAt);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
   test('request-scoped agent overrides session tracking', async () => {
     const hooks = await loadPluginWithOrchestratorSession();
     try {
@@ -1940,56 +4813,6 @@ describe('system.transform orchestrator injection', () => {
     } finally {
       await hooks.dispose?.();
     }
-  });
-});
-
-describe('multiplexer host gating', () => {
-  let originalEnv: typeof process.env;
-
-  beforeEach(() => {
-    originalEnv = { ...process.env };
-  });
-
-  afterEach(() => {
-    process.env = originalEnv;
-  });
-
-  test('multiplexer is host-gated off on v2', () => {
-    // Minimal base input satisfying every v1 condition: a configured
-    // multiplexer type plus a live inside-session env marker (TMUX).
-    process.env.TMUX = '/tmp/tmux-1000/default,1,0';
-    const baseInput = {
-      multiplexerConfig: {
-        type: 'tmux',
-        layout: 'main-vertical',
-        main_pane_size: 60,
-        zellij_pane_mode: 'agent-tab',
-      } satisfies MultiplexerConfig,
-    };
-
-    expect(shouldEnableMultiplexer(baseInput)).toBe(true); // v1 unchanged
-    expect(shouldEnableMultiplexer({ hostFlavor: 'v2', ...baseInput })).toBe(
-      false,
-    );
-  });
-
-  test('multiplexer session manager config is forced off on v2 hosts', () => {
-    const multiplexerConfig = {
-      type: 'tmux',
-      layout: 'main-vertical',
-      main_pane_size: 60,
-      zellij_pane_mode: 'agent-tab',
-    } satisfies MultiplexerConfig;
-
-    // v2: type forced to 'none' so the manager's env-based self-gate
-    // (which would fire inside tmux) cannot re-enable pane management.
-    expect(sessionManagerMultiplexerConfig('v2', multiplexerConfig).type).toBe(
-      'none',
-    );
-    // v1: the exact same config object is passed through untouched.
-    expect(sessionManagerMultiplexerConfig(undefined, multiplexerConfig)).toBe(
-      multiplexerConfig,
-    );
   });
 });
 
@@ -2014,5 +4837,976 @@ describe('v1 host plugin module contract', () => {
     // v1 loader: `tui` must be absent (or a function in a tui-only module);
     // a server module declaring `tui` is rejected outright.
     expect('tui' in module).toBe(false);
+  });
+});
+
+describe('plugin foreground fallback host gating', () => {
+  let originalEnv: typeof process.env;
+  let projectDir: string;
+
+  const V2_NOTICE =
+    '[foreground-fallback] v2 replay fallback disabled (no atomic per-turn model switch); retry-hook steering active';
+
+  const createFallbackClient = () => {
+    const noop = async () => ({});
+    const messages = mock(async () => ({ data: [] }));
+    const abort = mock(async () => ({}));
+    const promptAsync = mock(async () => ({}));
+    const session = new Proxy(
+      { messages, abort, promptAsync, get: noop, status: noop },
+      { get: (target, key) => Reflect.get(target, key) ?? noop },
+    );
+    const client = new Proxy(
+      { app: { log: noop }, session },
+      {
+        get: (target, key) =>
+          Reflect.get(target, key) ?? new Proxy({}, { get: () => noop }),
+      },
+    );
+    return { client, messages, abort, promptAsync };
+  };
+
+  const createHooks = (hostFlavor?: string) =>
+    plugin({
+      client: createFallbackClient().client,
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+      ...(hostFlavor ? { hostFlavor } : {}),
+    } as never);
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    projectDir = await mkdtemp(
+      path.join(os.tmpdir(), 'oh-my-opencode-slim-fallback-gate-'),
+    );
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: projectDir,
+      XDG_CONFIG_HOME: projectDir,
+      XDG_DATA_HOME: `${projectDir}/data`,
+      XDG_CACHE_HOME: `${projectDir}/cache`,
+      OPENCODE_LOG_DIR: `${projectDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        fallback: { enabled: true, maxRetries: 0 },
+        agents: {
+          orchestrator: { model: ['openai/gpt-b', 'openai/gpt-c'] },
+        },
+      }),
+    );
+  });
+
+  afterEach(async () => {
+    jest.useRealTimers();
+    process.env = originalEnv;
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  test('v2 host: the replay path stays disabled', async () => {
+    const captured: string[] = [];
+    const capture = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string) => {
+        captured.push(message);
+      },
+    );
+    try {
+      const { client, abort, promptAsync } = createFallbackClient();
+      const hooks = await plugin({
+        client,
+        directory: projectDir,
+        worktree: projectDir,
+        serverUrl: new URL('http://127.0.0.1:4096'),
+        hostFlavor: 'v2',
+      } as never);
+
+      // The startup notice is emitted exactly once.
+      expect(captured.filter((message) => message === V2_NOTICE)).toHaveLength(
+        1,
+      );
+
+      const switchModel = mock(async () => ({}));
+      await hooks.event?.({
+        event: {
+          type: 'session.error',
+          properties: {
+            sessionID: 'sess-v2-gate',
+            error: { message: 'Rate limit exceeded' },
+          },
+        },
+      } as never);
+      await hooks.event?.({
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: {
+              sessionID: 'sess-v2-gate',
+              id: 'm-v2-gate',
+              agent: 'orchestrator',
+              role: 'assistant',
+              providerID: 'openai',
+              modelID: 'gpt-b',
+              error: { message: 'Rate limit exceeded' },
+            },
+          },
+        },
+      } as never);
+      await hooks.event?.({
+        event: {
+          type: 'session.status',
+          properties: {
+            sessionID: 'sess-v2-gate',
+            status: {
+              type: 'retry',
+              attempt: 1,
+              message: 'rate limit, retrying...',
+            },
+          },
+        },
+      } as never);
+
+      // No replay intervention on v2: the host has no atomic per-turn
+      // conditional switch, so abort + re-prompt stays off there.
+      expect(switchModel).not.toHaveBeenCalled();
+      expect(abort).not.toHaveBeenCalled();
+      expect(promptAsync).not.toHaveBeenCalled();
+
+      await hooks.dispose?.();
+    } finally {
+      capture.mockRestore();
+    }
+  });
+
+  test('v2 host: retry-hook steering advances the chain in place', async () => {
+    const { client, abort, promptAsync } = createFallbackClient();
+    const hooks = await plugin({
+      client,
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+      hostFlavor: 'v2',
+    } as never);
+
+    try {
+      // The beforeEach fixture configures maxRetries: 0, so the first
+      // failover retry event switches immediately — no host retries
+      // absorbed, no replay.
+      const switchModel = mock(async () => ({}));
+      const retryEvent = {
+        sessionID: 'sess-v2-steer',
+        agent: 'orchestrator',
+        model: { providerID: 'openai', id: 'gpt-b' },
+        error: { message: 'Rate limit exceeded' },
+        decision: { retry: true, delay: 2_000 },
+      };
+      await hooks['v2.session.retry']?.(
+        retryEvent as never,
+        switchModel as never,
+      );
+      expect(switchModel).toHaveBeenCalledTimes(1);
+      expect(switchModel).toHaveBeenCalledWith('sess-v2-steer', {
+        providerID: 'openai',
+        id: 'gpt-c',
+      });
+      // The host is told to retry the current turn on the new model.
+      expect(retryEvent.decision).toEqual({ retry: true, delay: 500 });
+      // Steering never replays: the replay transport stays untouched.
+      expect(abort).not.toHaveBeenCalled();
+      expect(promptAsync).not.toHaveBeenCalled();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('disabled_hooks foreground-fallback performs no automatic intervention', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        disabled_hooks: ['foreground-fallback'],
+        fallback: { enabled: true, maxRetries: 0 },
+        agents: {
+          orchestrator: { model: ['openai/gpt-b', 'openai/gpt-c'] },
+        },
+      }),
+    );
+    const { client, abort, promptAsync } = createFallbackClient();
+    const hooks = await plugin({
+      client,
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+
+    try {
+      await hooks.event?.({
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: {
+              id: 'assistant-disabled-hook',
+              sessionID: 'session-disabled-hook',
+              role: 'assistant',
+              agent: 'orchestrator',
+              providerID: 'openai',
+              modelID: 'gpt-b',
+            },
+          },
+        },
+      } as never);
+      await hooks.event?.({
+        event: {
+          type: 'session.error',
+          properties: {
+            sessionID: 'session-disabled-hook',
+            info: { id: 'assistant-disabled-hook' },
+            error: { message: 'rate limit' },
+          },
+        },
+      } as never);
+
+      // The v2 retry-hook steering follows the same switch: disabled_hooks
+      // must leave the host decision untouched even with a configured
+      // chain and maxRetries: 0.
+      const switchModel = mock(async () => ({}));
+      const retryEvent = {
+        sessionID: 'session-disabled-hook',
+        agent: 'orchestrator',
+        model: { providerID: 'openai', id: 'gpt-b' },
+        error: { message: 'rate limit' },
+        decision: { retry: true, delay: 2_000 },
+      };
+      await hooks['v2.session.retry']?.(
+        retryEvent as never,
+        switchModel as never,
+      );
+      expect(switchModel).not.toHaveBeenCalled();
+      expect(retryEvent.decision).toEqual({ retry: true, delay: 2_000 });
+      expect(abort).not.toHaveBeenCalled();
+      expect(promptAsync).not.toHaveBeenCalled();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('plugin fallback keeps the first duplicate variant on replay and continuation', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        fallback: {
+          enabled: true,
+          maxRetries: 0,
+          continuationPolicy: 'stick-to-fallback',
+        },
+        agents: {
+          orchestrator: {
+            model: [
+              'openai/gpt-b',
+              { id: 'openai/gpt-c', variant: 'reasoning-high' },
+              { id: 'openai/gpt-c', variant: 'reasoning-low' },
+            ],
+          },
+        },
+      }),
+    );
+    const { client, messages, promptAsync } = createFallbackClient();
+    messages.mockResolvedValue({
+      data: [
+        {
+          info: { id: 'user-variant', role: 'user' },
+          parts: [{ type: 'text', text: 'hello' }],
+        },
+      ],
+    });
+    const hooks = await plugin({
+      client,
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+
+    jest.useFakeTimers();
+    try {
+      await hooks['chat.message']?.(
+        {
+          sessionID: 'session-variant',
+          agent: 'orchestrator',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        } as never,
+        {} as never,
+      );
+      await hooks.event?.({
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: {
+              id: 'assistant-variant',
+              sessionID: 'session-variant',
+              role: 'assistant',
+              agent: 'orchestrator',
+              providerID: 'openai',
+              modelID: 'gpt-b',
+            },
+          },
+        },
+      } as never);
+      await hooks.event?.({
+        event: {
+          type: 'session.error',
+          properties: {
+            sessionID: 'session-variant',
+            info: { id: 'assistant-variant' },
+            error: { message: 'rate limit' },
+          },
+        },
+      } as never);
+
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(promptAsync.mock.calls[0]?.[0]).toMatchObject({
+        body: {
+          model: {
+            providerID: 'openai',
+            modelID: 'gpt-c',
+          },
+          variant: 'reasoning-high',
+        },
+      });
+      await hooks.event?.({
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: {
+              sessionID: 'session-variant',
+              role: 'assistant',
+              agent: 'orchestrator',
+              providerID: 'openai',
+              modelID: 'gpt-c',
+            },
+          },
+        },
+      } as never);
+      const output = {
+        message: {
+          id: 'internal-variant',
+          role: 'user',
+          sessionID: 'session-variant',
+          agent: 'orchestrator',
+          model: { providerID: 'openai', modelID: 'gpt-b' },
+        },
+        parts: [createInternalAgentTextPart('background task completed')],
+      };
+      await hooks['chat.message']?.(
+        { sessionID: 'session-variant', agent: 'orchestrator' } as never,
+        output as never,
+      );
+      expect(output.message.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-c',
+        variant: 'reasoning-high',
+      });
+      expect(readTuiSnapshot(projectDir).agentVariants.orchestrator).toBe(
+        'reasoning-high',
+      );
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('a non-primary fallback without an inline variant does not inherit the agent variant', async () => {
+    const configPath = `${projectDir}/oh-my-opencode-slim.json`;
+    const config = await Bun.file(configPath).json();
+    config.fallback.continuationPolicy = 'stick-to-fallback';
+    config.agents.orchestrator.variant = 'high';
+    config.agents.orchestrator.model.push({
+      id: 'openai/gpt-c',
+      variant: 'low',
+    });
+    await Bun.write(configPath, JSON.stringify(config));
+    const { client, messages, promptAsync } = createFallbackClient();
+    messages.mockResolvedValue({
+      data: [
+        {
+          info: { role: 'user' },
+          parts: [{ type: 'text', text: 'hello' }],
+        },
+      ],
+    });
+    const hooks = await plugin({
+      client,
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+    const input = { sessionID: 'variantless', agent: 'orchestrator' };
+    const primary = { providerID: 'openai', modelID: 'gpt-b' };
+    const fallback = { providerID: 'openai', modelID: 'gpt-c' };
+    const info = { ...input, role: 'assistant', model: primary };
+    jest.useFakeTimers();
+    try {
+      await hooks['chat.message']?.(
+        { ...input, model: primary } as never,
+        {} as never,
+      );
+      await hooks.event?.({
+        event: { type: 'message.updated', properties: { info } },
+      } as never);
+      await hooks.event?.({
+        event: {
+          type: 'session.error',
+          properties: { ...input, error: { message: 'rate limit' } },
+        },
+      } as never);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(promptAsync.mock.calls[0]?.[0]?.body).toMatchObject({
+        model: fallback,
+      });
+      expect(promptAsync.mock.calls[0]?.[0]?.body).not.toHaveProperty(
+        'variant',
+      );
+      info.model = fallback;
+      await hooks.event?.({
+        event: { type: 'message.updated', properties: { info } },
+      } as never);
+      const output = {
+        message: { ...input, model: primary },
+        parts: [createInternalAgentTextPart('background task completed')],
+      };
+      await hooks['chat.message']?.(input as never, output as never);
+      expect({
+        projectedVariant:
+          readTuiSnapshot(projectDir).agentVariants.orchestrator,
+        continuationModel: output.message.model,
+      }).toEqual({ projectedVariant: undefined, continuationModel: fallback });
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('v2 host with fallback explicitly disabled: no notice, no steering', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        fallback: { enabled: false },
+        agents: {
+          orchestrator: { model: ['openai/gpt-b', 'openai/gpt-c'] },
+        },
+      }),
+    );
+    const captured: string[] = [];
+    const capture = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string) => {
+        captured.push(message);
+      },
+    );
+    try {
+      const hooks = await createHooks('v2');
+      expect(captured.filter((message) => message === V2_NOTICE)).toHaveLength(
+        0,
+      );
+      // Steering follows the same user switch: a configured chain must not
+      // make the retry hook act when fallback is disabled.
+      const switchModel = mock(async () => ({}));
+      const retryEvent = {
+        sessionID: 'sess-v2-off',
+        agent: 'orchestrator',
+        model: { providerID: 'openai', id: 'gpt-b' },
+        error: { message: 'Rate limit exceeded' },
+        decision: { retry: true, delay: 2_000 },
+      };
+      await hooks['v2.session.retry']?.(
+        retryEvent as never,
+        switchModel as never,
+      );
+      expect(switchModel).not.toHaveBeenCalled();
+      expect(retryEvent.decision).toEqual({ retry: true, delay: 2_000 });
+      await hooks.dispose?.();
+    } finally {
+      capture.mockRestore();
+    }
+  });
+
+  test('v2 host with foreground-fallback hook disabled: no notice, no steering', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        disabled_hooks: ['foreground-fallback'],
+        fallback: { enabled: true },
+        agents: {
+          orchestrator: { model: ['openai/gpt-b', 'openai/gpt-c'] },
+        },
+      }),
+    );
+    const captured: string[] = [];
+    const capture = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string) => {
+        captured.push(message);
+      },
+    );
+    try {
+      const hooks = await createHooks('v2');
+      expect(captured.filter((message) => message === V2_NOTICE)).toHaveLength(
+        0,
+      );
+      // disabled_hooks gates steering identically to fallback.enabled.
+      const switchModel = mock(async () => ({}));
+      const retryEvent = {
+        sessionID: 'sess-v2-hook-off',
+        agent: 'orchestrator',
+        model: { providerID: 'openai', id: 'gpt-b' },
+        error: { message: 'Rate limit exceeded' },
+        decision: { retry: true, delay: 2_000 },
+      };
+      await hooks['v2.session.retry']?.(
+        retryEvent as never,
+        switchModel as never,
+      );
+      expect(switchModel).not.toHaveBeenCalled();
+      expect(retryEvent.decision).toEqual({ retry: true, delay: 2_000 });
+      await hooks.dispose?.();
+    } finally {
+      capture.mockRestore();
+    }
+  });
+
+  for (const hostFlavor of [undefined, 'v1'] as const) {
+    test(`v1 host (${hostFlavor ?? 'absent'}): the manager stays enabled`, async () => {
+      const captured: string[] = [];
+      const capture = spyOn(loggerModule, 'log').mockImplementation(
+        (message: string) => {
+          captured.push(message);
+        },
+      );
+      try {
+        const hooks = await createHooks(hostFlavor);
+        expect(
+          captured.filter((message) => message === V2_NOTICE),
+        ).toHaveLength(0);
+
+        const switchModel = mock(async () => ({}));
+        const event = {
+          sessionID: 'sess-v1-gate',
+          agent: 'orchestrator',
+          model: { providerID: 'openai', id: 'gpt-b' },
+          error: { message: 'Rate limit exceeded' },
+          decision: { retry: true },
+        };
+        await hooks['v2.session.retry']?.(event as never, switchModel as never);
+        expect(switchModel).toHaveBeenCalledWith('sess-v1-gate', {
+          providerID: 'openai',
+          id: 'gpt-c',
+        });
+
+        await hooks.dispose?.();
+      } finally {
+        capture.mockRestore();
+      }
+    });
+  }
+});
+
+describe('plugin command registration gating', () => {
+  let originalEnv: typeof process.env;
+  let projectDir: string;
+
+  const createClient = () => {
+    const noop = async () => ({});
+    const session = new Proxy({}, { get: () => noop }) as Record<
+      string,
+      unknown
+    >;
+    return new Proxy(
+      { app: { log: noop }, session },
+      {
+        get(target, property) {
+          if (property in target) {
+            return target[property as keyof typeof target];
+          }
+          return new Proxy({}, { get: () => noop });
+        },
+      },
+    );
+  };
+
+  const writeConfig = (config: Record<string, unknown>) =>
+    Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({ companion: { enabled: false }, ...config }),
+    );
+
+  const createHooks = async () =>
+    plugin({
+      client: createClient(),
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+
+  const prepareCommands = async (): Promise<Record<string, unknown>> => {
+    const hooks = await createHooks();
+    try {
+      const draft: Record<string, unknown> = { agent: {}, mcp: {} };
+      (
+        hooks as unknown as { registryBridge: RegistryFactoryBridge }
+      ).registryBridge.prepareCommands(draft);
+      return (draft.command as Record<string, unknown> | undefined) ?? {};
+    } finally {
+      await hooks.dispose?.();
+    }
+  };
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    projectDir = await mkdtemp(
+      path.join(os.tmpdir(), 'oh-my-opencode-slim-command-gate-'),
+    );
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: projectDir,
+      XDG_CONFIG_HOME: projectDir,
+      XDG_DATA_HOME: `${projectDir}/data`,
+      XDG_CACHE_HOME: `${projectDir}/cache`,
+      OPENCODE_LOG_DIR: `${projectDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  test('registers every command by default', async () => {
+    await writeConfig({});
+    expect(Object.keys(await prepareCommands()).sort()).toEqual([
+      'deepwork',
+      'implement',
+      'interview',
+      'loop',
+      'reflect',
+    ]);
+  });
+
+  test('skips disabled_commands entries and keeps the rest', async () => {
+    await writeConfig({ disabled_commands: ['interview', 'loop'] });
+    expect(Object.keys(await prepareCommands()).sort()).toEqual([
+      'deepwork',
+      'implement',
+      'reflect',
+    ]);
+  });
+
+  test('disabled implement command is not registered', async () => {
+    await writeConfig({ disabled_commands: ['implement'] });
+    expect(Object.keys(await prepareCommands()).sort()).toEqual([
+      'deepwork',
+      'interview',
+      'loop',
+      'reflect',
+    ]);
+  });
+
+  test('disabled reflect skill also unregisters /reflect', async () => {
+    await writeConfig({ disabled_skills: ['reflect'] });
+    expect(Object.keys(await prepareCommands()).sort()).toEqual([
+      'deepwork',
+      'implement',
+      'interview',
+      'loop',
+    ]);
+  });
+
+  test('disabled commands stay execution-inert while enabled ones intercept', async () => {
+    await writeConfig({ disabled_commands: ['deepwork'] });
+    const hooks = await createHooks();
+    try {
+      // A user-defined command with the same name must not be rewritten by
+      // the disabled omos workflow (the twin of the registration gate).
+      const userOwnedOutput = {
+        parts: [{ type: 'text', text: 'user-owned /deepwork output' }],
+      };
+      await hooks['command.execute.before']?.(
+        {
+          command: 'deepwork',
+          sessionID: 'sess-command-gate',
+          arguments: 'do work',
+        } as never,
+        userOwnedOutput as never,
+      );
+      expect(userOwnedOutput.parts).toEqual([
+        { type: 'text', text: 'user-owned /deepwork output' },
+      ]);
+
+      // Negative control: an enabled command is still intercepted.
+      const enabledOutput = {
+        parts: [] as Array<{ type: string; text?: string }>,
+      };
+      await hooks['command.execute.before']?.(
+        {
+          command: 'loop',
+          sessionID: 'sess-command-gate',
+          arguments: '',
+        } as never,
+        enabledOutput as never,
+      );
+      expect(enabledOutput.parts.length).toBeGreaterThan(0);
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+});
+
+describe('backgroundJobs.pruneEvictedSessions wiring', () => {
+  let originalEnv: NodeJS.ProcessEnv;
+  let projectDir = '';
+
+  const noop = async () => ({});
+
+  /** Create hooks and capture the production board the plugin built. */
+  const createHooksWithBoard = async (
+    sessionOverrides: Record<string, unknown> = {},
+  ) => {
+    let coordinator: BackgroundJobCoordinator | undefined;
+    const original =
+      BackgroundJobCoordinator.prototype.addLaunchIdentityListener;
+    const spy = spyOn(
+      BackgroundJobCoordinator.prototype,
+      'addLaunchIdentityListener',
+    ).mockImplementation(function (this: BackgroundJobCoordinator, listener) {
+      coordinator ??= this;
+      return original.call(this, listener);
+    });
+    try {
+      const hooks = await plugin({
+        client: createPluginClient(noop, undefined, sessionOverrides),
+        directory: projectDir,
+        worktree: projectDir,
+        serverUrl: new URL('http://127.0.0.1:4096'),
+      } as never);
+      return { hooks, coordinator: coordinator as BackgroundJobCoordinator };
+    } finally {
+      spy.mockRestore();
+    }
+  };
+
+  const gcCallbackOf = (coordinator: BackgroundJobCoordinator) => {
+    const board = (coordinator as unknown as { board: ProductionBoard }).board;
+    return (
+      board as unknown as {
+        onEvictedSession?: (evicted: BackgroundJobEvictedSession) => void;
+      }
+    ).onEvictedSession;
+  };
+
+  const evicted = (
+    overrides: Partial<BackgroundJobEvictedSession> = {},
+  ): BackgroundJobEvictedSession => ({
+    taskID: 'ses_gc_child',
+    parentSessionID: 'parent-1',
+    agent: 'fixer',
+    description: 'evicted child',
+    state: 'completed',
+    background: true,
+    provisional: false,
+    pluginLaunched: true,
+    externalOrigin: false,
+    alias: 'fix-1',
+    lastUsedAt: 100,
+    ...overrides,
+  });
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    projectDir = await mkdtemp(
+      path.join(os.tmpdir(), 'oh-my-opencode-slim-gc-wiring-'),
+    );
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: projectDir,
+      XDG_CONFIG_HOME: projectDir,
+      XDG_DATA_HOME: `${projectDir}/data`,
+      XDG_CACHE_HOME: `${projectDir}/cache`,
+      OPENCODE_LOG_DIR: `${projectDir}/logs`,
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        backgroundJobs: { pruneEvictedSessions: true },
+      }),
+    );
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(projectDir, { recursive: true, force: true });
+    resetChildInputWaitForTests();
+  });
+
+  test('a parked child-input wait skips removal; without one the host session is removed once', async () => {
+    const remove = mock(async () => ({}));
+    const get = mock(async () => ({
+      data: { id: 'ses_gc_child', parentID: 'parent-1' },
+    }));
+    const { hooks, coordinator } = await createHooksWithBoard({
+      delete: remove,
+      get,
+      status: async () => ({ data: {} }),
+    });
+    try {
+      const onEvictedSession = gcCallbackOf(coordinator);
+      expect(onEvictedSession).toBeTypeOf('function');
+
+      // Parked wait at evict time: the record's removal is the board's own
+      // business (board tests); the wiring must skip the host session remove.
+      noteChildInputWait({
+        taskID: 'ses_gc_child',
+        parentSessionID: 'parent-1',
+        kind: 'question',
+        requestID: 'req_1',
+        questions: [{ question: 'continue?', header: 'Ask', options: [] }],
+      });
+      onEvictedSession?.(evicted());
+      expect(remove).not.toHaveBeenCalled();
+      expect(listChildInputWaits('ses_gc_child')).toHaveLength(1);
+
+      clearChildInputWaitsForSession('ses_gc_child');
+      onEvictedSession?.(evicted());
+      // Registered in the same tick as the fire; self-removal runs in a
+      // later microtask, so only the settle-and-await assertion below is
+      // deferred — the sync one pins the same-tick registration.
+      expect(pendingSessionPrune('ses_gc_child')).toBeDefined();
+      await pendingSessionPrune('ses_gc_child');
+      expect(pendingSessionPrune('ses_gc_child')).toBeUndefined();
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(remove.mock.calls[0]?.[0]).toMatchObject({
+        path: { id: 'ses_gc_child' },
+        query: { directory: projectDir },
+      });
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('foreground, provisional, restored and adopted records never reach the host', async () => {
+    const remove = mock(async () => ({}));
+    const get = mock(async () => ({
+      data: { id: 'ses_gc_child', parentID: 'parent-1' },
+    }));
+    const { hooks, coordinator } = await createHooksWithBoard({
+      delete: remove,
+      get,
+      status: async () => ({ data: {} }),
+    });
+    try {
+      const onEvictedSession = gcCallbackOf(coordinator);
+      for (const overrides of [
+        { background: false },
+        { provisional: true },
+        { externalOrigin: true, pluginLaunched: false },
+        { pluginLaunched: false },
+      ]) {
+        onEvictedSession?.(evicted(overrides));
+        expect(pendingSessionPrune('ses_gc_child')).toBeUndefined();
+      }
+      expect(get).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('a host parentID mismatch or failed read skips the delete', async () => {
+    const remove = mock(async () => ({}));
+    let reply: () => Promise<unknown> = async () => ({
+      data: { id: 'ses_gc_child', parentID: 'someone-else' },
+    });
+    const get = mock(() => reply());
+    const { hooks, coordinator } = await createHooksWithBoard({
+      delete: remove,
+      get,
+      status: async () => ({ data: {} }),
+    });
+    try {
+      const onEvictedSession = gcCallbackOf(coordinator);
+      onEvictedSession?.(evicted());
+      await pendingSessionPrune('ses_gc_child');
+      reply = async () => {
+        throw new Error('host unavailable');
+      };
+      onEvictedSession?.(evicted());
+      await pendingSessionPrune('ses_gc_child');
+      expect(get).toHaveBeenCalledTimes(2);
+      expect(remove).not.toHaveBeenCalled();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('a session the board tracks again is never deleted', async () => {
+    const remove = mock(async () => ({}));
+    const get = mock(async () => ({
+      data: { id: 'ses_gc_child', parentID: 'parent-1' },
+    }));
+    const { hooks, coordinator } = await createHooksWithBoard({
+      delete: remove,
+      get,
+      status: async () => ({ data: {} }),
+    });
+    try {
+      const board = (coordinator as unknown as { board: ProductionBoard })
+        .board;
+      // Revived / re-registered after the eviction snapshot.
+      board.registerLaunch({
+        taskID: 'ses_gc_child',
+        parentSessionID: 'parent-1',
+        agent: 'fixer',
+        background: true,
+      });
+      const callback1 = gcCallbackOf(coordinator);
+      expect(typeof callback1).toBe('function');
+      callback1?.(evicted());
+      await pendingSessionPrune('ses_gc_child');
+      expect(remove).not.toHaveBeenCalled();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('a remove-less host degrades to a no-op without throwing', async () => {
+    // createPluginClient's session proxy returns a resolving noop for any
+    // missing method — the shim's capability-probed degradation shape.
+    const { hooks, coordinator } = await createHooksWithBoard();
+    try {
+      const callback2 = gcCallbackOf(coordinator);
+      expect(typeof callback2).toBe('function');
+      expect(() => callback2?.(evicted())).not.toThrow();
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
+  test('flag off wires no eviction listener', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        backgroundJobs: { pruneEvictedSessions: false },
+      }),
+    );
+    const { hooks, coordinator } = await createHooksWithBoard();
+    try {
+      expect(gcCallbackOf(coordinator)).toBeUndefined();
+    } finally {
+      await hooks.dispose?.();
+    }
   });
 });

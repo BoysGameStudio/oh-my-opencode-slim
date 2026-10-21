@@ -1,0 +1,732 @@
+import { afterEach, describe, expect, test } from 'bun:test';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { adaptPermissions } from '../v2/adapters';
+import { loadPluginConfig } from './loader';
+import {
+  mergeAgentOverrides,
+  mergePresetMaps,
+  PresetResolutionError,
+  resolvePreset,
+  resolvePresetDefinition,
+  resolvePresets,
+} from './presets';
+import { PluginConfigSchema } from './schema';
+
+const originalXdg = process.env.XDG_CONFIG_HOME;
+const originalCustom = process.env.OPENCODE_CONFIG_DIR;
+
+afterEach(() => {
+  if (originalXdg === undefined) {
+    delete process.env.XDG_CONFIG_HOME;
+  } else {
+    process.env.XDG_CONFIG_HOME = originalXdg;
+  }
+  if (originalCustom === undefined) {
+    delete process.env.OPENCODE_CONFIG_DIR;
+  } else {
+    process.env.OPENCODE_CONFIG_DIR = originalCustom;
+  }
+});
+
+function parsePresets(input: unknown) {
+  const presets = PluginConfigSchema.parse(input).presets;
+  if (!presets) throw new Error('Expected presets in test config');
+  return presets;
+}
+
+describe('preset inheritance', () => {
+  test('marketplace directives resolve against the latest parent', () => {
+    const presets = parsePresets({
+      presets: {
+        base: { marketplace: { agents: ['owner/a', 'owner/b', 'owner/c'] } },
+        child: {
+          extends: 'base',
+          marketplace: { agents_remove: ['owner/a'] },
+        },
+        added: {
+          extends: 'child',
+          marketplace: { agents_add: ['owner/d'] },
+        },
+        restored: {
+          extends: 'child',
+          marketplace: { agents_add: ['owner/a'], agents_remove: [] },
+        },
+      },
+    });
+
+    expect(resolvePresetDefinition('child', presets).marketplace).toEqual({
+      agents: ['owner/b', 'owner/c'],
+    });
+    expect(resolvePresetDefinition('added', presets).marketplace).toEqual({
+      agents: ['owner/b', 'owner/c', 'owner/d'],
+    });
+    expect(resolvePresetDefinition('restored', presets).marketplace).toEqual({
+      agents: ['owner/b', 'owner/c', 'owner/a'],
+    });
+    expect(resolvePreset('added', presets)).toEqual({});
+  });
+
+  test('marketplace replacement and explicit empty list clear inherited agents', () => {
+    const presets = parsePresets({
+      presets: {
+        base: { marketplace: { agents: ['owner/a', 'owner/b'] } },
+        replaced: {
+          extends: 'base',
+          marketplace: { agents: ['owner/d'], agents_add: ['owner/e'] },
+        },
+        cleared: { extends: 'base', marketplace: { agents: [] } },
+      },
+    });
+    expect(resolvePresetDefinition('replaced', presets).marketplace).toEqual({
+      agents: ['owner/d', 'owner/e'],
+    });
+    expect(resolvePresetDefinition('cleared', presets).marketplace).toEqual({
+      agents: [],
+    });
+  });
+
+  test('normalizes marketplace activation from structured preset definitions', () => {
+    const presets = parsePresets({
+      presets: {
+        base: {
+          agents: { oracle: { model: 'provider/base' } },
+          marketplace: { agents: ['owner/a'] },
+        },
+        child: {
+          extends: 'base',
+          agents: { oracle: { temperature: 0.5 } },
+          marketplace: { agents_add: ['owner/b'] },
+        },
+      },
+    });
+
+    expect(resolvePresetDefinition('child', presets)).toEqual({
+      extends: 'base',
+      agents: {
+        oracle: { model: 'provider/base', temperature: 0.5 },
+      },
+      marketplace: { agents: ['owner/a', 'owner/b'] },
+    });
+  });
+
+  test('composes marketplace directives across config layers', () => {
+    const base = parsePresets({
+      presets: {
+        root: { marketplace: { agents: ['owner/a', 'owner/b'] } },
+        child: {
+          extends: 'root',
+          marketplace: { agents_add: ['owner/c'], agents_remove: ['owner/a'] },
+        },
+      },
+    });
+    const project = parsePresets({
+      presets: {
+        child: {
+          marketplace: { agents_add: ['owner/d'], agents_remove: ['owner/c'] },
+        },
+      },
+    });
+
+    const merged = mergePresetMaps(base, project);
+    expect(resolvePresetDefinition('child', merged ?? {}).marketplace).toEqual({
+      agents: ['owner/b', 'owner/d'],
+    });
+    expect(merged?.child).toMatchObject({
+      marketplace: {
+        agents_add: ['owner/d'],
+        agents_remove: ['owner/a', 'owner/c'],
+      },
+    });
+  });
+
+  test('project additions and removals cancel matching lower-layer directives', () => {
+    const user = parsePresets({
+      presets: {
+        base: { marketplace: { agents: ['owner/a', 'owner/b', 'owner/c'] } },
+        child: {
+          extends: 'base',
+          marketplace: { agents_remove: ['owner/a', 'owner/b'] },
+        },
+        added: { marketplace: { agents_add: ['owner/a', 'owner/b'] } },
+      },
+    });
+    const project = parsePresets({
+      presets: {
+        base: { marketplace: { agents_add: ['owner/d'] } },
+        child: { marketplace: { agents_add: ['owner/a'] } },
+        added: { marketplace: { agents_remove: ['owner/a'] } },
+      },
+    });
+
+    const merged = mergePresetMaps(user, project) ?? {};
+    expect(merged.child).toMatchObject({
+      marketplace: { agents_add: ['owner/a'], agents_remove: ['owner/b'] },
+    });
+    expect(resolvePresetDefinition('child', merged).marketplace).toEqual({
+      agents: ['owner/a', 'owner/c', 'owner/d'],
+    });
+    expect(resolvePresetDefinition('added', merged).marketplace).toEqual({
+      agents: ['owner/b'],
+    });
+  });
+
+  test('project replacement discards inherited directives but keeps local directives', () => {
+    const user = parsePresets({
+      presets: {
+        base: { marketplace: { agents: ['owner/a'] } },
+        child: {
+          extends: 'base',
+          marketplace: {
+            agents_add: ['owner/c'],
+            agents_remove: ['owner/b'],
+          },
+        },
+      },
+    });
+    const project = parsePresets({
+      presets: {
+        base: { marketplace: { agents_add: ['owner/d'] } },
+        child: {
+          marketplace: {
+            agents: [],
+            agents_add: ['owner/b', 'owner/e'],
+            agents_remove: ['owner/e'],
+          },
+        },
+      },
+    });
+
+    const merged = mergePresetMaps(user, project) ?? {};
+    expect(resolvePresetDefinition('base', merged).marketplace).toEqual({
+      agents: ['owner/a', 'owner/d'],
+    });
+    expect(resolvePresetDefinition('child', merged).marketplace).toEqual({
+      agents: ['owner/b'],
+    });
+  });
+
+  test('same-layer removal wins over addition and an empty directive clears lower state', () => {
+    const user = parsePresets({
+      presets: {
+        child: {
+          marketplace: {
+            agents: ['owner/a'],
+            agents_add: ['owner/b'],
+            agents_remove: ['owner/a'],
+          },
+        },
+      },
+    });
+    const project = parsePresets({
+      presets: {
+        child: {
+          marketplace: {
+            agents_add: ['owner/a'],
+            agents_remove: ['owner/a'],
+          },
+        },
+      },
+    });
+    const merged = mergePresetMaps(user, project) ?? {};
+    expect(resolvePresetDefinition('child', merged).marketplace).toEqual({
+      agents: ['owner/b'],
+    });
+
+    const cleared = mergePresetMaps(
+      merged,
+      parsePresets({
+        presets: { child: { marketplace: { agents_remove: [] } } },
+      }),
+    );
+    expect(resolvePresetDefinition('child', cleared ?? {}).marketplace).toEqual(
+      {
+        agents: ['owner/a', 'owner/b'],
+      },
+    );
+  });
+
+  test('validates unique non-empty marketplace package IDs', () => {
+    expect(() =>
+      parsePresets({
+        presets: {
+          invalid: { marketplace: { agents_add: ['owner/a', 'owner/a'] } },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      parsePresets({
+        presets: {
+          invalid: { marketplace: { agents_remove: [' ', 'owner/a'] } },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      parsePresets({
+        presets: {
+          invalid: { marketplace: { agents_add: ['owner/a', ' owner/a '] } },
+        },
+      }),
+    ).toThrow();
+    for (const id of ['owner', 'owner/package/extra', 'Owner/package']) {
+      expect(() =>
+        parsePresets({
+          presets: { invalid: { marketplace: { agents_add: [id] } } },
+        }),
+      ).toThrow();
+    }
+  });
+
+  test('preserves a flat marketplace-named custom agent, including empty overrides', () => {
+    const presets = parsePresets({
+      presets: {
+        model: { marketplace: { model: 'provider/model' } },
+        empty: { marketplace: {} },
+        inherited: {
+          extends: 'model',
+          marketplace: { temperature: 0.5 },
+        },
+      },
+    });
+
+    expect(resolvePreset('model', presets)).toEqual({
+      marketplace: { model: 'provider/model' },
+    });
+    expect(resolvePreset('empty', presets)).toEqual({ marketplace: {} });
+    expect(resolvePreset('inherited', presets)).toEqual({
+      marketplace: { model: 'provider/model', temperature: 0.5 },
+    });
+    expect(resolvePresetDefinition('inherited', presets).marketplace).toBe(
+      undefined,
+    );
+  });
+
+  test('keeps structured marketplace agent overrides separate from activation', () => {
+    const presets = parsePresets({
+      presets: {
+        custom: {
+          agents: { marketplace: { model: 'provider/model' } },
+          marketplace: { agents_add: ['owner/package'] },
+        },
+      },
+    });
+
+    expect(resolvePreset('custom', presets)).toEqual({
+      marketplace: { model: 'provider/model' },
+    });
+    expect(resolvePresetDefinition('custom', presets).marketplace).toEqual({
+      agents: ['owner/package'],
+    });
+  });
+
+  test('preserves flat marketplace agent overrides alongside activation layers', () => {
+    const agentLayer = parsePresets({
+      presets: {
+        custom: { marketplace: { model: 'provider/model' } },
+      },
+    });
+    const activationLayer = parsePresets({
+      presets: {
+        custom: { marketplace: { agents_add: ['owner/package'] } },
+      },
+    });
+
+    for (const merged of [
+      mergePresetMaps(agentLayer, activationLayer),
+      mergePresetMaps(activationLayer, agentLayer),
+    ]) {
+      expect(merged?.custom).toMatchObject({
+        agents: { marketplace: { model: 'provider/model' } },
+        marketplace: { agents_add: ['owner/package'] },
+      });
+      expect(resolvePresetDefinition('custom', merged ?? {})).toEqual({
+        agents: { marketplace: { model: 'provider/model' } },
+        marketplace: { agents: ['owner/package'] },
+      });
+    }
+  });
+
+  test('preserves empty marketplace agent overrides in flat inherited presets', () => {
+    const user = parsePresets({
+      presets: {
+        shared: { marketplace: { agents: ['owner/shared'] } },
+        custom: {
+          extends: 'shared',
+          marketplace: { model: 'provider/model' },
+        },
+      },
+    });
+    const project = parsePresets({
+      presets: {
+        custom: { marketplace: { agents_add: ['owner/project'] } },
+      },
+    });
+    const merged = mergePresetMaps(user, project) ?? {};
+
+    expect(resolvePresetDefinition('custom', merged)).toEqual({
+      extends: 'shared',
+      agents: { marketplace: { model: 'provider/model' } },
+      marketplace: { agents: ['owner/shared', 'owner/project'] },
+    });
+
+    const emptyAgentLayer = parsePresets({
+      presets: { custom: { marketplace: {} } },
+    });
+    const activationOnlyLayer = parsePresets({
+      presets: {
+        custom: { marketplace: { agents_add: ['owner/package'] } },
+      },
+    });
+    const emptyMerged =
+      mergePresetMaps(emptyAgentLayer, activationOnlyLayer) ?? {};
+    expect(resolvePresetDefinition('custom', emptyMerged)).toEqual({
+      agents: { marketplace: {} },
+      marketplace: { agents: ['owner/package'] },
+    });
+  });
+
+  test('canonical agent aliases win field-by-field over legacy aliases', () => {
+    expect(
+      mergeAgentOverrides(
+        {},
+        {
+          explore: {
+            model: 'legacy/model',
+            temperature: 0.2,
+            options: { legacy: true },
+          },
+          explorer: {
+            model: 'canonical/model',
+            options: { canonical: true },
+          },
+        },
+      ),
+    ).toEqual({
+      explorer: {
+        model: 'canonical/model',
+        temperature: 0.2,
+        options: { legacy: true, canonical: true },
+      },
+    });
+  });
+
+  test('canonical inheritance clears a same-layer aliased model', () => {
+    expect(
+      mergeAgentOverrides(
+        { explorer: { model: 'base/model' } },
+        {
+          explore: { model: 'legacy/model' },
+          explorer: { inheritModelFrom: 'session' },
+        },
+      ),
+    ).toEqual({ explorer: { inheritModelFrom: 'session' } });
+  });
+
+  test('resolves legacy flat presets unchanged', () => {
+    const presets = parsePresets({
+      presets: { fast: { explorer: { model: 'provider/fast' } } },
+    });
+
+    expect(resolvePreset('fast', presets)).toEqual({
+      explorer: { model: 'provider/fast' },
+    });
+  });
+
+  test('preserves legacy custom names that resemble preset metadata', () => {
+    const presets = parsePresets({
+      presets: {
+        custom: {
+          extends: { model: 'extends/model' },
+          agents: { model: 'agents/model' },
+          model: { model: 'model/model' },
+        },
+      },
+    });
+
+    expect(resolvePreset('custom', presets)).toEqual({
+      extends: { model: 'extends/model' },
+      agents: { model: 'agents/model' },
+      model: { model: 'model/model' },
+    });
+  });
+
+  test('does not confuse a model-like custom agent with the agents wrapper', () => {
+    const presets = parsePresets({
+      presets: {
+        custom: { agents: { model: { model: 'model/model' } } },
+      },
+    });
+
+    expect(resolvePreset('custom', presets)).toEqual({
+      model: { model: 'model/model' },
+    });
+  });
+
+  test('retains a legacy options-named custom agent', () => {
+    const presets = parsePresets({
+      presets: {
+        custom: { options: { model: 'options/model' } },
+      },
+    });
+
+    expect(resolvePreset('custom', presets)).toEqual({
+      options: { model: 'options/model' },
+    });
+  });
+
+  test('resolves multiple inheritance levels with child precedence', () => {
+    const presets = parsePresets({
+      presets: {
+        base: {
+          agents: {
+            oracle: { model: 'provider/base', temperature: 0.2 },
+          },
+        },
+        middle: {
+          extends: 'base',
+          agents: { oracle: { temperature: 0.5 } },
+        },
+        child: {
+          extends: 'middle',
+          agents: { oracle: { model: 'provider/child' } },
+        },
+      },
+    });
+
+    expect(resolvePreset('child', presets)).toEqual({
+      oracle: { model: 'provider/child', temperature: 0.5 },
+    });
+  });
+
+  test('a later layer keeps its written order and never drops unmentioned denies', () => {
+    // Order is precedence: a key the child layer re-defines keeps its
+    // written position; base keys the layer does not mention yield to its
+    // wildcard — except denies, which stay effective so a blanket rule can
+    // never loosen what the layer did not name (nested maps included).
+    const merged = (
+      base: Record<string, unknown>,
+      child: Record<string, unknown>,
+    ) => {
+      const presets = parsePresets({
+        presets: {
+          base: { agents: { oracle: { permission: base } } },
+          child: {
+            extends: 'base',
+            agents: { oracle: { permission: child } },
+          },
+        },
+      });
+      const rules = adaptPermissions(
+        resolvePreset('child', presets).oracle.permission,
+      );
+      // OpenCode's evaluator: the last rule whose action and resource
+      // globs both match wins.
+      const glob = (value: string, pattern: string) => {
+        let source = pattern
+          .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+          .replace(/\*/g, '.*')
+          .replace(/\?/g, '.');
+        if (source.endsWith(' .*')) source = `${source.slice(0, -3)}( .*)?`;
+        return new RegExp(`^${source}$`, 's').test(value);
+      };
+      return (action: string, resource = '*') =>
+        rules.findLast(
+          (r) => glob(action, r.action) && glob(resource, r.resource),
+        )?.effect;
+    };
+
+    // Loosening blanket: the base's unmentioned denies survive it.
+    const loosened = merged(
+      { edit: 'deny', read: 'allow', bash: { '*': 'ask', 'rm -rf /': 'deny' } },
+      { '*': 'allow', bash: { '*': 'allow' } },
+    );
+    expect(loosened('edit')).toBe('deny');
+    expect(loosened('read')).toBe('allow');
+    expect(loosened('bash', 'rm -rf /')).toBe('deny');
+    expect(loosened('bash')).toBe('allow');
+
+    // Written order: the re-defined allow follows the layer's wildcard.
+    const written = merged(
+      { read: 'ask', glob: 'allow' },
+      { '*': 'deny', read: 'allow' },
+    );
+    expect(written('read')).toBe('allow');
+    expect(written('glob')).toBe('deny');
+
+    // Lockdown: the blanket deny wins over base allows it does not mention.
+    const locked = merged({ read: 'allow', glob: 'allow' }, { '*': 'deny' });
+    expect(locked('read')).toBe('deny');
+    expect(locked('glob')).toBe('deny');
+
+    // A later wildcard tightens anything but loosens only what it names:
+    // an unmentioned base map moves after the wildcard only with the
+    // entries at least as strict as it (deny > ask > allow).
+    const guarded = { bash: { '*': 'allow', 'rm -rf /': 'deny' } };
+    const lockdown = merged(guarded, { '*': 'deny' });
+    expect(lockdown('bash')).toBe('deny');
+    expect(lockdown('bash', 'ls')).toBe('deny');
+    expect(lockdown('bash', 'rm -rf /')).toBe('deny');
+
+    const open = merged(guarded, { '*': 'allow' });
+    expect(open('bash', 'rm -rf /')).toBe('deny');
+    expect(open('bash', 'ls')).toBe('allow');
+    expect(open('bash')).toBe('allow');
+
+    expect(merged({ edit: 'allow' }, { '*': 'deny' })('edit')).toBe('deny');
+    expect(merged({ edit: 'deny' }, { '*': 'allow' })('edit')).toBe('deny');
+    expect(
+      merged({ edit: 'deny' }, { '*': 'allow', edit: 'allow' })('edit'),
+    ).toBe('allow');
+
+    // Overlapping patterns keep their precedence when the map moves: a
+    // narrower allow after a broad deny is raised to the wildcard, not lost.
+    const layered = merged(
+      { bash: { 'git *': 'deny', 'git log *': 'allow' } },
+      { '*': 'ask' },
+    );
+    expect(layered('bash', 'git log x')).toBe('ask');
+    expect(layered('bash', 'git push')).toBe('deny');
+    expect(layered('bash', 'ls')).toBe('ask');
+
+    // An ask-level wildcard keeps unmentioned asks and denies, not allows.
+    const asked = merged(
+      { bash: { '*': 'allow', 'git push*': 'ask', 'rm -rf /': 'deny' } },
+      { '*': 'ask' },
+    );
+    expect(asked('bash', 'ls')).toBe('ask');
+    expect(asked('bash', 'git push*')).toBe('ask');
+    expect(asked('bash', 'rm -rf /')).toBe('deny');
+
+    // Nested maps apply the same rule against their own wildcard.
+    const nested = merged(
+      { bash: { '*': 'ask', 'git status': 'allow', 'rm -rf /': 'deny' } },
+      { bash: { '*': 'deny' } },
+    );
+    expect(nested('bash', 'git status')).toBe('deny');
+    expect(nested('bash', 'rm -rf /')).toBe('deny');
+
+    // The base's own wildcard stays the fallback the layer's keys refine.
+    const refined = merged({ '*': 'deny' }, { read: 'allow' });
+    expect(refined('read')).toBe('allow');
+    expect(refined('edit')).toBe('deny');
+  });
+
+  test('deep-merges nested objects and replaces arrays', () => {
+    const presets = parsePresets({
+      presets: {
+        base: {
+          oracle: {
+            options: { reasoning: { effort: 'low' }, verbosity: 'low' },
+            skills: ['base'],
+          },
+        },
+        child: {
+          extends: 'base',
+          agents: {
+            oracle: {
+              options: { reasoning: { budget: 1000 } },
+              skills: ['child'],
+            },
+          },
+        },
+      },
+    });
+
+    expect(resolvePreset('child', presets)).toEqual({
+      oracle: {
+        options: {
+          reasoning: { effort: 'low', budget: 1000 },
+          verbosity: 'low',
+        },
+        skills: ['child'],
+      },
+    });
+  });
+
+  test('inheritModelFrom clears an inherited model', () => {
+    const presets = parsePresets({
+      presets: {
+        base: { oracle: { model: 'provider/base', variant: 'fast' } },
+        child: {
+          extends: 'base',
+          agents: { oracle: { inheritModelFrom: 'session' } },
+        },
+      },
+    });
+
+    expect(resolvePreset('child', presets)).toEqual({
+      oracle: { inheritModelFrom: 'session', variant: 'fast' },
+    });
+  });
+
+  test('missing parents and cycles fail without partial results', () => {
+    expect(() =>
+      resolvePreset('child', {
+        child: { extends: 'missing', agents: { oracle: { model: 'partial' } } },
+      }),
+    ).toThrow('Preset "child" extends missing preset "missing"');
+
+    expect(() =>
+      resolvePresets({
+        a: { extends: 'b', agents: { oracle: { model: 'a' } } },
+        b: { extends: 'a', agents: { oracle: { model: 'b' } } },
+      }),
+    ).toThrow(new PresetResolutionError('cycle', ['a', 'b', 'a']).message);
+  });
+
+  test('resolves a project preset extending a user preset', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'preset-layers-'));
+    const userDir = path.join(tempDir, 'user', 'opencode');
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    const previousXdg = process.env.XDG_CONFIG_HOME;
+    const previousCustom = process.env.OPENCODE_CONFIG_DIR;
+
+    try {
+      fs.mkdirSync(userDir, { recursive: true });
+      fs.mkdirSync(projectConfigDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(userDir, 'oh-my-opencode-slim.json'),
+        JSON.stringify({
+          presets: {
+            shared: {
+              oracle: {
+                model: 'provider/shared',
+                options: { fromUser: true },
+              },
+            },
+          },
+        }),
+      );
+      fs.writeFileSync(
+        path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+        JSON.stringify({
+          preset: 'project',
+          presets: {
+            project: {
+              extends: 'shared',
+              agents: { oracle: { temperature: 0.7 } },
+            },
+          },
+          agents: { oracle: { options: { fromProject: true } } },
+        }),
+      );
+      process.env.XDG_CONFIG_HOME = path.join(tempDir, 'user');
+      delete process.env.OPENCODE_CONFIG_DIR;
+
+      const config = loadPluginConfig(projectDir, { silent: true });
+      expect(config.agents?.oracle).toEqual({
+        model: 'provider/shared',
+        temperature: 0.7,
+        options: { fromUser: true, fromProject: true },
+      });
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = previousXdg;
+      if (previousCustom === undefined) delete process.env.OPENCODE_CONFIG_DIR;
+      else process.env.OPENCODE_CONFIG_DIR = previousCustom;
+    }
+  });
+});

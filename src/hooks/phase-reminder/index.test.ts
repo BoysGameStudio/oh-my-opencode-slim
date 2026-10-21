@@ -5,6 +5,7 @@ import {
 } from '../../utils';
 import {
   createPhaseReminderHook,
+  hasPhaseReminder,
   PHASE_REMINDER,
   PHASE_REMINDER_METADATA_KEY,
 } from './index';
@@ -35,7 +36,7 @@ describe('createPhaseReminderHook', () => {
     });
   });
 
-  test('appends one reminder to every historical orchestrator user message in the session', async () => {
+  test('appends one reminder, anchored on the first eligible orchestrator user message', async () => {
     const hook = createPhaseReminderHook();
     const output = {
       messages: [
@@ -61,12 +62,12 @@ describe('createPhaseReminderHook', () => {
     await hook['experimental.chat.messages.transform']({}, output);
 
     expect(output.messages[0].parts).toHaveLength(2);
-    expect(output.messages[3].parts).toHaveLength(2);
+    expect(output.messages[3].parts).toHaveLength(1);
     expect(output.messages[1].parts).toHaveLength(1);
     expect(output.messages[2].parts).toHaveLength(1);
   });
 
-  test('reconstructs byte-identical historical messages on the next turn', async () => {
+  test('reconstructs the anchored message byte-identically on the next turn', async () => {
     const hook = createPhaseReminderHook();
     const turnN = {
       messages: [
@@ -82,7 +83,7 @@ describe('createPhaseReminderHook', () => {
     };
 
     await hook['experimental.chat.messages.transform']({}, turnN);
-    const transformedHistory = structuredClone(turnN.messages);
+    const anchor = JSON.stringify(turnN.messages[0]);
     const turnNPlusOne = {
       messages: [
         ...turnN.messages.map((message) => ({
@@ -98,7 +99,11 @@ describe('createPhaseReminderHook', () => {
 
     await hook['experimental.chat.messages.transform']({}, turnNPlusOne);
 
-    expect(turnNPlusOne.messages.slice(0, -1)).toEqual(transformedHistory);
+    // The anchor's rendered bytes are identical on the next request; the
+    // non-anchor messages stay untouched (no reminder churn behind it).
+    expect(JSON.stringify(turnNPlusOne.messages[0])).toBe(anchor);
+    expect(turnNPlusOne.messages[1].parts).toHaveLength(1);
+    expect(turnNPlusOne.messages[2].parts).toHaveLength(1);
   });
 
   test('is idempotent when run twice on the same messages', async () => {
@@ -119,9 +124,11 @@ describe('createPhaseReminderHook', () => {
     await hook['experimental.chat.messages.transform']({}, output);
     await hook['experimental.chat.messages.transform']({}, output);
 
-    for (const message of output.messages) {
-      expect(message.parts.filter((part) => part.synthetic)).toHaveLength(1);
-    }
+    const tagged = output.messages.flatMap((message) =>
+      message.parts.filter(hasPhaseReminder),
+    );
+    expect(tagged).toHaveLength(1);
+    expect(output.messages[0].parts).toHaveLength(2);
   });
 
   test('skips non-orchestrator sessions', async () => {
@@ -394,5 +401,277 @@ describe('createPhaseReminderHook', () => {
     expect(output.messages[3].parts.length).toBe(2);
     expect(output.messages[3].parts[0].text).toBe('hello');
     expect(output.messages[3].parts[1].text).toBe(PHASE_REMINDER);
+  });
+
+  test('T1: anchor rendered bytes are identical across simulated successive turns', async () => {
+    const turn = (texts: string[]) => ({
+      messages: texts.map((text) => ({
+        info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+        parts: [{ type: 'text', text }],
+      })),
+    });
+    const hook = createPhaseReminderHook();
+
+    const firstTurn = turn(['a', 'b']);
+    await hook['experimental.chat.messages.transform']({}, firstTurn);
+    const anchorBytes = JSON.stringify(firstTurn.messages[0]);
+
+    const secondTurn = turn(['a', 'b', 'c']);
+    await hook['experimental.chat.messages.transform']({}, secondTurn);
+    const thirdTurn = turn(['a', 'b', 'c', 'd']);
+    await hook['experimental.chat.messages.transform']({}, thirdTurn);
+
+    expect(JSON.stringify(secondTurn.messages[0])).toBe(anchorBytes);
+    expect(JSON.stringify(thirdTurn.messages[0])).toBe(anchorBytes);
+    expect(
+      secondTurn.messages
+        .slice(1)
+        .flatMap((message) => message.parts.filter(hasPhaseReminder)),
+    ).toHaveLength(0);
+  });
+
+  test('T2: exactly one tagged part exists in the whole array, invariant to N', async () => {
+    const hook = createPhaseReminderHook();
+    for (const count of [1, 2, 3, 5, 8]) {
+      const output = {
+        messages: Array.from({ length: count }, (_, index) => ({
+          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+          parts: [{ type: 'text', text: `turn ${index}` }],
+        })),
+      };
+
+      await hook['experimental.chat.messages.transform']({}, output);
+
+      const tagged = output.messages.flatMap((message) =>
+        message.parts.filter(hasPhaseReminder),
+      );
+      expect(tagged).toHaveLength(1);
+      expect(output.messages[0].parts).toHaveLength(2);
+    }
+  });
+
+  test('T3: messages after the anchor carry no reminder', async () => {
+    const hook = createPhaseReminderHook();
+    const output = {
+      messages: ['first', 'second', 'third', 'fourth'].map((text) => ({
+        info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+        parts: [{ type: 'text', text }],
+      })),
+    };
+
+    await hook['experimental.chat.messages.transform']({}, output);
+
+    expect(output.messages[0].parts.some(hasPhaseReminder)).toBe(true);
+    for (const message of output.messages.slice(1)) {
+      expect(message.parts.some(hasPhaseReminder)).toBe(false);
+      expect(message.parts).toHaveLength(1);
+    }
+  });
+
+  test('T4: re-anchors to the new first eligible message after compaction/truncation', async () => {
+    const hook = createPhaseReminderHook();
+
+    // Start from an already-anchored view, then drop the anchor from the
+    // prefix (compaction/truncation) and transform the truncated view.
+    const turnN = {
+      messages: ['anchor', 'survived summary tail', 'latest'].map((text) => ({
+        info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+        parts: [{ type: 'text', text }],
+      })),
+    };
+
+    await hook['experimental.chat.messages.transform']({}, turnN);
+    expect(turnN.messages[0].parts[1].text).toBe(PHASE_REMINDER);
+
+    const truncated = { messages: turnN.messages.slice(1) };
+
+    await hook['experimental.chat.messages.transform']({}, truncated);
+
+    // The new first eligible message carries the single reminder; the old
+    // anchor's copy did not persist anywhere in the truncated view.
+    expect(truncated.messages[0].parts).toHaveLength(2);
+    expect(truncated.messages[0].parts[1].text).toBe(PHASE_REMINDER);
+    expect(truncated.messages[1].parts).toHaveLength(1);
+    expect(
+      truncated.messages.flatMap((message) =>
+        message.parts.filter(hasPhaseReminder),
+      ),
+    ).toHaveLength(1);
+  });
+
+  test('T5: running the transform twice in one request still yields exactly one reminder', async () => {
+    const hook = createPhaseReminderHook();
+    const output = {
+      messages: ['first', 'second'].map((text) => ({
+        info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+        parts: [{ type: 'text', text }],
+      })),
+    };
+
+    await hook['experimental.chat.messages.transform']({}, output);
+    await hook['experimental.chat.messages.transform']({}, output);
+
+    expect(
+      output.messages.flatMap((message) =>
+        message.parts.filter(hasPhaseReminder),
+      ),
+    ).toHaveLength(1);
+    expect(output.messages[0].parts).toHaveLength(2);
+    expect(output.messages[1].parts).toHaveLength(1);
+  });
+
+  test('T6: an internal-initiator first text part pushes the anchor to the next eligible message', async () => {
+    const hook = createPhaseReminderHook();
+    const output = {
+      messages: [
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+          parts: [createInternalAgentTextPart('internal notification')],
+        },
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+          parts: [{ type: 'text', text: 'real user turn' }],
+        },
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+          parts: [{ type: 'text', text: 'latest' }],
+        },
+      ],
+    };
+
+    await hook['experimental.chat.messages.transform']({}, output);
+
+    expect(output.messages[0].parts).toHaveLength(1);
+    expect(output.messages[1].parts).toHaveLength(2);
+    expect(output.messages[1].parts[1].text).toBe(PHASE_REMINDER);
+    expect(output.messages[2].parts).toHaveLength(1);
+  });
+
+  test('T7: a non-orchestrator latest message or no sessionID injects nothing', async () => {
+    const hook = createPhaseReminderHook();
+    const nonOrchestrator = {
+      messages: [
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+          parts: [{ type: 'text', text: 'first' }],
+        },
+        {
+          info: { role: 'user', agent: 'explorer', sessionID: 's1' },
+          parts: [{ type: 'text', text: 'latest' }],
+        },
+      ],
+    };
+    await hook['experimental.chat.messages.transform']({}, nonOrchestrator);
+    expect(
+      nonOrchestrator.messages.flatMap((message) =>
+        message.parts.filter(hasPhaseReminder),
+      ),
+    ).toHaveLength(0);
+
+    const noSessionID = {
+      messages: [
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+          parts: [{ type: 'text', text: 'first' }],
+        },
+        {
+          info: { role: 'user', agent: 'orchestrator' },
+          parts: [{ type: 'text', text: 'latest' }],
+        },
+      ],
+    };
+    await hook['experimental.chat.messages.transform']({}, noSessionID);
+    expect(
+      noSessionID.messages.flatMap((message) =>
+        message.parts.filter(hasPhaseReminder),
+      ),
+    ).toHaveLength(0);
+  });
+
+  test('T8: injected text is the PHASE_REMINDER constant byte-for-byte', async () => {
+    const hook = createPhaseReminderHook();
+    const output = {
+      messages: [
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+          parts: [{ type: 'text', text: 'hello' }],
+        },
+      ],
+    };
+
+    await hook['experimental.chat.messages.transform']({}, output);
+
+    expect(output.messages[0].parts[1].text).toBe(PHASE_REMINDER);
+    // Guards accidental edits to the constant: the exact bytes pinned here
+    // must match (the cache-payload snapshot owns the same value).
+    expect(output.messages[0].parts[1].text).toBe(
+      '<system-reminder>\n' +
+        '!IMPORTANT! Scheduler workflow: pick the lightest workflow that fits. Direct work: execute and verify proportionately. Otherwise: plan lanes → dispatch background specialists → track task IDs → await hook-driven completion → reconcile terminal results → verify. !END!\n' +
+        '</system-reminder>',
+    );
+  });
+
+  test('fork edge: mixed sessionIDs anchor on the first message matching the latest session, deterministically', async () => {
+    const hook = createPhaseReminderHook();
+    // Forked view: older turns carry the parent sessionID, only the fork
+    // turns match the latest user message's sessionID.
+    const output = {
+      messages: [
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 'parent' },
+          parts: [{ type: 'text', text: 'inherited turn' }],
+        },
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 'fork' },
+          parts: [{ type: 'text', text: 'fork turn 1' }],
+        },
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 'fork' },
+          parts: [{ type: 'text', text: 'fork turn 2' }],
+        },
+      ],
+    };
+
+    await hook['experimental.chat.messages.transform']({}, output);
+    const firstRun = JSON.stringify(output);
+
+    expect(output.messages[0].parts).toHaveLength(1);
+    expect(output.messages[1].parts).toHaveLength(2);
+    expect(output.messages[1].parts[1].text).toBe(PHASE_REMINDER);
+    expect(output.messages[2].parts).toHaveLength(1);
+
+    // Deterministic on a second run over the same view.
+    await hook['experimental.chat.messages.transform']({}, output);
+    expect(JSON.stringify(output)).toBe(firstRun);
+  });
+
+  test('fork edge: no message matches the latest sessionID, so nothing is injected', async () => {
+    const hook = createPhaseReminderHook();
+    // The latest user message carries a sessionID that no earlier message
+    // shares; the eligible-message scan finds no matching anchor.
+    const output = {
+      messages: [
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 'parent' },
+          parts: [{ type: 'text', text: 'inherited turn' }],
+        },
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 'fork' },
+          parts: [{ type: 'text', text: 'fork turn' }],
+        },
+        {
+          info: { role: 'user', agent: 'orchestrator', sessionID: 'other' },
+          parts: [{ type: 'image', url: 'http://example.com/img.png' }],
+        },
+      ],
+    };
+
+    await hook['experimental.chat.messages.transform']({}, output);
+
+    expect(
+      output.messages.flatMap((message) =>
+        message.parts.filter(hasPhaseReminder),
+      ),
+    ).toHaveLength(0);
   });
 });

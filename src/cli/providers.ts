@@ -1,4 +1,3 @@
-import { DEFAULT_AGENT_MCPS } from '../config/agent-mcps';
 import { CUSTOM_SKILLS } from './custom-skills';
 import type { InstallConfig } from './types';
 
@@ -10,17 +9,15 @@ export const GENERATED_PRESETS = ['openai', 'opencode-go'] as const;
 // Model mappings by provider/preset.
 export const MODEL_MAPPINGS = {
   openai: {
-    orchestrator: { model: 'openai/gpt-5.6-terra', variant: 'high' },
-    oracle: { model: 'openai/gpt-5.6-sol', variant: 'high' },
-    librarian: { model: 'openai/gpt-5.6-luna', variant: 'low' },
-    explorer: { model: 'openai/gpt-5.6-luna', variant: 'low' },
-    designer: { model: 'openai/gpt-5.6-luna', variant: 'medium' },
-    fixer: { model: 'openai/gpt-5.6-luna', variant: 'high' },
+    orchestrator: { model: 'openai/gpt-6.1-sol', variant: 'medium' },
+    oracle: { model: 'openai/gpt-6.1-sol', variant: 'high' },
+    explorer: { model: 'openai/gpt-6-luna', variant: 'low' },
+    designer: { model: 'openai/gpt-6-luna', variant: 'medium' },
+    fixer: { model: 'openai/gpt-6.1-sol', variant: 'low' },
   },
   kimi: {
     orchestrator: { model: 'kimi-for-coding/k2p5', variant: 'max' },
     oracle: { model: 'kimi-for-coding/k2p5', variant: 'high' },
-    librarian: { model: 'kimi-for-coding/k2p5', variant: 'low' },
     explorer: { model: 'kimi-for-coding/k2p5', variant: 'low' },
     designer: { model: 'kimi-for-coding/k2p5', variant: 'medium' },
     fixer: { model: 'kimi-for-coding/k2p5', variant: 'low' },
@@ -28,7 +25,6 @@ export const MODEL_MAPPINGS = {
   copilot: {
     orchestrator: { model: 'github-copilot/claude-opus-4.6', variant: 'max' },
     oracle: { model: 'github-copilot/claude-opus-4.6', variant: 'high' },
-    librarian: { model: 'github-copilot/grok-code-fast-1', variant: 'low' },
     explorer: { model: 'github-copilot/grok-code-fast-1', variant: 'low' },
     designer: {
       model: 'github-copilot/gemini-3.1-pro-preview',
@@ -39,7 +35,6 @@ export const MODEL_MAPPINGS = {
   'zai-plan': {
     orchestrator: { model: 'zai-coding-plan/glm-5', variant: 'max' },
     oracle: { model: 'zai-coding-plan/glm-5', variant: 'high' },
-    librarian: { model: 'zai-coding-plan/glm-5', variant: 'low' },
     explorer: { model: 'zai-coding-plan/glm-5', variant: 'low' },
     designer: { model: 'zai-coding-plan/glm-5', variant: 'medium' },
     fixer: { model: 'zai-coding-plan/glm-5', variant: 'low' },
@@ -48,7 +43,6 @@ export const MODEL_MAPPINGS = {
     orchestrator: { model: 'opencode-go/minimax-m3', variant: 'thinking' },
     oracle: { model: 'opencode-go/qwen3.7-max', variant: 'max' },
     explorer: { model: 'opencode-go/deepseek-v4-flash', variant: 'high' },
-    librarian: { model: 'opencode-go/deepseek-v4-flash', variant: 'high' },
     designer: { model: 'opencode-go/kimi-k2.7-code' },
     fixer: { model: 'opencode-go/deepseek-v4-flash', variant: 'high' },
     observer: { model: 'opencode-go/mimo-v2.5' },
@@ -108,8 +102,6 @@ export function generateLiteConfig(
       model: modelInfo.model,
       variant: modelInfo.variant,
       skills,
-      mcps:
-        DEFAULT_AGENT_MCPS[agentName as keyof typeof DEFAULT_AGENT_MCPS] ?? [],
     };
   };
 
@@ -126,18 +118,6 @@ export function generateLiteConfig(
   const presets = config.presets as Record<string, unknown>;
   for (const presetName of GENERATED_PRESETS) {
     presets[presetName] = buildPreset(presetName);
-  }
-
-  if (installConfig.companion === 'yes') {
-    config.companion = {
-      enabled: true,
-      position: 'bottom-right',
-      size: 'medium',
-      gifPack: 'default',
-      loopStyle: 'classic',
-      speed: 1,
-      debug: false,
-    };
   }
 
   return config;

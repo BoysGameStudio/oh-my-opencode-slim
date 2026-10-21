@@ -1,30 +1,47 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { parse } from 'jsonc-parser';
 import type { PluginConfig } from '../config';
+import { loadPluginConfig } from '../config/loader';
 import {
   buildPresetSummary,
+  clearProjectPresetOnDisk,
   deletePreset,
+  findPresetDependents,
+  getAllConfiguredPresets,
+  getEditablePreset,
+  getPresetSelectionState,
+  getPresetSource,
+  readProjectConfig,
   removeAgentFromPreset,
   setAgentOverride,
   switchPresetOnDisk,
+  wouldCreatePresetCycle,
   writePreset,
 } from './preset-switch';
 
 let previousXdgDataHome: string | undefined;
 let previousXdgConfigHome: string | undefined;
 let previousOpenCodeConfigDir: string | undefined;
+let previousPresetEnv: string | undefined;
 let tempDir: string;
 
 beforeEach(() => {
   previousXdgDataHome = process.env.XDG_DATA_HOME;
   previousXdgConfigHome = process.env.XDG_CONFIG_HOME;
   previousOpenCodeConfigDir = process.env.OPENCODE_CONFIG_DIR;
+  previousPresetEnv = process.env.OH_MY_OPENCODE_SLIM_PRESET;
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omos-preset-switch-'));
   process.env.XDG_DATA_HOME = tempDir;
   process.env.XDG_CONFIG_HOME = path.join(tempDir, 'xdg-config');
   delete process.env.OPENCODE_CONFIG_DIR;
+  delete process.env.OH_MY_OPENCODE_SLIM_PRESET;
+
+  const userConfigDir = path.join(tempDir, 'xdg-config', 'opencode');
+  fs.mkdirSync(userConfigDir, { recursive: true });
+  fs.writeFileSync(path.join(userConfigDir, 'oh-my-opencode-slim.json'), '{}');
 });
 
 afterEach(() => {
@@ -46,7 +63,200 @@ afterEach(() => {
     process.env.OPENCODE_CONFIG_DIR = previousOpenCodeConfigDir;
   }
 
+  if (previousPresetEnv === undefined) {
+    delete process.env.OH_MY_OPENCODE_SLIM_PRESET;
+  } else {
+    process.env.OH_MY_OPENCODE_SLIM_PRESET = previousPresetEnv;
+  }
+
   fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('lists inherited presets without writing ancestor project configs', () => {
+  const workspace = path.join(tempDir, 'workspace');
+  const project = path.join(workspace, 'repo');
+  const nested = path.join(project, 'packages', 'backend');
+  fs.mkdirSync(nested, { recursive: true });
+  const configs = [
+    {
+      directory: workspace,
+      config: { presets: { inherited: { fixer: { model: 'test/model' } } } },
+    },
+    {
+      directory: project,
+      config: { presets: { inherited: { fixer: { variant: 'high' } } } },
+    },
+  ];
+  const configPaths = configs.map(({ directory, config }) => {
+    const configDir = path.join(directory, '.opencode');
+    fs.mkdirSync(configDir);
+    const filename = path.join(configDir, 'oh-my-opencode-slim.json');
+    fs.writeFileSync(filename, JSON.stringify(config));
+    return filename;
+  });
+  const originals = configPaths.map((filename) => fs.readFileSync(filename));
+
+  expect(getAllConfiguredPresets(nested).inherited).toMatchObject({
+    fixer: { model: 'test/model', variant: 'high' },
+  });
+  expect(configPaths.map((filename) => fs.readFileSync(filename))).toEqual(
+    originals,
+  );
+});
+
+test('preserves valid presets and pins around a malformed ancestor layer', () => {
+  const workspace = path.join(tempDir, 'workspace');
+  const repository = path.join(workspace, 'repository');
+  const worktree = path.join(repository, 'worktrees', 'feature');
+  for (const directory of [workspace, repository, worktree]) {
+    fs.mkdirSync(path.join(directory, '.opencode'), { recursive: true });
+  }
+  fs.writeFileSync(
+    path.join(workspace, '.opencode', 'oh-my-opencode-slim.json'),
+    JSON.stringify({
+      preset: 'shared',
+      presets: {
+        shared: { fixer: { model: 'test/shared' } },
+      },
+    }),
+  );
+  fs.writeFileSync(
+    path.join(repository, '.opencode', 'oh-my-opencode-slim.json'),
+    '{ invalid',
+  );
+  fs.writeFileSync(
+    path.join(worktree, '.opencode', 'oh-my-opencode-slim.json'),
+    JSON.stringify({ presets: { local: { fixer: { model: 'test/local' } } } }),
+  );
+
+  expect(Object.keys(getAllConfiguredPresets(worktree)).sort()).toEqual([
+    'local',
+    'shared',
+  ]);
+  expect(readProjectConfig(worktree)?.preset).toBe('shared');
+  expect(getPresetSource(worktree, 'shared')).toBe('project');
+  const result = switchPresetOnDisk(
+    worktree,
+    'local',
+    loadPluginConfig(worktree, { silent: true }),
+  );
+  expect(result.ok).toBe(false);
+  expect(result.message).toContain('shared');
+});
+
+test('skips an unreadable ancestor without hiding valid project presets', () => {
+  const workspace = path.join(tempDir, 'workspace');
+  const worktree = path.join(workspace, 'worktrees', 'feature');
+  const filename = path.join(
+    workspace,
+    '.opencode',
+    'oh-my-opencode-slim.json',
+  );
+  fs.mkdirSync(path.dirname(filename), { recursive: true });
+  fs.writeFileSync(filename, '{}');
+  fs.mkdirSync(path.join(worktree, '.opencode'), { recursive: true });
+  fs.writeFileSync(
+    path.join(worktree, '.opencode', 'oh-my-opencode-slim.json'),
+    JSON.stringify({ presets: { local: { fixer: { model: 'test/local' } } } }),
+  );
+  const originalRead = fs.readFileSync;
+  const readSpy = spyOn(fs, 'readFileSync').mockImplementation(
+    (...args: any[]) => {
+      if (args[0] === filename) throw new Error('Unreadable fixture');
+      return originalRead(...(args as Parameters<typeof originalRead>));
+    },
+  );
+  try {
+    expect(getAllConfiguredPresets(worktree).local).toEqual({
+      fixer: { model: 'test/local' },
+    });
+  } finally {
+    readSpy.mockRestore();
+  }
+});
+
+test('ignores schema-invalid ancestor pins and presets just like runtime loading', () => {
+  const workspace = path.join(tempDir, 'workspace');
+  const worktree = path.join(workspace, 'worktrees', 'feature');
+  for (const directory of [workspace, worktree]) {
+    fs.mkdirSync(path.join(directory, '.opencode'), { recursive: true });
+  }
+  fs.writeFileSync(
+    path.join(workspace, '.opencode', 'oh-my-opencode-slim.json'),
+    JSON.stringify({
+      autoUpdate: 'not-a-boolean',
+      preset: 'shared',
+      presets: { discarded: { fixer: { model: 'test/discarded' } } },
+    }),
+  );
+  fs.writeFileSync(
+    path.join(worktree, '.opencode', 'oh-my-opencode-slim.json'),
+    JSON.stringify({ presets: { local: { fixer: { model: 'test/local' } } } }),
+  );
+
+  const config = loadPluginConfig(worktree, { silent: true });
+  expect(config.preset).toBeUndefined();
+  expect(readProjectConfig(worktree)?.preset).toBeUndefined();
+  expect(Object.keys(getAllConfiguredPresets(worktree))).toEqual(['local']);
+  expect(getPresetSource(worktree, 'discarded')).toBe('none');
+  const result = switchPresetOnDisk(worktree, 'local', config);
+  expect(result.ok).toBe(true);
+  const userPath = path.join(
+    tempDir,
+    'xdg-config',
+    'opencode',
+    'oh-my-opencode-slim.json',
+  );
+  expect(JSON.parse(fs.readFileSync(userPath, 'utf-8')).preset).toBe('local');
+});
+
+test('preset lookup uses runtime model inheritance rules across all layers', () => {
+  const workspace = path.join(tempDir, 'workspace');
+  const worktree = path.join(workspace, 'worktrees', 'feature');
+  const userPath = path.join(
+    tempDir,
+    'xdg-config',
+    'opencode',
+    'oh-my-opencode-slim.json',
+  );
+  fs.writeFileSync(
+    userPath,
+    JSON.stringify({
+      presets: {
+        shared: { fixer: { model: 'test/global' } },
+        fromUser: { fixer: { model: 'test/global' } },
+      },
+    }),
+  );
+  for (const directory of [workspace, worktree]) {
+    fs.mkdirSync(path.join(directory, '.opencode'), { recursive: true });
+  }
+  fs.writeFileSync(
+    path.join(workspace, '.opencode', 'oh-my-opencode-slim.json'),
+    JSON.stringify({
+      presets: { shared: { fixer: { model: 'test/ancestor' } } },
+    }),
+  );
+  fs.writeFileSync(
+    path.join(worktree, '.opencode', 'oh-my-opencode-slim.json'),
+    JSON.stringify({
+      presets: {
+        shared: { fixer: { inheritModelFrom: 'orchestrator' } },
+        fromUser: { fixer: { inheritModelFrom: 'orchestrator' } },
+      },
+    }),
+  );
+
+  const presets = getAllConfiguredPresets(worktree);
+  const runtimePresets = loadPluginConfig(worktree).presets;
+  expect(presets.shared).toEqual({
+    fixer: { inheritModelFrom: 'orchestrator' },
+  });
+  expect(presets.fromUser).toEqual({
+    fixer: { inheritModelFrom: 'orchestrator' },
+  });
+  expect(presets.shared).toEqual(runtimePresets?.shared);
+  expect(presets.fromUser).toEqual(runtimePresets?.fromUser);
 });
 
 describe('switchPresetOnDisk', () => {
@@ -95,7 +305,7 @@ describe('switchPresetOnDisk', () => {
       presets: {
         cheap: {
           orchestrator: { model: 'anthropic/claude-3.5-haiku' },
-          explorer: { model: 'openai/gpt-5.6-luna' },
+          explorer: { model: 'openai/gpt-6-luna' },
         },
       },
     };
@@ -112,7 +322,7 @@ describe('switchPresetOnDisk', () => {
     expect(result.summary).toContain(
       'orchestrator → model: anthropic/claude-3.5-haiku',
     );
-    expect(result.summary).toContain('explorer → model: openai/gpt-5.6-luna');
+    expect(result.summary).toContain('explorer → model: openai/gpt-6-luna');
   });
 
   test('persists preset name to a JSONC user config file', () => {
@@ -140,13 +350,362 @@ describe('switchPresetOnDisk', () => {
 
     switchPresetOnDisk(tempDir, 'cheap', config);
 
-    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+    const jsonText = fs.readFileSync(configPath, 'utf-8');
+    expect(jsonText).toContain('// User-selected preset should be updated');
+    const persisted = parse(jsonText) as {
       preset?: string;
       agents?: Record<string, unknown>;
     };
     expect(persisted.preset).toBe('cheap');
     expect(persisted.agents).toEqual({
       orchestrator: { model: 'old-model' },
+    });
+  });
+
+  test('effective scope updates an existing project-local preset override', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    fs.writeFileSync(
+      projectConfigPath,
+      `{
+        // Companion should preserve this project-local layer.
+        "preset": "old",
+      }`,
+    );
+
+    const userConfigPath = path.join(
+      tempDir,
+      'xdg-config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    fs.writeFileSync(
+      userConfigPath,
+      JSON.stringify({ preset: 'user-default' }),
+    );
+
+    const config: PluginConfig = {
+      presets: {
+        old: { orchestrator: { model: 'old-model' } },
+        cheap: { orchestrator: { model: 'cheap-model' } },
+      },
+    };
+
+    const result = switchPresetOnDisk(projectDir, 'cheap', config, {
+      scope: 'effective',
+    });
+
+    expect(result.ok).toBe(true);
+    const projectText = fs.readFileSync(projectConfigPath, 'utf-8');
+    expect(projectText).toContain('// Companion should preserve');
+    expect((parse(projectText) as { preset?: string }).preset).toBe('cheap');
+    expect(JSON.parse(fs.readFileSync(userConfigPath, 'utf-8')).preset).toBe(
+      'user-default',
+    );
+  });
+
+  test('project scope creates a local override without changing global preset', () => {
+    const projectDir = path.join(tempDir, 'project-create');
+    fs.mkdirSync(projectDir, { recursive: true });
+    const userConfigPath = path.join(
+      tempDir,
+      'xdg-config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    fs.writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        preset: 'global',
+        presets: {
+          global: { orchestrator: { model: 'global-model' } },
+          cheap: { orchestrator: { model: 'cheap-model' } },
+        },
+      }),
+    );
+
+    const config: PluginConfig = {
+      presets: {
+        global: { orchestrator: { model: 'global-model' } },
+        cheap: { orchestrator: { model: 'cheap-model' } },
+      },
+    };
+    const result = switchPresetOnDisk(projectDir, 'cheap', config, {
+      scope: 'project',
+    });
+
+    expect(result.ok).toBe(true);
+    const projectConfigPath = path.join(
+      projectDir,
+      '.opencode',
+      'oh-my-opencode-slim.jsonc',
+    );
+    expect(fs.existsSync(projectConfigPath)).toBe(true);
+    expect(
+      (parse(fs.readFileSync(projectConfigPath, 'utf8')) as { preset?: string })
+        .preset,
+    ).toBe('cheap');
+    expect(JSON.parse(fs.readFileSync(userConfigPath, 'utf8')).preset).toBe(
+      'global',
+    );
+  });
+
+  test('global scope updates user preset even when project override exists', () => {
+    const projectDir = path.join(tempDir, 'project-global');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    fs.writeFileSync(projectConfigPath, JSON.stringify({ preset: 'local' }));
+
+    const userConfigPath = path.join(
+      tempDir,
+      'xdg-config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    fs.writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        preset: 'global-old',
+        presets: {
+          'global-old': { orchestrator: { model: 'old-global-model' } },
+          'global-new': { orchestrator: { model: 'new-global-model' } },
+        },
+      }),
+    );
+
+    const result = switchPresetOnDisk(
+      projectDir,
+      'global-new',
+      {
+        presets: {
+          local: { orchestrator: { model: 'local-model' } },
+          'global-old': { orchestrator: { model: 'old-global-model' } },
+          'global-new': { orchestrator: { model: 'new-global-model' } },
+        },
+      },
+      { scope: 'global' },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(JSON.parse(fs.readFileSync(userConfigPath, 'utf8')).preset).toBe(
+      'global-new',
+    );
+    expect(
+      (parse(fs.readFileSync(projectConfigPath, 'utf8')) as { preset?: string })
+        .preset,
+    ).toBe('local');
+  });
+
+  test('global scope rejects presets defined only in the project layer', () => {
+    const projectDir = path.join(tempDir, 'project-global-catalog');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.jsonc'),
+      JSON.stringify({
+        presets: {
+          localOnly: { orchestrator: { model: 'local-model' } },
+        },
+      }),
+    );
+
+    const result = switchPresetOnDisk(
+      projectDir,
+      'localOnly',
+      {
+        presets: {
+          localOnly: { orchestrator: { model: 'local-model' } },
+        },
+      },
+      { scope: 'global' },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('not found');
+  });
+
+  test('clearing project override preserves other project settings and restores inheritance', () => {
+    const projectDir = path.join(tempDir, 'project-inherit');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    fs.writeFileSync(
+      projectConfigPath,
+      `{
+        "preset": "local" /* removed-field comment, with comma */,
+        "companion": {
+          // preserve unrelated project setting comment
+          "enabled": true
+        },
+      }`,
+    );
+
+    const result = clearProjectPresetOnDisk(projectDir);
+
+    expect(result.ok).toBe(true);
+    const text = fs.readFileSync(projectConfigPath, 'utf8');
+    expect(text).toContain('// preserve unrelated project setting comment');
+    const parsed = parse(text) as {
+      preset?: string;
+      companion?: { enabled?: boolean };
+    };
+    expect(parsed.preset).toBeUndefined();
+    expect(parsed.companion?.enabled).toBe(true);
+  });
+
+  test('clearing project override removes every duplicate top-level preset key', () => {
+    const projectDir = path.join(tempDir, 'project-inherit-duplicates');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    const projectConfigPath = path.join(
+      projectConfigDir,
+      'oh-my-opencode-slim.jsonc',
+    );
+    fs.writeFileSync(
+      projectConfigPath,
+      `{
+        "preset": "first",
+        // preserve companion comment
+        "companion": { "enabled": true },
+        "preset": "second",
+        // preserve unrelated comment
+        "unrelated": 7,
+        "preset": "third",
+      }`,
+    );
+
+    const result = clearProjectPresetOnDisk(projectDir);
+
+    expect(result.ok).toBe(true);
+    const text = fs.readFileSync(projectConfigPath, 'utf8');
+    expect(text.match(/"preset"\s*:/g) ?? []).toHaveLength(0);
+    expect(text).toContain('// preserve companion comment');
+    expect(text).toContain('// preserve unrelated comment');
+    expect(parse(text)).toEqual({
+      companion: { enabled: true },
+      unrelated: 7,
+    });
+  });
+
+  test('selection state interpolates global preset placeholders like the runtime loader', () => {
+    const projectDir = path.join(tempDir, 'project-env-selection');
+    fs.mkdirSync(projectDir, { recursive: true });
+    const userConfigPath = path.join(
+      tempDir,
+      'xdg-config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    fs.writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        preset: '{env:OMO_TEST_GLOBAL_PRESET}',
+        presets: {
+          global: { orchestrator: { model: 'global-model' } },
+        },
+      }),
+    );
+
+    process.env.OMO_TEST_GLOBAL_PRESET = 'global';
+    try {
+      expect(getPresetSelectionState(projectDir)).toMatchObject({
+        effective: 'global',
+        global: 'global',
+        project: undefined,
+      });
+    } finally {
+      delete process.env.OMO_TEST_GLOBAL_PRESET;
+    }
+  });
+
+  test('selection state separates effective, project, and global catalogs', () => {
+    const projectDir = path.join(tempDir, 'project-selection-state');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.jsonc'),
+      JSON.stringify({
+        preset: 'local',
+        presets: {
+          local: { orchestrator: { model: 'local-model' } },
+        },
+      }),
+    );
+    const userConfigPath = path.join(
+      tempDir,
+      'xdg-config',
+      'opencode',
+      'oh-my-opencode-slim.json',
+    );
+    fs.writeFileSync(
+      userConfigPath,
+      JSON.stringify({
+        preset: 'global',
+        presets: {
+          global: { orchestrator: { model: 'global-model' } },
+        },
+      }),
+    );
+
+    const state = getPresetSelectionState(projectDir);
+    expect(state).toEqual({
+      effective: 'local',
+      project: 'local',
+      global: 'global',
+      projectAvailable: ['global', 'local'],
+      globalAvailable: ['global'],
+    });
+  });
+
+  test('switching preserves activation directives and allows activation-only presets', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.jsonc');
+    const activation = { agents_add: ['team/toolkit/reviewer'] };
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        preset: 'old',
+        presets: {
+          base: { marketplace: { agents: ['team/toolkit/base'] } },
+          active: {
+            extends: 'base',
+            agents: { orchestrator: { model: 'openai/gpt-6' } },
+            marketplace: activation,
+          },
+          marketplaceOnly: { marketplace: { agents: [] } },
+        },
+      }),
+    );
+
+    const result = switchPresetOnDisk(tempDir, 'marketplaceOnly', {
+      presets: {
+        marketplaceOnly: { marketplace: { agents: [] } },
+      },
+    } as PluginConfig);
+
+    expect(result.ok).toBe(true);
+    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      preset?: string;
+      presets: Record<string, { marketplace?: unknown }>;
+    };
+    expect(persisted.preset).toBe('marketplaceOnly');
+    expect(persisted.presets.active.marketplace).toEqual(activation);
+    expect(persisted.presets.base.marketplace).toEqual({
+      agents: ['team/toolkit/base'],
     });
   });
 
@@ -173,9 +732,9 @@ describe('switchPresetOnDisk', () => {
     const result = switchPresetOnDisk(tempDir, 'cheap', config);
     expect(result.ok).toBe(true);
 
-    // The BOM is stripped on read, so the preset name is persisted; the
-    // rewritten file is plain JSON that parses cleanly.
-    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+    const content = fs.readFileSync(configPath, 'utf-8');
+    expect(content.startsWith('\uFEFF')).toBe(true);
+    const persisted = JSON.parse(content.slice(1)) as {
       preset?: string;
       agents?: Record<string, unknown>;
     };
@@ -186,7 +745,7 @@ describe('switchPresetOnDisk', () => {
   test('resolves legacy alias keys (explore → explorer)', () => {
     const config: PluginConfig = {
       presets: {
-        scout: { explore: { model: 'openai/gpt-5.6-luna' } },
+        scout: { explore: { model: 'openai/gpt-6-luna' } },
       },
     };
 
@@ -223,7 +782,7 @@ describe('switchPresetOnDisk', () => {
       presets: {
         fallback: {
           orchestrator: {
-            model: ['anthropic/claude-3.5-haiku', 'openai/gpt-5.6'],
+            model: ['anthropic/claude-3.5-haiku', 'openai/gpt-6'],
           },
         },
       },
@@ -280,15 +839,363 @@ describe('switchPresetOnDisk', () => {
     );
   });
 
-  test('does not throw when the user config file is missing', () => {
-    // No config file on disk; persistPresetName is best-effort.
+  test('applies an inheritance-only child preset and returns base agent summary', () => {
+    const config: PluginConfig = {
+      presets: {
+        base: { orchestrator: { model: 'anthropic/claude-3.5-haiku' } },
+        child: { extends: 'base', agents: {} },
+      },
+    };
+
+    const result = switchPresetOnDisk(tempDir, 'child', config);
+
+    expect(result.ok).toBe(true);
+    expect(result.presetName).toBe('child');
+    expect(result.summary).toContain(
+      'orchestrator → model: anthropic/claude-3.5-haiku',
+    );
+  });
+
+  test('applies child preset with overrides and returns merged effective summary', () => {
+    const config: PluginConfig = {
+      presets: {
+        base: {
+          orchestrator: { model: 'anthropic/claude-3.5-haiku' },
+          oracle: { model: 'openai/gpt-6-luna' },
+        },
+        child: {
+          extends: 'base',
+          agents: {
+            orchestrator: { model: 'openai/o3' },
+          },
+        },
+      },
+    };
+
+    const result = switchPresetOnDisk(tempDir, 'child', config);
+
+    expect(result.ok).toBe(true);
+    expect(result.presetName).toBe('child');
+    expect(result.summary).toContain('orchestrator → model: openai/o3');
+    expect(result.summary).toContain('oracle → model: openai/gpt-6-luna');
+  });
+
+  test('fails cleanly when preset extends a missing parent', () => {
+    const config: PluginConfig = {
+      presets: {
+        child: { extends: 'missing_parent', agents: {} },
+      },
+    };
+
+    const result = switchPresetOnDisk(tempDir, 'child', config);
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('missing preset "missing_parent"');
+  });
+
+  test('fails cleanly when preset inheritance contains a cycle', () => {
+    const config: PluginConfig = {
+      presets: {
+        a: { extends: 'b', agents: {} },
+        b: { extends: 'a', agents: {} },
+      },
+    };
+
+    const result = switchPresetOnDisk(tempDir, 'a', config);
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('inheritance cycle detected');
+  });
+
+  test('fails when the user config file is missing', () => {
+    fs.rmSync(path.join(tempDir, 'xdg-config', 'opencode'), {
+      recursive: true,
+      force: true,
+    });
+
     const config: PluginConfig = {
       presets: {
         cheap: { orchestrator: { model: 'anthropic/claude-3.5-haiku' } },
       },
     };
 
-    expect(() => switchPresetOnDisk(tempDir, 'cheap', config)).not.toThrow();
+    const result = switchPresetOnDisk(tempDir, 'cheap', config);
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('No user config file was found');
+    expect(result.message).not.toContain('Saved preset');
+  });
+
+  test('fails when the user config file is malformed', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      '{ invalid json',
+    );
+
+    const config: PluginConfig = {
+      presets: {
+        cheap: { orchestrator: { model: 'anthropic/claude-3.5-haiku' } },
+      },
+    };
+
+    const result = switchPresetOnDisk(tempDir, 'cheap', config);
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain(
+      'Could not read or parse the user config file',
+    );
+    expect(result.message).not.toContain('Saved preset');
+  });
+
+  test('fails when writing the user config file fails', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      '{"preset":"old"}',
+    );
+
+    const writeSpy = spyOn(fs, 'writeFileSync').mockImplementation(() => {
+      throw new Error('permission denied');
+    });
+    try {
+      const result = switchPresetOnDisk(tempDir, 'cheap', {
+        presets: {
+          cheap: { orchestrator: { model: 'anthropic/claude-3.5-haiku' } },
+        },
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain('Could not write the user config file');
+      expect(result.message).toContain('permission denied');
+      expect(result.message).not.toContain('Saved preset');
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  test('applies preset with only non-model fields (inheritModelFrom, skills, permission)', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      '{"preset":"initial"}',
+    );
+
+    const config: PluginConfig = {
+      presets: {
+        skillsOnly: {
+          orchestrator: {
+            inheritModelFrom: 'oracle',
+            skills: ['code-review'],
+            permission: 'read',
+          },
+        },
+      },
+    };
+
+    const result = switchPresetOnDisk(tempDir, 'skillsOnly', config);
+
+    expect(result.ok).toBe(true);
+    expect(result.summary.length).toBeGreaterThan(0);
+    expect(result.summary[0]).toContain('inherit: oracle');
+    expect(result.summary[0]).toContain('skills: code-review');
+    expect(result.summary[0]).toContain('permissions: yes');
+
+    const persisted = JSON.parse(
+      fs.readFileSync(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        'utf-8',
+      ),
+    ) as { preset?: string };
+    expect(persisted.preset).toBe('skillsOnly');
+  });
+
+  test('rejects switching when project config explicitly sets a different preset', () => {
+    const projectDir = path.join(tempDir, '.opencode');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, 'oh-my-opencode-slim.jsonc'),
+      JSON.stringify({
+        preset: 'project-preset',
+      }),
+    );
+
+    const config: PluginConfig = {
+      presets: {
+        'user-choice': {
+          orchestrator: { model: 'anthropic/claude-3.5-haiku' },
+        },
+        'project-preset': {
+          orchestrator: { model: 'openai/gpt-5' },
+        },
+      },
+    };
+
+    const result = switchPresetOnDisk(tempDir, 'user-choice', config);
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain(
+      'project config (.opencode) explicitly sets preset "project-preset"',
+    );
+    expect(result.message).toContain('takes precedence on reload');
+  });
+
+  test('allows switching when project config explicitly sets the same preset', () => {
+    const projectDir = path.join(tempDir, '.opencode');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, 'oh-my-opencode-slim.jsonc'),
+      JSON.stringify({
+        preset: 'shared-preset',
+      }),
+    );
+
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(path.join(configDir, 'oh-my-opencode-slim.json'), '{}');
+
+    const config: PluginConfig = {
+      presets: {
+        'shared-preset': {
+          orchestrator: { model: 'anthropic/claude-3.5-haiku' },
+        },
+      },
+    };
+
+    const result = switchPresetOnDisk(tempDir, 'shared-preset', config);
+
+    expect(result.ok).toBe(true);
+  });
+
+  test('allows switching when project preset resolves from an environment variable', () => {
+    const projectPresetEnv = 'OMOS_PROJECT_PRESET';
+    const previousProjectPreset = process.env[projectPresetEnv];
+    process.env[projectPresetEnv] = 'shared-preset';
+    try {
+      const projectDir = path.join(tempDir, '.opencode');
+      fs.mkdirSync(projectDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(projectDir, 'oh-my-opencode-slim.jsonc'),
+        JSON.stringify({ preset: `{env:${projectPresetEnv}}` }),
+      );
+
+      const result = switchPresetOnDisk(tempDir, 'shared-preset', {
+        presets: {
+          'shared-preset': {
+            orchestrator: { model: 'anthropic/claude-3.5-haiku' },
+          },
+        },
+      });
+
+      expect(result.ok).toBe(true);
+    } finally {
+      if (previousProjectPreset === undefined) {
+        delete process.env[projectPresetEnv];
+      } else {
+        process.env[projectPresetEnv] = previousProjectPreset;
+      }
+    }
+  });
+
+  test('blocks switching when the expanded project preset differs', () => {
+    const projectPresetEnv = 'OMOS_PROJECT_PRESET';
+    const previousProjectPreset = process.env[projectPresetEnv];
+    process.env[projectPresetEnv] = 'project-preset';
+    try {
+      const projectDir = path.join(tempDir, '.opencode');
+      fs.mkdirSync(projectDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(projectDir, 'oh-my-opencode-slim.jsonc'),
+        JSON.stringify({ preset: `{env:${projectPresetEnv}}` }),
+      );
+
+      const result = switchPresetOnDisk(tempDir, 'user-choice', {
+        presets: {
+          'user-choice': {
+            orchestrator: { model: 'anthropic/claude-3.5-haiku' },
+          },
+        },
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain(
+        'project config (.opencode) explicitly sets preset "project-preset"',
+      );
+    } finally {
+      if (previousProjectPreset === undefined) {
+        delete process.env[projectPresetEnv];
+      } else {
+        process.env[projectPresetEnv] = previousProjectPreset;
+      }
+    }
+  });
+
+  test('allows switching when the project preset environment variable is missing', () => {
+    const projectPresetEnv = 'OMOS_MISSING_PROJECT_PRESET';
+    const previousProjectPreset = process.env[projectPresetEnv];
+    delete process.env[projectPresetEnv];
+    try {
+      const projectDir = path.join(tempDir, '.opencode');
+      fs.mkdirSync(projectDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(projectDir, 'oh-my-opencode-slim.jsonc'),
+        JSON.stringify({ preset: `{env:${projectPresetEnv}}` }),
+      );
+
+      const result = switchPresetOnDisk(tempDir, 'user-choice', {
+        presets: {
+          'user-choice': {
+            orchestrator: { model: 'anthropic/claude-3.5-haiku' },
+          },
+        },
+      });
+
+      expect(result.ok).toBe(true);
+    } finally {
+      if (previousProjectPreset === undefined) {
+        delete process.env[projectPresetEnv];
+      } else {
+        process.env[projectPresetEnv] = previousProjectPreset;
+      }
+    }
+  });
+
+  test('rejects switching when the environment selects a different preset', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({ preset: 'old', presets: { old: {}, selected: {} } }),
+    );
+    process.env.OH_MY_OPENCODE_SLIM_PRESET = 'env-selected';
+
+    const config: PluginConfig = {
+      presets: {
+        selected: {
+          orchestrator: { model: 'anthropic/claude-3.5-haiku' },
+        },
+      },
+    };
+
+    const result = switchPresetOnDisk(tempDir, 'selected', config);
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('OH_MY_OPENCODE_SLIM_PRESET');
+    expect(result.message).toContain('"env-selected"');
+    expect(result.message).toContain('takes precedence on reload');
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf-8'))).toEqual({
+      preset: 'old',
+      presets: { old: {}, selected: {} },
+    });
   });
 });
 
@@ -303,7 +1210,7 @@ describe('writePreset', () => {
     );
 
     const ok = writePreset(tempDir, 'scout', {
-      explorer: { model: 'openai/gpt-5.6-luna' },
+      explorer: { model: 'openai/gpt-6-luna' },
     });
 
     expect(ok).toBe(true);
@@ -314,7 +1221,7 @@ describe('writePreset', () => {
       ),
     ) as { presets?: Record<string, unknown> };
     expect(persisted.presets?.scout).toEqual({
-      explorer: { model: 'openai/gpt-5.6-luna' },
+      explorer: { model: 'openai/gpt-6-luna' },
     });
     // existing fields preserved
     expect(persisted.preset).toBe('old');
@@ -334,11 +1241,13 @@ describe('writePreset', () => {
     );
 
     const ok = writePreset(tempDir, 'scout', {
-      explorer: { model: 'openai/gpt-5.6-luna' },
+      explorer: { model: 'openai/gpt-6-luna' },
     });
 
     expect(ok).toBe(true);
-    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+    const content = fs.readFileSync(configPath, 'utf-8');
+    expect(content.startsWith('\uFEFF')).toBe(true);
+    const persisted = JSON.parse(content.slice(1)) as {
       preset?: string;
       presets?: Record<string, unknown>;
     };
@@ -346,7 +1255,7 @@ describe('writePreset', () => {
     expect(persisted.preset).toBe('old');
     expect(persisted.presets?.existing).toEqual({ oracle: { model: 'a' } });
     expect(persisted.presets?.scout).toEqual({
-      explorer: { model: 'openai/gpt-5.6-luna' },
+      explorer: { model: 'openai/gpt-6-luna' },
     });
   });
 
@@ -392,6 +1301,488 @@ describe('writePreset', () => {
       ),
     ) as { presets?: Record<string, unknown> };
     expect(persisted.presets?.solo).toEqual({ orchestrator: { model: 'x' } });
+  });
+
+  test('preserves local extends and only local agents when writing preset definition', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        presets: {
+          base: { orchestrator: { model: 'anthropic/claude-3.5-haiku' } },
+        },
+      }),
+    );
+
+    const ok = writePreset(tempDir, 'child', {
+      extends: 'base',
+      agents: { explorer: { model: 'openai/gpt-6-luna' } },
+    });
+
+    expect(ok).toBe(true);
+    const persisted = JSON.parse(
+      fs.readFileSync(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        'utf-8',
+      ),
+    ) as { presets?: Record<string, unknown> };
+
+    // Does NOT materialize orchestrator from base; keeps extends and local agents only
+    expect(persisted.presets?.child).toEqual({
+      extends: 'base',
+      agents: { explorer: { model: 'openai/gpt-6-luna' } },
+    });
+  });
+
+  test('writes inheritance-only child preset with extends and empty agents', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(path.join(configDir, 'oh-my-opencode-slim.json'), '{}');
+
+    const ok = writePreset(tempDir, 'child', {
+      extends: 'base',
+      agents: {},
+    });
+
+    expect(ok).toBe(true);
+    const persisted = JSON.parse(
+      fs.readFileSync(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        'utf-8',
+      ),
+    ) as { presets?: Record<string, unknown> };
+
+    expect(persisted.presets?.child).toEqual({
+      extends: 'base',
+      agents: {},
+    });
+  });
+
+  test('preserves empty structured agents alongside marketplace directives', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    fs.writeFileSync(configPath, '{}');
+
+    expect(
+      writePreset(tempDir, 'child', {
+        extends: 'base',
+        agents: {},
+        marketplace: { agents_add: ['team/agent'] },
+      }),
+    ).toBe(true);
+
+    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      presets: Record<string, unknown>;
+    };
+    expect(persisted.presets.child).toEqual({
+      extends: 'base',
+      agents: {},
+      marketplace: { agents_add: ['team/agent'] },
+    });
+  });
+
+  test('writes activation-only definitions and preserves JSONC and unrelated keys', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.jsonc');
+    fs.writeFileSync(
+      configPath,
+      '{\n  // retained note\n  "unrelated": true,\n  "presets": {}\n}',
+    );
+
+    expect(
+      writePreset(tempDir, 'marketplace', {
+        marketplace: { agents: ['team/toolkit/reviewer'] },
+      }),
+    ).toBe(true);
+
+    const contents = fs.readFileSync(configPath, 'utf-8');
+    expect(contents).toContain('// retained note');
+    const persisted = JSON.parse(
+      contents.replace('// retained note\n', ''),
+    ) as {
+      unrelated: boolean;
+      presets: Record<string, unknown>;
+    };
+    expect(persisted.unrelated).toBe(true);
+    expect(persisted.presets.marketplace).toEqual({
+      marketplace: { agents: ['team/toolkit/reviewer'] },
+    });
+  });
+
+  test('merges editor changes against the current same-preset config', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        presets: {
+          active: {
+            orchestrator: { model: 'openai/old' },
+            marketplace: { agents: ['team/a'] },
+          },
+        },
+      }),
+    );
+
+    const base = getEditablePreset(tempDir, 'active');
+    const current = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      presets: Record<string, Record<string, unknown>>;
+    };
+    current.presets.active.marketplace = { agents: ['team/a', 'team/b'] };
+    current.presets.active.oracle = { model: 'openai/concurrent' };
+    fs.writeFileSync(configPath, JSON.stringify(current));
+
+    expect(
+      writePreset(
+        tempDir,
+        'active',
+        {
+          ...base,
+          agents: {
+            ...base.agents,
+            orchestrator: { model: 'anthropic/new' },
+          },
+          marketplace: base.marketplace,
+        },
+        { mergeChangesFrom: base },
+      ),
+    ).toBe(true);
+
+    const saved = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      presets: Record<string, Record<string, unknown>>;
+    };
+    expect(saved.presets.active.marketplace).toEqual({
+      agents: ['team/a', 'team/b'],
+    });
+    const savedAgents = saved.presets.active.agents as Record<string, unknown>;
+    expect(savedAgents.oracle).toEqual({
+      model: 'openai/concurrent',
+    });
+    expect(savedAgents.orchestrator).toEqual({
+      model: 'anthropic/new',
+    });
+  });
+
+  test('merges distinct fields changed on the same agent', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        presets: {
+          active: {
+            orchestrator: { model: 'openai/old', temperature: 0.2 },
+          },
+        },
+      }),
+    );
+    const base = getEditablePreset(tempDir, 'active');
+
+    const diskEditor = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      presets: Record<string, Record<string, unknown>>;
+    };
+    diskEditor.presets.active.orchestrator = {
+      model: 'openai/new',
+      temperature: 0.2,
+    };
+    fs.writeFileSync(configPath, JSON.stringify(diskEditor));
+
+    expect(
+      writePreset(
+        tempDir,
+        'active',
+        {
+          ...base,
+          agents: {
+            orchestrator: { model: 'openai/old', temperature: 0.7 },
+          },
+        },
+        { mergeChangesFrom: base },
+      ),
+    ).toBe(true);
+
+    const saved = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      presets: Record<string, { orchestrator: Record<string, unknown> }>;
+    };
+    expect(saved.presets.active.orchestrator).toEqual({
+      model: 'openai/new',
+      temperature: 0.7,
+    });
+  });
+
+  test('preserves independent agent additions and removals during merge', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        presets: {
+          active: {
+            orchestrator: { model: 'openai/old' },
+            oracle: { model: 'openai/remove' },
+          },
+        },
+      }),
+    );
+    const base = getEditablePreset(tempDir, 'active');
+
+    const diskEditor = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      presets: Record<string, Record<string, unknown>>;
+    };
+    diskEditor.presets.active.orchestrator = { model: 'openai/new' };
+    diskEditor.presets.active.explorer = { model: 'openai/added' };
+    fs.writeFileSync(configPath, JSON.stringify(diskEditor));
+
+    expect(
+      writePreset(
+        tempDir,
+        'active',
+        {
+          ...base,
+          agents: { orchestrator: base.agents.orchestrator },
+        },
+        { mergeChangesFrom: base },
+      ),
+    ).toBe(true);
+
+    const saved = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      presets: Record<string, Record<string, unknown>>;
+    };
+    expect(saved.presets.active).toEqual({
+      orchestrator: { model: 'openai/new' },
+      explorer: { model: 'openai/added' },
+    });
+  });
+
+  test('rejects concurrent changes to the same agent field', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    const initial = {
+      presets: {
+        active: {
+          orchestrator: { temperature: 0.2 },
+        },
+      },
+    };
+    fs.writeFileSync(configPath, JSON.stringify(initial));
+    const base = getEditablePreset(tempDir, 'active');
+
+    const changedOnDisk = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      presets: Record<string, Record<string, { temperature: number }>>;
+    };
+    changedOnDisk.presets.active.orchestrator.temperature = 0.8;
+    fs.writeFileSync(configPath, JSON.stringify(changedOnDisk));
+    const beforeRejectedWrite = fs.readFileSync(configPath, 'utf-8');
+
+    expect(
+      writePreset(
+        tempDir,
+        'active',
+        {
+          ...base,
+          agents: {
+            orchestrator: { temperature: 0.9 },
+          },
+        },
+        { mergeChangesFrom: base },
+      ),
+    ).toBe(false);
+    expect(fs.readFileSync(configPath, 'utf-8')).toBe(beforeRejectedWrite);
+  });
+
+  test('rejects concurrent updates to nested options or permission subtrees', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    const baseConfig = {
+      presets: {
+        active: {
+          orchestrator: {
+            options: { thinking: { budget: 100 } },
+            permission: { edit: 'ask' },
+          },
+        },
+      },
+    };
+
+    for (const field of ['options', 'permission'] as const) {
+      fs.writeFileSync(configPath, JSON.stringify(baseConfig));
+      const base = getEditablePreset(tempDir, 'active');
+      const changedOnDisk = JSON.parse(
+        fs.readFileSync(configPath, 'utf-8'),
+      ) as {
+        presets: Record<string, Record<string, Record<string, unknown>>>;
+      };
+      changedOnDisk.presets.active.orchestrator[field] =
+        field === 'options' ? { thinking: { budget: 200 } } : { edit: 'allow' };
+      fs.writeFileSync(configPath, JSON.stringify(changedOnDisk));
+      const beforeRejectedWrite = fs.readFileSync(configPath, 'utf-8');
+
+      expect(
+        writePreset(
+          tempDir,
+          'active',
+          {
+            ...base,
+            agents: {
+              orchestrator: {
+                ...base.agents.orchestrator,
+                [field]:
+                  field === 'options'
+                    ? { thinking: { budget: 300 } }
+                    : { edit: 'deny' },
+              },
+            },
+          },
+          { mergeChangesFrom: base },
+        ),
+      ).toBe(false);
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(beforeRejectedWrite);
+    }
+  });
+
+  test('rejects conflicting concurrent parent changes without writing', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        presets: {
+          child: {
+            extends: 'base',
+            agents: { orchestrator: { model: 'openai/old' } },
+            marketplace: { agents: ['team/a'] },
+          },
+        },
+      }),
+    );
+
+    const base = getEditablePreset(tempDir, 'child');
+    const changedOnDisk = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      presets: Record<string, Record<string, unknown>>;
+    };
+    changedOnDisk.presets.child.extends = 'disk-parent';
+    fs.writeFileSync(configPath, JSON.stringify(changedOnDisk));
+
+    expect(
+      writePreset(
+        tempDir,
+        'child',
+        {
+          ...base,
+          extends: 'editor-parent',
+          agents: {
+            orchestrator: { model: 'anthropic/new' },
+          },
+        },
+        { mergeChangesFrom: base },
+      ),
+    ).toBe(false);
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf-8'))).toEqual(
+      changedOnDisk,
+    );
+  });
+
+  test('rejects saving an edited preset that was deleted from disk', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        presets: { active: { orchestrator: { model: 'old' } } },
+      }),
+    );
+    const base = getEditablePreset(tempDir, 'active');
+    const deletedOnDisk = { presets: {} };
+    fs.writeFileSync(configPath, JSON.stringify(deletedOnDisk));
+
+    expect(
+      writePreset(
+        tempDir,
+        'active',
+        { orchestrator: { model: 'new' } },
+        { mergeChangesFrom: base },
+      ),
+    ).toBe(false);
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf-8'))).toEqual(
+      deletedOnDisk,
+    );
+  });
+
+  test('serializes preset writes with concurrent config mutations', async () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    const configPath = path.join(configDir, 'oh-my-opencode-slim.json');
+    const readyPath = path.join(tempDir, 'lease-held');
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        presets: { active: { marketplace: { agents: ['team/agent'] } } },
+      }),
+    );
+
+    const configIoUrl = new URL('../cli/config-io.ts', import.meta.url).href;
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '-e',
+        `const { mutateJsonFile } = await import(${JSON.stringify(configIoUrl)});\n` +
+          `const fs = await import('node:fs');\n` +
+          `mutateJsonFile(process.argv[1], (current) => {\n` +
+          `  fs.writeFileSync(process.argv[2], 'ready');\n` +
+          `  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);\n` +
+          `  return { ...current, concurrentWriter: true };\n` +
+          `});`,
+        configPath,
+        readyPath,
+      ],
+      { cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe' },
+    );
+    const deadline = Date.now() + 5000;
+    while (!fs.existsSync(readyPath) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(fs.existsSync(readyPath)).toBe(true);
+
+    expect(
+      writePreset(tempDir, 'newPreset', {
+        marketplace: { agents_add: ['team/new-agent'] },
+      }),
+    ).toBe(true);
+    expect(await child.exited).toBe(0);
+
+    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as {
+      concurrentWriter?: boolean;
+      presets?: Record<string, { marketplace?: unknown }>;
+    };
+    expect(persisted.concurrentWriter).toBe(true);
+    expect(persisted.presets?.active.marketplace).toEqual({
+      agents: ['team/agent'],
+    });
+    expect(persisted.presets?.newPreset.marketplace).toEqual({
+      agents_add: ['team/new-agent'],
+    });
   });
 });
 
@@ -461,6 +1852,212 @@ describe('deletePreset', () => {
   test('returns false when no config file exists', () => {
     expect(deletePreset(tempDir, 'anything')).toBe(false);
   });
+
+  test('rejects deleting a base preset that has dependents in editable user config', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        presets: {
+          base: { orchestrator: { model: 'a' } },
+          child: { extends: 'base', agents: {} },
+        },
+      }),
+    );
+
+    const ok = deletePreset(tempDir, 'base');
+
+    expect(ok).toBe(false);
+    const persisted = JSON.parse(
+      fs.readFileSync(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        'utf-8',
+      ),
+    ) as { presets?: Record<string, unknown> };
+    // base was NOT deleted
+    expect(persisted.presets?.base).toBeDefined();
+    expect(persisted.presets?.child).toBeDefined();
+  });
+
+  test('successfully deletes a base preset once its dependents are removed', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        presets: {
+          base: { orchestrator: { model: 'a' } },
+          child: { extends: 'base', agents: {} },
+        },
+      }),
+    );
+
+    // Delete dependent first
+    const deletedChild = deletePreset(tempDir, 'child');
+    expect(deletedChild).toBe(true);
+
+    // Now deleting base succeeds
+    const deletedBase = deletePreset(tempDir, 'base');
+    expect(deletedBase).toBe(true);
+
+    const persisted = JSON.parse(
+      fs.readFileSync(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        'utf-8',
+      ),
+    ) as { presets?: Record<string, unknown> };
+    expect(persisted.presets?.base).toBeUndefined();
+  });
+
+  test('rejects deleting a base preset that has dependents in project config', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        presets: {
+          baseInUser: { orchestrator: { model: 'a' } },
+        },
+      }),
+    );
+
+    const projectDir = path.join(tempDir, '.opencode');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, 'oh-my-opencode-slim.jsonc'),
+      JSON.stringify({
+        presets: {
+          childInProject: { extends: 'baseInUser' },
+        },
+      }),
+    );
+
+    const ok = deletePreset(tempDir, 'baseInUser');
+
+    expect(ok).toBe(false);
+    const persisted = JSON.parse(
+      fs.readFileSync(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        'utf-8',
+      ),
+    ) as { presets?: Record<string, unknown> };
+    expect(persisted.presets?.baseInUser).toBeDefined();
+  });
+});
+
+describe('findPresetDependents', () => {
+  test('returns names of presets directly extending the base', () => {
+    const presets = {
+      base: { orchestrator: { model: 'a' } },
+      child1: { extends: 'base', agents: {} },
+      child2: { extends: 'base', orchestrator: { model: 'b' } },
+      other: { extends: 'something_else', agents: {} },
+      standalone: { orchestrator: { model: 'c' } },
+    };
+
+    const dependents = findPresetDependents('base', presets);
+
+    expect(dependents.sort()).toEqual(['child1', 'child2']);
+  });
+
+  test('returns empty array when no dependents exist', () => {
+    const presets = {
+      base: { orchestrator: { model: 'a' } },
+      standalone: { orchestrator: { model: 'c' } },
+    };
+
+    expect(findPresetDependents('base', presets)).toEqual([]);
+  });
+});
+
+describe('wouldCreatePresetCycle', () => {
+  test('prevents self-inheritance', () => {
+    const presets = {
+      alpha: { orchestrator: { model: 'a' } },
+    };
+
+    expect(wouldCreatePresetCycle('alpha', 'alpha', presets)).toBe(true);
+  });
+
+  test('detects 2-element cycle (A -> B -> A)', () => {
+    const presets = {
+      alpha: { orchestrator: { model: 'a' } },
+      beta: { extends: 'alpha', agents: {} },
+    };
+
+    // If alpha extends beta, cycle: alpha -> beta -> alpha
+    expect(wouldCreatePresetCycle('alpha', 'beta', presets)).toBe(true);
+    // Beta extending another standalone preset is fine
+    expect(wouldCreatePresetCycle('beta', 'other', presets)).toBe(false);
+  });
+
+  test('detects multi-element cycle (A -> B -> C -> A)', () => {
+    const presets = {
+      a: { orchestrator: { model: 'a' } },
+      b: { extends: 'a', agents: {} },
+      c: { extends: 'b', agents: {} },
+    };
+
+    // If a extends c: a -> c -> b -> a
+    expect(wouldCreatePresetCycle('a', 'c', presets)).toBe(true);
+    // If a extends b: a -> b -> a
+    expect(wouldCreatePresetCycle('a', 'b', presets)).toBe(true);
+    // If c extends a: already in hierarchy, extending a creates c -> a -> c
+    expect(wouldCreatePresetCycle('c', 'a', presets)).toBe(false); // c extending a simply points higher up (c -> a is a tree without cycle)
+  });
+
+  test('allows valid inheritance without cycles', () => {
+    const presets = {
+      base: { orchestrator: { model: 'a' } },
+      child: { orchestrator: { model: 'b' } },
+    };
+
+    expect(wouldCreatePresetCycle('child', 'base', presets)).toBe(false);
+  });
+});
+
+describe('getEditablePreset', () => {
+  test('returns local extends and local agents only, without materializing inherited agents', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        presets: {
+          base: {
+            orchestrator: { model: 'anthropic/claude-3.5-haiku' },
+            oracle: { model: 'openai/o3' },
+          },
+          child: {
+            extends: 'base',
+            agents: {
+              explorer: { model: 'openai/gpt-6-luna' },
+            },
+          },
+        },
+      }),
+    );
+
+    const editable = getEditablePreset(tempDir, 'child');
+
+    expect(editable.extends).toBe('base');
+    // ONLY explorer is returned as local agent; orchestrator and oracle are NOT materialized
+    expect(editable.agents).toEqual({
+      explorer: { model: 'openai/gpt-6-luna' },
+    });
+  });
+
+  test('returns empty preset definition for nonexistent preset', () => {
+    const editable = getEditablePreset(tempDir, 'nonexistent');
+
+    expect(editable.extends).toBeUndefined();
+    expect(editable.agents).toEqual({});
+  });
 });
 
 describe('setAgentOverride / removeAgentFromPreset', () => {
@@ -504,6 +2101,40 @@ describe('setAgentOverride / removeAgentFromPreset', () => {
   });
 });
 
+describe('getPresetSource', () => {
+  test('classifies presets as project, user, or none', () => {
+    const configDir = path.join(tempDir, 'opencode-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        presets: {
+          userOnly: { orchestrator: { model: 'a' } },
+          both: { orchestrator: { model: 'from-user' } },
+        },
+      }),
+    );
+
+    const projectDir = path.join(tempDir, '.opencode');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, 'oh-my-opencode-slim.jsonc'),
+      JSON.stringify({
+        presets: {
+          projectOnly: { orchestrator: { model: 'b' } },
+          both: { orchestrator: { model: 'from-project' } },
+        },
+      }),
+    );
+
+    expect(getPresetSource(tempDir, 'projectOnly')).toBe('project');
+    expect(getPresetSource(tempDir, 'both')).toBe('project');
+    expect(getPresetSource(tempDir, 'userOnly')).toBe('user');
+    expect(getPresetSource(tempDir, 'missing')).toBe('none');
+  });
+});
+
 describe('buildPresetSummary', () => {
   test('orders fields as model, variant, temp, options', () => {
     const summary = buildPresetSummary({
@@ -517,6 +2148,25 @@ describe('buildPresetSummary', () => {
 
     expect(summary).toEqual([
       'oracle → model: anthropic/claude-sonnet-4-6 → variant: thinking → temp: 0.2 → options: yes',
+    ]);
+  });
+
+  test('formats non-model fields including inherit, skills, mcps, and permissions', () => {
+    const summary = buildPresetSummary({
+      orchestrator: {
+        inheritModelFrom: 'oracle',
+        skills: ['code-review', 'ast-grep'],
+        skills_add: ['extra-skill'],
+        skills_remove: ['removed-skill'],
+        skills_include_local: true,
+        mcps: ['github', 'fetch'],
+        prompt: 'system instructions',
+        permission: { edit: 'allow' },
+      },
+    });
+
+    expect(summary).toEqual([
+      'orchestrator → inherit: oracle → skills: code-review,ast-grep → skills_add: extra-skill → skills_remove: removed-skill → skills_include_local: true → mcps: github,fetch → prompt: yes → permissions: yes',
     ]);
   });
 });

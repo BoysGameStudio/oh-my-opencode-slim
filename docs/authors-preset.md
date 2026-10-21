@@ -19,7 +19,7 @@ This is the exact configuration the author runs day-to-day.
   "presets": {
     "openai": {
       "orchestrator": {
-        "model": "openai/gpt-5.6-fast",
+        "model": "openai/gpt-6-sol-fast",
         "skills": [
           "*",
           "!make-interfaces-feel-better"
@@ -31,7 +31,7 @@ This is the exact configuration the author runs day-to-day.
         ]
       },
       "oracle": {
-        "model": "openai/gpt-5.6-fast",
+        "model": "openai/gpt-6-sol-fast",
         "variant": "high",
         "skills": [
           "ce-brainstorm",
@@ -44,25 +44,18 @@ This is the exact configuration the author runs day-to-day.
           "crawl4ai"
         ]
       },
-      "librarian": {
+      "explorer": {
         "model": "openai/gpt-5.3-codex-spark",
         "variant": "low",
         "skills": [
           "customer-research"
         ],
         "mcps": [
+          "codegraph",
           "context7",
           "gh_app",
           "searxng",
           "crawl4ai"
-        ]
-      },
-      "explorer": {
-        "model": "openai/gpt-5.3-codex-spark",
-        "variant": "low",
-        "skills": [],
-        "mcps": [
-          "codegraph"
         ]
       },
       "designer": {
@@ -112,13 +105,13 @@ This is the exact configuration the author runs day-to-day.
       "command": "npx",
       "args": ["-y", "@agentclientprotocol/claude-agent-acp"],
       "description": "Claude ACP agent for launching Claude Code",
-      "wrapperModel": "openai/gpt-5.6-luna-fast",
+      "wrapperModel": "openai/gpt-6-luna-fast",
       "permissionMode": "allow",
       "timeoutMs": 0
     }
   },
-  "tmux": {
-    "enabled": true,
+  "multiplexer": {
+    "type": "tmux",
     "layout": "main-vertical",
     "main_pane_size": 60
   }

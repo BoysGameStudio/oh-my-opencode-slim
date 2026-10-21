@@ -10,6 +10,7 @@ import {
   readDashboardAuthFile,
   tryBecomeDashboard,
 } from './dashboard';
+import { interviewOwnerSessionID } from './document';
 import type { InterviewSessionRuntime } from './runtime';
 import { createInterviewServer, createInterviewServerDeps } from './server';
 import { createInterviewService } from './service';
@@ -29,15 +30,14 @@ export function createDashboardManager(
     sessionClient?: DashboardConfig['sessionClient'];
     /** Already-listening server for the dashboard role to adopt. */
     server?: Server;
-    /** Timer seams for isolating the session fallback poller. */
-    timers?: {
-      setInterval: typeof setInterval;
-      clearInterval: typeof clearInterval;
-    };
+    hostFlavor?: DashboardConfig['hostFlavor'];
   } = {},
 ): {
   service: ReturnType<typeof createInterviewService>;
-  registerCommand: (config: Record<string, unknown>) => void;
+  registerCommand: (
+    config: Record<string, unknown>,
+    enabled?: { interview?: boolean; implement?: boolean },
+  ) => void;
   handleCommandExecuteBefore: (
     input: { command: string; sessionID: string; arguments: string },
     output: { parts: Array<{ type: string; text?: string }> },
@@ -221,16 +221,14 @@ export function createDashboardManager(
   // ── Timer-based fallback for nudge/answer polling ─────────────
   const FALLBACK_POLL_INTERVAL = 10_000;
   let fallbackTimer: ReturnType<typeof setInterval> | null = null;
-  const setFallbackInterval = options.timers?.setInterval ?? setInterval;
-  const clearFallbackInterval = options.timers?.clearInterval ?? clearInterval;
   const stopFallbackTimer = () => {
     if (!fallbackTimer) return;
-    clearFallbackInterval(fallbackTimer);
+    clearInterval(fallbackTimer);
     fallbackTimer = null;
   };
   const startFallbackTimer = () => {
     if (fallbackTimer) return;
-    fallbackTimer = setFallbackInterval(() => {
+    fallbackTimer = setInterval(() => {
       if (disposed || isDashboard || !dashboardBaseUrl) return;
       for (const sessionID of registeredSessions) {
         const interviewId = service.getActiveInterviewId(sessionID);
@@ -249,6 +247,7 @@ export function createDashboardManager(
       dashboard = await tryBecomeDashboard({
         port: dashboardPort,
         outputFolder,
+        hostFlavor: options.hostFlavor,
         sessionClient: options.sessionClient ?? getClient(ctx).session,
         server: options.server,
       });
@@ -272,7 +271,7 @@ export function createDashboardManager(
           if (disposed) return;
           dashboard?.pushState({
             interviewId: interview.id,
-            sessionID: interview.sessionID,
+            sessionID: interviewOwnerSessionID(interview),
             idea: interview.idea,
             mode: 'awaiting-agent',
             summary: 'Interview created.',
@@ -287,8 +286,9 @@ export function createDashboardManager(
           });
           // Register session directory for file scanning
           dashboard?.registerSession({
-            sessionID: interview.sessionID,
+            sessionID: interviewOwnerSessionID(interview),
             directory: ctx.directory,
+            outputFolder,
             pid: process.pid,
             registeredAt: Date.now(),
           });
@@ -303,6 +303,7 @@ export function createDashboardManager(
         dashboard.registerSession({
           sessionID: `dashboard-self-${process.pid}`,
           directory: ctx.directory,
+          outputFolder,
           pid: process.pid,
           registeredAt: Date.now(),
         });
@@ -590,7 +591,7 @@ export function createDashboardManager(
 
   return {
     service,
-    registerCommand: (c) => service.registerCommand(c),
+    registerCommand: (c, enabled) => service.registerCommand(c, enabled),
     handleCommandExecuteBefore: async (input, output) => {
       await ensureInitialized();
       if (disposed) return;
@@ -609,6 +610,7 @@ export function createDashboardManager(
           body: JSON.stringify({
             sessionID,
             directory: ctx.directory,
+            outputFolder,
             pid: process.pid,
           }),
           signal: AbortSignal.timeout(3000),
@@ -923,7 +925,7 @@ function stateToEntry(
 ): InterviewStateEntry {
   return {
     interviewId,
-    sessionID: state.interview.sessionID,
+    sessionID: interviewOwnerSessionID(state.interview),
     idea: state.interview.idea,
     mode: state.mode,
     summary: state.summary,
@@ -982,7 +984,7 @@ async function registerInterviewViaHttp(
     },
     body: JSON.stringify({
       interviewId: interview.id,
-      sessionID: interview.sessionID,
+      sessionID: interviewOwnerSessionID(interview),
       idea: interview.idea,
       mode: 'awaiting-agent',
       summary: 'Interview created.',

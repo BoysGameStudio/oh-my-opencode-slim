@@ -17,7 +17,6 @@ describe('providers', () => {
 
   test('generateLiteConfig defaults to openai and includes generated presets', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
@@ -33,27 +32,25 @@ describe('providers', () => {
     );
     const agents = (config.presets as any).openai;
     expect(agents).toBeDefined();
-    expect(agents.orchestrator.model).toBe('openai/gpt-5.6-terra');
-    expect(agents.orchestrator.variant).toBe('high');
-    expect(agents.fixer.model).toBe('openai/gpt-5.6-luna');
-    expect(agents.fixer.variant).toBe('high');
+    expect(agents.orchestrator.model).toBe('openai/gpt-6.1-sol');
+    expect(agents.orchestrator.variant).toBe('medium');
+    expect(agents.fixer.model).toBe('openai/gpt-6.1-sol');
+    expect(agents.fixer.variant).toBe('low');
   });
 
   test('preserves exact OpenAI model and variant mappings', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
 
     const agents = (config.presets as any).openai;
     const expected = {
-      orchestrator: { model: 'openai/gpt-5.6-terra', variant: 'high' },
-      oracle: { model: 'openai/gpt-5.6-sol', variant: 'high' },
-      librarian: { model: 'openai/gpt-5.6-luna', variant: 'low' },
-      explorer: { model: 'openai/gpt-5.6-luna', variant: 'low' },
-      designer: { model: 'openai/gpt-5.6-luna', variant: 'medium' },
-      fixer: { model: 'openai/gpt-5.6-luna', variant: 'high' },
+      orchestrator: { model: 'openai/gpt-6.1-sol', variant: 'medium' },
+      oracle: { model: 'openai/gpt-6.1-sol', variant: 'high' },
+      explorer: { model: 'openai/gpt-6-luna', variant: 'low' },
+      designer: { model: 'openai/gpt-6-luna', variant: 'medium' },
+      fixer: { model: 'openai/gpt-6.1-sol', variant: 'low' },
     } as const;
 
     expect(MODEL_MAPPINGS.openai).toEqual(expected);
@@ -62,7 +59,6 @@ describe('providers', () => {
 
   test('generateLiteConfig can set opencode-go as active preset', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       preset: 'opencode-go',
       backgroundSubagents: 'no',
       reset: false,
@@ -73,28 +69,25 @@ describe('providers', () => {
     expect((config.presets as any).openai).toBeDefined();
     const agents = (config.presets as any)['opencode-go'];
     expect(agents).toBeDefined();
-    expect(agents.orchestrator.model).toBe('opencode-go/minimax-m3');
-    expect(agents.orchestrator.variant).toBe('thinking');
-    expect(agents.oracle.model).toBe('opencode-go/qwen3.7-max');
-    expect(agents.oracle.variant).toBe('max');
+    expect(agents).toMatchObject({
+      orchestrator: { model: 'opencode-go/minimax-m3', variant: 'thinking' },
+      oracle: { model: 'opencode-go/qwen3.7-max', variant: 'max' },
+      explorer: {
+        model: 'opencode-go/deepseek-v4-flash',
+        variant: 'high',
+      },
+      designer: { model: 'opencode-go/kimi-k2.7-code' },
+      fixer: { model: 'opencode-go/deepseek-v4-flash', variant: 'high' },
+      observer: { model: 'opencode-go/mimo-v2.5' },
+    });
     expect(agents.council).toBeUndefined();
-    expect(agents.librarian.model).toBe('opencode-go/deepseek-v4-flash');
-    expect(agents.librarian.variant).toBe('high');
-    expect(agents.librarian.mcps).toEqual(['context7', 'gh_grep']);
-    expect(agents.explorer.model).toBe('opencode-go/deepseek-v4-flash');
-    expect(agents.explorer.variant).toBe('high');
-    expect(agents.designer.model).toBe('opencode-go/kimi-k2.7-code');
     expect(agents.designer.variant).toBeUndefined();
-    expect(agents.fixer.model).toBe('opencode-go/deepseek-v4-flash');
-    expect(agents.fixer.variant).toBe('high');
-    expect(agents.observer.model).toBe('opencode-go/mimo-v2.5');
     expect(agents.observer.variant).toBeUndefined();
   });
 
   test('generateLiteConfig rejects unsupported preset', () => {
     expect(() =>
       generateLiteConfig({
-        installCustomSkills: false,
         preset: 'not-real',
         backgroundSubagents: 'no',
         reset: false,
@@ -105,7 +98,6 @@ describe('providers', () => {
   test('generateLiteConfig rejects non-generated model mappings as active presets', () => {
     expect(() =>
       generateLiteConfig({
-        installCustomSkills: false,
         preset: 'kimi',
         backgroundSubagents: 'no',
         reset: false,
@@ -116,7 +108,6 @@ describe('providers', () => {
   test('generateLiteConfig rejects inherited property names as presets', () => {
     expect(() =>
       generateLiteConfig({
-        installCustomSkills: false,
         preset: 'toString',
         backgroundSubagents: 'no',
         reset: false,
@@ -124,40 +115,16 @@ describe('providers', () => {
     ).toThrow('Unsupported preset "toString"');
   });
 
-  test('generateLiteConfig companion: yes', () => {
+  test('generateLiteConfig omits companion config', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
-      backgroundSubagents: 'no',
-      reset: false,
-      companion: 'yes',
-    });
-
-    expect(config.companion).toBeDefined();
-    expect((config.companion as any).enabled).toBe(true);
-    expect((config.companion as any).position).toBe('bottom-right');
-    expect((config.companion as any).size).toBe('medium');
-  });
-
-  test('generateLiteConfig companion: no or omitted', () => {
-    const configYes = generateLiteConfig({
-      installCustomSkills: false,
-      backgroundSubagents: 'no',
-      reset: false,
-      companion: 'no',
-    });
-    expect(configYes.companion).toBeUndefined();
-
-    const configOmitted = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
-    expect(configOmitted.companion).toBeUndefined();
+    expect(config.companion).toBeUndefined();
   });
 
   test('generateLiteConfig includes default skills', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
@@ -182,31 +149,15 @@ describe('providers', () => {
     expect(agents.fixer.skills).toEqual([]);
   });
 
-  test('generateLiteConfig includes mcps field', () => {
+  test('generateLiteConfig omits mcps (runtime defaults apply)', () => {
     const config = generateLiteConfig({
-      installCustomSkills: false,
       backgroundSubagents: 'no',
       reset: false,
     });
 
     const agents = (config.presets as any).openai;
-    expect(agents.orchestrator.mcps).toBeDefined();
-    expect(Array.isArray(agents.orchestrator.mcps)).toBe(true);
-    expect(agents.librarian.mcps).toBeDefined();
-    expect(Array.isArray(agents.librarian.mcps)).toBe(true);
-  });
-
-  test('generateLiteConfig openai includes correct mcps', () => {
-    const config = generateLiteConfig({
-      installCustomSkills: false,
-      backgroundSubagents: 'no',
-      reset: false,
-    });
-
-    const agents = (config.presets as any).openai;
-    expect(agents.orchestrator.mcps).toEqual(['*', '!context7']);
-    expect(agents.librarian.mcps).toContain('context7');
-    expect(agents.librarian.mcps).toContain('gh_grep');
-    expect(agents.designer.mcps).toEqual([]);
+    expect(agents.orchestrator.mcps).toBeUndefined();
+    expect(agents.explorer.mcps).toBeUndefined();
+    expect(agents.designer.mcps).toBeUndefined();
   });
 });

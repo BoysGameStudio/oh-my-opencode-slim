@@ -1,22 +1,25 @@
 /**
- * v2 compaction hook bridge (`ctx.session.hook("compaction")`, v2.0.0+).
+ * v2 compaction hook bridge (`ctx.session.hook("compaction")`).
  *
  * Coverage:
- * - tagged synthetic parts are stripped from the compaction event's
- *   message list while untagged content (user text, command markers,
- *   untagged synthetic parts) passes through unchanged
+ * - phase reminders and deepwork goal pointers are stripped, but job
+ *   boards and untagged content survive to bridge running-job state into
+ *   the summary
  * - read-only guarantees: `system` is never modified and `result` is
  *   never set (host-owned; open host bug — the compaction system prompt
  *   may be absent, so the bridge must not add or rewrite one)
- * - registration degrade: a host that rejects the hook name keeps the
- *   rest of setup intact with a one-time deterministic log (mirrors the
- *   prompt / model.request degrade tests in setup.e2e.test.ts)
+ * - registration contract: a host that rejects the hook
+ *   name fails setup loudly — the error propagates instead of being
+ *   swallowed with a fallback log (mirrors the model.request contract
+ *   test in setup.e2e.test.ts)
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { readdirSync as readDirSync, readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { createTaggedSyntheticPart } from '../hooks/cache-safe-injection';
+import { GOAL_POINTER_METADATA_KEY } from '../hooks/deepwork-goal';
 import { PHASE_REMINDER_METADATA_KEY } from '../hooks/phase-reminder';
 import { BACKGROUND_JOB_BOARD_METADATA_KEY } from '../hooks/task-session-manager/board-injection';
 import { flushLoggerForTesting } from '../utils/logger';
@@ -38,13 +41,17 @@ function makeCompactionEvent(
 }
 
 describe('createSessionCompactionBridge', () => {
-  test('strips tagged synthetic parts and preserves untagged content', async () => {
+  test('strips phase reminders but keeps job boards and untagged content', async () => {
     const userText = { type: 'text', text: 'real user text' };
     const commandPart = {
       type: 'text',
       text: 'DEEPWORK EXPANDED',
       synthetic: true,
     };
+    const board = createTaggedSyntheticPart({
+      text: 'BOARD',
+      metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
+    });
     const user = {
       id: 'msg_1',
       role: 'user',
@@ -55,22 +62,21 @@ describe('createSessionCompactionBridge', () => {
           metadataKey: PHASE_REMINDER_METADATA_KEY,
         }),
         createTaggedSyntheticPart({
-          text: 'BOARD',
-          metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
+          text: 'GOAL POINTER',
+          metadataKey: GOAL_POINTER_METADATA_KEY,
         }),
+        board,
         commandPart,
       ],
     };
+    const assistantBoard = createTaggedSyntheticPart({
+      text: 'BOARD 2',
+      metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
+    });
     const assistant = {
       id: 'msg_2',
       role: 'assistant',
-      content: [
-        { type: 'text', text: 'assistant text' },
-        createTaggedSyntheticPart({
-          text: 'BOARD 2',
-          metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
-        }),
-      ],
+      content: [{ type: 'text', text: 'assistant text' }, assistantBoard],
     };
     const event = makeCompactionEvent([user, assistant]);
 
@@ -82,15 +88,18 @@ describe('createSessionCompactionBridge', () => {
     expect(event.messages[1]).toBe(assistant);
     // Untagged parts survive with their original object identity
     // (user text AND the untagged synthetic command part).
-    expect(user.content).toEqual([userText, commandPart]);
+    expect(user.content).toEqual([userText, board, commandPart]);
     expect(user.content[0]).toBe(userText);
-    expect(user.content[1]).toBe(commandPart);
+    expect(user.content[1]).toBe(board);
+    expect(user.content[2]).toBe(commandPart);
     expect(assistant.content).toEqual([
       { type: 'text', text: 'assistant text' },
+      assistantBoard,
     ]);
+    expect(assistant.content[1]).toBe(assistantBoard);
   });
 
-  test('drops messages that consist solely of tagged parts (trailing volatile board)', async () => {
+  test('keeps a board-only trailing message but drops a reminder-only message', async () => {
     const real = {
       id: 'msg_1',
       role: 'user',
@@ -106,12 +115,23 @@ describe('createSessionCompactionBridge', () => {
         }),
       ],
     };
-    const event = makeCompactionEvent([real, volatile]);
+    const reminder = {
+      id: 'msg_3',
+      role: 'user',
+      content: [
+        createTaggedSyntheticPart({
+          text: 'phase',
+          metadataKey: PHASE_REMINDER_METADATA_KEY,
+        }),
+      ],
+    };
+    const event = makeCompactionEvent([real, volatile, reminder]);
 
     await createSessionCompactionBridge()(event);
 
-    expect(event.messages).toHaveLength(1);
+    expect(event.messages).toHaveLength(2);
     expect(event.messages[0]).toBe(real);
+    expect(event.messages[1]).toBe(volatile);
     expect(real.content).toEqual([{ type: 'text', text: 'hi' }]);
   });
 
@@ -246,7 +266,7 @@ describe('createV2Setup compaction hook', () => {
 
   beforeEach(async () => {
     originalEnv = { ...process.env };
-    fixtureRoot = await mkdtemp('/tmp/omo-v2-compaction-');
+    fixtureRoot = await mkdtemp(path.join(tmpdir(), 'omo-v2-compaction-'));
     projectDir = path.join(fixtureRoot, 'project');
     configDir = path.join(fixtureRoot, 'config');
     logDir = path.join(fixtureRoot, 'logs');
@@ -256,23 +276,26 @@ describe('createV2Setup compaction hook', () => {
       // plugin config, companion disabled.
       JSON.stringify({ companion: { enabled: false } }),
     );
-    process.env = {
-      ...originalEnv,
-      OPENCODE_CONFIG_DIR: configDir,
-      XDG_CONFIG_HOME: path.join(fixtureRoot, 'xdg-config'),
-      XDG_DATA_HOME: path.join(fixtureRoot, 'xdg-data'),
-      XDG_CACHE_HOME: path.join(fixtureRoot, 'xdg-cache'),
-      OPENCODE_LOG_DIR: logDir,
-    };
+    process.env.OPENCODE_CONFIG_DIR = configDir;
+    process.env.XDG_CONFIG_HOME = path.join(fixtureRoot, 'xdg-config');
+    process.env.XDG_DATA_HOME = path.join(fixtureRoot, 'xdg-data');
+    process.env.XDG_CACHE_HOME = path.join(fixtureRoot, 'xdg-cache');
+    process.env.OPENCODE_LOG_DIR = logDir;
     delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
   });
 
   afterEach(async () => {
-    process.env = originalEnv;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
     await rm(fixtureRoot, { recursive: true, force: true });
   });
 
-  function makeCtx(options?: { rejectCompaction?: boolean }): {
+  function makeCtx(options?: {
+    rejectCompaction?: boolean;
+    switchModel?: boolean;
+  }): {
     ctx: V2Context;
     hooks: string[];
     rejected: string[];
@@ -292,6 +315,17 @@ describe('createV2Setup compaction hook', () => {
           id: 'proj_compact',
           directory: projectDir,
           canonical: projectDir,
+        },
+      },
+      mcp: {
+        transform: async (
+          cb: (draft: {
+            list: () => [];
+            set: (...args: unknown[]) => void;
+          }) => void,
+        ) => {
+          cb({ list: () => [], set: () => {} });
+          return { dispose: () => {} };
         },
       },
       agent: {
@@ -323,6 +357,7 @@ describe('createV2Setup compaction hook', () => {
           }
           return { dispose: () => {} };
         },
+        switchModel: options?.switchModel ? async () => {} : undefined,
       },
       event: { subscribe: () => neverIterable() },
     } as unknown as V2Context;
@@ -335,7 +370,21 @@ describe('createV2Setup compaction hook', () => {
     };
   }
 
-  test('registers the compaction hook; the registered callback strips tagged parts', async () => {
+  test.each([true, false])(
+    'registers the retry hook only with switchModel (%p)',
+    async (switchModel) => {
+      const { ctx, hooks } = makeCtx({ switchModel });
+      const cleanup = await createV2Setup()(ctx);
+      try {
+        expect(hooks.includes('retry')).toBe(switchModel);
+      } finally {
+        await cleanup();
+      }
+    },
+    20_000,
+  );
+
+  test('registers the compaction hook; the registered callback keeps the board', async () => {
     const { ctx, hooks, getCompactionCb, getContextCb } = makeCtx();
     const cleanup = await createV2Setup()(ctx);
 
@@ -360,7 +409,13 @@ describe('createV2Setup compaction hook', () => {
       };
       const event = makeCompactionEvent([message]);
       await cb(event);
-      expect(message.content).toEqual([{ type: 'text', text: 'user text' }]);
+      expect(message.content).toEqual([
+        { type: 'text', text: 'user text' },
+        createTaggedSyntheticPart({
+          text: 'BOARD',
+          metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
+        }),
+      ]);
 
       await flushLoggerForTesting();
       expect(readPluginLog()).toContain(
@@ -371,29 +426,28 @@ describe('createV2Setup compaction hook', () => {
     }
   }, 20_000);
 
-  test('host rejecting the compaction hook name degrades: one log, setup completes', async () => {
+  test('host rejecting the compaction hook name fails setup loudly', async () => {
+    // Hook-name rejection is a host contract
+    // violation, not a degrade path — the error propagates out of setup
+    // instead of being swallowed with a fallback log line.
     const { ctx, hooks, rejected, getContextCb } = makeCtx({
       rejectCompaction: true,
     });
-    const cleanup = await createV2Setup()(ctx);
+    await expect(createV2Setup()(ctx)).rejects.toThrow(
+      'unknown session hook: compaction',
+    );
 
-    try {
-      // The compaction registration was attempted exactly once and
-      // rejected; every other session bridge still registered.
-      expect(rejected).toEqual(['compaction']);
-      expect(hooks).toContain('context');
-      expect(getContextCb()).toBeFunction();
+    // The compaction registration was attempted exactly once and
+    // rejected; bridges registered before the failure are intact.
+    expect(rejected).toEqual(['compaction']);
+    expect(hooks).toContain('context');
+    expect(getContextCb()).toBeFunction();
 
-      await flushLoggerForTesting();
-      const logText = readPluginLog();
-      expect(logText).toContain(
-        '[v2] session.hook(compaction) unavailable; compaction sees tagged content',
-      );
-      expect(
-        logText.match(/compaction sees tagged content/g) ?? [],
-      ).toHaveLength(1);
-    } finally {
-      await cleanup(); // must not throw despite the rejected hook
-    }
+    await flushLoggerForTesting();
+    const logText = readPluginLog();
+    expect(logText).not.toContain('compaction sees tagged content');
+    expect(logText).not.toContain(
+      '[v2] compaction bridge registered (session.compaction)',
+    );
   }, 20_000);
 });

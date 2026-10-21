@@ -20,8 +20,8 @@ import { log } from '../../utils/logger';
  *   args call produced an output byte-identical to the prior call. A call
  *   that returns NEW information resets the run, so it can never accumulate
  *   toward a block (a legitimate re-read after the file changed).
- * - task_status/task_result use a separate task-ID/lifecycle-state stream, so
- *   alternating polls are still recognized without treating tool changes as
+ * - task_status alone uses a task-ID/lifecycle-state stream, so
+ *   polls are still recognized without treating arg changes as
  *   progress. The stream resets at a parent turn boundary or meaningful
  *   action.
  * - tool.execute.before never increments the counter, so overlapping
@@ -32,9 +32,9 @@ import { log } from '../../utils/logger';
  * - All non-exempt tools warn at N confirmed-identical consecutive calls.
  * - Only read-only file-analysis tools (read, grep, glob) hard-block after M
  *   confirmed identical results to prevent infinite loops (#1071).
- * - External async process/task supervision tools (task_status, task_result)
- *   warn at N calls but stay warn-only (never hard-block) to avoid deadlocking
- *   terminal result retrieval for long-running background tasks.
+ * - Task supervision (task_status) warns at N calls but stays warn-only
+ *   (never hard-blocks) to avoid deadlocking result retrieval for
+ *   long-running background tasks.
  * - Task management and lifecycle tools (task, task_cancel, task_message,
  *   task_revive) remain exempt; task-session-manager owns its own
  *   duplicate-spawn guards (#1056/#1070).
@@ -66,8 +66,8 @@ const LOOP_GUARD_EXEMPT: Record<string, true> = {
 /**
  * Tools that may be hard-blocked when repeated. Only read-only file analysis
  * (read, grep, glob) hard-blocks after confirmed identical results (#1071).
- * External task supervision tools (task_status, task_result) and tools with
- * side effects stay warn-only to prevent terminal result retrieval deadlocks.
+ * Task supervision (task_status) stays warn-only to prevent terminal
+ * result retrieval deadlocks.
  */
 const LOOP_GUARD_BLOCK_TOOLS: Record<string, true> = {
   read: true,
@@ -110,8 +110,8 @@ STOP repeating this call. Instead:
 3. If the task is actually done, produce your final answer now instead of calling more tools.
 `;
 
-/** Max sessions tracked before evicting the least-recently-observed session. */
-const MAX_TRACKED_SESSIONS = 512;
+/** Max entries per tracking map before FIFO eviction. */
+export const MAX_TRACKED_SESSIONS = 512;
 
 /** Deterministic fingerprint of tool + args, insensitive to key order. */
 function fingerprint(tool: string, args: unknown): string {
@@ -152,12 +152,13 @@ interface TaskSupervisionState {
   runs: number;
 }
 
-const TASK_SUPERVISION_TOOLS = new Set(['task_status', 'task_result']);
+const TASK_SUPERVISION_TOOLS = new Set(['task_status']);
 
 function taskIDFromArgs(args: unknown): string | undefined {
   if (!args || typeof args !== 'object' || Array.isArray(args))
     return undefined;
-  const taskID = (args as Record<string, unknown>).task_id;
+  const record = args as Record<string, unknown>;
+  const taskID = record.sessionID ?? record.task_id;
   return typeof taskID === 'string' && taskID.trim() !== ''
     ? taskID.trim()
     : undefined;
@@ -165,7 +166,9 @@ function taskIDFromArgs(args: unknown): string | undefined {
 
 function taskIDFromOutput(output: unknown): string | undefined {
   if (typeof output !== 'string') return undefined;
-  const match = output.match(/(?:task_id:\s*|Task\s+[^\n(]*\()([^\s)]+)/i);
+  const match = output.match(
+    /(?:(?:task_id|sessionID):\s*|Task\s+[^\n(]*\()([^\s)]+)/i,
+  );
   return match?.[1];
 }
 
@@ -199,7 +202,7 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
   const sessions = new Map<string, SessionState>();
   /** Per-call state so `after` can re-check without re-deriving args. */
   const callKeys = new Map<string, CallState>();
-  /** Polling state is shared by task_status/task_result for each task. */
+  /** Polling state is shared by task_status result and status reads. */
   const taskSupervision = new Map<string, Map<string, TaskSupervisionState>>();
   /** Completed wait-tool calls since the last reset, per session (#1139). */
   const waitRuns = new Map<string, number>();
@@ -210,17 +213,12 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
     taskSupervision.delete(sessionID);
   }
 
-  /** Prune the session maps to MAX_TRACKED_SESSIONS (FIFO by insertion). */
+  /** FIFO-cap tracked maps; a throwing tool never runs `after` (callKeys). */
   function keepSessionsBounded(): void {
-    while (sessions.size > MAX_TRACKED_SESSIONS) {
-      const oldest = sessions.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      sessions.delete(oldest);
-    }
-    while (waitRuns.size > MAX_TRACKED_SESSIONS) {
-      const oldest = waitRuns.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      waitRuns.delete(oldest);
+    for (const map of [sessions, waitRuns, callKeys]) {
+      while (map.size > MAX_TRACKED_SESSIONS) {
+        map.delete(map.keys().next().value as string);
+      }
     }
   }
 
@@ -231,6 +229,7 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
     ): Promise<void> => {
       const sessionID = input.sessionID;
       if (!sessionID) return;
+      keepSessionsBounded();
       const tool = input.tool.toLowerCase();
 
       // Wait tools: refuse once the per-turn wait counter confirms a loop.

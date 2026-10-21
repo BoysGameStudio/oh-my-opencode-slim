@@ -1,7 +1,5 @@
 import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
-import { fileURLToPath } from 'node:url';
-import { syncBundledSkillsFromPackage } from '../hooks/auto-update-checker/skill-sync';
 import {
   detectBackgroundSubagentsTarget,
   expandHomePath,
@@ -10,12 +8,10 @@ import {
   manualBackgroundSubagentsInstructions,
   writeBackgroundSubagentsBlock,
 } from './background-subagents';
-import { installCompanion } from './companion';
 import {
   addPluginToOpenCodeConfig,
   addPluginToOpenCodeTuiConfig,
   detectCurrentConfig,
-  disableDefaultAgents,
   enableLspByDefault,
   generateLiteConfig,
   getOpenCodePath,
@@ -24,7 +20,6 @@ import {
   warmOpenCodePluginCache,
   writeLiteConfig,
 } from './config-manager';
-import { CUSTOM_SKILLS } from './custom-skills';
 import { getExistingLiteConfigPath } from './paths';
 import type { ConfigMergeResult, InstallArgs, InstallConfig } from './types';
 
@@ -69,10 +64,6 @@ function printSuccess(message: string): void {
 
 function printError(message: string): void {
   console.log(`${SYMBOLS.cross} ${RED}${message}${RESET}`);
-}
-
-function printWarning(message: string): void {
-  console.log(`${SYMBOLS.warn} ${YELLOW}${message}${RESET}`);
 }
 
 function printInfo(message: string): void {
@@ -251,45 +242,6 @@ export async function configureBackgroundSubagents(
   return { enabledNow: false, configuredTarget: target };
 }
 
-export async function shouldInstallCompanion(
-  config: InstallConfig,
-): Promise<boolean> {
-  if (config.companion === 'yes') {
-    return true;
-  }
-  if (config.companion === 'no') return false;
-
-  if (config.dryRun) {
-    printInfo(
-      'Dry run mode - would ask to install the desktop companion (default: no).',
-    );
-    config.companion = 'no';
-    return false;
-  }
-
-  if (!process.stdin.isTTY) {
-    printInfo(
-      'Skipped desktop companion prompt in non-TTY mode. Use --companion=yes to install it.',
-    );
-    config.companion = 'no';
-    return false;
-  }
-
-  console.log();
-  printInfo('The optional desktop companion shows live agent activity.');
-  const shouldInstall = await confirm(
-    'Install and enable the desktop companion?',
-    false,
-  );
-  config.companion = shouldInstall ? 'yes' : 'no';
-
-  if (!shouldInstall) {
-    printInfo('Desktop companion install skipped.');
-  }
-
-  return shouldInstall;
-}
-
 function handleStepResult(
   result: ConfigMergeResult,
   successMsg: string,
@@ -304,32 +256,13 @@ function handleStepResult(
   return true;
 }
 
-function handleOptionalCompanionResult(result: ConfigMergeResult): void {
-  if (result.success) {
-    printSuccess(
-      `Companion installed ${SYMBOLS.arrow} ${DIM}${result.configPath}${RESET}`,
-    );
-    return;
-  }
-
-  printWarning(`Desktop companion install skipped: ${result.error}`);
-  printInfo(
-    'The desktop companion is optional; continuing plugin installation without it.',
-  );
-}
-
 async function runInstall(config: InstallConfig): Promise<number> {
   const detected = detectCurrentConfig();
   const isUpdate = detected.isInstalled;
 
   printHeader(isUpdate);
 
-  const companionInstall = await shouldInstallCompanion(config);
-
-  let totalSteps = 7;
-  if (config.installCustomSkills) totalSteps += 1;
-  if (companionInstall) totalSteps += 1;
-  totalSteps += 1;
+  const totalSteps = 7;
 
   let step = 1;
 
@@ -374,14 +307,6 @@ async function runInstall(config: InstallConfig): Promise<number> {
     }
   }
 
-  printStep(step++, totalSteps, 'Disabling OpenCode default agents...');
-  if (config.dryRun) {
-    printInfo('Dry run mode - skipping agent disabling');
-  } else {
-    const agentResult = disableDefaultAgents();
-    if (!handleStepResult(agentResult, 'Default agents disabled')) return 1;
-  }
-
   printStep(step++, totalSteps, 'Enabling OpenCode LSP integration...');
   if (config.dryRun) {
     printInfo('Dry run mode - skipping LSP configuration');
@@ -392,13 +317,6 @@ async function runInstall(config: InstallConfig): Promise<number> {
 
   printStep(step++, totalSteps, 'Configuring OpenCode background subagents...');
   const backgroundSubagents = await configureBackgroundSubagents(config);
-
-  if (companionInstall) {
-    printStep(step++, totalSteps, 'Installing desktop companion binary...');
-    const companionResult = await installCompanion(config);
-    handleOptionalCompanionResult(companionResult);
-    if (!companionResult.success) config.companion = 'no';
-  }
 
   printStep(step++, totalSteps, 'Writing oh-my-opencode-slim configuration...');
   if (config.dryRun) {
@@ -426,84 +344,6 @@ async function runInstall(config: InstallConfig): Promise<number> {
         )
       )
         return 1;
-    }
-  }
-
-  // Install custom skills if requested
-  if (config.installCustomSkills) {
-    printStep(step++, totalSteps, 'Synchronizing custom skills...');
-    if (config.dryRun) {
-      printInfo('Dry run mode - would synchronize custom skills:');
-      for (const skill of CUSTOM_SKILLS) {
-        printInfo(`  - ${skill.name}`);
-      }
-    } else {
-      try {
-        const packageRoot = fileURLToPath(new URL('../..', import.meta.url));
-        const result = syncBundledSkillsFromPackage(packageRoot, {
-          force: config.forceSkillSync,
-        });
-        const categorizedSkipped = new Set([
-          ...result.staged,
-          ...result.adopted,
-          ...result.customized,
-        ]);
-        const preservedSkills = result.skippedExisting.filter(
-          (skill) => !categorizedSkipped.has(skill),
-        );
-
-        if (result.installed.length > 0) {
-          for (const skill of result.installed) {
-            printSuccess(`Installed/Updated: ${skill}`);
-          }
-        }
-        if (preservedSkills.length > 0) {
-          for (const skill of preservedSkills) {
-            printInfo(`Skipped/Preserved: ${skill}`);
-          }
-        }
-        if (result.failed.length > 0) {
-          for (const skill of result.failed) {
-            if (skill === '__lock__') {
-              printError('Lock acquisition failed');
-            } else if (skill === '__manifest__') {
-              printError('Manifest write failed');
-            } else {
-              printError(`Failed: ${skill}`);
-            }
-          }
-        }
-        if (result.staged.length > 0) {
-          for (const skill of result.staged) {
-            printInfo(`Staged for review: ${skill}`);
-          }
-        }
-        if (result.adopted.length > 0) {
-          for (const skill of result.adopted) {
-            printInfo(`Adopted: ${skill}`);
-          }
-        }
-        if (result.customized.length > 0) {
-          for (const skill of result.customized) {
-            printInfo(`Customized: ${skill}`);
-          }
-        }
-
-        const realFailed = result.failed.filter(
-          (skill) => skill !== '__lock__' && skill !== '__manifest__',
-        );
-        printSuccess(
-          `Skill synchronization complete: ` +
-            `${result.installed.length} installed/updated, ` +
-            `${preservedSkills.length} skipped/preserved, ` +
-            `${result.staged.length} staged, ` +
-            `${result.adopted.length} adopted, ` +
-            `${result.customized.length} customized, ` +
-            `${realFailed.length} failed.`,
-        );
-      } catch (err) {
-        printError(`Failed to synchronize custom skills: ${err}`);
-      }
     }
   }
 
@@ -546,6 +386,11 @@ async function runInstall(config: InstallConfig): Promise<number> {
   console.log('  5. Verify the agents are responding:');
   console.log(`     ${BLUE}> ping all agents${RESET}`);
   console.log();
+  console.log(
+    `${DIM}Optional: install the desktop companion with ` +
+      `bunx oh-my-opencode-slim companion install${RESET}`,
+  );
+  console.log();
 
   const modelsInfo =
     config.preset && config.preset !== 'openai'
@@ -567,15 +412,12 @@ async function runInstall(config: InstallConfig): Promise<number> {
 
 export async function install(args: InstallArgs): Promise<number> {
   const config: InstallConfig = {
-    installCustomSkills: args.skills === 'yes' || args.skills === 'force',
-    forceSkillSync: args.skills === 'force',
     preset: args.preset,
     promptForStar: args.tui,
     dryRun: args.dryRun,
     reset: args.reset ?? false,
     backgroundSubagents: args.backgroundSubagents ?? 'ask',
     backgroundSubagentsTarget: args.backgroundSubagentsTarget,
-    companion: args.companion,
   };
 
   return runInstall(config);

@@ -36,12 +36,15 @@ The task API and background-control tools are:
 |------|---------|
 | `task(..., background: true)` | Start a specialist in the background and immediately return a task ID |
 | hook-driven completion | OpenCode injects terminal background task results automatically |
-| `task_status` | Check the status of a tracked task |
-| `task_result` | Retrieve a tracked task's result |
-| `task_message` | Queue a non-interrupting message and return `queued` |
+| `task_status` | Check a tracked task (read-only fallback for owned untracked sessions after a restart); `result: true` retrieves its result |
+| `task_message` | Send a non-interrupting message and return `queued` (v2: steering acceptance with `delivery: "steer"`) |
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction |
-| `wait_for_user` | Plugin-provided orchestrator tool that pauses automatic orchestrator wakes while the user performs external manual work |
+| `wait_for_user` | Plugin-provided orchestrator tool (v1 only) that pauses automatic orchestrator wakes while the user performs external manual work; not registered on v2, where the native `question` tool is the blocking boundary |
+
+The delegation tool named `task()` here is `subagent()` on v2, with
+`task_id`/`sessionID` as the matching resume id; bare `task()` mentions on this
+page refer to that host-specific delegation tool.
 
 If these are not available, the scheduler cannot use the default background
 workflow. Configure the environment variable through the installer or use the
@@ -68,6 +71,85 @@ Its job is to:
 - communicate concise progress and outcomes to the user.
 
 Specialists do the work. The orchestrator manages the work.
+
+### Children moved to worktrees
+
+Moving a child session to another directory does not move its task ownership.
+The delegating parent's plugin instance still observes that tracked child's
+lifecycle, so completion and revived-run notifications do not require polling
+`task_status`. The destination directory handles its own permissions and runtime
+profiles; unrelated sessions remain excluded from the parent's event handling.
+
+### Unattributed sessions and restart scope
+
+A child observed before it can be attributed to a task launch is retained as a
+provisional placeholder. It remains resolvable by task ID or alias for
+`task_status`, but is omitted from the operational Background Job Board listing.
+A placeholder does not trigger stopped-job recovery or completed/error publication
+wakes for its parent, including after repeated executions: it is not yet known to
+be delegated work. This lets another plugin own a child session's notifications.
+Attribution through the existing task launch path promotes it to an ordinary
+listed task, including recovery and publication wakes.
+This distinction uses explicit provenance, not agent names or description text.
+
+Aliases and reusable-session history are process-local and do not survive process
+restarts as a reusable board. Post-restart recovery is partial and best-effort;
+it does not guarantee restoration of those aliases or the complete history. Two
+read-only channels work after a restart: a background launch's marker in the
+parent's history still resolves its alias when it is the final non-empty line of
+that tool result (tail-anchored only), and `task_status` reports a read-only
+observed state for an owned session the board no longer tracks — completed or
+uncertain running-or-incomplete from transcript evidence (unknown when the
+live status read fails), never claiming definite running — pointing to a `task_status` result read for completed text; it never
+re-registers or prompts the task. One recovery channel is explicit:
+`task_revive` on a raw session ID verifies the
+session against the host (existence and parent ownership) and re-adopts an
+untracked child owned by the calling parent, then
+continues it with the new prompt.
+Recovery verifies the original agent and latest delivered round before importing
+a retained terminal row. This cache-only import does not launch or notify.
+`task_cancel` still cannot abort a run launched before the restart — the board
+has no live handle to it (tracked in #1387).
+The production board numbers a parent's children only when the host's creation
+time shows that parent session was created while the plugin instance runs: the
+board saw every numbered alias it could have. Any other parent (created before a
+restart, or with no creation time) gives its new children their exact session
+ID as alias, and task creation still succeeds. This is deliberate: no cheap host
+read bounds the numbers issued before a restart. The live child count misses
+deleted children and a persisted high-water mark can miss a failed write, so
+either floor could hand an old `fix-2` to a new child while history still pairs
+`fix-2` with another session. Adopted and rehydrated host children keep their
+session ID as alias; a restored child keeps its historical alias only when
+history pairs that alias with it alone and no row of that parent holds it
+(never once the parent's readable history is cut: a v2 compaction or,
+on v1, more than 1,000 messages).
+None of them consumes a new number. A forked session counts as new, but the
+aliases in its copied history belong to the original parent: refer to the
+fork's new children by exact session ID.
+
+The continuation guidance changes the static orchestrator prompt and board
+wording. Existing sessions incur a one-time prompt-cache re-warm on their
+first request with this version; this is not a cache-neutral release. The
+new guidance remains deterministic and does not rewrite earlier messages.
+
+On v2 hosts with `session.prompt` and `session.context`, adoption queues the new
+instruction in the same session after shared recovery verifies parent ownership,
+agent evidence, and readable history. Host-proven aliases use the same path;
+unverified or ambiguous aliases remain refused. Recovery uses the session's
+host outcome: a terminal round is imported, and a round without a terminal
+outcome (still running, or awaiting the host's restart resume) is refused
+except for an explicit queued revive. The host wakes an idle session or runs
+the input
+after the current execution; revival does not wait for idle or interrupt it.
+The plugin assigns a message ID before admission and only delivers the terminal
+answer after that exact input. An older execution's result, error, or idle event
+cannot complete the continuation. Missing input/answer evidence remains pending.
+Only one continuation is admitted locally at a time. An uncertain admission must
+not be retried: its lease stays held until acknowledgement or an attributable
+answer proves completion. Queued adoption does not arm a session-wide timeout
+abort, because that could kill the preceding execution. Deletion suppresses late
+delivery without a compensating interrupt. V1 adoption retains its live-status
+gate; existing tracked revival retains its previous idle-verification behavior.
 
 ---
 
@@ -160,27 +242,51 @@ The orchestrator should use background completion events to:
 - collect outputs before final response,
 - surface failures or blocked tasks clearly.
 
-Use `task_status` to inspect a task and `task_result` to collect its result.
-`task_message` queues a non-interrupting message and returns `queued`; it does
-not stop the current generation. Use `task_cancel` to stop a generation while
+Use `task_status` to inspect a task and `task_status` with `result: true` to collect its result.
+A result read is a read, not a required step before every continuation.
+`task_message` sends a non-interrupting message and does not stop the current
+generation. On v2 it accepts an optional `delivery`: the default `"queue"`
+waits for an idle boundary — `resume: false` never wakes the child, so
+consumption is not confirmed — while `"steer"` offers an amendment to a
+running lane at the next supported step boundary of the current run. On v1
+the parameter does not exist and the message is simply queued, returning
+`queued`. On either host, acceptance does not mean the child read it —
+report acceptance without claiming consumption, reconcile the amendment
+against the child's eventual result, and never resume, cancel, or relaunch
+the running child just to deliver an amendment. Use `task_cancel` to stop a generation while
 retaining its session, then inspect and reconcile any partial file changes before
-launching replacement work. Use `task_revive` to resume a retained session with a
-new instruction.
+launching replacement work. On v1, continue an existing session with
+`task_revive` even when it is missing from Reusable Sessions. A new task still
+uses `task()` without an id. `task_revive` verifies the host session and
+continues in that same child; it does not spawn a replacement.
 
 A cancelled, errored, or stopped retained session may be revived immediately
 once its retained state has been verified safe. Acknowledgement controls parent
 and job-board consumption and reusable-pool display, not same-session revival.
-`task()` never drops an explicit `task_id` to spawn another session.
+The delegation tool (`task()` on v1, `subagent()` on v2) never drops an explicit
+resume id (`task_id` on v1, `sessionID` on v2) to spawn another session.
 
 Terminal jobs are reconciled automatically after their result is injected into
 the orchestrator session. That lifecycle state is not proof the output was used;
 the orchestrator must still verify it consumed the relevant result before
 finalizing.
 
+Parent terminal notifications are best-effort, with retries bounded by the
+existing notification policy (a zero retry budget still permits the initial
+send). Each transport wait is limited to 10 seconds. No notification attempt
+retains its lifecycle lease after that local wait ends, even if the host call
+never settles; other lifecycle operations still enforce their own safety checks.
+A timeout does not cancel a notification already queued by the host, so an
+ambiguous outcome can produce duplicate deliveries if a retry also succeeds.
+Acceptance of any attempt for the same current publication suppresses further
+retries, including a late acceptance while another attempt is pending. This
+records host acceptance, not parent consumption or job-board reconciliation;
+it is not an exactly-once delivery guarantee.
+
 To stop self-reinforcing acknowledgment loops, a brand-new `task` spawn is
 refused while the parent still owns an unreconciled terminal job with the same
 agent and an exactly matching objective. The refusal names the existing task ID
-and directs the caller to `task_result`; once that result has been retrieved,
+and directs the caller to `task_status` with `result: true`; once that result has been retrieved,
 the same objective may be dispatched again for follow-up work.
 
 Separately, the default-on orchestrator wake scheduler may prompt an
@@ -199,7 +305,7 @@ forever-running ghost, and a session that already reached a terminal host
 outcome is settled to it (the typed NotFound classification is a v2
 in-process artifact — on v1 hosts the probe harmlessly never tombstones). On
 OpenCode v2 hosts with the optional `ctx.storage` domain, deletion tombstones
-and alias counters additionally persist across host restarts (see the
+and epochs additionally persist across host restarts (see the
 [v2 compatibility doc](opencode-v2-compatibility.md#background-job-state-rehydrate-probe-and-persistence)).
 
 Specialist outputs are inputs, not final truth. The orchestrator reconciles them
@@ -222,13 +328,9 @@ reconciled, and supported by final-state evidence.
 
 ### Explorer
 
-Read-only reconnaissance and codebase mapping. Usually the first background task
-for unfamiliar work.
-
-### Librarian
-
-External docs, version-specific API behavior, and real-world examples. Runs in
-parallel with Explorer when implementation depends on current library behavior.
+Read-only reconnaissance, codebase mapping, and external research (docs,
+version-specific API behavior, real-world examples). Usually the first
+background task for unfamiliar work.
 
 ### Fixer
 
@@ -412,6 +514,10 @@ Behavior:
   host-observed progress re-arms the cap. Busy caused by the wake itself does
   **not** rearm the cap; unrelated busy/error lifecycle events do. The wake
   prompt text is static and does **not** include a fingerprint or snapshot.
+  The no-progress caps live in a process-global wake gate that the plugin's
+  dispose hook clears on instance teardown, so a recreated plugin generation
+  (for example after `opencode reload` on v2 hosts) starts with fresh caps
+  instead of inheriting the previous generation's.
 - Static wake text (internal initiator part via `promptAsync` only — no message
   transform injection or history rewrite):
 
@@ -420,6 +526,12 @@ Behavior:
 Finish any incomplete TODOs. Await running agents; if one appears stuck, assess it and cancel/respawn only when justified. Do not respond to this reminder.
 </system-reminder>
 ```
+
+If the same delta-less wake body was already delivered in the session, the
+repeat sends a strictly shorter, non-identical marker instead
+(`Repeat wake #N:`) so identical reminder bytes are not
+persisted repeatedly; delta-bearing wakes and child-input asks always carry
+the full template.
 
 The scheduler does **not** perform automatic cancellation and does not rely on
 the local job board. When no incomplete TODOs remain, it ends the current idle
@@ -440,6 +552,73 @@ the children-only fingerprint keeps the two-wake no-progress cap bounding
 cost. v2's native subagent completion nudges still cover the happy path; this
 watchdog covers stuck children and unreconciled jobs.
 
+#### v2 structural defaults
+
+On OpenCode v2 hosts the host's native background notifier already delivers
+each run's first terminal result (completed, error, or cancelled) to the
+parent: an idle parent gets a new turn, a busy parent gets a steer. Two plugin
+channels would duplicate that delivery, so on v2 they are **structurally off**
+— not configurable:
+
+- The passive Background Job Board is never injected into orchestrator
+  prompts. `backgroundJobs.boardInjection` is a v1-only switch: on v2 an
+  explicit `true` is ignored with a load-time warning.
+- The periodic idle evaluation described above never runs.
+  `backgroundJobs.orchestratorWake.periodicWakeEnabled` is honored on v1
+  only: on v2 an explicit `true` is ignored with a load-time warning.
+
+Event-driven wakes keep working on both flavors: stopped-job recovery, later
+terminal publications of the same run (for example a child that
+self-continued), and child-input asks still wake an idle parent, and their
+SDK-error retries still use the idle timer. On v2, terminal retirement is
+observation-based: the plugin watches the host's native `<subagent>`
+deliveries in the parent's transcript and retires the matching record, with a
+timestamp fallback for a missed observation. On v1, `boardInjection: false`
+keeps tracking, wake, and `task_status` working — the orchestrator simply no
+longer passively sees the board, and terminal retirement runs through
+prompt-shape consumption instead.
+
+Child-input wakes wait 250 ms before notifying the parent, on both host
+versions. Per-kind policy applies: by default only question asks wake the
+parent; permission asks do not (#1504). Built-in subagents no longer receive
+the `question` tool by default (`question` defaults to `deny` for every
+non-orchestrator agent), so question wakes fire only for agents with an
+explicit `question` allow/ask override. Requests answered during that window by
+the host, a UI auto-replier, or another caller are discarded. Requests still
+open are checked again before delivery. Duplicate events enrich the queued
+notice without restarting the deadline. Stopped-job recovery and
+terminal-publication wakes are not delayed. An ask arriving during a host read
+or model-selection lookup defers a child-input-only wake until settling
+completes, without sending a stopped-job notice in its place. Overflowed
+request IDs are also revalidated: resolved requests cannot keep an overflow-only
+wake alive. Remaining overflow notices carry task IDs for `task_status`, and
+delivery retires only the overflow IDs actually sent, preserving requests added
+while a send is in flight. Entries beyond the retained-ID cap stay counted
+because their state cannot be checked. Delivery still uses the existing
+`delivery:'queue'` behavior. In headless setups with no UI or external
+responder, a parked permission ask no longer produces a parent wake; the child
+stays parked (visible via `task_status` as `waiting_input`), so either set
+`backgroundJobs.childInputWakeKinds.permission = true` or rely on
+`wallClockTimeoutMs`.
+
+Wake and `task_status` share compact request details and reply guidance.
+V1 questions and permission requests use `task_reply`; v2 forms require the
+host UI, waiting, or `task_cancel`. V2 notices keep question summaries and option
+labels; full option descriptions stay in the host UI. A pending request
+suppresses the generic “await completion” status guidance. Shorter notices do not skip the host's
+normal model step after a tool result or guarantee that a model emits no filler.
+
+With the board off, the plugin still retires natively delivered results: on
+the parent's next real user turn they are registered, and once the prompt
+advances they are reconciled. Stopped jobs are **not** retired that way,
+because a stop has no native notification. They stay stopped and
+unreconciled, so the stopped-job recovery wake still reports them, and
+`task_revive` acknowledges them when the parent resumes the work. The
+recovery wake and overflow notices point at `task_status` instead of the
+board. Reopen corrections are still delivered with the board off, in a
+board-free variant that points at `task_status`: if a reconciled job reopens
+to running, the parent is told once not to rely on its earlier result.
+
 For external manual work, the orchestrator first gives the user concrete steps,
 then calls `wait_for_user` as its final tool action. This explicit signal covers
 text-only HITL turns without attempting to infer intent from assistant prose. The
@@ -450,41 +629,34 @@ messages (including foreground-fallback replays), fallback teardown, session
 errors, and idle/busy events do not clear it. Immediate choices, clarifications,
 and pasted command output continue to use the `question` tool. If
 `wait_for_user` is intentionally listed in `disabled_tools`, the orchestrator
-uses the `question` tool as the blocking boundary instead.
+uses the `question` tool as the blocking boundary instead. On v2 hosts
+`wait_for_user` is never registered; the orchestrator always uses the native
+`question` tool, whose open form also suppresses automatic wakes.
 
 ### Background Job Board Injection
 
-By default, each prompt uses the `latest` board strategy. The hook removes prior
-metadata-tagged board messages and injects the current board snapshot, preserving
-the existing strip-and-replace behavior.
+Board placement is change-only; the placement rule itself is not configurable. A fresh board part is
+placed only when the rendered board text differs from the board last injected
+for that parent — one board per state change of the job set. Once placed, the
+board is frozen: later turns replay it byte-identically on its original anchor
+message, so bytes the provider already cached never change. Unchanged turns
+inject nothing at all — no board part and no marker — because they carry zero
+new information. A transition to an empty board set is itself a state change
+and renders once.
 
-For checkpoint-oriented workflows, opt in to the append-only strategy:
+Placement only ever targets a user-role tail (a board part appended to the
+last real user message, keeping the message count stable so the provider's
+tail cache breakpoint lands on stable content). An assistant tail is never a
+placement target: a board appended there could not be retained for replay, so
+it would silently vanish from the next payload and break the byte prefix —
+the pending state change renders on the next user-side tail instead.
 
-```jsonc
-{
-  "backgroundJobs": {
-    "strategy": "checkpoint-compatible",
-    "maxRetainedSnapshots": 20
-  }
-}
-```
-
-`checkpoint-compatible` preserves prior board snapshots and appends a snapshot
-anchored after the current real-message tail only when the formatted board
-changes. Once created, snapshots are replayed on every managed turn, including
-turns with an internal initiator or an empty board; those turns do not create a
-new snapshot. Re-running injection with an unchanged board does not create a
-duplicate. This changes board message history only; task coordination, storage,
-terminal reconciliation, and reusable-session behavior remain unchanged. The
-retained snapshot cache is in memory, is limited to 20 snapshots per cache epoch,
-and is reset when OpenCode reports a session boundary or a compacted/rebased
-message history. `maxRetainedSnapshots` controls
-the epoch size and accepts integers from 1 to 100 (default `20`). When a changed
-snapshot would exceed the configured limit, all retained snapshots are discarded
-and only the new current snapshot is kept. This intentionally creates one cache
-miss at the epoch boundary, after which a fresh run of up to the configured limit
-can accumulate. The cache is lost on plugin restart, so snapshots are not
-restored beyond those present in the current OpenCode message history.
+Retained boards are in-memory per parent session and are cleared at session
+end; they are not restored across a plugin restart beyond what the current
+OpenCode message history still carries. Board injection is v1-only: on v2
+hosts the board never renders (the native notifier and inbox delivery replace
+it), and on v1 the `backgroundJobs.boardInjection: false` switch turns the
+render off while tracking, wake, and `task_status` keep working.
 
 ### Runtime Liveness Reconciliation
 
@@ -510,12 +682,82 @@ or cancellation.
 Stopped-job recovery facts are checked again by task ID and run generation
 before a queued recovery wake is delivered. The inline detail queue is bounded;
 when it overflows, the wake carries an explicit overflow signal directing the
-orchestrator to inspect all unreconciled stopped jobs on the board.
+orchestrator to inspect all unreconciled stopped jobs on the board. With board
+injection off, the overflow signal instead lists the overflowed task IDs that
+are still stopped (up to 64 per parent, with a note for any beyond that) so
+the orchestrator can check each with `task_status`.
 
 Malformed status entries and failed status requests are surfaced as `status
 uncertain`; they never prove that a job stopped or completed and do not confirm
 a pending stop. Each observation is generation-aware, so a delayed response
 cannot modify a relaunched task.
+
+### Terminal-Session GC
+
+Retention trims are the only board mechanic that evicts acknowledged terminal
+records: the per-agent count caps and context-budget caps over reusable and
+retained-stopped entries. All four trim paths share one eviction choke point —
+suppression tombstone, board delete, then the optional GC listener.
+`backgroundJobs.pruneEvictedSessions` (default `false`; see
+[Configuration](configuration.md#background-job-management)) gates what happens
+next: when enabled, the evicted record's host child session is removed through
+the session-remove path (capability-probed; hosts without `session.remove`
+degrade to a logged no-op)). On OpenCode v2 hosts there is no live session-status map, so the
+idle check cannot pass and every prune is skipped (logged as `not-idle`):
+the option currently reclaims sessions on v1 hosts only.
+
+A host session is deleted only when every one of these holds:
+
+- the record is terminal or retained-stopped and was actually evicted by a
+  trim;
+- the record is a background launch (`background: true`); foreground task
+  children are never deleted;
+- the record is not provisional, and never was: an unattributed
+  `session.created` placeholder under a managed parent may be a session this
+  plugin did not create, so it keeps its host session even after a later
+  promotion;
+- this plugin's own tracked native task call launched the child as a fresh
+  background run (not a `task_id` resume). Sessions adopted by `task_revive`,
+  adopted terminal host children, sessions restored from the parent
+  transcript (`restoreRetainedSession`), and records rehydrated after a
+  plugin reload carry external provenance and are never deleted;
+- no parked child-input wait exists (an open question or permission request
+  on the child blocks removal);
+- immediately before the delete, a bounded host `session.get` (same timeout as
+  runtime status reads) returns the session and its `parentID` equals the
+  record's parent session. A read failure, timeout, missing parent, or
+  mismatch skips the delete;
+- a bounded host `session.status` read shows the session idle (or absent
+  from the live status map). Busy, retry, malformed, or failed reads skip the
+  delete;
+- the board does not track the task again, checked both before and after the
+  host reads: a session that was re-registered, revived, adopted, or leased
+  after the eviction is live work and keeps its host session.
+
+The delete itself has the same deadline and is aborted when it expires. An
+error-returning, falsy, or timed-out delete is logged as a failed prune, not
+a success. Every read and the delete are bounded, so the in-flight prune that
+`task_revive` waits on always settles, and recovery waits on it only for a
+bounded interval before asking for a retry. Two eviction paths are deliberately excluded:
+`clearParent` (parent `session.deleted`) and explicit `drop` — both can evict
+running or unreconciled records whose host sessions are still live. There is
+no wall-clock TTL, no polling, and no startup sweep: GC runs only where
+retention already decided to evict.
+
+Each tombstone is consumed at most once. A post-pruning revive by raw session
+ID is fenced three ways: a transient host read failure never touches the
+tombstone (only a confirmed host 404 counts as absence); the caller's parent
+transcript must show it actually delegated the task before any ending is
+disclosed or the tombstone is consumed; and a tombstone without a recorded
+terminal state (stopped eviction or drop) yields a result-free "no longer
+tracked" refusal. Verified owners of ended tasks get the ending state
+("completed" / "ended in state X") and are pointed at this session's
+transcript instead of the recorded result. A revive whose host read races the
+asynchronous prune delete awaits the in-flight prune (bounded) and re-reads
+before adopting. Residual crash window: the host `session.remove` can land
+before the tombstone's asynchronous persistence flush, in which case a
+restart loses both the session and its recorded result; the transcript
+remains the source of truth.
 
 ### Background Task Concurrency
 
@@ -581,8 +823,10 @@ path unchanged: it skips background concurrency admission (no semaphore
 slot), is not wall-clock supervised, executes synchronously on the host, and
 its status is registered through the existing foreground bookkeeping.
 Unconfigured providers, different providers, and undeterminable providers
-leave `background: true` untouched (fail-open); the default (omitted)
-behavior is unchanged.
+leave `background: true` untouched (fail-open). On v2 hosts, when the
+background-default flip is active, an omitted
+`background` is first defaulted to `true` (the flip runs before this check), so
+it is converted for configured same-provider pairs too.
 
 ### Opt-in Wall-clock Supervisor
 
@@ -618,9 +862,10 @@ Late completion, busy, retry, or error events cannot replace a published hard
 timeout, and a hard wall-clock timeout is not recoverable through the existing
 external task-wait timeout path. The timeout outcome remains visible to the
 parent through the normal terminal-unreconciled Background Job Board flow; no
-prompt or raw task-result rewrite is used. Timeout terminals also issue a
-permanent logical pane-close intent so generic and cmux multiplexer paths do not
-respawn a pane on late busy events.
+prompt or raw task-result rewrite is used. The timeout path has no multiplexer
+coupling: pane lifecycle runs entirely in the TUI client and reacts only to
+session events, so the former permanent logical pane-close intent was removed
+together with the server-side pane lifecycle.
 
 `wallClockTimeoutMs` accepts `0` or integers from `60000` through `2147483647`;
 `abortGraceMs` accepts integers from `1000` through `60000`. This feature is

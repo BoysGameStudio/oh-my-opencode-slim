@@ -2,6 +2,18 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { BinaryFetch } from './types';
 
+export function fitUtf8(text: string, maxBytes: number, maxUnits = Infinity) {
+  let base = '';
+  let bytes = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char);
+    if (base.length + char.length > maxUnits || bytes + size > maxBytes) break;
+    base += char;
+    bytes += size;
+  }
+  return base;
+}
+
 function extensionForMime(contentType: string) {
   const mime = contentType.split(';')[0]?.trim().toLowerCase();
   const map: Record<string, string> = {
@@ -20,7 +32,10 @@ export function buildBinaryResultMessage(
 ) {
   const subject = fetchResult.binaryKind.toUpperCase();
   if (savedPath) return `${subject} content saved to ${savedPath}`;
-  return `${subject} content omitted because it exceeds the download limit.`;
+  const bytes = fetchResult.data?.byteLength ?? fetchResult.contentLength;
+  const size = typeof bytes === 'number' ? ` (${bytes} bytes)` : '';
+  if (fetchResult.data) return `${subject} content fetched${size}.`;
+  return `${subject} content omitted because it exceeds the download limit${size}.`;
 }
 
 export async function saveBinary(
@@ -33,11 +48,13 @@ export async function saveBinary(
   const initialName =
     filename || `webfetch-${Date.now()}.${extensionForMime(contentType)}`;
   const parsed = path.parse(initialName);
+  const ext = parsed.ext || `.${extensionForMime(contentType)}`;
   for (let attempt = 0; attempt < 1000; attempt++) {
+    const suffix = `-${attempt}${ext}`;
     const candidateName =
       attempt === 0
         ? initialName
-        : `${parsed.name}-${attempt}${parsed.ext || `.${extensionForMime(contentType)}`}`;
+        : `${fitUtf8(parsed.name, 255 - Buffer.byteLength(suffix))}${suffix}`;
     const file = path.join(binaryDir, candidateName);
     try {
       await writeFile(file, data, { flag: 'wx' });

@@ -272,6 +272,11 @@ describe('maskTaskOutputStructure', () => {
   test('deterministic: same input twice → identical output', () => {
     const input =
       '<task id="abc" state="running">text (sessionID: ses_9f8e7d) postgres://deploy:hunter2@db';
-    expect(maskTaskOutputStructure(input)).toBe(maskTaskOutputStructure(input));
+    const first = maskTaskOutputStructure(input);
+    const second = maskTaskOutputStructure(input);
+    expect(first).toBe(second);
+    expect(first).toBe(
+      '<task id="[masked]" state="[masked]">text (sessionID: [masked]) postgres://deploy:…@db',
+    );
   });
 });

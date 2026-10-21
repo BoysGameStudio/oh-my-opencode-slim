@@ -5,11 +5,11 @@ important dependency source repositories into a local ignored workspace so agent
 can read library internals.
 
 It is orchestrator-owned. The orchestrator delegates source discovery and URL/ref
-resolution to `@librarian`, asks for approval, then performs the git and
+resolution to `@explorer`, asks for approval, then performs the git and
 filesystem operations directly.
 
 There is intentionally no helper script. Dependency discovery, ref validation,
-and cloning are repo-specific enough that the orchestrator/librarian workflow is
+and cloning are repo-specific enough that the orchestrator/explorer workflow is
 safer than a brittle cross-ecosystem script.
 
 Cloned repositories live under `.slim/clonedeps/repos/<safe-repo-name>/`, one
@@ -20,4 +20,4 @@ metadata. After cloning, the orchestrator should add or update a concise
 read-only cloned repo path directly with a one-sentence purpose.
 
 If `.slim/clonedeps.json` already exists, read it first and reuse those clones
-before asking `@librarian` for new recommendations.
+before asking `@explorer` for new recommendations.

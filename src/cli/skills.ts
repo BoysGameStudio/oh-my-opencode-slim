@@ -130,6 +130,7 @@ export function resolveEffectiveSkills(
   base: readonly string[] | undefined,
   add: readonly string[] | undefined,
   remove: readonly string[] | undefined,
+  defaultSkills?: readonly string[],
 ): string[] | undefined {
   const addList = Array.isArray(add) ? add : [];
   const removeList = Array.isArray(remove) ? remove : [];
@@ -142,6 +143,7 @@ export function resolveEffectiveSkills(
   // what the agent already gets and removals prune from it.
   const workingBase =
     base ??
+    defaultSkills ??
     (agentName === 'orchestrator'
       ? ['*']
       : getDefaultGrantedSkillNames(agentName));

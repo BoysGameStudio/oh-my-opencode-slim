@@ -1,10 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
-  aliasHighWaterMark,
   type BackgroundJobStorageBackend,
-  bumpAliasHighWaterMark,
   clearSuppression,
   configureBackgroundJobPersistence,
+  getSuppressionTombstone,
   loadInitialBackgroundJobPersistence,
   MAX_PERSISTED_TOMBSTONES,
   recordSuppression,
@@ -94,6 +93,65 @@ describe('background-job persistence', () => {
     expect(ledger.deletionEpochs.get('ses_next')).toBe(2);
   });
 
+  test('tombstone terminal result survives a simulated restart', async () => {
+    const { backend } = createMemoryBackend();
+    configureBackgroundJobPersistence(backend);
+    await loadInitialBackgroundJobPersistence();
+
+    recordSuppression('ses_terminal', 1, {
+      state: 'completed',
+      resultSummary: 'the answer is 42',
+    });
+    await flushWrites();
+    expect(getSuppressionTombstone('ses_terminal')?.terminalState).toBe(
+      'completed',
+    );
+    // Full-field fixture: any field the load path drops breaks the
+    // equality below, regardless of which fields the assertions name.
+    const before = getSuppressionTombstone('ses_terminal');
+
+    // Simulated restart: same backend, fresh module state. The load path
+    // must carry the persisted terminal result through, or a post-restart
+    // task_revive cannot recognize the completed work.
+    configureBackgroundJobPersistence(backend);
+    await loadInitialBackgroundJobPersistence();
+
+    expect(getSuppressionTombstone('ses_terminal')).toEqual(before);
+  });
+
+  test('a malformed persisted terminal payload is dropped wholesale on load', async () => {
+    const { backend, map } = createMemoryBackend();
+    configureBackgroundJobPersistence(backend);
+    await loadInitialBackgroundJobPersistence();
+
+    recordSuppression('ses_half', 3, {
+      state: 'completed',
+      resultSummary: 'will be corrupted',
+    });
+    await flushWrites();
+    // Corrupt the persisted tombstone entry: a terminal state without a
+    // result summary. The load sanitizer must drop the pair wholesale —
+    // the consumer contract is all-or-nothing.
+    for (const [entryKey, entryValue] of map) {
+      if (entryKey.includes('ses_half') && typeof entryValue === 'object') {
+        map.set(entryKey, {
+          taskID: 'ses_half',
+          epoch: 3,
+          recordedAt: 1,
+          terminalState: 'completed',
+        });
+      }
+    }
+
+    configureBackgroundJobPersistence(backend);
+    await loadInitialBackgroundJobPersistence();
+
+    const tombstone = getSuppressionTombstone('ses_half');
+    expect(tombstone?.epoch).toBe(3);
+    expect(tombstone?.terminalState).toBeUndefined();
+    expect(tombstone?.resultSummary).toBeUndefined();
+  });
+
   test('clear-on-relaunch write-through removes the persisted tombstone but keeps the epoch', async () => {
     const { backend } = createMemoryBackend();
     configureBackgroundJobPersistence(backend);
@@ -118,83 +176,6 @@ describe('background-job persistence', () => {
     );
     expect(freshLedger.tombstones.has('ses_relaunch')).toBe(false);
     expect(freshLedger.deletionEpochs.get('ses_relaunch')).toBe(1);
-  });
-
-  test('alias counters never reuse a historical alias across a simulated restart', async () => {
-    const { backend } = createMemoryBackend();
-    configureBackgroundJobPersistence(backend);
-    await loadInitialBackgroundJobPersistence();
-
-    const firstBoard = new BackgroundJobBoard();
-    const a = firstBoard.registerLaunch({
-      taskID: 'ses_a',
-      parentSessionID: 'parent-alias',
-      agent: 'fixer',
-      description: 'first',
-    });
-    const b = firstBoard.registerLaunch({
-      taskID: 'ses_b',
-      parentSessionID: 'parent-alias',
-      agent: 'fixer',
-      description: 'second',
-    });
-    expect(a.alias).toBe('fix-1');
-    expect(b.alias).toBe('fix-2');
-    await flushWrites();
-
-    // Simulated restart: fresh board seeds from the persisted high-water
-    // mark; the alias MAPPING is not restored (old ids resolve not-found),
-    // but no NEW alias collides with a historical one.
-    configureBackgroundJobPersistence(backend);
-    await loadInitialBackgroundJobPersistence();
-    expect(aliasHighWaterMark('parent-alias', 'fix')).toBe(2);
-
-    const restarted = new BackgroundJobBoard();
-    const c = restarted.registerLaunch({
-      taskID: 'ses_c',
-      parentSessionID: 'parent-alias',
-      agent: 'fixer',
-      description: 'third',
-    });
-    expect(c.alias).toBe('fix-3');
-  });
-
-  test('two concurrently-live boards sharing a prefix never reuse an alias', async () => {
-    const { backend } = createMemoryBackend();
-    configureBackgroundJobPersistence(backend);
-    await loadInitialBackgroundJobPersistence();
-
-    const boardA = new BackgroundJobBoard();
-    expect(
-      boardA.registerLaunch({
-        taskID: 'ses_live_a1',
-        parentSessionID: 'parent-live',
-        agent: 'fixer',
-        description: 'a1',
-      }).alias,
-    ).toBe('fix-1');
-    expect(
-      boardA.registerLaunch({
-        taskID: 'ses_live_a2',
-        parentSessionID: 'parent-live',
-        agent: 'fixer',
-        description: 'a2',
-      }).alias,
-    ).toBe('fix-2');
-    await flushWrites();
-
-    // A second LIVE board in the same process must seed from the live
-    // high-water max (writtenAliasMax), not only the backend snapshot
-    // frozen at configure time — otherwise it would hand out fix-1 again.
-    const boardB = new BackgroundJobBoard();
-    expect(
-      boardB.registerLaunch({
-        taskID: 'ses_live_b1',
-        parentSessionID: 'parent-live',
-        agent: 'fixer',
-        description: 'b1',
-      }).alias,
-    ).toBe('fix-3');
   });
 
   test('writes queued before a reconfiguration never land on the new backend', async () => {
@@ -235,33 +216,16 @@ describe('background-job persistence', () => {
     ).toBe(true);
   });
 
-  test('alias high-water marks never regress on concurrent bumps', async () => {
-    const { backend } = createMemoryBackend();
-    configureBackgroundJobPersistence(backend);
-    await loadInitialBackgroundJobPersistence();
-
-    bumpAliasHighWaterMark('parent-race', 'fix', 5);
-    bumpAliasHighWaterMark('parent-race', 'fix', 3); // stale writer
-    await flushWrites();
-
-    configureBackgroundJobPersistence(backend);
-    await loadInitialBackgroundJobPersistence();
-    expect(aliasHighWaterMark('parent-race', 'fix')).toBe(5);
-  });
-
   test('storage-absent fallback: pure memory, zero behavior change', async () => {
     configureBackgroundJobPersistence(undefined);
 
     expect(() => {
       recordSuppression('ses_fallback', 1);
       clearSuppression('ses_fallback');
-      bumpAliasHighWaterMark('parent-fallback', 'fix', 7);
     }).not.toThrow();
     await flushWrites();
 
-    // No backend → nothing is seeded into fresh boards or ledgers and
-    // alias numbering restarts from 1 exactly as before persistence.
-    expect(aliasHighWaterMark('parent-fallback', 'fix')).toBe(0);
+    // No backend → nothing is seeded into fresh boards or ledgers.
     const board = new BackgroundJobBoard();
     const record = board.registerLaunch({
       taskID: 'ses_fresh',

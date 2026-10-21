@@ -6,8 +6,7 @@ import {
   hasTaggedPart,
   isTaggedPart,
   isVolatileTaggedMessage,
-  runWithSyntheticPartCacheHintScope,
-  setDefaultSyntheticPartCacheHint,
+  omittedOrFull,
   stripTaggedContent,
 } from './cache-safe-injection';
 import type { MessageWithParts } from './types';
@@ -37,7 +36,7 @@ describe('createTaggedSyntheticPart', () => {
     });
   });
 
-  test('omits cache entirely when neither spec nor default provides it (v1 bytes)', () => {
+  test('never adds cache marks to a tagged part (v1 bytes)', () => {
     const part = createTaggedSyntheticPart({
       text: 'hello',
       metadataKey: KEY,
@@ -49,114 +48,6 @@ describe('createTaggedSyntheticPart', () => {
       metadata: { [KEY]: true },
     });
     expect('cache' in part).toBe(false);
-  });
-
-  test('copies an explicit spec cache hint (ttl included when set)', () => {
-    const part = createTaggedSyntheticPart({
-      text: 'hello',
-      metadataKey: KEY,
-      cache: { type: 'ephemeral' },
-    });
-    expect(part.cache).toEqual({ type: 'ephemeral' });
-
-    const ttl = createTaggedSyntheticPart({
-      text: 'hello',
-      metadataKey: KEY,
-      cache: { type: 'persistent', ttlSeconds: 300 },
-    });
-    expect(ttl.cache).toEqual({ type: 'persistent', ttlSeconds: 300 });
-  });
-
-  test('scoped default applies while set and restores after', () => {
-    const restore = setDefaultSyntheticPartCacheHint({ type: 'ephemeral' });
-    try {
-      const inside = createTaggedSyntheticPart({
-        text: 'hello',
-        metadataKey: KEY,
-      });
-      expect(inside.cache).toEqual({ type: 'ephemeral' });
-      // An explicit spec hint always wins over the default.
-      const explicit = createTaggedSyntheticPart({
-        text: 'hello',
-        metadataKey: KEY,
-        cache: { type: 'persistent' },
-      });
-      expect(explicit.cache).toEqual({ type: 'persistent' });
-    } finally {
-      restore();
-    }
-    const outside = createTaggedSyntheticPart({
-      text: 'hello',
-      metadataKey: KEY,
-    });
-    expect('cache' in outside).toBe(false);
-  });
-
-  test('the created hint is a copy, not a shared reference', () => {
-    const hint = { type: 'ephemeral' as const };
-    const part = createTaggedSyntheticPart({
-      text: 'hello',
-      metadataKey: KEY,
-      cache: hint,
-    });
-    expect(part.cache).not.toBe(hint);
-    expect(part.cache).toEqual(hint);
-  });
-
-  test('interleaved scopes keep independent defaults across awaited transforms', async () => {
-    // Greptile P2 scenario: two concurrent bridged transforms interleave
-    // their set/restore across an await. Scope A restores while scope B is
-    // still running; parts created by B afterwards must still carry B's
-    // own default (a plain module global would have been cleared by A's
-    // restore).
-    let releaseA!: () => void;
-    const gateA = new Promise<void>((resolve) => {
-      releaseA = resolve;
-    });
-    const scopeA = runWithSyntheticPartCacheHintScope(async () => {
-      const restoreA = setDefaultSyntheticPartCacheHint({
-        type: 'ephemeral',
-      });
-      await gateA; // B enters and sets its own default while A waits
-      restoreA();
-    });
-    // Let A run to its await point (set done, parked on gateA).
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    const partB = await runWithSyntheticPartCacheHintScope(async () => {
-      const restoreB = setDefaultSyntheticPartCacheHint({
-        type: 'persistent',
-      });
-      releaseA(); // A finishes and restores while B is still running
-      await scopeA;
-      const part = createTaggedSyntheticPart({
-        text: 'created after A restored',
-        metadataKey: KEY,
-      });
-      restoreB();
-      return part;
-    });
-    expect(partB.cache).toEqual({ type: 'persistent' });
-
-    // After both scopes end, no default leaks (v1 bytes unchanged).
-    const outside = createTaggedSyntheticPart({
-      text: 'outside',
-      metadataKey: KEY,
-    });
-    expect('cache' in outside).toBe(false);
-  });
-
-  test('parts created outside any scope never see a scoped default', async () => {
-    await runWithSyntheticPartCacheHintScope(async () => {
-      const restore = setDefaultSyntheticPartCacheHint({
-        type: 'ephemeral',
-      });
-      restore();
-    });
-    const outside = createTaggedSyntheticPart({
-      text: 'outside',
-      metadataKey: KEY,
-    });
-    expect('cache' in outside).toBe(false);
   });
 });
 
@@ -272,5 +163,31 @@ describe('appendTrailingVolatileMessage / isVolatileTaggedMessage', () => {
     expect(messages).toHaveLength(2);
     const trailing = messages[1] as MessageWithParts;
     expect(trailing.parts[0].text).toBe('board v2');
+  });
+});
+
+describe('omittedOrFull', () => {
+  test('returns the full text at or below the cap', () => {
+    expect(omittedOrFull('hello', 5)).toBe('hello');
+    expect(omittedOrFull('hello', 6)).toBe('hello');
+  });
+
+  test('omits above the cap instead of truncating', () => {
+    expect(omittedOrFull('hello world', 5)).toBeUndefined();
+  });
+
+  test('property: every cap yields either the whole input or nothing', () => {
+    // A truncated restriction reads as an authorization ("only read
+    // directory A" cut short becomes "read directory A"), so no cap may
+    // ever return a strict prefix of the input.
+    const input = 'only read directory A; never touch directory B';
+    for (let cap = 0; cap <= input.length + 2; cap += 1) {
+      const result = omittedOrFull(input, cap);
+      if (cap >= input.length) {
+        expect(result).toBe(input);
+      } else {
+        expect(result).toBeUndefined();
+      }
+    }
   });
 });

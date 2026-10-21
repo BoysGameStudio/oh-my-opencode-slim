@@ -7,23 +7,27 @@ import {
   DEFAULT_MODELS,
   loadAgentPrompt,
   type PluginConfig,
+  type Preset,
   SUBAGENT_NAMES,
 } from '../config';
 import { getAgentMcpList } from '../config/agent-mcps';
-import type { RuntimeConfig } from '../config/runtime';
+import type { HostAgentConfig, RuntimeConfig } from '../config/runtime';
+import { hostLegacyAgent } from '../config/runtime';
+import { applyOrchestratorModelConfig } from '../config/strip-orchestrator-model';
+import { mergeWithAliases } from '../config/utils';
 import { escapeRegExp, normalizeAgentName } from '../utils/agent-variant';
-import { delegationVocabulary } from '../v2/adapters';
+import { delegationVocabulary, parseModelRef } from '../v2/adapters';
 
 import {
   createCouncilAgent,
   ensureCouncilCompactionException,
+  ensureCouncilSynthesisReinforcement,
 } from './council';
-import { buildCouncillorAgents, getCouncillorSeatName } from './council-agents';
+import { buildCouncillorAgents } from './council-agents';
 import { createCouncillorAgent } from './councillor';
 import { createDesignerAgent } from './designer';
 import { createExplorerAgent } from './explorer';
 import { createFixerAgent } from './fixer';
-import { createLibrarianAgent } from './librarian';
 import { createObserverAgent } from './observer';
 import { createOracleAgent } from './oracle';
 import {
@@ -31,7 +35,12 @@ import {
   createOrchestratorAgent,
   resolvePrompt,
 } from './orchestrator';
-import { appendTaskRejectionInstruction } from './task-rejection';
+import { mergeTaskStance, TASK_NO_NESTED_DISPATCH } from './permissions';
+import {
+  appendObserverDispatchInstruction,
+  appendTaskRejectionInstruction,
+  OBSERVER_DISPATCH_ROLES,
+} from './task-rejection';
 
 export { ensureCouncilCompactionException } from './council';
 export type { AgentDefinition } from './orchestrator';
@@ -42,12 +51,17 @@ type AgentFactory = (
   customAppendPrompt?: string,
 ) => AgentDefinition;
 
-const TASK_CONTROL_TOOL_NAMES = [
+const ORCHESTRATOR_DEFAULT_TOOL_NAMES = [
   'task_cancel',
   'task_message',
+  'task_reply',
   'task_revive',
   'task_status',
-  'task_result',
+  'acp_run',
+] as const;
+const MARKETPLACE_TOOL_NAMES = [
+  'marketplace_inspect',
+  'marketplace_manage',
 ] as const;
 const SAFE_AGENT_ALIAS_RE = /^[a-z][a-z0-9_-]*$/i;
 
@@ -72,20 +86,15 @@ function getPrimaryModelFromOverride(
 
 /**
  * Alias-aware override lookup inside a merged (preset-aware) agents record.
- * Mirrors getAgentOverride semantics without the host layer, which the
- * config hook applies separately at merge time.
+ * Mirrors getAgentOverride semantics (field-level merge, canonical wins)
+ * without the host layer, which the config hook applies separately at merge
+ * time.
  */
 function getOverrideFromAgents(
   agents: Record<string, AgentOverrideConfig>,
   name: string,
 ): AgentOverrideConfig | undefined {
-  return (
-    agents[name] ??
-    agents[
-      Object.keys(AGENT_ALIASES).find((key) => AGENT_ALIASES[key] === name) ??
-        ''
-    ]
-  );
+  return mergeWithAliases(agents, name);
 }
 
 function buildAcpAgentDefinition(
@@ -103,7 +112,10 @@ function buildAcpAgentDefinition(
       'Your only job is to send the user task to the configured external ACP agent using the acp_run tool, then return the ACP agent result.',
       `Always call acp_run with agent: ${JSON.stringify(
         name,
-      )} and pass the full user task as prompt.`,
+      )} and pass the actual task, constraints, and relevant context as prompt, not wrapper-routing instructions.`,
+      'For each invocation, extract an explicitly requested inner ACP selector (for example, "Inner ACP selector: <value>") into acp_run.model. This is the exact ACP-advertised selector, not an OpenCode provider/model.',
+      'Never infer the inner selector from the outer wrapper model, a previous call, or incidental model names in the task. Native subagent.model selects only the outer wrapper.',
+      'If no inner model was requested, omit acp_run.model to use the external agent default. If an explicit inner model request cannot be resolved to an exact selector, report the ambiguity to the caller instead of calling acp_run without model or guessing a default.',
       'Do not edit files yourself unless the ACP result explicitly asks you to report a local follow-up to the orchestrator.',
     ].join('\n');
 
@@ -202,7 +214,12 @@ function applyOverrides(
     agent.description = override.description;
   }
   if (override.permission) {
-    agent.config.permission = override.permission;
+    // Keep the factory's nested-dispatch stance when the override doesn't
+    // address `task` (shared with the host-entry and marketplace sites).
+    agent.config.permission = mergeTaskStance(
+      override.permission,
+      agent.config.permission,
+    );
   }
 }
 
@@ -210,42 +227,56 @@ function applyOverrides(
  * Apply an explicit model inheritance policy after the agent factory has
  * supplied its built-in fallback model. OpenCode uses the parent session model
  * when an agent config does not specify `model`.
+ *
+ * A combined array-chain policy (`model: [...]` + `inheritModelFrom`) keeps
+ * the SDK-level inheritance: the agent follows the live session/orchestrator
+ * model and `_modelArray` remains the runtime fallback chain. A scalar `model`
+ * still wins outright (explicit model precedence, see getModelForAgent).
  */
 function applyModelInheritance(
   agent: AgentDefinition,
   override: AgentOverrideConfig | undefined,
-  orchestratorModel: string | undefined,
 ): void {
-  if (override?.model !== undefined) return;
+  // Scalar models are explicit and always win. An array may be combined with
+  // inheritance: keep it as the fallback chain while the live parent model
+  // supplies the current primary.
+  if (override?.model !== undefined && !Array.isArray(override.model)) return;
 
   if (
     override?.inheritModelFrom === 'session' ||
-    (override?.inheritModelFrom === 'orchestrator' &&
-      orchestratorModel === undefined)
+    override?.inheritModelFrom === 'orchestrator'
   ) {
     delete agent.config.model;
+    // The chain head's inline variant belongs to the chain head model, not
+    // to the inherited session model; drop it unless explicitly configured.
+    if (override?.variant === undefined) {
+      delete agent.config.variant;
+    }
   }
 }
 
 /**
  * Apply model inheritance to the final host agent config after the host layer
- * has been merged. This clears stale host models for `session` inheritance,
- * which cannot be handled by the agent definition alone.
+ * has been merged. This clears stale host models for `session` and
+ * `orchestrator` inheritance so delegated agents follow the live parent model.
+ *
+ * Combined array-chain policies (`model: [...]` + `inheritModelFrom`) are
+ * honored here too: inheritance clears the host model so the SDK keeps
+ * following the live parent model. A chain head's inline variant stamped by
+ * the earlier passes is cleared alongside the rewritten model. Scalar models
+ * keep explicit precedence and skip
+ * inheritance entirely.
  */
 export function applyModelInheritanceToConfig(
   configAgent: Record<string, unknown>,
   runtime: RuntimeConfig,
 ): void {
   const mergedAgents = runtime.agents();
-  const orchestratorModel = getPrimaryModelFromOverride(
-    runtime.agent('orchestrator'),
-  );
-
   for (const agentName of Object.keys(configAgent)) {
     const override = getOverrideFromAgents(mergedAgents, agentName);
     if (!override) continue;
     if (
-      override.model !== undefined ||
+      (override.model !== undefined && !Array.isArray(override.model)) ||
       override.inheritModelFrom === undefined
     ) {
       continue;
@@ -258,12 +289,16 @@ export function applyModelInheritanceToConfig(
     }
 
     const agentConfig = entry as Record<string, unknown>;
-    if (override.inheritModelFrom === 'session') {
-      delete agentConfig.model;
-    } else if (orchestratorModel === undefined) {
-      delete agentConfig.model;
-    } else {
-      agentConfig.model = orchestratorModel;
+    delete agentConfig.model;
+    // The array-primary and runtime preset passes stamp the chain head's
+    // inline variant into this entry next to its model. A combined policy
+    // rewrites or clears that model, so the stale variant — which belongs
+    // to the chain head model, not the inherited one — must go with it.
+    // Explicit agent-level variants win and are left alone; scalar-model
+    // agents never reach this point. Mirrors the agent-layer cleanup in
+    // applyModelInheritance.
+    if (Array.isArray(override.model) && override.variant === undefined) {
+      delete agentConfig.variant;
     }
   }
 }
@@ -272,12 +307,282 @@ function isKnownAgentName(name: string): boolean {
   return (ALL_AGENT_NAMES as readonly string[]).includes(name);
 }
 
+// ---------------------------------------------------------------------------
+// Runtime state projection
+//
+// The config hook and the v2 hot-profile refresh both need the exact same
+// final model resolution: host-layer merge, array-primary pass, runtime
+// preset pass, model inheritance, sidebar projection, and orchestrator-model
+// stripping. These helpers are the single source of truth for that pipeline;
+// the config hook owns only the host-container side effects (model-switch
+// tracking, container assignment).
+// ---------------------------------------------------------------------------
+
+/** Sidebar model/variant projection for one agent set. */
+export interface AgentModelProjection {
+  agentModels: Record<string, string>;
+  agentVariants: Record<string, string>;
+}
+
+/**
+ * Inference/runtime fields of one agent that may hot-apply to NEW child
+ * sessions plus the sidebar. Everything else (prompt, tools, permissions,
+ * skills, MCPs, description) stays frozen for a session's lifetime.
+ */
+export interface AgentRuntimeProfile {
+  model?: { providerID: string; id: string; variant?: string };
+  temperature?: number;
+  providerOptions?: Record<string, unknown>;
+  sidebarModel: string;
+  sidebarVariant?: string;
+}
+
+export type AgentRuntimeProfiles = Record<string, AgentRuntimeProfile>;
+
+/**
+ * Merge the host opencode `agent` layer over the plugin's agent configs with
+ * the plugin's shallow-merge precedence (host fields win per agent). The
+ * optional `onUserModelSwitch` observes host-persisted models only — the
+ * config hook uses it for the fallback-chain disable bookkeeping; the
+ * read-only profile refresh passes none.
+ */
+export function mergeHostAgentConfigs(
+  agents: Record<string, Record<string, unknown>>,
+  hostAgents: Record<string, HostAgentConfig> | undefined,
+  onUserModelSwitch?: (agentName: string, hostModel: string) => void,
+): Record<string, Record<string, unknown>> {
+  const merged: Record<string, Record<string, unknown>> = {};
+  for (const [name, pluginAgent] of Object.entries(agents)) {
+    const existing = hostAgents?.[name] ?? hostLegacyAgent(hostAgents, name);
+    if (existing && typeof existing.model === 'string') {
+      onUserModelSwitch?.(name, existing.model);
+    }
+    merged[name] = existing
+      ? { ...pluginAgent, ...existing }
+      : { ...pluginAgent };
+  }
+
+  // Display names are host-facing keys. Mirror their inference overrides to
+  // the canonical entry used by runtime-profile lookup unless the host also
+  // supplied a canonical override. Other host config stays independent.
+  for (const [name, pluginAgent] of Object.entries(agents)) {
+    const displayName = pluginAgent.displayName;
+    if (typeof displayName !== 'string') continue;
+    const visibleName = normalizeAgentName(displayName);
+    const displayOverride = hostAgents?.[visibleName];
+    const displayConfig = merged[visibleName];
+    const canonicalOverride = hostAgents?.[name];
+    const canonical = merged[name];
+    if (!displayOverride || !displayConfig || !canonical) continue;
+    // A canonical host entry is authoritative as a whole; falling back to
+    // display-name fields individually can mix incompatible model settings.
+    if (canonicalOverride !== undefined) continue;
+    for (const key of ['model', 'variant', 'temperature', 'options'] as const) {
+      if (displayConfig[key] !== undefined) canonical[key] = displayConfig[key];
+    }
+    if (typeof displayOverride.model === 'string') {
+      onUserModelSwitch?.(name, displayOverride.model);
+    }
+  }
+  return merged;
+}
+
+/** Model value for one entry (string model only; arrays resolved upstream). */
+function entryModelString(
+  entry: Record<string, unknown> | undefined,
+): string | undefined {
+  return typeof entry?.model === 'string' ? entry.model : undefined;
+}
+
+/**
+ * Project the runtime state for a set of resolved agent definitions:
+ *
+ * 1. array-primary pass (`runtime.modelArrays` → first model unless the
+ *    entry already pinned one);
+ * 2. runtime-preset override pass (in-session preset switch wins);
+ * 3. model-inheritance policy (`inheritModelFrom`);
+ * 4. sidebar projection (`recordTuiAgentModels` payload);
+ * 5. per-agent runtime profiles for model/variant/temperature/options.
+ *
+ * `agentConfigs` is mutated in place (entries only, matching the config
+ * hook's historical behavior) and orchestrator-model stripping is applied
+ * AFTER the projection so the sidebar/profile keep the configured model.
+ */
+export function projectAgentRuntimeState(input: {
+  runtime: RuntimeConfig;
+  agentDefs: readonly AgentDefinition[];
+  agentConfigs: Record<string, Record<string, unknown>>;
+  /** Resolved runtime-preset agent map (in-session switch), when active. */
+  runtimePreset?: Preset;
+}): { profiles: AgentRuntimeProfiles; projection: AgentModelProjection } {
+  const { runtime, agentDefs, agentConfigs, runtimePreset } = input;
+
+  // 1. Array-primary pass.
+  if (Object.keys(runtime.modelArrays).length > 0) {
+    for (const [agentName, models] of Object.entries(runtime.modelArrays)) {
+      if (models.length === 0) continue;
+      const chosen = models[0];
+      const entry = agentConfigs[agentName];
+      if (entry) {
+        // A user-selected model (host layer) takes precedence over the
+        // config's fallback chain.
+        if (entry.model === undefined) {
+          entry.model = chosen.id;
+          if (chosen.variant) {
+            entry.variant = chosen.variant;
+          }
+        }
+      } else {
+        agentConfigs[agentName] = {
+          model: chosen.id,
+          ...(chosen.variant ? { variant: chosen.variant } : {}),
+        };
+      }
+    }
+  }
+
+  // 2. Runtime-preset override pass.
+  if (runtimePreset) {
+    for (const [agentName, override] of Object.entries(runtimePreset)) {
+      const resolvedName = AGENT_ALIASES[agentName] ?? agentName;
+      const entry = agentConfigs[resolvedName];
+      if (!entry) continue;
+
+      if (typeof override.model === 'string') {
+        entry.model = override.model;
+      } else if (Array.isArray(override.model) && override.model.length > 0) {
+        const first = override.model[0];
+        entry.model = typeof first === 'string' ? first : first.id;
+        if (typeof first !== 'string' && first.variant) {
+          entry.variant = first.variant;
+        }
+      }
+      // Explicitly set or clear scalar fields so switching from Preset A
+      // (which sets a field) to Preset B (which doesn't) leaves no stale
+      // values behind.
+      if (typeof override.variant === 'string') {
+        entry.variant = override.variant;
+      } else if ('variant' in override) {
+        delete entry.variant;
+      }
+      if (typeof override.temperature === 'number') {
+        entry.temperature = override.temperature;
+      } else if ('temperature' in override) {
+        delete entry.temperature;
+      }
+      if (
+        override.options &&
+        typeof override.options === 'object' &&
+        !Array.isArray(override.options)
+      ) {
+        entry.options = override.options;
+      } else if ('options' in override) {
+        delete entry.options;
+      }
+    }
+  }
+
+  // 3. Model-inheritance policy (authoritative for inheritModelFrom agents).
+  applyModelInheritanceToConfig(agentConfigs, runtime);
+
+  // 4. Sidebar projection (pre-strip; mirrors the historical capture).
+  const projection: AgentModelProjection = {
+    agentModels: {},
+    agentVariants: {},
+  };
+  for (const agentDef of agentDefs) {
+    if (
+      agentDef.name === 'council' ||
+      agentDef.name === 'councillor' ||
+      agentDef.name.startsWith('councillor-')
+    ) {
+      continue;
+    }
+    const entry = agentConfigs[agentDef.name];
+    // Session-following combined agents have no launch model of their own:
+    // entry.model is cleared, the chain head is only a fallback tail, and
+    // agentDef.config.model is deleted by inheritance. Skip the chain-head
+    // probe so they display 'default'.
+    const followsSessionModel =
+      runtime.combinedModelInheritanceSource(agentDef.name) === 'session';
+    const resolvedModel =
+      entryModelString(entry) ??
+      (followsSessionModel
+        ? undefined
+        : runtime.runtimeChains[agentDef.name]?.[0]
+          ? runtime.runtimeChains[agentDef.name][0]
+          : typeof agentDef.config.model === 'string'
+            ? agentDef.config.model
+            : undefined);
+    const resolvedVariant =
+      typeof entry?.variant === 'string'
+        ? entry.variant
+        : typeof agentDef.config.variant === 'string'
+          ? agentDef.config.variant
+          : undefined;
+
+    projection.agentModels[agentDef.name] = resolvedModel ?? 'default';
+    if (resolvedVariant) {
+      projection.agentVariants[agentDef.name] = resolvedVariant;
+    }
+  }
+
+  // 5. Runtime profiles for NEW child dispatches. Keyed by every resolved
+  // config entry (includes display-name aliases) so a child whose session
+  // agent is either spelling resolves the same profile.
+  const profiles: AgentRuntimeProfiles = {};
+  for (const [name, entry] of Object.entries(agentConfigs)) {
+    const modelString = entryModelString(entry);
+    const ref = parseModelRef(modelString);
+    const variant =
+      typeof entry.variant === 'string' ? entry.variant : undefined;
+    const temperature =
+      typeof entry.temperature === 'number' ? entry.temperature : undefined;
+    const providerOptions =
+      entry.options &&
+      typeof entry.options === 'object' &&
+      !Array.isArray(entry.options)
+        ? {
+            ...(entry.options as Record<string, unknown>),
+          }
+        : undefined;
+    const sidebarModel = projection.agentModels[name];
+    const sidebarVariant = projection.agentVariants[name] ?? variant;
+    profiles[name] = {
+      ...(ref ? { model: { ...ref, ...(variant ? { variant } : {}) } } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(providerOptions ? { providerOptions } : {}),
+      sidebarModel: sidebarModel ?? modelString ?? 'default',
+      ...(sidebarVariant !== undefined ? { sidebarVariant } : {}),
+    };
+  }
+
+  // 6. Orchestrator-model stripping runs AFTER the projection capture, exactly
+  // as the config hook has always ordered it.
+  applyOrchestratorModelConfig({
+    agents: agentConfigs,
+    enabled: runtime.stripOrchestratorModel,
+    presets: runtime.plugin?.presets,
+    configPreset: runtime.plugin?.preset,
+    runtimePreset: runtime.getRuntimePreset(),
+  });
+
+  return { profiles, projection };
+}
+
 function normalizeCustomAgentName(name: string): string {
   return name.trim();
 }
 
 function isSafeCustomAgentName(name: string): boolean {
-  return SAFE_AGENT_ALIAS_RE.test(name) && !isKnownAgentName(name);
+  // The councillor- prefix is reserved for dynamic council seats; a custom
+  // agent taking it would become a phantom seat in the council-inject hook's
+  // seat list (agents/index.ts filters agentDefs by the same prefix).
+  return (
+    SAFE_AGENT_ALIAS_RE.test(name) &&
+    !isKnownAgentName(name) &&
+    !name.startsWith('councillor-')
+  );
 }
 
 function hasCustomAgentModel(
@@ -341,20 +646,26 @@ function injectDisplayNames(
 
 /**
  * Apply default permissions to an agent.
- * Sets 'question' permission to 'allow' and includes skill permission presets.
- * If configuredSkills is provided, it honors that list instead of defaults.
+ * Includes skill permission presets. If configuredSkills is provided, it
+ * honors that list instead of defaults.
  *
- * Note: If the agent already explicitly sets question to 'deny', that is
- * respected (e.g. councillor should not ask questions).
+ * Question policy: subagents never block on the human. A background
+ * child's question parks with no tokens moving and no headless answerer
+ * (task_reply covers permissions on both hosts; v2 form questions need a
+ * host UI), so subagents default to 'deny' — same stance as `wait_for_user`
+ * and as v2's own built-in subagents. The orchestrator is the only ask
+ * channel. Explicit per-agent config always wins.
  */
 function applyDefaultPermissions(
   agent: AgentDefinition,
   configuredSkills?: readonly string[],
   disabledSkills?: readonly string[],
+  nestedDispatchEnabled = false,
+  isPrimaryAgent = false,
 ): void {
-  // If the user supplied a shorthand string permission (e.g. "ask"),
-  // it already applies to all tools — preserve it as-is and skip the
-  // object merge, which would corrupt it by spreading the string.
+  // A shorthand string is a user-level rule for every tool. Keep its original
+  // form; marketplace tools independently fail closed through their caller
+  // identity guard for every non-orchestrator agent.
   if (typeof agent.config.permission === 'string') {
     return;
   }
@@ -371,24 +682,58 @@ function applyDefaultPermissions(
     disabledSkills,
   );
 
-  // Respect explicit deny on question (councillor)
-  const questionPerm = existing.question === 'deny' ? 'deny' : 'allow';
-  const taskControlPermissions = Object.fromEntries(
-    TASK_CONTROL_TOOL_NAMES.map((toolName) => [
+  // Subagents don't ask the human by default: a parked child question
+  // has no headless answerer. Explicit config wins.
+  const questionPerm =
+    agent.name === 'orchestrator'
+      ? (existing.question ?? 'allow')
+      : (existing.question ?? 'deny');
+  const orchestratorDefaultPermissions = Object.fromEntries(
+    ORCHESTRATOR_DEFAULT_TOOL_NAMES.map((toolName) => [
       toolName,
       existing[toolName] ?? (agent.name === 'orchestrator' ? 'allow' : 'deny'),
     ]),
   );
+  // Primary agents get allow because quiet interview prompts forbid printing
+  // the state block; subagents never run interviews.
+  const interviewSubmitPermission =
+    existing.interview_submit_state ?? (isPrimaryAgent ? 'allow' : 'deny');
   const waitForUserPerm =
     agent.name === 'orchestrator'
       ? (existing.wait_for_user ?? 'allow')
       : 'deny';
+  const marketplacePermissions = Object.fromEntries(
+    MARKETPLACE_TOOL_NAMES.map((toolName) => {
+      const configured = existing[toolName];
+      const orchestratorPermission =
+        configured === 'allow' || configured === 'ask' || configured === 'deny'
+          ? configured
+          : 'allow';
+      return [
+        toolName,
+        agent.name === 'orchestrator' ? orchestratorPermission : 'deny',
+      ];
+    }),
+  );
 
   agent.config.permission = {
     ...existing,
+    // Nested-dispatch default: non-orchestrator agents without an explicit
+    // `task` stance (custom, ACP, write-capable marketplace) deny spawning.
+    // The compiled v2 permission base allows every unmatched action, so an
+    // absent entry would let any child spawn once the host depth limit is
+    // raised; the orchestrator keeps unrestricted delegation. Gated on the
+    // same v2 + observer condition as the stances (v1 stays untouched).
+    ...(nestedDispatchEnabled &&
+    existing.task === undefined &&
+    agent.name !== 'orchestrator'
+      ? { task: { ...TASK_NO_NESTED_DISPATCH } }
+      : {}),
     question: questionPerm,
-    ...taskControlPermissions,
+    ...orchestratorDefaultPermissions,
+    interview_submit_state: interviewSubmitPermission,
     wait_for_user: waitForUserPerm,
+    ...marketplacePermissions,
     // Apply skill permissions as nested object under 'skill' key
     skill: {
       ...(typeof existing.skill === 'object' ? existing.skill : {}),
@@ -409,7 +754,6 @@ export function isSubagent(name: string): name is SubagentName {
 
 const SUBAGENT_FACTORIES: Record<SubagentName, AgentFactory> = {
   explorer: createExplorerAgent,
-  librarian: createLibrarianAgent,
   oracle: createOracleAgent,
   designer: createDesignerAgent,
   fixer: createFixerAgent,
@@ -442,6 +786,19 @@ export function createAgents(
     // The bare councillor is only meaningful as part of configured Council Mode.
     disabled.add('councillor');
   }
+  // Nested dispatch ships only where it is live: v2 hosts (the only flavor
+  // with a depth limit) and an enabled observer. The v1 host enables a
+  // child's task tool whenever its permission carries ANY task rule — with
+  // no depth limit — so emitting stances there would change every advisor's
+  // toolset for nothing.
+  const nestedDispatchEnabled =
+    options?.hostFlavor === 'v2' && !disabled.has('observer');
+  // Explicitly disabling the council agent disables the whole chain: the
+  // injected procedure dispatches seats and then delegates synthesis to
+  // the council agent, so seats/pointer/hook without it would dangle.
+  if (disabled.has('council')) {
+    disabled.add('councillor');
+  }
 
   const primaryModel = runtime.primaryModel;
   const orchestratorOverride = getOverrideFromAgents(
@@ -451,8 +808,9 @@ export function createAgents(
   const configuredOrchestratorModel =
     getPrimaryModelFromOverride(orchestratorOverride);
 
-  // Preserve the historical fixer → librarian fallback unless an explicit
-  // inheritance policy opts the fixer into a different source.
+  // Preserve the historical fixer → research-agent fallback (now explorer)
+  // unless an explicit inheritance policy opts the fixer into a different
+  // source.
   const getModelForAgent = (name: SubagentName): string => {
     const override = getOverrideFromAgents(mergedAgents, name);
     if (override?.model === undefined) {
@@ -465,19 +823,19 @@ export function createAgents(
     }
 
     if (name === 'fixer' && override?.model === undefined) {
-      const librarianOverride = getOverrideFromAgents(
+      const explorerOverride = getOverrideFromAgents(
         mergedAgents,
-        'librarian',
+        'explorer',
       )?.model;
-      let librarianModel: string | undefined;
-      if (Array.isArray(librarianOverride)) {
-        const first = librarianOverride[0];
-        librarianModel = typeof first === 'string' ? first : first?.id;
+      let explorerModel: string | undefined;
+      if (Array.isArray(explorerOverride)) {
+        const first = explorerOverride[0];
+        explorerModel = typeof first === 'string' ? first : first?.id;
       } else {
-        librarianModel = librarianOverride;
+        explorerModel = explorerOverride;
       }
       return (
-        librarianModel ?? primaryModel ?? (DEFAULT_MODELS.librarian as string)
+        explorerModel ?? primaryModel ?? (DEFAULT_MODELS.explorer as string)
       );
     }
     return primaryModel ?? (DEFAULT_MODELS[name] as string);
@@ -491,16 +849,36 @@ export function createAgents(
     .map(([name, factory]) => {
       // Get base agent definition using the subagent factory with undefined prompts
       const agent = factory(getModelForAgent(name), undefined, undefined);
+      if (!nestedDispatchEnabled) {
+        // Drop only the pattern stances this branch adds (object-shaped
+        // task entries); pre-existing blanket-deny strings stay untouched.
+        const permission = agent.config.permission as
+          | Record<string, unknown>
+          | undefined;
+        if (
+          permission &&
+          typeof permission === 'object' &&
+          typeof permission.task === 'object'
+        ) {
+          const rest = { ...permission };
+          delete rest.task;
+          agent.config.permission = rest as typeof agent.config.permission;
+        }
+      }
 
       const customPrompts = loadAgentPrompt(name, {
         preset: runtime.preset,
         projectDirectory: options?.projectDirectory,
+        hostFlavor: options?.hostFlavor,
       });
 
       const override = getOverrideFromAgents(mergedAgents, name);
       const inlinePrompt = override?.prompt;
       const defaultPrompt = appendTaskRejectionInstruction(
-        agent.config.prompt ?? '',
+        appendObserverDispatchInstruction(
+          agent.config.prompt ?? '',
+          nestedDispatchEnabled && OBSERVER_DISPATCH_ROLES.has(name),
+        ),
       );
 
       agent.config.prompt = resolvePrompt(
@@ -511,8 +889,12 @@ export function createAgents(
         customPrompts.appendPrompt,
       );
       if (name === 'council') {
+        // resolvePrompt above may have replaced the generated prompt with
+        // an inline or council.md override; re-apply the idempotent
+        // fallback reinforcement so the required report structure and the
+        // compaction exception survive the override.
         agent.config.prompt = ensureCouncilCompactionException(
-          agent.config.prompt ?? '',
+          ensureCouncilSynthesisReinforcement(agent.config.prompt ?? ''),
         );
       }
 
@@ -548,6 +930,7 @@ export function createAgents(
     const customPrompts = loadAgentPrompt(name, {
       preset: runtime.preset,
       projectDirectory: options?.projectDirectory,
+      hostFlavor: options?.hostFlavor,
     });
 
     return [
@@ -572,7 +955,11 @@ export function createAgents(
           `ACP agent name '${name}' must match /^[a-z][a-z0-9_-]*$/i`,
         );
       }
-      if (isKnownAgentName(name) || AGENT_ALIASES[name] !== undefined) {
+      if (
+        isKnownAgentName(name) ||
+        AGENT_ALIASES[name] !== undefined ||
+        name.startsWith('councillor-')
+      ) {
         throw new Error(
           `ACP agent '${name}' conflicts with a built-in agent name or alias`,
         );
@@ -597,8 +984,13 @@ export function createAgents(
     if (override) {
       applyOverrides(agent, override);
     }
-    applyModelInheritance(agent, override, configuredOrchestratorModel);
-    applyDefaultPermissions(agent, override?.skills, runtime.disabledSkills);
+    applyModelInheritance(agent, override);
+    applyDefaultPermissions(
+      agent,
+      override?.skills,
+      runtime.disabledSkills,
+      nestedDispatchEnabled,
+    );
     return agent;
   });
 
@@ -607,32 +999,50 @@ export function createAgents(
     if (override) {
       applyOverrides(agent, override);
     }
-    applyModelInheritance(agent, override, configuredOrchestratorModel);
-    applyDefaultPermissions(agent, override?.skills, runtime.disabledSkills);
+    applyModelInheritance(agent, override);
+    applyDefaultPermissions(
+      agent,
+      override?.skills,
+      runtime.disabledSkills,
+      nestedDispatchEnabled,
+    );
     return agent;
   });
 
   const acpSubAgents = protoAcpAgents.map((agent) => {
-    applyDefaultPermissions(agent, undefined, runtime.disabledSkills);
+    applyDefaultPermissions(
+      agent,
+      undefined,
+      runtime.disabledSkills,
+      nestedDispatchEnabled,
+    );
     return agent;
   });
 
   // Build dynamic councillor agents from council config (flatten mode).
   // Each councillor becomes a dispatchable subagent with its own model,
-  // so the orchestrator can task() them with native panes at depth 1.
+  // so the orchestrator can delegate to them with the host delegation tool
+  // (`task()` on v1, `subagent()` on v2) with native panes at depth 1.
   // Only a *configured* color is inherited: councillor override first, then
   // council override. No default fallback — unconfigured councillors stay
   // colorless so the host TUI palette keeps assigning distinct colors.
   const councillorColor =
     getOverrideFromAgents(mergedAgents, 'councillor')?.color ??
     getOverrideFromAgents(mergedAgents, 'council')?.color;
-  const councillorAgents = buildCouncillorAgents(runtime, disabled).map(
-    (agent) => {
-      if (councillorColor) agent.config.color ??= councillorColor;
-      applyDefaultPermissions(agent, undefined, runtime.disabledSkills);
-      return agent;
-    },
-  );
+  const councillorAgents = buildCouncillorAgents(
+    runtime,
+    disabled,
+    nestedDispatchEnabled,
+  ).map((agent) => {
+    if (councillorColor) agent.config.color ??= councillorColor;
+    applyDefaultPermissions(
+      agent,
+      undefined,
+      runtime.disabledSkills,
+      nestedDispatchEnabled,
+    );
+    return agent;
+  });
 
   const allSubAgents = [
     ...builtInSubAgents,
@@ -643,7 +1053,10 @@ export function createAgents(
 
   for (const agent of [...acpSubAgents, ...councillorAgents]) {
     agent.config.prompt = appendTaskRejectionInstruction(
-      agent.config.prompt ?? '',
+      appendObserverDispatchInstruction(
+        agent.config.prompt ?? '',
+        nestedDispatchEnabled && agent.name.startsWith('councillor-'),
+      ),
     );
   }
 
@@ -655,16 +1068,21 @@ export function createAgents(
   const orchestratorPrompts = loadAgentPrompt('orchestrator', {
     preset: runtime.preset,
     projectDirectory: options?.projectDirectory,
+    hostFlavor: options?.hostFlavor,
   });
   const orchestrator = createOrchestratorAgent(
     orchestratorModel,
     undefined,
     undefined,
-    disabled,
-    councillorAgents.length > 0 ? ['council'] : undefined,
-    !runtime.disabledTools.includes('wait_for_user'),
-    runtime.backgroundJobs.orchestratorWake.enabled,
-    options?.hostFlavor,
+    {
+      disabledAgents: disabled,
+      excludeDescriptions:
+        councillorAgents.length > 0 ? ['council'] : undefined,
+      waitForUser: !runtime.disabledTools.includes('wait_for_user'),
+      wakeScheduler: runtime.backgroundJobs.orchestratorWake.enabled,
+      hostFlavor: options?.hostFlavor,
+      routingBlock: runtime.routingBlock,
+    },
   );
 
   const inlineOrchestratorPrompt = orchestratorOverride?.prompt;
@@ -681,15 +1099,13 @@ export function createAgents(
   if (orchestratorOverride) {
     applyOverrides(orchestrator, orchestratorOverride);
   }
-  applyModelInheritance(
-    orchestrator,
-    orchestratorOverride,
-    configuredOrchestratorModel,
-  );
+  applyModelInheritance(orchestrator, orchestratorOverride);
   applyDefaultPermissions(
     orchestrator,
     orchestratorOverride?.skills,
     runtime.disabledSkills,
+    nestedDispatchEnabled,
+    true,
   );
 
   // Collect all display names from orchestrator and all subagents
@@ -722,6 +1138,9 @@ export function createAgents(
       `- Role: ${agent.description ?? `External ACP agent ${agent.name}`}`,
       '- **Delegate when:** The user explicitly asks for this ACP-backed agent, or the task matches its role and benefits from software/subscription-specific capabilities outside OpenCode.',
       '- **Do not delegate when:** The built-in specialists can handle the task more directly or local file ownership would conflict with another writer lane.',
+      '- **Model selection:** Native subagent.model selects the OUTER OpenCode wrapper only; keep it independent of the INNER ACP selector passed in acp_run.model. Do not change the outer model to select an inner model.',
+      '- **Delegation prompt:** When the user explicitly requests a known inner selector, use "Inner ACP selector: <value>\nTask: ..." with the task, constraints, and relevant context. The wrapper extracts this into acp_run.model; this is LLM-mediated, not a new native subagent argument.',
+      '- **No guessing:** Do not infer an inner selector from the outer model, earlier calls, or incidental model names in task content. If an explicit inner model request is unresolved, report the ambiguity rather than silently using a default. With no inner request, omit the selector line.',
       '- **Result handling:** Treat returned output as external-agent work. Reconcile any reported file changes before continuing.',
     ].join('\n');
   });
@@ -783,15 +1202,28 @@ export function createAgents(
     updatedPrompt = `${updatedPrompt}\n\n${rewrittenAcps.join('\n\n')}`;
   }
 
-  // Inject council-dispatch block if dynamic councillors exist (flatten mode)
+  // Static pointer = roster only. The seat list lives here because v2's
+  // native subagent roster filters hidden agents out — on v2 this line is
+  // the orchestrator's only always-present source of seat IDs. v1 applies no
+  // hidden filter (as of opencode 1.18.35, `agents.list()` and the task
+  // tool's describeTask carry no hidden check), so hidden councillors do
+  // surface in the v1 task roster — a host-side gap outside omos's control.
+  // v2 compounds this with agent-param guidance ('name not in available
+  // subagents → pass through model parameter', subagent.ts:31-33) that
+  // actively steers away from exact-name dispatch; a roster-visible-but-@-hidden
+  // agent flag upstream would let the Council Mode block's dispatch clause be
+  // retired by observation.
+  // The dispatch procedure is NOT mirrored here (it reads every turn): the
+  // council-inject hook carries it, injected on the FIRST council keyword
+  // and then standing in history. The disabled variant keeps a one-line
+  // manual hint because with the hook off no block will ever appear.
   if (councillorAgents.length > 0) {
-    const dispatchList = councillorAgents
-      .map(
-        (a: AgentDefinition) =>
-          `   - ${vocab.tool}(${vocab.agentParam}='${a.name}', description='Councillor ${getCouncillorSeatName(a.name)} on <brief topic>', prompt=<user's question>)`,
-      )
-      .join('\n');
-    updatedPrompt = `${updatedPrompt}\n\n## Council Mode\n\nWhen you need to run a council or the user asks for consensus/multiple opinions, use this procedure INSTEAD of delegating to @council:\n\n1. If the question references an external resource (PR, URL, issue, doc), fetch its content FIRST using your own tools (webfetch/bash/gh), then embed a concise summary in the prompt you send to each councillor — councillors have read-only codebase access only and cannot fetch external content themselves.\n2. Dispatch the user's question (with any fetched context) to each councillor in PARALLEL via ${vocab.tool}():\n${dispatchList}\n3. Collect ALL councillor responses. If any councillor returns empty or does not respond within 3 minutes, proceed without it — do not wait indefinitely. If a councillor's response is empty, retry that councillor once before continuing.\n4. Call ${vocab.tool}(${vocab.agentParam}='council', description='Synthesize council report') with a prompt that includes the original user question AND all councillor responses. For each councillor, label its response with its seat name AND its model (e.g. "alpha (gpt-5.6-luna)"). Format each councillor's seat name and response clearly separated. If a councillor failed or timed out, include that status explicitly (e.g. "beta (gemini-3-pro): FAILED/TIMED OUT") instead of omitting it. Skip only councillors that returned empty after one retry.\n5. Present the council's synthesized report.\n\nThis ensures each councillor runs with its own model and the council agent synthesizes the full multi-model consensus.`;
+    const seatList = councillorAgents
+      .map((a: AgentDefinition) => a.name)
+      .join(', ');
+    updatedPrompt = runtime.disabledHooks.has('council-inject')
+      ? `${updatedPrompt}\n\n## Council\nSeats: ${seatList} — dispatch via ${vocab.tool}() when the user asks for consensus.`
+      : `${updatedPrompt}\n\n## Council\nSeats: ${seatList}`;
   }
 
   orchestrator.config.prompt = updatedPrompt;
@@ -813,6 +1245,14 @@ export function getAgentConfigs(
 ): Record<string, SDKAgentConfig> {
   const agents = createAgents(runtime, options);
 
+  return getAgentConfigsFromDefinitions(runtime, agents);
+}
+
+/** Project a previously constructed agent set without rebuilding definitions. */
+export function getAgentConfigsFromDefinitions(
+  runtime: RuntimeConfig,
+  agents: readonly AgentDefinition[],
+): Record<string, SDKAgentConfig> {
   const applyClassification = (
     name: string,
     sdkConfig: SDKAgentConfig & {
@@ -821,11 +1261,7 @@ export function getAgentConfigs(
       hidden?: boolean;
     },
   ): void => {
-    if (name === 'council') {
-      // Council is callable both as a primary agent (user-facing)
-      // and as a subagent (orchestrator can delegate to it)
-      sdkConfig.mode = 'all';
-    } else if (name === 'councillor' || name.startsWith('councillor-')) {
+    if (name === 'councillor' || name.startsWith('councillor-')) {
       // Internal agent - subagent mode, hidden from @ autocomplete.
       // Dynamic councillors are named councillor-<seat> (see council-agents.ts).
       sdkConfig.mode = 'subagent';

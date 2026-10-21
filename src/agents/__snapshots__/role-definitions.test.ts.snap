@@ -1,0 +1,31 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`specialist role definitions matches golden factory prompts and descriptions 1`] = `
+[
+  {
+    "description": "Fast codebase search and external docs/web research.",
+    "name": "explorer",
+    "promptSha256": "7cb1b44d33cef3b2ad8549519edd37c50cf59b6c75b6ca9c406b059357269cef",
+  },
+  {
+    "description": "Strategic technical advisor.",
+    "name": "oracle",
+    "promptSha256": "a87d726b17d12654f6fbb606a2869f5fb6d44f7c150c65346d9fbfbd17224ba0",
+  },
+  {
+    "description": "UI/UX design, review, and implementation.",
+    "name": "designer",
+    "promptSha256": "2f30988368a2e701290186508aca4e44ff47711da4dc60d0bdcba1527c6b97f4",
+  },
+  {
+    "description": "Fast implementation specialist.",
+    "name": "fixer",
+    "promptSha256": "741d308228a16adafc94e352747870241d508dc47de036664c6350642e8af199",
+  },
+  {
+    "description": "Visual analysis specialist; requires a vision-capable model.",
+    "name": "observer",
+    "promptSha256": "e746651cfdd0ace5734f4b332d9d15e6fa7ed4954c8eb506f2e91875fef96528",
+  },
+]
+`;

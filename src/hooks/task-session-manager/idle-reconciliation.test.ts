@@ -1,277 +1,178 @@
-import { describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard } from '../../utils';
-import { COMPLETED_WITHOUT_TEXT_DIAGNOSTIC } from '../../utils/task';
+import { expect, mock, test } from 'bun:test';
 import { createIdleReconciler } from './idle-reconciliation';
 
-async function flushChildIdleReconcile(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 5));
+function fakeGate() {
+  const reconciles: Array<{ run: unknown; signal: unknown }> = [];
+  const gate = {
+    capture: () => ({ taskID: 'child', generation: 1, readStartedAt: 1 }),
+    observe: () => ({ kind: 'deferred', record: {} }),
+    reconcile: mock(async (run: unknown, signal: unknown) => {
+      reconciles.push({ run, signal });
+      return { kind: 'stale' };
+    }),
+    dispose() {},
+  };
+  return { gate, reconciles };
 }
 
-/** Poll the board until the predicate holds (bounded) — CI runners can be
- * slower than the fixed 5ms flush, and the stabilization loop needs extra
- * macrotask hops (delay(0) per probe). */
-async function waitForBoardRecord(
-  board: BackgroundJobBoard,
-  predicate: (record: { state: string } | undefined) => boolean,
-  timeoutMs = 500,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate(board.get('child-1'))) return;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-function createHarness(options?: {
-  stopConfirmationGraceMs?: number;
-  readSessionOutcome?: (
-    sessionID: string,
-  ) => Promise<{ outcome?: string; resultText?: string } | undefined>;
-  outcomeStabilization?: { probes: number; intervalMs: number };
-}) {
-  const board = new BackgroundJobBoard();
-  const terminalListener = mock(() => {});
-  board.addTerminalStateListener(terminalListener);
-  const contextFilesForPrompt = mock(() => []);
-  const prune = mock(() => {});
+test('child idle preserves event provenance and requests runtime inspection', () => {
+  const calls: string[] = [];
+  const token = { taskID: 'child', generation: 1, readStartedAt: 1 };
   const reconciler = createIdleReconciler({
-    backgroundJobBoard: board,
-    reconcileInjectedTerminalJobs: mock(() => {}),
-    idleReconcileDelayMs: 0,
-    stopConfirmationGraceMs: options?.stopConfirmationGraceMs ?? 0,
+    terminalGate: {
+      capture: () => token,
+      observe: (_token: unknown, runtime: unknown) => {
+        calls.push('observe');
+        expect(runtime).toEqual({
+          kind: 'quiescent',
+          origin: 'session.idle',
+          readStartedAt: 1,
+          observedAt: 1,
+        });
+        return { kind: 'deferred', record: {} };
+      },
+      reconcile: async () => {
+        calls.push('inspect');
+        return { kind: 'stale' };
+      },
+      dispose() {},
+    } as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 1,
     hasInputWait: () => false,
-    getIdleSessionToken: () => Symbol('idle'),
+    getIdleSessionToken: () => Symbol(),
     isCurrentIdleSessionToken: () => true,
-    taskContextTracker: {
-      pendingManagedTaskIds: new Set(['child-1']),
-      contextFilesForPrompt,
-      prune,
-    },
-    readSessionOutcome: options?.readSessionOutcome,
-    outcomeStabilization: options?.outcomeStabilization,
   });
-  board.registerLaunch({
-    taskID: 'child-1',
-    parentSessionID: 'parent-1',
-    agent: 'fixer',
-    description: 'fix idle race',
-    now: 0,
+  reconciler.scheduleChildIdleReconciliation('child', 1, 1);
+  expect(calls).toEqual(['observe', 'inspect']);
+  expect(reconciler.clearAllTimers()).toEqual([]);
+});
+test('parent reconciliation retains its independent delay and invalidation', async () => {
+  const acknowledge = mock(() => {});
+  const reconciler = createIdleReconciler({
+    terminalGate: {} as never,
+    reconcileInjectedTerminalJobs: acknowledge,
+    idleReconcileDelayMs: 1,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
   });
-  return { board, reconciler, terminalListener, contextFilesForPrompt, prune };
-}
-
-async function observeIdle(
-  reconciler: ReturnType<typeof createIdleReconciler>,
-  idleObservedAt: number,
-  generation: number,
-): Promise<void> {
-  reconciler.scheduleChildIdleReconciliation(
-    'child-1',
-    idleObservedAt,
-    generation,
-  );
-  await flushChildIdleReconcile();
-}
-
-describe('idle reconciliation stop confirmation', () => {
-  test('idle then busy inside grace remains running with no terminal listener', async () => {
-    const { board, reconciler, terminalListener } = createHarness({
-      stopConfirmationGraceMs: 60_000,
-    });
-    const generation = board.get('child-1')?.generation ?? 1;
-
-    await observeIdle(reconciler, 10, generation);
-    expect(board.get('child-1')).toMatchObject({ state: 'running' });
-    expect(terminalListener).not.toHaveBeenCalled();
-
-    board.markRunningFromLiveSession('child-1', 15);
-    await observeIdle(reconciler, 16, generation);
-
-    expect(board.get('child-1')).toMatchObject({
-      state: 'running',
-      stopConfirmationStartedAt: 17,
-    });
-    expect(terminalListener).not.toHaveBeenCalled();
-  });
-
-  test('repeated idle beyond confirmation grace becomes stopped exactly once', async () => {
-    const {
-      board,
-      reconciler,
-      terminalListener,
-      contextFilesForPrompt,
-      prune,
-    } = createHarness();
-    const generation = board.get('child-1')?.generation ?? 1;
-
-    await observeIdle(reconciler, 10, generation);
-    expect(board.get('child-1')).toMatchObject({ state: 'running' });
-    expect(terminalListener).not.toHaveBeenCalled();
-
-    await observeIdle(reconciler, 20, generation);
-    expect(board.get('child-1')).toMatchObject({
-      state: 'stopped',
-      terminalUnreconciled: true,
-    });
-    expect(terminalListener).toHaveBeenCalledTimes(1);
-    expect(contextFilesForPrompt).toHaveBeenCalledTimes(1);
-    expect(prune).toHaveBeenCalledTimes(1);
-
-    await observeIdle(reconciler, 30, generation);
-    expect(board.get('child-1')).toMatchObject({ state: 'stopped' });
-    expect(terminalListener).toHaveBeenCalledTimes(1);
-  });
-
-  test('a busy observation resets pending stop confirmation', async () => {
-    const { board, reconciler, terminalListener } = createHarness();
-    const generation = board.get('child-1')?.generation ?? 1;
-
-    await observeIdle(reconciler, 10, generation);
-    expect(board.get('child-1')?.stopConfirmationStartedAt).toBe(11);
-
-    board.markRunningFromLiveSession('child-1', 15);
-    expect(board.get('child-1')).toMatchObject({
-      state: 'running',
-      stopConfirmationStartedAt: undefined,
-    });
-
-    await observeIdle(reconciler, 20, generation);
-    expect(board.get('child-1')).toMatchObject({ state: 'running' });
-    expect(board.get('child-1')?.stopConfirmationStartedAt).toBe(21);
-    expect(terminalListener).not.toHaveBeenCalled();
-  });
+  reconciler.scheduleIdleReconciliation('cancelled');
+  reconciler.onInvalidateIdle('cancelled');
+  reconciler.scheduleIdleReconciliation('parent');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(acknowledge).toHaveBeenCalledTimes(1);
+  expect(acknowledge).toHaveBeenCalledWith('parent');
+  reconciler.clearAllTimers();
 });
 
-describe('host outcome confirmation (v2: no session.status map)', () => {
-  test('quiescent job with host outcome succeeded and result text settles completed with the real text', async () => {
-    const readSessionOutcome = mock(
-      async () =>
-        ({ outcome: 'succeeded', resultText: 'Real result summary.' }) as const,
-    );
-    const { board, reconciler, terminalListener } = createHarness({
-      stopConfirmationGraceMs: 60_000,
-      readSessionOutcome,
-    });
-    const generation = board.get('child-1')?.generation ?? 1;
-
-    await observeIdle(reconciler, 10, generation);
-    await waitForBoardRecord(board, (r) => r?.state === 'reconciled');
-
-    expect(readSessionOutcome).toHaveBeenCalledWith('child-1');
-    const record = board.get('child-1');
-    expect(record).toMatchObject({
-      state: 'reconciled',
-      terminalState: 'completed',
-      terminalUnreconciled: false,
-      statusUncertain: false,
-    });
-    expect(record?.resultSummary).toBe('Real result summary.');
-    expect(terminalListener).toHaveBeenCalledTimes(1);
+test('deferred-error backstop renews while the fallback is in flight, then consumes and terminalizes', async () => {
+  const { gate, reconciles } = fakeGate();
+  let fallbackInFlight = true;
+  let deferred = 'rate limit exceeded';
+  const consumed: string[] = [];
+  const reconciler = createIdleReconciler({
+    terminalGate: gate as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 5,
+    isFallbackInProgress: () => fallbackInFlight,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
+    consumeDeferredError: (sessionID) => {
+      expect(sessionID).toBe('child');
+      const message = deferred;
+      deferred = '';
+      consumed.push(message);
+      return message || undefined;
+    },
   });
 
-  test('succeeded but textless settles error with the diagnostic after stabilization probes (incident #1115 precedent)', async () => {
-    const readSessionOutcome = mock(
-      async () => ({ outcome: 'succeeded' }) as const,
-    );
-    const { board, reconciler } = createHarness({
-      stopConfirmationGraceMs: 60_000,
-      outcomeStabilization: { probes: 2, intervalMs: 0 },
-      readSessionOutcome,
-    });
-    const generation = board.get('child-1')?.generation ?? 1;
+  reconciler.scheduleDeferredErrorBackstop('child', 1, 1);
+  // While the fallback is in flight the backstop only renews: nothing is
+  // consumed, nothing is reconciled.
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  expect(consumed).toEqual([]);
+  expect(reconciles).toHaveLength(0);
 
-    await observeIdle(reconciler, 10, generation);
-    await waitForBoardRecord(board, (r) => r?.state === 'reconciled');
+  // The fallback leaves the window: the next fire consumes the deferred
+  // error and terminalizes it through the gate.
+  fallbackInFlight = false;
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  expect(consumed).toEqual(['rate limit exceeded']);
+  expect(reconciles).toHaveLength(1);
+  expect(reconciles[0]?.signal).toEqual({
+    kind: 'session-error',
+    message: 'rate limit exceeded',
+  });
+  reconciler.clearAllTimers();
+});
 
-    expect(readSessionOutcome).toHaveBeenCalledTimes(3); // initial + 2 probes
-    const record = board.get('child-1');
-    expect(record).toMatchObject({
-      state: 'reconciled',
-      terminalState: 'error',
-      terminalUnreconciled: false,
-    });
-    expect(record?.resultSummary).toBe(COMPLETED_WITHOUT_TEXT_DIAGNOSTIC);
+test('deferred-error backstop renewal is bounded when the fallback never leaves the window', async () => {
+  const { gate, reconciles } = fakeGate();
+  const deferred = 'rate limit exceeded';
+  const reconciler = createIdleReconciler({
+    terminalGate: gate as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 2,
+    // Stuck fallback: always claims to be in flight.
+    isFallbackInProgress: () => true,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
+    consumeDeferredError: () => deferred,
   });
 
-  test('succeeded with text arriving on a later stabilization probe settles completed', async () => {
-    let calls = 0;
-    const readSessionOutcome = mock(async () => {
-      calls += 1;
-      return calls >= 2
-        ? { outcome: 'succeeded', resultText: 'Late but real text.' }
-        : { outcome: 'succeeded' };
-    });
-    const { board, reconciler } = createHarness({
-      stopConfirmationGraceMs: 60_000,
-      outcomeStabilization: { probes: 3, intervalMs: 0 },
-      readSessionOutcome,
-    });
-    const generation = board.get('child-1')?.generation ?? 1;
+  reconciler.scheduleDeferredErrorBackstop('child', 1, 1);
+  // Past the renewal cap (5 renewals × 2ms) the deferred error must
+  // terminalize even though the fallback still claims to be in flight.
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  expect(reconciles).toHaveLength(1);
+  expect(reconciles[0]?.signal).toEqual({
+    kind: 'session-error',
+    message: 'rate limit exceeded',
+  });
+  reconciler.clearAllTimers();
+});
 
-    await observeIdle(reconciler, 10, generation);
-    await waitForBoardRecord(board, (r) => r?.state === 'reconciled');
-
-    const record = board.get('child-1');
-    expect(record).toMatchObject({
-      state: 'reconciled',
-      terminalState: 'completed',
-    });
-    expect(record?.resultSummary).toBe('Late but real text.');
+test('deferred-error backstop skips the publish when nothing is deferred at fire time', async () => {
+  const { gate, reconciles } = fakeGate();
+  const reconciler = createIdleReconciler({
+    terminalGate: gate as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 2,
+    isFallbackInProgress: () => false,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
+    // Busy already cleared the deferral (the timer was cancelled too
+    // late); nothing to publish.
+    consumeDeferredError: () => undefined,
   });
 
-  test('quiescent job with host outcome failed settles error', async () => {
-    const { board, reconciler } = createHarness({
-      stopConfirmationGraceMs: 60_000,
-      readSessionOutcome: async () => ({ outcome: 'failed' }),
-    });
-    const generation = board.get('child-1')?.generation ?? 1;
+  reconciler.scheduleDeferredErrorBackstop('child', 1, 1);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(reconciles).toHaveLength(0);
+  reconciler.clearAllTimers();
+});
 
-    await observeIdle(reconciler, 10, generation);
-    await waitForBoardRecord(board, (r) => r?.state === 'reconciled');
-
-    const record = board.get('child-1');
-    expect(record).toMatchObject({
-      state: 'reconciled',
-      terminalState: 'error',
-      terminalUnreconciled: false,
-    });
-    expect((record?.resultSummary ?? '').toLowerCase()).not.toContain(
-      'undefined',
-    );
-    expect(record?.resultSummary).toBe('Host reported outcome: failed.');
+test('busy cancels a pending deferred-error backstop', async () => {
+  const { gate, reconciles } = fakeGate();
+  const reconciler = createIdleReconciler({
+    terminalGate: gate as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 10,
+    isFallbackInProgress: () => false,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
+    consumeDeferredError: () => 'rate limit exceeded',
   });
 
-  test('late busy after idle wins over a stale host outcome probe', async () => {
-    const { board, reconciler } = createHarness({
-      stopConfirmationGraceMs: 60_000,
-      readSessionOutcome: async () => ({
-        outcome: 'succeeded',
-        resultText: 'x',
-      }),
-    });
-    const generation = board.get('child-1')?.generation ?? 1;
-
-    board.markRunningFromLiveSession('child-1', 20); // busy AFTER idleObservedAt 10
-    await observeIdle(reconciler, 10, generation);
-
-    expect(board.get('child-1')).toMatchObject({ state: 'running' });
-  });
-
-  test('quiescent job without a host outcome self-confirms stopped after grace', async () => {
-    const { board, reconciler, terminalListener } = createHarness({
-      stopConfirmationGraceMs: 5,
-      readSessionOutcome: async () => undefined,
-    });
-    const generation = board.get('child-1')?.generation ?? 1;
-
-    await observeIdle(reconciler, 10, generation);
-    expect(board.get('child-1')).toMatchObject({ state: 'running' });
-
-    // No external re-observation: the reconciler must complete the stop
-    // confirmation itself after the grace elapses (the v1 design relied on
-    // the periodic runtime-status reconciler, which is unavailable on v2).
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(board.get('child-1')).toMatchObject({ state: 'stopped' });
-    expect(terminalListener).toHaveBeenCalledTimes(1);
-  });
+  reconciler.scheduleDeferredErrorBackstop('child', 1, 1);
+  // The re-prompt landed before the backstop fired.
+  reconciler.clearIdleTimers('child');
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  expect(reconciles).toHaveLength(0);
+  reconciler.clearAllTimers();
 });

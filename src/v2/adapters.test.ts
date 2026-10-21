@@ -1,31 +1,26 @@
 import { describe, expect, test } from 'bun:test';
 import { createReadOnlyAgentPermission } from '../agents/permissions';
+import { PermissionConfigSchema } from '../config/schema';
 import {
   adaptPermissions,
+  adaptTool,
   applyAgentToDraft,
   parseModelRef,
-  rewritePromptForV2,
+  snapshotNativeAgentForRegistry,
 } from './adapters';
-import type { V2AgentDraft } from './types';
-
-function globMatch(pattern: string, value: string): boolean {
-  if (pattern === '*') return true;
-  if (pattern === value) return true;
-  const escaped = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*/g, '.*');
-  return new RegExp(`^${escaped}$`).test(value);
-}
+import { compilePermissionPolicy } from './permissions';
+import type { V2AgentDraft, V2PermissionRule } from './types';
 
 function evaluatePermission(
-  rules: Array<{ action: string; resource: string; effect: string }>,
-  tool: string,
+  rules: readonly V2PermissionRule[],
+  action: string,
   resource = '*',
 ): string {
-  const match = [...rules]
-    .reverse()
-    .find((r) => globMatch(r.action, tool) && globMatch(r.resource, resource));
-  return match?.effect ?? 'ask';
+  const policy = compilePermissionPolicy({
+    baselineRules: rules,
+    hostRules: [],
+  });
+  return policy.decide(action, resource);
 }
 
 describe('parseModelRef', () => {
@@ -58,6 +53,44 @@ describe('parseModelRef', () => {
   });
 });
 
+describe('adaptTool agent context', () => {
+  test('does not invent orchestrator identity for marketplace tools', async () => {
+    let capturedAgent: string | undefined = 'not-called';
+    const marketplaceTool = adaptTool(
+      'marketplace_manage',
+      {
+        execute: async (_args, context) => {
+          capturedAgent = (context as { agent?: string }).agent;
+          return 'ok';
+        },
+      },
+      '/project',
+      {},
+    );
+
+    await marketplaceTool.execute({}, undefined);
+    expect(capturedAgent).toBeUndefined();
+  });
+
+  test('preserves legacy missing-agent context for unrelated tools', async () => {
+    let capturedAgent: string | undefined;
+    const unrelatedTool = adaptTool(
+      'task_status',
+      {
+        execute: async (_args, context) => {
+          capturedAgent = (context as { agent?: string }).agent;
+          return 'ok';
+        },
+      },
+      '/project',
+      {},
+    );
+
+    await unrelatedTool.execute({}, undefined);
+    expect(capturedAgent).toBe('orchestrator');
+  });
+});
+
 describe('adaptPermissions', () => {
   test('returns the v2 permissive base for no permission', () => {
     const rules = adaptPermissions(undefined);
@@ -82,6 +115,20 @@ describe('adaptPermissions', () => {
       resource: '*',
       effect: 'allow',
     });
+  });
+
+  test('compiles observer-only task patterns in last-match order', () => {
+    const rules = adaptPermissions({
+      task: { '*': 'deny', observer: 'allow' },
+    });
+    const subagent = rules
+      .filter((rule) => rule.action === 'subagent')
+      .map((rule) => [rule.resource, rule.effect]);
+    // Evaluators use findLast: '*' deny first, observer allow last.
+    expect(subagent).toEqual([
+      ['*', 'deny'],
+      ['observer', 'allow'],
+    ]);
   });
 
   test('maps v1 bash -> v2 execute and bash', () => {
@@ -134,26 +181,49 @@ describe('adaptPermissions', () => {
     );
     expect(evaluatePermission(rules, 'bash', 'ls')).toBe('deny');
   });
-});
 
-describe('rewritePromptForV2', () => {
-  test('rewrites delegation call + param', () => {
-    expect(
-      rewritePromptForV2(
-        "task(subagent_type='explorer', description='x', prompt='y')",
-      ),
-    ).toBe("subagent(agent='explorer', description='x', prompt='y')");
-  });
-
-  test('passes through non-strings unchanged', () => {
-    expect(rewritePromptForV2(undefined)).toBeUndefined();
-    expect(rewritePromptForV2(42)).toBe(42);
-  });
-
-  test('rewrites every occurrence', () => {
-    expect(rewritePromptForV2('task(a)\ntask(b)')).toBe(
-      'subagent(a)\nsubagent(b)',
+  test('config-parsed permissions keep author order through the pipeline', () => {
+    // Regression: zod's shaped object emitted declared keys first and
+    // catchall keys after, moving the author's "*": "deny" base BEHIND the
+    // specific allows — under last-match-wins that denied the allows, so a
+    // read-only preset lost every file tool. The record parse must keep
+    // the author's key order, and the compiled rules must keep the
+    // wildcard deny before the allows.
+    const parsed = PermissionConfigSchema.parse({
+      '*': 'deny',
+      bash: 'deny',
+      edit: 'deny',
+      write: 'deny',
+      apply_patch: 'deny',
+      ast_grep_replace: 'deny',
+      task: 'deny',
+      question: 'deny',
+      read: 'allow',
+      glob: 'allow',
+      grep: 'allow',
+      lsp: 'allow',
+      list: 'allow',
+      codesearch: 'allow',
+      ast_grep_search: 'allow',
+      external_directory: 'allow',
+    });
+    expect(Object.keys(parsed).at(0)).toBe('*');
+    const rules = adaptPermissions(parsed);
+    const wildcardDenyIdx = rules.findIndex(
+      (r) => r.action === '*' && r.resource === '*' && r.effect === 'deny',
     );
+    const readAllowIdx = rules.findIndex(
+      (r) => r.action === 'read' && r.resource === '*' && r.effect === 'allow',
+    );
+    expect(wildcardDenyIdx).toBeLessThan(readAllowIdx);
+    expect(evaluatePermission(rules, 'read', 'src/v2/adapters.ts')).toBe(
+      'allow',
+    );
+    expect(evaluatePermission(rules, 'glob', 'src/**/*.ts')).toBe('allow');
+    expect(evaluatePermission(rules, 'edit', 'src/v2/adapters.ts')).toBe(
+      'deny',
+    );
+    expect(evaluatePermission(rules, 'bash', 'ls')).toBe('deny');
   });
 });
 
@@ -177,7 +247,7 @@ describe('applyAgentToDraft', () => {
     return { draft, calls };
   }
 
-  test('sets id/name/mode and rewrites the prompt into system', () => {
+  test('sets id/name/mode and passes the prompt through to system', () => {
     const { draft, calls } = recorder();
     applyAgentToDraft(draft, 'explorer', {
       description: 'recon',
@@ -191,7 +261,7 @@ describe('applyAgentToDraft', () => {
       name: 'explorer',
       mode: 'subagent',
       description: 'recon',
-      system: "Delegate via subagent(agent='x')",
+      system: "Delegate via task(subagent_type='x')",
     });
   });
 
@@ -216,7 +286,10 @@ describe('applyAgentToDraft', () => {
 
     const request = calls[0].agent.request as Record<string, unknown>;
     expect(
-      Object.hasOwn(request.settings as Record<string, unknown>, 'temperature'),
+      Object.hasOwn(
+        (request.settings as Record<string, unknown> | undefined) ?? {},
+        'temperature',
+      ),
     ).toBe(false);
   });
 
@@ -226,6 +299,134 @@ describe('applyAgentToDraft', () => {
 
     const request = calls[0].agent.request as Record<string, unknown>;
     expect((request.settings as Record<string, unknown>).temperature).toBe(0);
+  });
+
+  test('maps options into request.body (provider options are not dropped)', () => {
+    const { draft, calls } = recorder();
+    applyAgentToDraft(draft, 'a', {
+      options: { thinking: { type: 'enabled', budgetTokens: 4096 } },
+    });
+
+    const request = calls[0].agent.request as Record<string, unknown>;
+    expect(request.body).toEqual({
+      thinking: { type: 'enabled', budgetTokens: 4096 },
+    });
+  });
+
+  test('ignores array/null options in request.body', () => {
+    const { draft, calls } = recorder();
+    applyAgentToDraft(draft, 'a', { options: [1, 2] as never });
+    applyAgentToDraft(draft, 'b', { options: null as never });
+
+    for (const call of calls) {
+      const request = call.agent.request as Record<string, unknown>;
+      expect(request.body).toBeUndefined();
+    }
+  });
+
+  test('clears an existing model when the finalized config inherits it', () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const draft: V2AgentDraft = {
+      list: () => [],
+      get: () => undefined,
+      default: () => {},
+      remove: () => {},
+      update: (_id, update) => {
+        const agent: Record<string, unknown> = {
+          model: { providerID: 'old-provider', id: 'old-model' },
+        };
+        update(agent);
+        calls.push(agent);
+      },
+    };
+    applyAgentToDraft(draft, 'a', {});
+
+    expect(calls[0]).not.toHaveProperty('model');
+  });
+
+  test('merges request fields without discarding native sibling values', () => {
+    const existing = {
+      settings: { topP: 0.8, temperature: 0.4 },
+      headers: { authorization: 'host-token', existing: 'yes' },
+      body: { hostValue: true },
+    };
+    const draft: V2AgentDraft = {
+      list: () => [],
+      get: () => undefined,
+      default: () => {},
+      remove: () => {},
+      update: (_id, update) => {
+        const agent: Record<string, unknown> = { request: existing };
+        update(agent);
+        expect(agent.request).toEqual({
+          settings: { topP: 0.8, temperature: 0.2, frequencyPenalty: 0.1 },
+          headers: {
+            authorization: 'host-token',
+            existing: 'yes',
+            extra: 'v1',
+          },
+          body: { hostValue: true, extra: 'v1' },
+        });
+      },
+    };
+    applyAgentToDraft(draft, 'a', {
+      temperature: 0.2,
+      request: {
+        settings: { frequencyPenalty: 0.1 },
+        headers: { extra: 'v1' },
+        body: { extra: 'v1' },
+      },
+    });
+  });
+
+  test('snapshots and reapplies a native agent without flattening permissions', () => {
+    const native = {
+      id: 'native',
+      name: 'Native',
+      description: 'host description',
+      system: 'host system',
+      mode: 'primary',
+      hidden: true,
+      model: { providerID: 'anthropic', id: 'claude', variant: 'thinking' },
+      request: {
+        settings: { temperature: 0.3, topP: 0.9 },
+        headers: { 'x-host': 'kept' },
+        body: { hostOption: true },
+      },
+      permissions: [
+        { action: 'read', resource: 'private/**', effect: 'deny' },
+        { action: 'read', resource: 'public/**', effect: 'allow' },
+      ],
+    };
+    const snapshot = snapshotNativeAgentForRegistry(native);
+    const { draft, calls } = recorder();
+    applyAgentToDraft(draft, 'native', snapshot.config, snapshot.permissions);
+
+    expect(snapshot.config).toMatchObject({
+      model: 'anthropic/claude',
+      variant: 'thinking',
+      prompt: 'host system',
+      mode: 'primary',
+      hidden: true,
+      description: 'host description',
+    });
+    expect(snapshot.config).not.toHaveProperty('permission');
+    expect(snapshot.permissions).toEqual(native.permissions);
+    expect(calls[0].agent).toMatchObject({
+      model: { providerID: 'anthropic', id: 'claude', variant: 'thinking' },
+      system: 'host system',
+      request: {
+        settings: { temperature: 0.3, topP: 0.9 },
+        headers: { 'x-host': 'kept' },
+        body: { hostOption: true },
+      },
+      permissions: native.permissions,
+    });
+  });
+
+  test('model-less native agents do not override configured models', () => {
+    const snapshot = snapshotNativeAgentForRegistry({ id: 'explorer' });
+    expect(snapshot.config).not.toHaveProperty('model');
   });
 
   test('permission deny beats tools-list allow (tools first, last-wins)', () => {

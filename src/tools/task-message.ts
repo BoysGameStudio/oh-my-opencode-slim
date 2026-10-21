@@ -7,12 +7,24 @@ import {
   type ContinuationModelSelection,
   parseContinuationModelSelection,
 } from '../hooks/task-session-manager/continuation-model-selection';
+import { pluginDisposedMessage } from '../hooks/task-session-manager/session-recovery';
 import type { BackgroundJobStore } from '../utils/background-job-store';
+import { fetchChildTranscript } from '../utils/child-transcript';
+import { isRecord } from '../utils/guards';
 import { getClient } from '../utils/opencode-client';
 import { OperationTimeoutError, withTimeout } from '../utils/session';
+import { type DelegationWording, delegationWording } from '../v2/delegation';
+import {
+  type CanonicalTaskResolver,
+  idParamFor,
+  readTaskRef,
+  resolveTaskRecord,
+  taskRefArgs,
+  unknownTaskRefError,
+} from './task-ref';
 
 const z = tool.schema;
-const MAX_MESSAGE_LENGTH = 500;
+const MAX_MESSAGE_LENGTH = 2000;
 const DEFAULT_MESSAGE_TIMEOUT_MS = 10_000;
 const MODEL_LOOKUP_HISTORY_LIMIT = 20;
 
@@ -30,38 +42,76 @@ export function createTaskMessageTool(options: {
   input: PluginInput;
   backgroundJobBoard: BackgroundJobStore;
   messageTimeoutMs?: number;
+  promptMessageIDFor?: (
+    taskID: string,
+    generation: number,
+  ) => string | undefined;
+  resolveCanonicalTaskRef?: CanonicalTaskResolver;
+  isDisposed?: () => boolean;
 }): Record<'task_message', ToolDefinition> {
+  const idParam = idParamFor(options.input);
+  const hostFlavorAtCreation = (options.input as { hostFlavor?: string })
+    .hostFlavor;
   const task_message = tool({
     description:
       'Queue a bounded message for a live child task without launching, resuming, or interrupting it.',
     args: {
-      task_id: z
-        .string()
-        .describe('Tracked live task ID or parent-scoped alias'),
+      ...taskRefArgs(idParam),
       message: z
         .string()
         .trim()
         .min(1)
         .max(MAX_MESSAGE_LENGTH)
-        .describe('Short message to queue for the child task'),
+        .describe(
+          `Bounded message (max ${MAX_MESSAGE_LENGTH} chars) for the child task; for longer handoffs, continue the session with task_revive once it settles`,
+        ),
+      ...(hostFlavorAtCreation === 'v2'
+        ? {
+            delivery: z
+              .enum(['queue', 'steer'])
+              .optional()
+              .describe(
+                'queue (default) waits for the child to go idle; ' +
+                  'steer is admitted for the next supported step ' +
+                  'boundary of the current run without launching, ' +
+                  'resuming, or interrupting it',
+              ),
+          }
+        : {}),
     },
     async execute(args, toolContext) {
       const parentSessionID = toolContext?.sessionID;
       if (!parentSessionID) throw new Error('task_message requires sessionID');
 
-      const requested = args.task_id.trim();
-      const job = options.backgroundJobBoard.resolve(
-        parentSessionID,
-        requested,
-      );
-      if (!job) throw new Error(`Unknown task ID or alias: ${args.task_id}`);
+      const hostFlavor = (options.input as { hostFlavor?: string }).hostFlavor;
+      const delegation = delegationWording(hostFlavor);
+
+      const requested = readTaskRef(args, idParam);
+      if (!requested) throw new Error(`task_message requires ${idParam}`);
+      const ref = await resolveTaskRecord(options, parentSessionID, requested);
+      if (ref.kind === 'disposed') throw new Error(pluginDisposedMessage());
+      if (ref.kind === 'refused') throw new Error(ref.reason);
+      // The await above resumes in a later microtask; a disposal queued in
+      // that gap must still stop the send path (the helper's disposed
+      // check ran before the gap).
+      if (options.isDisposed?.()) throw new Error(pluginDisposedMessage());
+      const { identity, job } = ref;
+      if (job && job.parentSessionID !== parentSessionID) {
+        // Another parent's record: not this caller's task, and the
+        // settled-session recovery route would reject the same ownership
+        // mismatch — keep the bare unknown error.
+        throw new Error(`Unknown task ID or alias: ${identity}`);
+      }
+      if (!job) {
+        throw unknownTaskRefError(identity, delegation.resumeParam);
+      }
 
       const currentJob = getCurrentTaskMessageJob(
         options.backgroundJobBoard,
         parentSessionID,
-        requested,
         job.taskID,
         job.generation,
+        delegation,
       );
 
       const lease = options.backgroundJobBoard.acquireMessageLease(
@@ -80,9 +130,9 @@ export function createTaskMessageTool(options: {
         getCurrentTaskMessageJob(
           options.backgroundJobBoard,
           parentSessionID,
-          requested,
           lease.taskID,
           lease.generation,
+          delegation,
         );
 
         const session = getClient(options.input).session;
@@ -92,26 +142,72 @@ export function createTaskMessageTool(options: {
           options.messageTimeoutMs ?? DEFAULT_MESSAGE_TIMEOUT_MS,
         );
         const deadline = Date.now() + messageTimeoutMs;
-        const lookupController = new AbortController();
-        let modelSelection: ContinuationModelSelection | undefined;
-        try {
-          modelSelection = await withTimeout(
-            readCurrentChildModel(
-              session,
-              lease.taskID,
-              options.input.directory,
-              lookupController.signal,
-            ),
-            messageTimeoutMs,
-            `Task message model lookup timed out after ${messageTimeoutMs}ms`,
+        if (hostFlavor === 'v2' && args.delivery === 'steer') {
+          const promptMessageID = options.promptMessageIDFor?.(
+            lease.taskID,
+            lease.generation,
           );
-        } finally {
-          lookupController.abort();
+          if (promptMessageID) {
+            // A running board generation may still be queued behind an old
+            // host execution. Admission alone does not make it steerable.
+            const controller = new AbortController();
+            try {
+              const response = await withTimeout(
+                fetchChildTranscript(
+                  getClient(options.input),
+                  lease.taskID,
+                  options.input.directory,
+                  undefined,
+                  controller.signal,
+                ),
+                messageTimeoutMs,
+                'Task steering continuation lookup timed out; no message was sent',
+              );
+              if (
+                !isRecord(response) ||
+                !Array.isArray(response.data) ||
+                !response.data.some(
+                  (entry) =>
+                    isRecord(entry) &&
+                    isRecord(entry.info) &&
+                    entry.info.id === promptMessageID &&
+                    entry.info.role === 'user',
+                )
+              ) {
+                throw new Error(
+                  `Task ${requested} has an unconfirmed queued continuation; no steering message was sent. Use task_status to inspect it before retrying.`,
+                );
+              }
+            } finally {
+              controller.abort();
+            }
+          }
         }
-        if (!modelSelection) {
-          throw new Error(
-            `Task ${requested} has no authoritative model identity; refusing message`,
-          );
+        let modelSelection: ContinuationModelSelection | undefined;
+        // v2 prompts inherit persisted session selection; per-call overrides
+        // cannot be represented atomically. Keep the v1 lookup/pin unchanged.
+        if (hostFlavor !== 'v2') {
+          const lookupController = new AbortController();
+          try {
+            modelSelection = await withTimeout(
+              readCurrentChildModel(
+                session,
+                lease.taskID,
+                options.input.directory,
+                lookupController.signal,
+              ),
+              messageTimeoutMs,
+              `Task message model lookup timed out after ${messageTimeoutMs}ms`,
+            );
+          } finally {
+            lookupController.abort();
+          }
+          if (options.isDisposed?.()) throw new Error(pluginDisposedMessage());
+          if (!modelSelection) {
+            throw new Error(
+              `Task ${requested} has no authoritative model identity; refusing message`,
+            );
+          }
         }
 
         const remainingTimeoutMs = deadline - Date.now();
@@ -126,18 +222,28 @@ export function createTaskMessageTool(options: {
           lease,
           () => {
             assertMessageLease(options.backgroundJobBoard, lease, requested);
+            if (options.isDisposed?.())
+              throw new Error(pluginDisposedMessage());
             const currentJob = getCurrentTaskMessageJob(
               options.backgroundJobBoard,
               parentSessionID,
-              requested,
               lease.taskID,
               lease.generation,
+              delegation,
             );
             const body = {
               agent: currentJob.agent,
-              model: modelSelection.model,
-              variant: modelSelection.variant ?? 'default',
+              ...(modelSelection
+                ? {
+                    model: modelSelection.model,
+                    variant: modelSelection.variant ?? 'default',
+                  }
+                : {}),
               noReply: true,
+              ...(hostFlavor === 'v2' &&
+              (args as { delivery?: string }).delivery === 'steer'
+                ? { delivery: 'steer' as const }
+                : {}),
               parts: [{ type: 'text', text: args.message.trim() }],
             } as Parameters<typeof prompt>[0]['body'];
             return prompt({
@@ -154,10 +260,21 @@ export function createTaskMessageTool(options: {
         const latestJob = getCurrentTaskMessageJob(
           options.backgroundJobBoard,
           parentSessionID,
-          requested,
           lease.taskID,
           lease.generation,
+          delegation,
         );
+        if (
+          hostFlavor === 'v2' &&
+          (args as { delivery?: string }).delivery === 'steer'
+        ) {
+          return (
+            `Message accepted for steering ${latestJob.alias} ` +
+            `(${latestJob.taskID}) at the next supported step boundary; ` +
+            `it was not launched or resumed and consumption is ` +
+            `not confirmed.`
+          );
+        }
         return `Message queued for ${latestJob.alias} (${latestJob.taskID}) without launching or resuming it.`;
       } catch (error) {
         keepLeaseUntilSettled =
@@ -231,10 +348,6 @@ function assertSuccessfulMessageResponse(response: unknown): void {
   );
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
 function errorText(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === 'string') return error;
@@ -252,34 +365,6 @@ async function readCurrentChildModel(
   signal: AbortSignal,
 ): Promise<ContinuationModelSelection | undefined> {
   if (!isRecord(session)) return undefined;
-
-  const query = directory ? { directory } : undefined;
-  let get: unknown;
-  try {
-    get = session.get;
-  } catch {
-    get = undefined;
-  }
-  if (typeof get === 'function') {
-    try {
-      const response = await get.call(session, {
-        path: { id: taskID },
-        query,
-        signal,
-      });
-      if (isRecord(response) && isRecord(response.data)) {
-        const selection = parseContinuationModelSelection(
-          response.data.model,
-          response.data.variant,
-        );
-        if (selection) return selection;
-      }
-    } catch {
-      // Fall through to the authoritative latest user message.
-      if (signal.aborted) return undefined;
-    }
-  }
-  if (signal.aborted) return undefined;
 
   let messages: unknown;
   try {
@@ -301,14 +386,23 @@ async function readCurrentChildModel(
     });
     if (!isRecord(response) || !Array.isArray(response.data)) return undefined;
 
+    // Execution messages reflect hook rewrites; Session.model can be stale.
     for (let index = response.data.length - 1; index >= 0; index -= 1) {
       const message = response.data[index];
       if (!isRecord(message) || !isRecord(message.info)) continue;
-      if (message.info.role !== 'user') continue;
-      return parseContinuationModelSelection(
-        message.info.model,
+      if (message.info.summary === true) continue;
+      const selection = parseContinuationModelSelection(
+        message.info.role === 'user'
+          ? message.info.model
+          : message.info.role === 'assistant'
+            ? {
+                providerID: message.info.providerID,
+                modelID: message.info.modelID,
+              }
+            : undefined,
         message.info.variant,
       );
+      if (selection) return selection;
     }
   } catch {
     return undefined;
@@ -320,34 +414,43 @@ async function readCurrentChildModel(
 function getCurrentTaskMessageJob(
   backgroundJobBoard: BackgroundJobStore,
   parentSessionID: string,
-  requested: string,
   expectedTaskID: string,
   expectedGeneration: number,
+  delegation: DelegationWording,
 ): NonNullable<ReturnType<BackgroundJobStore['get']>> {
   const current = backgroundJobBoard.get(expectedTaskID);
-  const resolved = backgroundJobBoard.resolve(parentSessionID, requested);
-  if (!current || !resolved || resolved.taskID !== expectedTaskID) {
+  if (!current || current.parentSessionID !== parentSessionID) {
     throw new Error(
-      `Task ${requested} is no longer tracked; refusing stale message`,
+      `Task ${expectedTaskID} is no longer tracked; refusing stale message`,
     );
   }
-  if (
-    current.taskID !== expectedTaskID ||
-    current.generation !== expectedGeneration ||
-    resolved.generation !== expectedGeneration
-  ) {
+  if (current.generation !== expectedGeneration) {
     throw new Error(
-      `Task ${requested} run generation changed; refusing stale message`,
+      `Task ${expectedTaskID} run generation changed; refusing stale message`,
     );
   }
   if (current.cancellationRequested) {
     throw new Error(
-      `Task ${requested} cannot queue a message: cancellation was requested`,
+      `Task ${expectedTaskID} cannot queue a message: cancellation was requested`,
     );
   }
   if (current.state !== 'running') {
+    if (current.state === 'stopped') {
+      throw new Error(
+        `Task ${expectedTaskID} stopped without a terminal result. task_message only queues messages for running tasks and does not continue it. Use task_revive with ${delegation.resumeParam}: "${expectedTaskID}" to continue the retained session.`,
+      );
+    }
+    const terminalState =
+      current.state === 'reconciled'
+        ? (current.terminalState ?? 'completed')
+        : current.state;
+    if (['completed', 'error', 'cancelled'].includes(terminalState)) {
+      throw new Error(
+        `Task ${expectedTaskID} is terminal (${terminalState}). task_message only queues messages for running tasks and does not continue it. Continue that same session with task_revive and ${delegation.resumeParam}: "${expectedTaskID}".`,
+      );
+    }
     throw new Error(
-      `Task ${requested} cannot queue a message: board state is ${current.state}, not running`,
+      `Task ${expectedTaskID} cannot queue a message: board state is ${current.state}, not running`,
     );
   }
   return current;

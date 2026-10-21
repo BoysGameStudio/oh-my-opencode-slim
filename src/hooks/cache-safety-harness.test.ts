@@ -7,18 +7,16 @@
  * cache-payload.snapshot.test.ts.
  */
 
-import {
-  DEFAULT_MAX_RETAINED_SNAPSHOTS,
-  resolveImageRouting,
-} from '../config/constants';
+import { resolveImageRouting } from '../config/constants';
 import { RuntimeConfig } from '../config/runtime';
+import { collapseInterviewHistory } from '../interview/history';
 import { BackgroundJobBoard, createInternalAgentTextPart } from '../utils';
 import { createDisplayNameMentionRewriter } from '../utils/agent-variant';
 import { isTaggedPart } from './cache-safe-injection';
-import { createFilterAvailableSkillsHook } from './filter-available-skills';
+import { createCouncilInjectHook } from './council-inject';
+import { createDeepworkGoalHook } from './deepwork-goal';
 import { processImageAttachments } from './image-hook';
 import { createPhaseReminderHook } from './phase-reminder';
-import { createPostFileToolNudgeHook } from './post-file-tool-nudge';
 import { SessionLifecycle } from './session-lifecycle';
 import {
   BACKGROUND_JOB_BOARD_METADATA_KEY,
@@ -32,16 +30,19 @@ export const FIXTURE_NOW = 1_700_000_000_000;
 
 export type TransformOutput = { messages: unknown[] };
 
-export type BoardStrategy = 'latest' | 'checkpoint-compatible';
-
 export interface PipelineOptions {
-  /** Board injection strategy under test; defaults to the production default. */
-  strategy?: BoardStrategy;
+  activeInterview?: boolean;
+  /**
+   * Enable the deepwork goal pointer for the fixture session. Off by
+   * default: the pointer is a trailing volatile message that changes
+   * payload tails, so only the cache-safety suites opt in; other suites
+   * test board/bridge behavior in isolation.
+   */
+  goalPointer?: boolean;
 }
 
 export interface Pipeline {
   run: (output: TransformOutput) => Promise<void>;
-  markFileToolPending: () => void;
   board: BackgroundJobBoard;
 }
 
@@ -75,8 +76,6 @@ export function createPipeline(options: PipelineOptions = {}): Pipeline {
     } as never,
     {
       maxSessionsPerAgent: 2,
-      maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
-      ...(options.strategy ? { strategy: options.strategy } : {}),
       backgroundJobBoard: board,
       shouldManageSession: (sessionID) =>
         sessionAgentMap.get(sessionID) === 'orchestrator',
@@ -87,21 +86,31 @@ export function createPipeline(options: PipelineOptions = {}): Pipeline {
     },
   );
 
-  const postFileToolNudge = createPostFileToolNudgeHook({
-    shouldInject: shouldInjectOrchestratorReminder,
-    coordinator: lifecycle,
-  });
-
   const phaseReminder = createPhaseReminderHook({
     shouldInject: shouldInjectOrchestratorReminder,
   });
 
-  const filterAvailableSkills = createFilterAvailableSkillsHook(
-    {} as never,
-    RuntimeConfig.get('/tmp/cache-safety-fixture'),
-  );
+  const councilInject = createCouncilInjectHook({
+    wording: {
+      tool: 'task',
+      agentParam: 'subagent_type',
+      resumeParam: 'task_id',
+    },
+  });
+
+  // Goal pointer joins the mirror pipeline in src/index.ts order. Off by
+  // default (see PipelineOptions); the cache-safety suites opt in to
+  // exercise the trailing volatile pointer's byte stability.
+  const deepworkGoal = createDeepworkGoalHook({
+    isEligible: (sessionID) =>
+      options.goalPointer === true &&
+      shouldInjectOrchestratorReminder(sessionID),
+  });
 
   const run = async (output: TransformOutput): Promise<void> => {
+    if (options.activeInterview) {
+      collapseInterviewHistory(output.messages as never);
+    }
     for (const message of output.messages as MessageWithParts[]) {
       if (message.info.role !== 'user') continue;
       for (const part of message.parts) {
@@ -122,15 +131,11 @@ export function createPipeline(options: PipelineOptions = {}): Pipeline {
       {} as never,
       output as never,
     );
-    await postFileToolNudge['experimental.chat.messages.transform'](
-      {} as never,
-      output as never,
-    );
     await phaseReminder['experimental.chat.messages.transform'](
       {} as never,
       output as never,
     );
-    await filterAvailableSkills['experimental.chat.messages.transform'](
+    await councilInject['experimental.chat.messages.transform'](
       {} as never,
       output as never,
     );
@@ -138,11 +143,15 @@ export function createPipeline(options: PipelineOptions = {}): Pipeline {
       {} as never,
       output as never,
     );
+    // Trailing-most volatile message, after the board (src/index.ts order).
+    await deepworkGoal['experimental.chat.messages.transform'](
+      {} as never,
+      output as never,
+    );
   };
 
   return {
     run,
-    markFileToolPending: () => lifecycle.markPending(SESSION_ID),
     board,
   };
 }
@@ -193,7 +202,7 @@ export function internalInitiatorTurn(id: string, text: string) {
 /**
  * Conversation fixture covering the paths that produced past cache bugs:
  * plain orchestrator turns, assistant tool loops, a specialist message, an
- * internal-initiator continuation, and a message carrying a rewritable
+ * internal-initiator continuation, and a message carrying a
  * <available_skills> block.
  */
 export function buildHistory(): unknown[] {
@@ -210,6 +219,10 @@ export function buildHistory(): unknown[] {
     ),
     assistantTurn('m08', 'Wrapping up.'),
     userTurn('m09', 'final adjustments please'),
+    // Council-triggered turn: exercises the council-inject transform in the
+    // property pipeline (block appended to this turn must stay byte-stable
+    // across replays like every other tagged injection).
+    userTurn('m10', 'before we ship, run a council on the final design'),
   ];
 }
 

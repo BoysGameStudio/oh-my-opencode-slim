@@ -14,11 +14,28 @@ import {
   SUBAGENT_NAMES,
 } from './config/constants';
 import { loadPluginConfig } from './config/loader';
+import { MultiplexerConfigSchema, type MultiplexerType } from './config/schema';
 import {
-  recordTmuxPane,
-  removeTmuxPane,
-} from './multiplexer/tmux-pane-registry';
-import { openPresetManager } from './tui-preset';
+  createOnceGate,
+  logHostUnsupported,
+  PLUGIN_LOG_SINK,
+} from './multiplexer/client/diagnostics';
+import {
+  createTuiPaneWiring,
+  initClientLogging,
+  type TuiPaneWiring,
+} from './multiplexer/client/tui-wiring';
+import {
+  buildV2PaneWiringOptions,
+  describeV2HostMode,
+  detectV2HostMode,
+} from './multiplexer/client/v2-host';
+import {
+  KILL_ALL_KEYBIND,
+  killAllRunningSubagents,
+  killAllSummaryMessage,
+} from './tui-kill';
+import { fetchModelNameMap, openPresetManager } from './tui-preset';
 import {
   readTuiSnapshot,
   readTuiSnapshotAsync,
@@ -27,6 +44,17 @@ import {
   type TuiSnapshot,
 } from './tui-state';
 import { isPluginDisabledByEnv } from './utils/env';
+import { log } from './utils/logger';
+import {
+  notifyConfigChanged,
+  registerConfigChangeListener,
+} from './v2/config-change-coordinator';
+import {
+  canOpenPresetManagerV2,
+  openPresetManagerV2,
+  type V2PresetManagerContext,
+  type V2PresetUiSurface,
+} from './v2/preset-manager';
 
 const PLUGIN_NAME = 'oh-my-opencode-slim';
 const CONFIG_WARNING_COLOR = 'orange';
@@ -37,7 +65,6 @@ const FALLBACK_SIDEBAR_AGENTS = SUBAGENT_NAMES.filter(
     !DEFAULT_DISABLED_AGENTS.includes(agent),
 );
 const BORDER = { type: 'single' };
-const TMUX_PANE_HEARTBEAT_MS = 10_000;
 const ACTIVITY_FRAME_MS = 100;
 const ACTIVITY_FRAMES = [
   '⠋',
@@ -51,6 +78,25 @@ const ACTIVITY_FRAMES = [
   '⠇',
   '⠏',
 ] as const;
+
+/** Once-per-process gate for the v2-host multiplexer diagnostic (NFR-6). */
+const v2HostUnsupportedGate = createOnceGate();
+
+/**
+ * Standalone and invalid v2 hosts cannot create panes (NFR-6): a multiplexer
+ * configured there is ignored. Records that at most once per process so the
+ * disabled feature is self-explaining instead of silently dropping config;
+ * callers re-run it whenever the config is (re)read.
+ */
+function warnV2HostUnsupportedMultiplexer(
+  configuredType: MultiplexerType,
+  detail: { mode: string; reason?: string },
+): void {
+  if (configuredType === 'none') return;
+  if (!v2HostUnsupportedGate('v2-host-unsupported')) return;
+  initClientLogging();
+  logHostUnsupported(PLUGIN_LOG_SINK, configuredType, detail);
+}
 
 type Child =
   | JSX.Element
@@ -114,14 +160,7 @@ function getTuiDirectory(api: {
   return api.state?.path?.directory ?? process.cwd();
 }
 
-export interface ActiveTmuxPaneRegistration {
-  sessionId?: string;
-  paneId?: string;
-  ownerPid: number;
-  lastRecordedAt: number;
-}
-
-/** Route shapes accepted by `syncTmuxPaneRegistration`: v1 `{ name, params }` and v2 `{ type, sessionID }`. */
+/** Route shapes accepted by the sidebar: v1 `{ name, params }` and v2 `{ type, sessionID }`. */
 export type TuiRouteView =
   | {
       name?: string;
@@ -132,7 +171,7 @@ export type TuiRouteView =
       sessionID?: string;
     };
 
-function resolveRouteSessionId(route: TuiRouteView): string | undefined {
+export function resolveRouteSessionId(route: TuiRouteView): string | undefined {
   const view = route as {
     name?: string;
     params?: { sessionID?: unknown };
@@ -148,45 +187,52 @@ function resolveRouteSessionId(route: TuiRouteView): string | undefined {
   return undefined;
 }
 
-function clearTmuxPaneRegistration(
-  registration: ActiveTmuxPaneRegistration,
-): void {
-  if (registration.sessionId && registration.paneId) {
-    removeTmuxPane(
-      registration.sessionId,
-      registration.paneId,
-      registration.ownerPid,
-    );
+/**
+ * Resolves the project scope for panes owned by the displayed conversation.
+ *
+ * A TUI can be launched from one directory while resuming a session created
+ * in another. `state.path.directory` keeps the launch scope in that case,
+ * while the selected session retains the directory its children inherit.
+ * Prefer that session directory so multiplexer event filtering, status reads,
+ * and spawned attach panes all use the same scope as the displayed session.
+ */
+export function resolveTuiPaneDirectory(api: {
+  route?: { current?: TuiRouteView };
+  state?: {
+    path?: { directory?: string };
+    session?: {
+      get?: (sessionID: string) => { directory?: unknown } | undefined;
+    };
+  };
+}): string {
+  const fallback = getTuiDirectory(api);
+  const sessionID = api.route?.current
+    ? resolveRouteSessionId(api.route.current)
+    : undefined;
+  if (!sessionID) return fallback;
+
+  try {
+    const directory = api.state?.session?.get?.(sessionID)?.directory;
+    return typeof directory === 'string' && directory.length > 0
+      ? directory
+      : fallback;
+  } catch {
+    return fallback;
   }
-  registration.sessionId = undefined;
-  registration.paneId = undefined;
-  registration.lastRecordedAt = 0;
 }
 
-export function syncTmuxPaneRegistration(
-  route: TuiRouteView,
-  registration: ActiveTmuxPaneRegistration,
-  now = Date.now(),
-): void {
-  const paneId = process.env.TMUX_PANE;
-  const sessionId = resolveRouteSessionId(route);
-  const unchanged =
-    registration.sessionId === sessionId && registration.paneId === paneId;
-
-  if (!paneId || !sessionId) {
-    clearTmuxPaneRegistration(registration);
-    return;
-  }
-  if (unchanged && now - registration.lastRecordedAt < TMUX_PANE_HEARTBEAT_MS) {
-    return;
-  }
-  if (!unchanged) clearTmuxPaneRegistration(registration);
-
-  if (recordTmuxPane(sessionId, paneId, registration.ownerPid)) {
-    registration.sessionId = sessionId;
-    registration.paneId = paneId;
-    registration.lastRecordedAt = now;
-  }
+/** Route-scoped pane context, shared by initial wiring and subsequent events. */
+export function paneWiringOptions(
+  api: Parameters<typeof resolveTuiPaneDirectory>[0] & {
+    route: { current: TuiRouteView };
+  },
+) {
+  const getDirectory = () => resolveTuiPaneDirectory(api);
+  return {
+    directory: getDirectory(),
+    getDirectory,
+    getDisplayedSessionId: () => resolveRouteSessionId(api.route.current),
+  };
 }
 
 export function splitSidebarModelId(model: string): {
@@ -323,6 +369,16 @@ export function applyRemoteAgentModels(
 
 const REMOTE_RETRY_MS = 5_000;
 
+const MODEL_NAMES_TTL_MS = 60_000;
+
+const MODEL_NAMES_FETCH_TIMEOUT_MS = 2_000;
+
+export interface ModelNamesCache {
+  directory?: string;
+  names: ReadonlyMap<string, string>;
+  at?: number;
+}
+
 interface RemoteModelCache {
   directory?: string;
   models?: Record<string, string>;
@@ -355,6 +411,61 @@ async function hydrateRemoteModels(
   return applyRemoteAgentModels(snapshot, models);
 }
 
+/**
+ * TTL-cached provider/model display-name map for the sidebar. Falls back
+ * silently to the previous (possibly empty) map on fetch failure — the
+ * sidebar polls forever, so failures must never toast or throw.
+ */
+export async function hydrateModelNames(
+  client: unknown,
+  directory: string,
+  cache: ModelNamesCache,
+  now: () => number = Date.now,
+  timeoutMs: number = MODEL_NAMES_FETCH_TIMEOUT_MS,
+): Promise<ReadonlyMap<string, string>> {
+  const cached =
+    cache.directory === directory &&
+    (cache.names.size > 0 ||
+      (cache.at !== undefined && now() - cache.at < MODEL_NAMES_TTL_MS))
+      ? cache.names
+      : undefined;
+  if (
+    cached !== undefined &&
+    cache.at !== undefined &&
+    now() - cache.at < MODEL_NAMES_TTL_MS
+  ) {
+    return cached;
+  }
+  try {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const names = await Promise.race([
+      fetchModelNameMap({ client }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('model names fetch timed out')),
+          timeoutMs,
+        );
+      }),
+    ]).finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
+    cache.directory = directory;
+    cache.names = new Map(Object.entries(names));
+    cache.at = now();
+  } catch (err) {
+    // Rate-limit retries via TTL. Keep last-known names only when the failed
+    // fetch is for the same directory; a directory switch must not inherit
+    // the previous project's labels.
+    log('[v2][tui] model name fetch failed', String(err));
+    if (cache.directory !== directory) {
+      cache.names = new Map();
+    }
+    cache.directory = directory;
+    cache.at = now();
+  }
+  return cache.names;
+}
+
 /** Skip overlapping sidebar refreshes so a slow host fetch cannot pile up. */
 export function createSerializedRefresh(run: () => Promise<void>): () => void {
   let inFlight = false;
@@ -379,6 +490,10 @@ export function isRefreshCurrent(
   return startedDirectory === currentDirectory;
 }
 
+function visibleConversationRoot(snapshot: TuiSnapshot, id?: string) {
+  return id === undefined ? undefined : resolveTuiSnapshotRoot(snapshot, id);
+}
+
 export function getActiveSidebarAgentNames(
   snapshot: TuiSnapshot,
   visibleRootID?: string,
@@ -391,10 +506,7 @@ export function getActiveSidebarAgentNames(
   // every window's subagents from one process, so only the session tree
   // can separate them — and a late-learned link re-roots both sides
   // consistently. Without a visible session (home route) keep the union.
-  const root =
-    visibleRootID === undefined
-      ? undefined
-      : resolveTuiSnapshotRoot(snapshot, visibleRootID);
+  const root = visibleConversationRoot(snapshot, visibleRootID);
   for (const [sessionID, agentName] of Object.entries(
     snapshot.activeSessions,
   )) {
@@ -405,6 +517,20 @@ export function getActiveSidebarAgentNames(
       names.add(agentName);
     }
   }
+  for (const [parentID, byAgent] of Object.entries(snapshot.reusableByAgent)) {
+    if (
+      root !== undefined &&
+      resolveTuiSnapshotRoot(snapshot, parentID) !== root
+    ) {
+      continue;
+    }
+    for (const [agentName, entries] of Object.entries(byAgent)) {
+      // The projection prepends running jobs ahead of terminal history.
+      if (entries[0]?.running === true) {
+        names.add(agentName);
+      }
+    }
+  }
   return names;
 }
 
@@ -413,8 +539,21 @@ export interface SidebarSessionTarget {
   sessionID: string;
   agentName: string;
   alias?: string;
-  model?: string;
-  status?: 'busy' | 'retry';
+  status?: 'busy' | 'retry' | 'reusable' | 'stopped';
+  /**
+   * 1-based position among the active sessions of the same agent sharing
+   * this session's parent scope. Present only when that scope runs more
+   * than one: parallel same-agent dispatches read as siblings, not nesting.
+   */
+  siblingOrdinal?: number;
+  /** Active same-agent sibling count of this session's parent scope. */
+  siblingTotal?: number;
+  /**
+   * Display name of the intermediate parent when this row is nested
+   * depth-2 (its parent is itself a managed child session, e.g. a
+   * specialist rather than the orchestrator). Human-facing only.
+   */
+  viaParent?: string;
 }
 
 export interface SidebarAgentTargets {
@@ -438,8 +577,8 @@ export function getSidebarAgentTargets(
   snapshot: TuiSnapshot,
   visibleRootID?: string,
 ): SidebarAgentTargets[] {
-  if (visibleRootID === undefined) return [];
-  const root = resolveTuiSnapshotRoot(snapshot, visibleRootID);
+  const root = visibleConversationRoot(snapshot, visibleRootID);
+  if (root === undefined) return [];
   const byAgent = new Map<string, SidebarSessionTarget[]>();
   for (const [sessionID, agentName] of Object.entries(
     snapshot.activeSessions,
@@ -453,7 +592,6 @@ export function getSidebarAgentTargets(
       sessionID,
       agentName,
       alias: details?.alias,
-      model: details?.model,
       status: details?.status,
     });
     byAgent.set(agentName, list);
@@ -461,9 +599,83 @@ export function getSidebarAgentTargets(
   return [...byAgent.entries()].map(([agentName, sessions]) => ({
     agentName,
     sessions: disambiguateDuplicateAliases(
-      sessions.sort(compareSidebarTargets),
+      annotateSiblingAttribution(
+        snapshot,
+        sessions.sort(compareSidebarTargets),
+      ),
     ),
   }));
+}
+
+/**
+ * Sibling attribution for parallel same-agent dispatches (human-facing
+ * display only; never injected into model context). Within one agent
+ * group, ACTIVE sessions sharing a parent scope get 1-based ordinals when
+ * that scope runs more than one ("explorer 1/2"), and a session whose
+ * parent is itself a managed child session (depth-2 nesting, e.g.
+ * dispatched by a specialist rather than the orchestrator) gets a
+ * "via <parent>" marker so true nesting stays visibly distinct from
+ * sibling dispatch. Terminal history rows never join a sibling count.
+ */
+function annotateSiblingAttribution(
+  snapshot: TuiSnapshot,
+  sessions: SidebarSessionTarget[],
+): SidebarSessionTarget[] {
+  const isActive = (session: SidebarSessionTarget): boolean =>
+    session.status !== 'reusable' && session.status !== 'stopped';
+  const totals = new Map<string, number>();
+  for (const session of sessions) {
+    if (!isActive(session)) continue;
+    const parent = snapshot.sessionParents[session.sessionID];
+    if (parent !== undefined) totals.set(parent, (totals.get(parent) ?? 0) + 1);
+  }
+  const ordinals = new Map<string, number>();
+  return sessions.map((session) => {
+    const parent = snapshot.sessionParents[session.sessionID];
+    const next: SidebarSessionTarget = { ...session };
+    delete next.siblingOrdinal;
+    delete next.siblingTotal;
+    delete next.viaParent;
+    if (parent === undefined) return next;
+    const total = totals.get(parent);
+    if (isActive(session) && total !== undefined && total > 1) {
+      const ordinal = (ordinals.get(parent) ?? 0) + 1;
+      ordinals.set(parent, ordinal);
+      next.siblingOrdinal = ordinal;
+      next.siblingTotal = total;
+    }
+    const grandparent = snapshot.sessionParents[parent];
+    if (grandparent !== undefined && grandparent !== parent) {
+      // Same display name the parent's own row uses: live board alias, else
+      // the board alias from the grandparent's reusable list (the parent may
+      // be idle by the time the child row renders), else the short id suffix
+      // (already the distinguishing tail, never the shared prefix).
+      const boardAlias = Object.values(
+        snapshot.reusableByAgent[grandparent] ?? {},
+      )
+        .flat()
+        .find((entry) => entry.taskID === parent)?.alias;
+      next.viaParent =
+        snapshot.sessionDetails[parent]?.alias ??
+        boardAlias ??
+        shortSessionID(parent);
+    }
+    return next;
+  });
+}
+
+/** "1/2" sibling ordinal plus the depth-2 "via <parent>" nesting marker,
+ * joined for the sidebar row annotation. Undefined when neither applies. */
+export function sidebarSiblingAnnotation(
+  target: SidebarSessionTarget,
+): string | undefined {
+  const parts = [
+    target.siblingOrdinal !== undefined && target.siblingTotal !== undefined
+      ? `${target.siblingOrdinal}/${target.siblingTotal}`
+      : undefined,
+    target.viaParent !== undefined ? `via ${target.viaParent}` : undefined,
+  ].filter((part) => part !== undefined);
+  return parts.length > 0 ? parts.join(' ') : undefined;
 }
 
 /** When two sessions share an alias (nested branches), append a short id. */
@@ -483,6 +695,82 @@ function disambiguateDuplicateAliases(
       alias: `${session.alias} ${shortSessionID(session.sessionID)}`,
     };
   });
+}
+
+/** One clickable reusable destination of an agent in the visible conversation. */
+export interface SidebarReusableTarget {
+  taskID: string;
+  alias: string;
+  completedAt?: number;
+  lastUsedAt?: number;
+  running?: true;
+  stopped?: true;
+}
+
+/**
+ * Reusable sessions per agent for the visible conversation. Mirrors the
+ * parent-scoping of
+ * getSidebarAgentTargets (#1147): only entries whose parent session
+ * resolves to the same conversation root as the visible session are
+ * offered; without a visible session there is no conversation to scope
+ * to and no reusable destinations are rendered.
+ */
+export function getSidebarReusableTargets(
+  snapshot: TuiSnapshot,
+  visibleRootID?: string,
+): Map<string, SidebarReusableTarget[]> {
+  const targets = new Map<string, SidebarReusableTarget[]>();
+  const root = visibleConversationRoot(snapshot, visibleRootID);
+  if (root === undefined) return targets;
+  for (const [parentSessionID, byAgent] of Object.entries(
+    snapshot.reusableByAgent,
+  )) {
+    if (resolveTuiSnapshotRoot(snapshot, parentSessionID) !== root) continue;
+    for (const [agentName, entries] of Object.entries(byAgent)) {
+      const current = targets.get(agentName) ?? [];
+      const byTaskID = new Map(current.map((entry) => [entry.taskID, entry]));
+      for (const entry of entries) {
+        const candidate: SidebarReusableTarget = {
+          taskID: entry.taskID,
+          alias: entry.alias,
+          ...(entry.running === true ? { running: true as const } : {}),
+          ...(entry.terminalState === 'stopped'
+            ? { stopped: true as const }
+            : {}),
+          ...(entry.completedAt !== undefined
+            ? { completedAt: entry.completedAt }
+            : {}),
+          ...(entry.lastUsedAt !== undefined
+            ? { lastUsedAt: entry.lastUsedAt }
+            : {}),
+        };
+        const existing = byTaskID.get(entry.taskID);
+        if (
+          existing === undefined ||
+          reusableRecency(candidate) > reusableRecency(existing)
+        ) {
+          byTaskID.set(entry.taskID, candidate);
+        }
+      }
+      const merged = [...byTaskID.values()];
+      targets.set(agentName, merged);
+    }
+  }
+  for (const entries of targets.values()) {
+    entries.sort((a, b) => {
+      if (a.running !== b.running) return a.running ? -1 : 1;
+      if (a.running) return 0;
+      return (
+        reusableRecency(b) - reusableRecency(a) ||
+        b.taskID.localeCompare(a.taskID)
+      );
+    });
+  }
+  return targets;
+}
+
+function reusableRecency(target: SidebarReusableTarget): number {
+  return Math.max(target.lastUsedAt ?? 0, target.completedAt ?? 0);
 }
 
 function compareSidebarTargets(
@@ -519,6 +807,8 @@ export function shortSessionID(sessionID: string): string {
  */
 export interface SidebarInteraction {
   navigate?: (sessionID: string) => void;
+  isOpen: () => boolean;
+  toggleOpen: () => void;
   expandedAgents: () => ReadonlySet<string>;
   toggleAgent: (agentName: string) => void;
   /** Reset expansion when the project directory or visible root changes. */
@@ -527,16 +817,29 @@ export interface SidebarInteraction {
   hasSelectedText?: () => boolean;
 }
 
+/**
+ * The active preset row rendered below the header/config status block and
+ * above the agent list. `onActivate` is present only when the host can open
+ * the preset manager (v2 dialogs); without it the row is informational-only.
+ */
+export interface SidebarPresetRow {
+  name: string;
+  onActivate?: () => void;
+}
+
 export function createSidebarInteraction(
   navigate: ((sessionID: string) => void) | undefined,
   hasSelectedText?: () => boolean,
 ): SidebarInteraction {
+  const [open, setOpen] = createSignal(true);
   const [expanded, setExpanded] = createSignal<ReadonlySet<string>>(new Set());
   let lastDirectory: string | undefined;
   let lastRootID: string | undefined;
   return {
     navigate,
     hasSelectedText,
+    isOpen: open,
+    toggleOpen: () => setOpen((value: boolean) => !value),
     expandedAgents: expanded,
     toggleAgent: (agentName: string) => {
       setExpanded((prev: ReadonlySet<string>) => {
@@ -588,11 +891,7 @@ export function makeRouteNavigator(
   };
 }
 
-export function getSidebarActivityIndicator(
-  active: boolean,
-  now = Date.now(),
-): string {
-  if (!active) return ' ';
+export function getSidebarActivityIndicator(now = Date.now()): string {
   const frame = Math.floor(now / ACTIVITY_FRAME_MS) % ACTIVITY_FRAMES.length;
   return ACTIVITY_FRAMES[frame];
 }
@@ -610,7 +909,6 @@ interface AgentRowTheme {
 
 const STATUS_ACTIVE_COLOR = '#22c55e';
 const STATUS_RETRY_COLOR = '#f59e0b';
-const STATUS_COLUMN_WIDTH = 8;
 
 function hasPrimarySelection(hasSelectedText?: () => boolean): boolean {
   try {
@@ -738,6 +1036,8 @@ function decorateInteractiveRow(
     hoverBackground: unknown;
     onActivate?: () => void;
     hasSelectedText?: () => boolean;
+    /** Skip hover painting (e.g. static headers) while keeping activation. */
+    paintHover?: boolean;
   },
 ): JSX.Element {
   const row = node as unknown as HoverRowRenderable;
@@ -757,13 +1057,19 @@ function decorateInteractiveRow(
     }
   };
 
-  setProp(node as never, 'onMouseOver', () => {
-    applyHover(true);
-  });
-  setProp(node as never, 'onMouseOut', (event?: { x?: number; y?: number }) => {
-    if (isPointerInsideRow(row, event)) return;
-    applyHover(false);
-  });
+  if (opts.paintHover !== false) {
+    setProp(node as never, 'onMouseOver', () => {
+      applyHover(true);
+    });
+    setProp(
+      node as never,
+      'onMouseOut',
+      (event?: { x?: number; y?: number }) => {
+        if (isPointerInsideRow(row, event)) return;
+        applyHover(false);
+      },
+    );
+  }
   if (opts.onActivate) {
     setProp(node as never, 'onMouseUp', (event?: { button?: number }) => {
       if (!shouldActivateRow(event, opts.hasSelectedText)) return;
@@ -773,46 +1079,101 @@ function decorateInteractiveRow(
   return node;
 }
 
-function sessionStatusView(
-  status: SidebarSessionTarget['status'],
-  theme: AgentRowTheme,
-): { label: string; color: unknown } {
-  if (status === 'retry') {
-    return { label: 'retrying', color: theme.warning ?? STATUS_RETRY_COLOR };
-  }
-  return { label: 'active', color: theme.success ?? STATUS_ACTIVE_COLOR };
-}
+export const STATUS_DOT_GLYPH = '•';
+export const STATUS_STOPPED_GLYPH = '⚰';
 
-function activityIndicator(
+function statusDot(
   active: boolean,
+  hasHistory: boolean,
   now: () => number,
   theme: AgentRowTheme,
 ): JSX.Element {
-  // Nested reactive leaf: only this glyph re-renders on the 100 ms
-  // animation tick. Rebuilding the clickable parent on every frame
-  // would drop the mouse target between press and release.
   return text(
     {
-      fg: active ? (theme.accent ?? theme.text) : theme.textMuted,
+      fg: active
+        ? (theme.success ?? STATUS_ACTIVE_COLOR)
+        : hasHistory
+          ? '#60a5fa'
+          : theme.textMuted,
       width: 2,
     },
-    active ? [() => getSidebarActivityIndicator(true, now())] : [' '],
+    active
+      ? [() => `${getSidebarActivityIndicator(now())} `]
+      : [hasHistory ? '✦ ' : `${STATUS_DOT_GLYPH} `],
   );
 }
 
-function agentRow(
-  label: string,
-  model: string,
-  variant: string | undefined,
-  active: boolean,
-  now: () => number,
-  theme: AgentRowTheme,
-  sessionCount?: number,
-  expanded = false,
-  onClick?: () => void,
-  hoverBackground?: unknown,
-  hasSelectedText?: () => boolean,
-): JSX.Element {
+interface AgentRowOptions {
+  label: string;
+  model: string;
+  modelName?: string;
+  variant?: string;
+  active: boolean;
+  now: () => number;
+  theme: AgentRowTheme;
+  sessionCount?: number;
+  expanded: boolean;
+  annotation?: string;
+  onClick?: () => void;
+  hoverBackground?: unknown;
+  hasSelectedText?: () => boolean;
+  hasHistory: boolean;
+}
+
+function agentHeaderCells({
+  label,
+  active,
+  now,
+  theme,
+  sessionCount,
+  expanded,
+  annotation,
+  hasHistory,
+}: AgentRowOptions): JSX.Element[] {
+  return [
+    statusDot(active, hasHistory, now, theme),
+    text(
+      {
+        fg: theme.textMuted,
+        wrapMode: 'none',
+        truncate: true,
+        flexShrink: 1,
+      },
+      [label],
+    ),
+    ...(annotation !== undefined
+      ? [
+          text(
+            {
+              fg: theme.textMuted,
+              flexShrink: 1,
+              wrapMode: 'none',
+              truncate: true,
+            },
+            [` ${annotation}`],
+          ),
+        ]
+      : []),
+    ...(sessionCount !== undefined && sessionCount > 1
+      ? [
+          text({ fg: theme.textMuted, wrapMode: 'none', flexShrink: 0 }, [
+            ` ${expanded ? '▾' : '▸'}${sessionCount}`,
+          ]),
+        ]
+      : []),
+  ];
+}
+
+function agentRow(options: AgentRowOptions): JSX.Element {
+  const {
+    model,
+    modelName,
+    variant,
+    theme,
+    onClick,
+    hoverBackground,
+    hasSelectedText,
+  } = options;
   const modelParts = splitSidebarModelId(model);
   const detailRows: JSX.Element[] = [];
 
@@ -835,6 +1196,9 @@ function agentRow(
     detailRows.push(detailRow('provider', modelParts.provider));
   }
   detailRows.push(detailRow('model', modelParts.model));
+  if (modelName && modelName !== modelParts.model) {
+    detailRows.push(detailRow('name', modelName));
+  }
   if (variant) {
     detailRows.push(detailRow('variant', variant));
   }
@@ -845,16 +1209,7 @@ function agentRow(
       flexDirection: 'row',
       shouldFill: true,
     },
-    [
-      text({ fg: theme.textMuted, width: 14 }, [label]),
-      activityIndicator(active, now, theme),
-      ...(sessionCount !== undefined && sessionCount > 1
-        ? [
-            text({ fg: theme.textMuted, width: 4 }, [expanded ? ' ▴' : ' ▾']),
-            text({ fg: theme.textMuted }, [`${sessionCount}`]),
-          ]
-        : []),
-    ],
+    agentHeaderCells(options),
   );
   decorateInteractiveRow(header, {
     hoverBackground: hoverBackground ?? resolveHoverBackground(theme),
@@ -873,20 +1228,10 @@ function agentRow(
   );
 }
 
-function compactAgentRow(
-  label: string,
-  model: string,
-  _variant: string | undefined,
-  active: boolean,
-  now: () => number,
-  theme: AgentRowTheme,
-  sessionCount?: number,
-  expanded = false,
-  onClick?: () => void,
-  hoverBackground?: unknown,
-  hasSelectedText?: () => boolean,
-): JSX.Element {
-  const modelName = splitSidebarModelId(model).model;
+function compactAgentRow(options: AgentRowOptions): JSX.Element {
+  const { model, modelName, theme, onClick, hoverBackground, hasSelectedText } =
+    options;
+  const displayedModel = modelName ?? splitSidebarModelId(model).model;
   const row = box(
     {
       width: '100%',
@@ -897,28 +1242,23 @@ function compactAgentRow(
     [
       box(
         {
-          width: 16,
+          width: options.annotation !== undefined ? 24 : 16,
           flexShrink: 0,
           flexDirection: 'row',
           shouldFill: false,
         },
-        [
-          text({ fg: theme.textMuted, width: 14 }, [label]),
-          activityIndicator(active, now, theme),
-        ],
+        [...agentHeaderCells(options), box({ flexGrow: 1, shouldFill: false })],
       ),
+      box({ flexDirection: 'row', flexGrow: 1, shouldFill: false }),
       text(
         {
           fg: theme.textMuted,
           wrapMode: 'none',
           truncate: true,
           flexShrink: 1,
+          marginLeft: 1,
         },
-        [
-          sessionCount !== undefined && sessionCount > 1
-            ? `${expanded ? '▴' : '▾'}${sessionCount} ${modelName}`
-            : modelName,
-        ],
+        [displayedModel],
       ),
     ],
   );
@@ -930,30 +1270,50 @@ function compactAgentRow(
 }
 
 /**
- * One expanded subagent destination: `ora-1  model  status`.
+ * One expanded subagent destination: a fixed-width status indicator and alias.
  * Hover mutates this box in place so the click target survives ticks.
  */
 function sessionTargetRow(
   target: SidebarSessionTarget,
   theme: AgentRowTheme,
+  now: () => number,
   onActivate: () => void,
   hoverBackground: unknown,
   hasSelectedText?: () => boolean,
 ): JSX.Element {
   const label = target.alias ?? shortSessionID(target.sessionID);
-  const status = sessionStatusView(target.status, theme);
-  const modelName = target.model
-    ? splitSidebarModelId(target.model).model
-    : '—';
+  const annotation = sidebarSiblingAnnotation(target);
+  const reusable = target.status === 'reusable';
+  const stopped = target.status === 'stopped';
+  const indicatorColor =
+    reusable || stopped
+      ? theme.textMuted
+      : target.status === 'retry'
+        ? (theme.warning ?? STATUS_RETRY_COLOR)
+        : (theme.success ?? STATUS_ACTIVE_COLOR);
   const row = box(
     {
       width: '100%',
       flexDirection: 'row',
       paddingLeft: 2,
-      columnGap: 1,
       shouldFill: true,
     },
     [
+      text(
+        {
+          fg: indicatorColor,
+          width: 2,
+          flexShrink: 0,
+          wrapMode: 'none',
+        },
+        [
+          reusable
+            ? `${STATUS_DOT_GLYPH} `
+            : stopped
+              ? `${STATUS_STOPPED_GLYPH} `
+              : () => `${getSidebarActivityIndicator(now())} `,
+        ],
+      ),
       text(
         {
           fg: theme.textMuted,
@@ -962,26 +1322,19 @@ function sessionTargetRow(
         },
         [label],
       ),
-      text(
-        {
-          fg: theme.textMuted,
-          wrapMode: 'none',
-          truncate: true,
-          flexGrow: 1,
-          flexShrink: 1,
-          minWidth: 0,
-        },
-        [modelName],
-      ),
-      text(
-        {
-          fg: status.color,
-          width: STATUS_COLUMN_WIDTH,
-          flexShrink: 0,
-          wrapMode: 'none',
-        },
-        [status.label],
-      ),
+      ...(annotation !== undefined
+        ? [
+            text(
+              {
+                fg: theme.textMuted,
+                flexShrink: 1,
+                wrapMode: 'none',
+                truncate: true,
+              },
+              [` ${annotation}`],
+            ),
+          ]
+        : []),
     ],
   );
   return decorateInteractiveRow(row, {
@@ -1046,7 +1399,7 @@ export function getContrastForeground(
   return RGBA.fromInts(255, 255, 255);
 }
 
-function renderSidebar(
+export function renderSidebar(
   snapshot: TuiSnapshot,
   version: string,
   theme: {
@@ -1065,8 +1418,18 @@ function renderSidebar(
   now: () => number = Date.now,
   visibleRootID?: string,
   interaction?: SidebarInteraction,
+  presetRow?: SidebarPresetRow,
+  modelNames?: ReadonlyMap<string, string>,
 ): JSX.Element {
   const configStatusRow = buildConfigStatusRow(configInvalid, theme);
+  const presetRowEl = presetRow
+    ? buildPresetRow(
+        presetRow,
+        theme,
+        resolveHoverBackground(theme),
+        interaction?.hasSelectedText,
+      )
+    : null;
   const activeAgents = getActiveSidebarAgentNames(snapshot, visibleRootID);
   const targetsByAgent = new Map(
     getSidebarAgentTargets(snapshot, visibleRootID).map((group) => [
@@ -1074,8 +1437,48 @@ function renderSidebar(
       group.sessions,
     ]),
   );
+  // History marker (#1197 follow-up): only rendered when clickable — a
+  // marker without navigation would be dead pixels (no navigate, no marker).
+  const navigate = interaction?.navigate;
+  const reusableByAgent =
+    navigate === undefined
+      ? new Map<string, SidebarReusableTarget[]>()
+      : getSidebarReusableTargets(snapshot, visibleRootID);
   const expandedAgents = interaction?.expandedAgents() ?? new Set<string>();
+  const sidebarOpen = interaction?.isOpen() ?? true;
   const hoverBackground = resolveHoverBackground(theme);
+  const header = box(
+    {
+      width: '100%',
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+    },
+    [
+      box({ flexDirection: 'row', alignItems: 'center' }, [
+        text({ fg: theme.textMuted, width: 2 }, [sidebarOpen ? '▼ ' : '▶ ']),
+        box({ paddingRight: 1, backgroundColor: theme.accent }, [
+          text(
+            {
+              fg: getContrastForeground(
+                theme.accent,
+                theme.text,
+                theme.background,
+              ),
+            },
+            ['OMO-Slim'],
+          ),
+        ]),
+      ]),
+      text({ fg: theme.textMuted }, [`v${version}`]),
+    ],
+  );
+  decorateInteractiveRow(header, {
+    hoverBackground,
+    onActivate: interaction?.toggleOpen,
+    hasSelectedText: interaction?.hasSelectedText,
+    paintHover: false,
+  });
   return box(
     {
       width: '100%',
@@ -1084,101 +1487,104 @@ function renderSidebar(
       borderColor: theme.borderActive,
       paddingTop: 1,
       paddingBottom: 1,
-      paddingLeft: 1,
       paddingRight: 1,
     },
     [
-      box(
-        {
-          width: '100%',
-          flexDirection: 'row',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-        },
-        [
-          box(
-            { paddingLeft: 1, paddingRight: 1, backgroundColor: theme.accent },
-            [
-              text(
-                {
-                  fg: getContrastForeground(
-                    theme.accent,
-                    theme.text,
-                    theme.background,
-                  ),
-                },
-                ['OMO-Slim'],
-              ),
-            ],
-          ),
-          text({ fg: theme.textMuted }, [`v${version}`]),
-        ],
-      ),
-      configStatusRow,
-      box({ width: '100%', marginTop: 1 }, [
-        text({ fg: theme.text }, ['Agents']),
-      ]),
-      ...getSidebarAgentNames(snapshot).flatMap((agentName) => {
-        const model = snapshot.agentModels[agentName] ?? 'pending';
-        const variant = snapshot.agentVariants[agentName];
-        const active = activeAgents.has(agentName);
-        const sessions = targetsByAgent.get(agentName) ?? [];
-        // Rows only become interactive when this window can navigate AND
-        // the agent has live subagent sessions in this conversation.
-        const clickable =
-          interaction?.navigate !== undefined && sessions.length > 0;
-        const expanded =
-          clickable && sessions.length > 1 && expandedAgents.has(agentName);
-        const onAgentClick = clickable
-          ? () => {
-              if (sessions.length === 1) {
-                interaction?.navigate?.(sessions[0].sessionID);
-              } else {
-                interaction?.toggleAgent(agentName);
-              }
-            }
-          : undefined;
-        const agentRowEl = compactSidebar
-          ? compactAgentRow(
-              agentName,
-              model,
-              variant,
-              active,
-              now,
-              theme,
-              clickable ? sessions.length : undefined,
-              expanded,
-              onAgentClick,
-              hoverBackground,
-              interaction?.hasSelectedText,
-            )
-          : agentRow(
-              agentName,
-              model,
-              variant,
-              active,
-              now,
-              theme,
-              clickable ? sessions.length : undefined,
-              expanded,
-              onAgentClick,
-              hoverBackground,
-              interaction?.hasSelectedText,
+      header,
+      ...(sidebarOpen ? [configStatusRow, presetRowEl] : []),
+      ...(sidebarOpen
+        ? getSidebarAgentNames(snapshot).flatMap((agentName) => {
+            const model = snapshot.agentModels[agentName] ?? 'pending';
+            const variant = snapshot.agentVariants[agentName];
+            const active = activeAgents.has(agentName);
+            const sessions = targetsByAgent.get(agentName) ?? [];
+            const reusable = reusableByAgent.get(agentName) ?? [];
+            const seenSessionIDs = new Set(
+              sessions.map((target) => target.sessionID),
             );
-        if (!expanded) return [agentRowEl];
-        return [
-          agentRowEl,
-          ...sessions.map((target) =>
-            sessionTargetRow(
-              target,
+            const reusableTargets = reusable
+              .filter((target) => !seenSessionIDs.has(target.taskID))
+              .map(
+                (target): SidebarSessionTarget => ({
+                  sessionID: target.taskID,
+                  agentName,
+                  alias: target.alias,
+                  status:
+                    target.running === true
+                      ? 'busy'
+                      : target.stopped === true
+                        ? 'stopped'
+                        : 'reusable',
+                }),
+              );
+            const mergedTargets = [...sessions, ...reusableTargets];
+            const history = reusableTargets.some(
+              (target) =>
+                target.status === 'reusable' || target.status === 'stopped',
+            );
+            const clickable =
+              interaction?.navigate !== undefined && mergedTargets.length > 0;
+            const expanded =
+              mergedTargets.length > 1 &&
+              clickable &&
+              expandedAgents.has(agentName);
+            // Only annotate when the rows are actually rendered: a collapsed
+            // agent row never reaches sessionTargetRow, so computing the
+            // sibling/via annotation there is wasted work on every tick.
+            const allTargets = expanded
+              ? annotateSiblingAttribution(snapshot, mergedTargets)
+              : mergedTargets;
+            const onAgentClick = clickable
+              ? () => {
+                  if (allTargets.length === 1) {
+                    interaction?.navigate?.(allTargets[0].sessionID);
+                  } else if (allTargets.length > 1) {
+                    interaction?.toggleAgent(agentName);
+                  }
+                }
+              : undefined;
+            const singleAnnotation =
+              !expanded && mergedTargets.length === 1 && sessions.length === 1
+                ? sidebarSiblingAnnotation(sessions[0])
+                : undefined;
+            const rowOptions: AgentRowOptions = {
+              // Label only: every lookup below stays keyed by the canonical
+              // agent ID so models, activity, expansion and history keep
+              // resolving.
+              label: snapshot.agentDisplayNames?.[agentName] || agentName,
+              model,
+              modelName: modelNames?.get(model),
+              variant,
+              active,
+              now,
               theme,
-              () => interaction?.navigate?.(target.sessionID),
+              sessionCount: clickable ? allTargets.length : undefined,
+              expanded,
+              onClick: onAgentClick,
               hoverBackground,
-              interaction?.hasSelectedText,
-            ),
-          ),
-        ];
-      }),
+              hasSelectedText: interaction?.hasSelectedText,
+              hasHistory: !active && history,
+            };
+            rowOptions.annotation = singleAnnotation;
+            const agentRowEl = compactSidebar
+              ? compactAgentRow(rowOptions)
+              : agentRow(rowOptions);
+            if (!expanded) return [agentRowEl];
+            return [
+              agentRowEl,
+              ...allTargets.map((target) =>
+                sessionTargetRow(
+                  target,
+                  theme,
+                  now,
+                  () => interaction?.navigate?.(target.sessionID),
+                  hoverBackground,
+                  interaction?.hasSelectedText,
+                ),
+              ),
+            ];
+          })
+        : []),
     ],
   );
 }
@@ -1203,18 +1609,75 @@ function buildConfigStatusRow(
   );
 }
 
-function readConfigState(directory: string): {
+function resolveMultiplexerType(value: unknown): MultiplexerType {
+  const parsed = MultiplexerConfigSchema.safeParse(value ?? {});
+  return parsed.success ? parsed.data.type : 'none';
+}
+
+/**
+ * Active-preset row. With `onActivate` it behaves like the agent rows
+ * (same hover/click decoration); without one it is a muted, informational
+ * line — capability detection happens in the v2 setup, never here.
+ */
+function buildPresetRow(
+  presetRow: SidebarPresetRow,
+  theme: { text: unknown; textMuted: unknown },
+  hoverBackground: unknown,
+  hasSelectedText?: () => boolean,
+): JSX.Element {
+  const clickable = presetRow.onActivate !== undefined;
+  const row = box(
+    {
+      width: '100%',
+      flexDirection: 'row',
+      marginTop: 1,
+      columnGap: 1,
+      ...(clickable ? { shouldFill: true } : {}),
+    },
+    [
+      text({ fg: theme.textMuted, width: 6 }, ['Preset']),
+      text(
+        {
+          fg: clickable ? theme.text : theme.textMuted,
+          wrapMode: 'none',
+          truncate: true,
+          flexShrink: 1,
+        },
+        [presetRow.name],
+      ),
+      ...(clickable
+        ? [text({ fg: theme.textMuted, flexShrink: 0 }, ['▸'])]
+        : []),
+    ],
+  );
+  if (!clickable) return row;
+  return decorateInteractiveRow(row, {
+    hoverBackground,
+    onActivate: presetRow.onActivate,
+    hasSelectedText,
+  });
+}
+
+export interface SidebarConfigState {
   configInvalid: boolean;
   compactSidebar: boolean;
-} {
+  multiplexerType: MultiplexerType;
+  /** Active preset name (`config.preset`), undefined when unset. */
+  presetName?: string;
+}
+
+export function readConfigState(
+  directory: string,
+  hostFlavor?: string,
+): SidebarConfigState {
   let configInvalid = false;
   const config = loadPluginConfig(directory, {
+    hostFlavor,
     silent: true,
     onWarning: (warning) => {
       // Only genuinely broken configs (parse/load/schema failures) mark the
-      // sidebar invalid. Benign deprecation notices (deprecated-key) and
-      // missing-preset do not, otherwise a config that loads fine would be
-      // shown as "Config invalid".
+      // sidebar invalid. Benign missing-preset notices do not, otherwise a
+      // config that loads fine would be shown as "Config invalid".
       if (
         warning.kind === 'invalid-json' ||
         warning.kind === 'invalid-schema' ||
@@ -1225,15 +1688,26 @@ function readConfigState(directory: string): {
     },
   });
   const compactSidebar = config.compactSidebar ?? true;
-  return { configInvalid, compactSidebar };
+  const multiplexerType = resolveMultiplexerType(config.multiplexer);
+  const presetName =
+    typeof config.preset === 'string' && config.preset.length > 0
+      ? config.preset
+      : undefined;
+  return { configInvalid, compactSidebar, multiplexerType, presetName };
 }
 
-export function readConfigInvalid(directory: string): boolean {
-  return readConfigState(directory).configInvalid;
-}
-
-export function readCompactSidebar(directory: string): boolean {
-  return readConfigState(directory).compactSidebar;
+/**
+ * Surface a broken config without replacing config-backed rows with the
+ * loader's fallback defaults. Once the file is valid again, the fresh state
+ * atomically replaces the retained values.
+ */
+export function retainLastGoodConfigState(
+  current: SidebarConfigState,
+  next: SidebarConfigState,
+): SidebarConfigState {
+  return next.configInvalid
+    ? { ...current, configInvalid: true }
+    : { ...next, configInvalid: false };
 }
 
 const DEFAULT_SIDEBAR_SLOT_ORDER = 900;
@@ -1306,12 +1780,15 @@ interface V2TuiSlotClaim {
   render: (input: { sessionID: string }) => JSX.Element;
 }
 
-interface V2TuiContext {
+interface V2TuiContext extends V2PresetManagerContext {
   location?: { directory: string };
   client?: unknown;
+  data?: V2PresetManagerContext['data'] & {
+    on?: (type: string, handler: (event: unknown) => void) => unknown;
+  };
   renderer: { requestRender: () => void; getSelection?: () => unknown };
   theme: V2TuiThemeTokens;
-  ui: {
+  ui: V2PresetUiSurface & {
     slot: (claim: V2TuiSlotClaim) => () => void;
     router: {
       current: () => { type?: string; sessionID?: string };
@@ -1342,113 +1819,346 @@ function v2ThemeView(theme: V2TuiThemeTokens): {
   };
 }
 
-/**
- * V2 entry point: sidebar slot + refresh loop; returns cleanup.
- * `/preset` stays v1-only (`api.command` is absent on v2).
- */
-async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
-  if (isPluginDisabledByEnv()) return;
+interface SidebarRuntimeAdapter {
+  hostFlavor?: string;
+  version: string;
+  getDirectory: () => string;
+  getVisibleSession: () => string | undefined;
+  client?: unknown;
+  renderer: { requestRender: () => void; getSelection?: () => unknown };
+  theme: () => Parameters<typeof renderSidebar>[2];
+  navigate?: (sessionID: string) => void;
+  registerSlot: (render: () => JSX.Element) => undefined | (() => void);
+  subscribeConfigChanges?: (
+    directory: string,
+    listener: () => { ok: boolean; reason?: string } | undefined,
+  ) => () => void;
+  getPresetRow?: (
+    directory: string,
+    presetName?: string,
+  ) => SidebarPresetRow | undefined;
+  onMultiplexerConfig?: (type: MultiplexerType) => void;
+}
 
-  const version = (await readPackageVersion()) ?? 'dev';
-  let configDirectory = ctx.location?.directory ?? process.cwd();
-  let { configInvalid, compactSidebar } = readConfigState(configDirectory);
+/** One refresh/animation/interaction lifecycle for both host slot contracts. */
+function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
+  let configDirectory = adapter.getDirectory();
+  let { configInvalid, compactSidebar, multiplexerType, presetName } =
+    readConfigState(configDirectory, adapter.hostFlavor);
+  adapter.onMultiplexerConfig?.(multiplexerType);
+  const applyConfigState = (): boolean => {
+    const next = retainLastGoodConfigState(
+      { configInvalid, compactSidebar, multiplexerType, presetName },
+      readConfigState(configDirectory, adapter.hostFlavor),
+    );
+    const changed =
+      next.configInvalid !== configInvalid ||
+      next.compactSidebar !== compactSidebar ||
+      next.multiplexerType !== multiplexerType ||
+      next.presetName !== presetName;
+    if (changed) {
+      configInvalid = next.configInvalid;
+      compactSidebar = next.compactSidebar;
+      multiplexerType = next.multiplexerType;
+      presetName = next.presetName;
+      adapter.onMultiplexerConfig?.(multiplexerType);
+    }
+    return changed;
+  };
   const [snapshot, setSnapshot] = createSignal(
     readTuiSnapshot(configDirectory),
   );
   const [animationNow, setAnimationNow] = createSignal(Date.now());
-  const tmuxRegistration: ActiveTmuxPaneRegistration = {
-    ownerPid: process.pid,
-    lastRecordedAt: 0,
-  };
-  syncTmuxPaneRegistration(ctx.ui.router.current(), tmuxRegistration);
   let disposed = false;
+  let unregisterConfigListener = () => {};
   const remoteCache: RemoteModelCache = {};
+  const modelNamesCache: ModelNamesCache = { names: new Map() };
+  const [modelNames, setModelNames] = createSignal<ReadonlyMap<string, string>>(
+    modelNamesCache.names,
+  );
   const refreshSidebar = async () => {
     if (disposed) return;
-    const currentDirectory = ctx.location?.directory ?? process.cwd();
-    syncTmuxPaneRegistration(ctx.ui.router.current(), tmuxRegistration);
+    const currentDirectory = adapter.getDirectory();
     let nextSnapshot = await readTuiSnapshotAsync(currentDirectory);
     if (disposed) return;
     const directoryChanged = currentDirectory !== configDirectory;
+    let stateChanged = false;
     if (directoryChanged) {
       configDirectory = currentDirectory;
-      ({ configInvalid, compactSidebar } = readConfigState(configDirectory));
+      ({ configInvalid, compactSidebar, multiplexerType, presetName } =
+        readConfigState(configDirectory, adapter.hostFlavor));
+      adapter.onMultiplexerConfig?.(multiplexerType);
+      // Never carry one project's last-good config state into another.
+      bindConfigListener();
+      stateChanged = true;
+    }
+    // Config-backed rows (preset label, invalid badge, compact mode) are
+    // re-read on EVERY poll — even when the snapshot is unchanged — so
+    // manual config edits surface without waiting for the next write.
+    if (!directoryChanged) {
+      try {
+        stateChanged = applyConfigState();
+      } catch (err) {
+        log('[v2][tui] config state read failed', String(err));
+      }
     }
     nextSnapshot = await hydrateRemoteModels(
       nextSnapshot,
-      ctx.client,
+      adapter.client,
       currentDirectory,
       remoteCache,
     );
     if (disposed) return;
-    if (
-      !isRefreshCurrent(
-        currentDirectory,
-        ctx.location?.directory ?? process.cwd(),
-      )
-    ) {
+    const namesBefore = modelNamesCache.names;
+    await hydrateModelNames(adapter.client, currentDirectory, modelNamesCache);
+    if (!isRefreshCurrent(currentDirectory, adapter.getDirectory())) {
       return;
     }
-    if (!directoryChanged && snapshotSectionsEqual(nextSnapshot, snapshot())) {
+    if (modelNamesCache.names !== namesBefore) {
+      setModelNames(modelNamesCache.names);
+    }
+    const snapshotChanged =
+      directoryChanged || !snapshotSectionsEqual(nextSnapshot, snapshot());
+    if (!snapshotChanged && !stateChanged) {
       return;
     }
-    setSnapshot(nextSnapshot);
-    ctx.renderer.requestRender();
+    if (snapshotChanged) {
+      setSnapshot(nextSnapshot);
+    }
+    if (!disposed) adapter.renderer.requestRender();
   };
+  const interaction = createSidebarInteraction(
+    adapter.navigate,
+    selectionGuard(adapter.renderer),
+  );
   const scheduleRefresh = createSerializedRefresh(refreshSidebar);
+  const bindConfigListener = () => {
+    unregisterConfigListener();
+    if (!adapter.subscribeConfigChanges) return;
+    unregisterConfigListener = adapter.subscribeConfigChanges(
+      configDirectory,
+      () => {
+        let changed = false;
+        try {
+          changed = applyConfigState();
+        } catch (err) {
+          log('[v2][tui] config state read failed', String(err));
+          return { ok: false, reason: String(err) };
+        }
+        if (changed) {
+          adapter.renderer.requestRender();
+          scheduleRefresh();
+        }
+        return { ok: true };
+      },
+    );
+  };
+  bindConfigListener();
   scheduleRefresh();
-  const renderTimer = setInterval(scheduleRefresh, 1000);
+  const rawRefreshMs = Number(process.env.OH_MY_OPENCODE_SLIM_TUI_REFRESH_MS);
+  // Test hook: shrink the 1s sidebar poll. Guarded so a bad value cannot
+  // spin the timer (setInterval clamps non-positive delays to ~1ms).
+  const renderIntervalMs =
+    Number.isFinite(rawRefreshMs) && rawRefreshMs >= 10 ? rawRefreshMs : 1000;
+  const renderTimer = setInterval(scheduleRefresh, renderIntervalMs);
   const animationTimer = setInterval(() => {
-    // Same scoping as the render: hidden foreign-conversation activity
-    // must not keep this window's sidebar rerendering every frame.
     if (
       !disposed &&
-      getActiveSidebarAgentNames(snapshot(), visibleSession()).size > 0
+      getActiveSidebarAgentNames(snapshot(), adapter.getVisibleSession()).size >
+        0
     ) {
       setAnimationNow(Date.now());
     }
   }, ACTIVITY_FRAME_MS);
 
-  const visibleSession = () => resolveRouteSessionId(ctx.ui.router.current());
-
-  // Clickable sidebar: navigation is optional on v2 hosts (feature-detected
-  // at startup); without it the sidebar renders informatively.
-  const interaction = createSidebarInteraction(
-    makeRouteNavigator(ctx.ui.router, 'navigate', true),
-    selectionGuard(ctx.renderer),
+  const disposeSlot = adapter.registerSlot(() =>
+    reactiveElement(() => {
+      const visible = adapter.getVisibleSession();
+      const currentSnapshot = snapshot();
+      interaction.syncScope(
+        configDirectory,
+        visible === undefined
+          ? undefined
+          : resolveTuiSnapshotRoot(currentSnapshot, visible),
+      );
+      return renderSidebar(
+        currentSnapshot,
+        adapter.version,
+        adapter.theme(),
+        configInvalid,
+        compactSidebar,
+        animationNow,
+        visible,
+        interaction,
+        adapter.getPresetRow?.(configDirectory, presetName),
+        modelNames(),
+      );
+    }),
   );
 
-  const disposeSlot = ctx.ui.slot({
-    append: 'sidebar.content',
-    render: () =>
-      reactiveElement(() => {
-        const visible = visibleSession();
-        const currentSnapshot = snapshot();
-        interaction.syncScope(
-          configDirectory,
-          visible === undefined
-            ? undefined
-            : resolveTuiSnapshotRoot(currentSnapshot, visible),
-        );
-        return renderSidebar(
-          currentSnapshot,
-          version,
-          v2ThemeView(ctx.theme),
-          configInvalid,
-          compactSidebar,
-          animationNow,
-          visible,
-          interaction,
-        );
-      }),
+  return {
+    getDirectory: () => configDirectory,
+    getSnapshot: snapshot,
+    setSnapshot,
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      unregisterConfigListener();
+      disposeSlot?.();
+      clearInterval(renderTimer);
+      clearInterval(animationTimer);
+    },
+  };
+}
+
+/** V2 slot adapter; `/preset` remains registered by src/v2/tui.ts. */
+async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
+  if (isPluginDisabledByEnv()) return;
+  const presetManagerCtx = (directory: string): V2TuiContext => {
+    const augmented = Object.create(ctx as object) as V2TuiContext;
+    augmented.onConfigChanged = () =>
+      notifyConfigChanged(directory, 'preset-manager');
+    return augmented;
+  };
+  // Tracks the runtime's effective `multiplexer.type` (onMultiplexerConfig).
+  let multiplexerType: MultiplexerType = 'none';
+  // Client-side pane lifecycle: the v2 host adapter classifies this process's
+  // access mode (shared service / explicit server / standalone) and supplies
+  // the lifecycle seams. Standalone and malformed modes cannot host panes —
+  // their private server has no joinable address — so they get the
+  // once-per-process diagnostic (pointing at the native-surface fallback)
+  // instead of a wiring. The mode is constant per process, which keeps the
+  // diagnostic well-defined across directory changes.
+  const v2HostMode = detectV2HostMode(process.argv);
+  let hostFailureDetail: { mode: string; reason?: string } | null =
+    v2HostMode.mode === 'standalone' || v2HostMode.mode === 'invalid'
+      ? describeV2HostMode(v2HostMode)
+      : null;
+  let paneWiring: TuiPaneWiring | null = null;
+  let paneWiringSetting: string | null = null;
+  // Set by the setup teardown. A config-triggered rebuild can be waiting on
+  // the host or the reachability probe when the TUI closes; this flag makes
+  // such a rebuild self-dispose instead of going live after teardown.
+  let paneWiringClosed = false;
+  const disposePaneWiring = async (): Promise<void> => {
+    const stale = paneWiring;
+    if (stale === null) return;
+    paneWiring = null;
+    paneWiringSetting = null;
+    await stale.dispose().catch(() => {
+      // Best-effort teardown; pane leftovers fall to the FR-8 sweep.
+    });
+  };
+  const createPaneWiring = async (): Promise<void> => {
+    try {
+      const paneHost = await buildV2PaneWiringOptions({
+        location: ctx.location,
+        client: ctx.client,
+        data: ctx.data,
+        ui: ctx.ui,
+        env: process.env,
+        argv: process.argv,
+      });
+      if (paneHost.options !== null) {
+        const wiring = await createTuiPaneWiring({
+          ...paneHost.options,
+          client: ctx.client,
+        });
+        if (paneWiringClosed) {
+          await wiring.dispose().catch(() => {
+            // Best-effort teardown; pane leftovers fall to the FR-8 sweep.
+          });
+          return;
+        }
+        paneWiring = wiring;
+        paneWiringSetting = multiplexerType;
+      } else {
+        hostFailureDetail = describeV2HostMode(paneHost.mode);
+      }
+    } catch (error) {
+      log('[pane-lifecycle] v2 wiring failed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+  /**
+   * v2 hosts hot-reload config, so the pane wiring must follow the effective
+   * `multiplexer.type` (FR-9) for the whole process lifetime: disabling
+   * disposes the wiring, enabling or switching adapters rebuilds it, and an
+   * unchanged setting keeps it (its directory accessor follows the route).
+   * Rebuilds are serialized; every run re-reads the latest state.
+   */
+  let paneWiringSync: Promise<void> = Promise.resolve();
+  const reconcilePaneWiring = (): Promise<void> => {
+    paneWiringSync = paneWiringSync
+      .then(async () => {
+        if (paneWiringClosed) return;
+        if (hostFailureDetail !== null || multiplexerType === 'none') {
+          await disposePaneWiring();
+          return;
+        }
+        if (paneWiring !== null && paneWiringSetting === multiplexerType)
+          return;
+        await disposePaneWiring();
+        await createPaneWiring();
+      })
+      .catch((error) => {
+        log('[pane-lifecycle] v2 wiring reconcile failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    return paneWiringSync;
+  };
+  const warnPaneUnsupported = () => {
+    if (hostFailureDetail === null) return;
+    warnV2HostUnsupportedMultiplexer(multiplexerType, hostFailureDetail);
+  };
+  const version = (await readPackageVersion()) ?? 'dev';
+  const runtime = createSidebarRuntime({
+    version,
+    hostFlavor: 'v2',
+    getDirectory: () => ctx.location?.directory ?? process.cwd(),
+    getVisibleSession: () => resolveRouteSessionId(ctx.ui.router.current()),
+    client: ctx.client,
+    renderer: ctx.renderer,
+    theme: () => v2ThemeView(ctx.theme),
+    navigate: makeRouteNavigator(ctx.ui.router, 'navigate', true),
+    registerSlot: (render) =>
+      ctx.ui.slot({ append: 'sidebar.content', render }),
+    subscribeConfigChanges: (directory, listener) =>
+      registerConfigChangeListener(directory, listener),
+    onMultiplexerConfig: (type) => {
+      multiplexerType = type;
+      warnPaneUnsupported();
+      void reconcilePaneWiring();
+    },
+    getPresetRow: (directory, presetName) => {
+      if (presetName === undefined) return undefined;
+      if (!canOpenPresetManagerV2(ctx)) return { name: presetName };
+      return {
+        name: presetName,
+        onActivate: () => {
+          void openPresetManagerV2(presetManagerCtx(directory), directory);
+        },
+      };
+    },
   });
+  // The runtime reports the initial setting synchronously; let the first
+  // wiring settle before setup returns.
+  await paneWiringSync;
 
   return () => {
-    disposed = true;
-    disposeSlot();
-    clearInterval(renderTimer);
-    clearInterval(animationTimer);
-    clearTmuxPaneRegistration(tmuxRegistration);
+    paneWiringClosed = true;
+    runtime.dispose();
+    // Release what is live now (the wiring's unsubscribe loop runs
+    // synchronously), then settle any in-flight rebuild: it self-disposes
+    // when it sees `paneWiringClosed`, so a wiring created during the
+    // teardown window cannot outlive the TUI.
+    void disposePaneWiring();
+    void (async () => {
+      await paneWiringSync;
+      await disposePaneWiring();
+    })();
   };
 }
 
@@ -1470,10 +2180,50 @@ function buildPresetCommand(
   return {
     title: 'Switch preset',
     value: 'preset',
-    description: 'Switch agent presets at runtime (e.g. /preset cheap)',
+    description: 'Switch agent presets at runtime',
     slash: { name: 'preset' },
     onSelect: () => {
       openPresetManager(api, directoryGetter(), snapshotRef);
+    },
+  };
+}
+
+/**
+ * Build the TUI slash command for `/killall`. Same legacy `api.command`
+ * registration as `/preset`: pure TUI entry point, no picker and no
+ * confirmation — it is an emergency escape hatch. The actual work is the
+ * shared helper in `src/tui-kill.ts`; post-kill reconciliation rides the
+ * existing idle pipeline.
+ */
+function buildKillAllCommand(
+  api: TuiPluginApi,
+  directoryGetter: () => string,
+  snapshotGetter: () => TuiSnapshot,
+): TuiCommand {
+  return {
+    title: 'OMO: kill all running subagents',
+    value: 'omo.kill_all',
+    description: 'Abort every running subagent of this conversation',
+    slash: { name: 'killall' },
+    keybind: KILL_ALL_KEYBIND,
+    onSelect: () => {
+      void killAllRunningSubagents(
+        (api as { client?: unknown }).client,
+        snapshotGetter(),
+        resolveRouteSessionId(api.route.current),
+        directoryGetter(),
+      )
+        .then((result) => {
+          api.ui.toast({
+            variant: result.failed > 0 ? 'warning' : 'info',
+            message: killAllSummaryMessage(result),
+          });
+        })
+        .catch((error) => {
+          log('[tui-kill] kill-all flow failed', {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
     },
   };
 }
@@ -1493,119 +2243,58 @@ const plugin: TuiDualContractModule = {
   tui: async (api, _options, meta) => {
     if (isPluginDisabledByEnv()) return;
 
-    const version = meta.version ?? (await readPackageVersion()) ?? 'dev';
-    let configDirectory = getTuiDirectory(api);
-    let { configInvalid, compactSidebar } = readConfigState(configDirectory);
-    const [snapshot, setSnapshot] = createSignal(
-      readTuiSnapshot(configDirectory),
-    );
-    const [animationNow, setAnimationNow] = createSignal(Date.now());
-    const tmuxRegistration: ActiveTmuxPaneRegistration = {
-      ownerPid: process.pid,
-      lastRecordedAt: 0,
-    };
-    syncTmuxPaneRegistration(api.route.current, tmuxRegistration);
-    const remoteCache: RemoteModelCache = {};
-    const refreshSidebar = async () => {
-      const currentDirectory = getTuiDirectory(api);
-      syncTmuxPaneRegistration(api.route.current, tmuxRegistration);
-      let nextSnapshot = await readTuiSnapshotAsync(currentDirectory);
-      const directoryChanged = currentDirectory !== configDirectory;
-      if (directoryChanged) {
-        configDirectory = currentDirectory;
-        ({ configInvalid, compactSidebar } = readConfigState(configDirectory));
-      }
-      nextSnapshot = await hydrateRemoteModels(
-        nextSnapshot,
-        (api as { client?: unknown }).client,
-        currentDirectory,
-        remoteCache,
-      );
-      if (!isRefreshCurrent(currentDirectory, getTuiDirectory(api))) return;
-      if (
-        !directoryChanged &&
-        snapshotSectionsEqual(nextSnapshot, snapshot())
-      ) {
-        return;
-      }
-      setSnapshot(nextSnapshot);
-      api.renderer.requestRender();
-    };
-    const scheduleRefresh = createSerializedRefresh(refreshSidebar);
-    scheduleRefresh();
-    const renderTimer = setInterval(scheduleRefresh, 1000);
-    const animationTimer = setInterval(() => {
-      // Same scoping as the render: hidden foreign-conversation activity
-      // must not keep this window's sidebar rerendering every frame.
-      if (
-        getActiveSidebarAgentNames(
-          snapshot(),
-          resolveRouteSessionId(api.route.current),
-        ).size > 0
-      ) {
-        setAnimationNow(Date.now());
-      }
-    }, ACTIVITY_FRAME_MS);
-
-    api.lifecycle.onDispose(() => {
-      clearInterval(renderTimer);
-      clearInterval(animationTimer);
-      clearTmuxPaneRegistration(tmuxRegistration);
-    });
-
-    // Clickable sidebar: v1 hosts always expose api.route.navigate.
-    const interaction = createSidebarInteraction(
-      makeRouteNavigator(api.route, 'navigate', false),
-      selectionGuard(api.renderer),
-    );
-
-    api.slots.register({
-      order: resolveSidebarSlotOrder(api.tuiConfig?.plugin, PLUGIN_NAME),
-      slots: {
-        sidebar_content() {
-          return reactiveElement(() => {
-            const visible = resolveRouteSessionId(api.route.current);
-            const currentSnapshot = snapshot();
-            interaction.syncScope(
-              configDirectory,
-              visible === undefined
-                ? undefined
-                : resolveTuiSnapshotRoot(currentSnapshot, visible),
-            );
-            return renderSidebar(
-              currentSnapshot,
-              version,
-              api.theme.current,
-              configInvalid,
-              compactSidebar,
-              animationNow,
-              visible,
-              interaction,
-            );
-          });
-        },
+    const runtime = createSidebarRuntime({
+      version: meta.version ?? (await readPackageVersion()) ?? 'dev',
+      getDirectory: () => getTuiDirectory(api),
+      getVisibleSession: () => resolveRouteSessionId(api.route.current),
+      client: (api as { client?: unknown }).client,
+      renderer: api.renderer,
+      theme: () => api.theme.current,
+      navigate: makeRouteNavigator(api.route, 'navigate', false),
+      registerSlot: (render) => {
+        api.slots.register({
+          order: resolveSidebarSlotOrder(api.tuiConfig?.plugin, PLUGIN_NAME),
+          slots: { sidebar_content: render },
+        });
+        return undefined;
       },
     });
+    api.lifecycle.onDispose(runtime.dispose);
 
     // `/preset` is a pure TUI slash command (like the built-in `/models`):
     // it opens a picker, switches the preset via on-disk state, and never
     // sends a message to the server or triggers an LLM turn. The legacy
     // `api.command` API is still populated in OpenCode 1.18; if it is absent
     // (e.g. a future v2-only build), registration is skipped gracefully.
+    // `/killall` (+ alt+w) rides the same registration: it only
+    // resolves visible-conversation targets from the snapshot and aborts
+    // them via the shared helper.
     if (api.command) {
       const snapshotRef: { snapshot: TuiSnapshot } = {
         get snapshot() {
-          return snapshot();
+          return runtime.getSnapshot();
         },
         set snapshot(value: TuiSnapshot) {
-          setSnapshot(value);
+          runtime.setSnapshot(value);
         },
       };
       const disposeCommands = api.command.register(() => [
-        buildPresetCommand(api, () => configDirectory, snapshotRef),
+        buildPresetCommand(api, runtime.getDirectory, snapshotRef),
+        buildKillAllCommand(api, runtime.getDirectory, runtime.getSnapshot),
       ]);
       api.lifecycle.onDispose(disposeCommands);
     }
+
+    // Client-side pane lifecycle (v1; the v2 `setup()` wires its own). The
+    // wiring owns admission, config, log init, serverUrl reflection and the
+    // event projection; disposal closes this client's panes best-effort.
+    const paneWiring = await createTuiPaneWiring({
+      ...paneWiringOptions(api),
+      eventBus: api.event,
+      client: (api as { client?: unknown }).client,
+      env: process.env,
+    });
+    api.lifecycle.onDispose(() => paneWiring.dispose());
   },
   setup,
 };

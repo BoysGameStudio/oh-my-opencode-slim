@@ -1,7 +1,9 @@
 import { z } from 'zod';
+import { MarketplacePackageIdSchema } from '../marketplace/schemas';
 import {
   AGENT_THEME_COLORS,
-  DEFAULT_MAX_RETAINED_SNAPSHOTS,
+  DEFAULT_CHILD_INPUT_WAKE_KINDS,
+  STRING_ONLY_PERMISSION_KEYS,
 } from './constants';
 import { CouncilConfigSchema } from './council-schema';
 import { ProviderModelIdSchema } from './model-id-schema';
@@ -19,29 +21,27 @@ const PermissionRuleSchema = z.union([
   z.record(z.string(), PermissionActionSchema),
 ]);
 
-// Known keys are typed for typo protection; .catchall() types the index
-// signature to match the SDK's PermissionConfig, so no cast is needed at
-// the assignment site. Unknown tool keys are still validated as rules.
+// A permission object's key order IS its precedence: opencode compiles the
+// entries into {action, resource, effect} rules and evaluates them
+// last-match-wins, so authors write the wildcard base ("*": "deny") first
+// and specific allows after. zod's z.object() emits declared keys first and
+// catchall keys after, which silently inverted that order and made a
+// read-only preset deny its own allows. A record parse preserves author
+// order; the string-only keys keep their narrower validation below.
 const PermissionObjectSchema = z
-  .object({
-    read: PermissionRuleSchema.optional(),
-    edit: PermissionRuleSchema.optional(),
-    glob: PermissionRuleSchema.optional(),
-    grep: PermissionRuleSchema.optional(),
-    list: PermissionRuleSchema.optional(),
-    bash: PermissionRuleSchema.optional(),
-    task: PermissionRuleSchema.optional(),
-    external_directory: PermissionRuleSchema.optional(),
-    lsp: PermissionRuleSchema.optional(),
-    skill: PermissionRuleSchema.optional(),
-    todowrite: PermissionActionSchema.optional(),
-    question: PermissionActionSchema.optional(),
-    webfetch: PermissionActionSchema.optional(),
-    websearch: PermissionActionSchema.optional(),
-    codesearch: PermissionActionSchema.optional(),
-    doom_loop: PermissionActionSchema.optional(),
-  })
-  .catchall(PermissionRuleSchema);
+  .record(z.string(), PermissionRuleSchema)
+  .superRefine((permission, ctx) => {
+    for (const key of STRING_ONLY_PERMISSION_KEYS) {
+      const value = permission[key];
+      if (value !== undefined && typeof value !== 'string') {
+        ctx.addIssue({
+          code: 'custom',
+          path: [key],
+          message: "Expected 'ask' | 'allow' | 'deny'",
+        });
+      }
+    }
+  });
 
 export const PermissionConfigSchema = z.union([
   PermissionActionSchema,
@@ -92,6 +92,12 @@ export const AgentOverrideConfigSchema = z
       .describe(
         "Skill names to remove from this agent's effective skills list. Applied after `skills_add` during config resolution, so removal wins over addition. Folded into `skills` at resolution time.",
       ),
+    skills_include_local: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, adds valid skills from the current/ancestor project `.opencode/skills/**/SKILL.md` and `.agents/skills/**/SKILL.md` trees to this agent's effective skills before `skills_remove`. Global and external skill sources are excluded.",
+      ),
     mcps: z.array(z.string()).optional(), // MCPs this agent can use ("*" = all, "!item" = exclude)
     prompt: z.string().min(1).optional(),
     orchestratorPrompt: z.string().min(1).optional(),
@@ -112,7 +118,8 @@ export const MultiplexerTypeSchema = z.enum([
   'zellij',
   'herdr',
   'kitty',
-  'cmux',
+  'wezterm',
+  'cmux-tui',
   'none',
 ]);
 export type MultiplexerType = z.infer<typeof MultiplexerTypeSchema>;
@@ -128,17 +135,191 @@ export const MultiplexerLayoutSchema = z.enum([
 
 export type MultiplexerLayout = z.infer<typeof MultiplexerLayoutSchema>;
 
-// Zellij pane placement options
-export const ZellijPaneModeSchema = z.enum(['agent-tab', 'current-tab']);
-export type ZellijPaneMode = z.infer<typeof ZellijPaneModeSchema>;
+export const MULTIPLEXER_MAIN_PANE_SIZE_MIN = 20;
+export const MULTIPLEXER_MAIN_PANE_SIZE_MAX = 80;
+export const MULTIPLEXER_MAIN_PANE_SIZE_DEFAULT = 60;
 
-// Multiplexer integration configuration (new unified config)
-export const MultiplexerConfigSchema = z.object({
+const MultiplexerMainPaneSizeSchema = z
+  .number()
+  .min(MULTIPLEXER_MAIN_PANE_SIZE_MIN)
+  .max(MULTIPLEXER_MAIN_PANE_SIZE_MAX);
+
+/**
+ * Explicit cmux-tui binary path. Shared by `MultiplexerConfigStrictSchema`
+ * and the sanitizer's per-key check so validation and sanitization can never
+ * drift apart (a drift here let an invalid value reject the whole config
+ * layer instead of dropping the one bad key).
+ */
+const MultiplexerCmuxTuiBinarySchema = z.string().min(1);
+
+/**
+ * Subagent pane surface: the full `tui` (v1 default) or the lightweight
+ * `mini` interface (v2 default). The host wiring resolves an omitted value.
+ */
+export const MultiplexerViewerSchema = z.enum(['tui', 'mini']);
+
+export type MultiplexerViewer = z.infer<typeof MultiplexerViewerSchema>;
+
+/**
+ * Invalid `type` / `layout` / `main_pane_size` / `cmux_tui_binary` / `viewer`
+ * values disable pane management with one diagnostic.
+ */
+export const MULTIPLEXER_INVALID_VALUE_MESSAGE =
+  'Invalid multiplexer config value; pane management is disabled. Expected ' +
+  'type (auto|tmux|zellij|herdr|kitty|wezterm|cmux-tui|none), layout ' +
+  '(main-horizontal|main-vertical|tiled|even-horizontal|even-vertical), ' +
+  'main_pane_size (20-80), cmux_tui_binary (non-empty string), ' +
+  'viewer (tui|mini).';
+
+export const MULTIPLEXER_RENAMED_TYPE_MESSAGE =
+  'multiplexer.type "cmux" was renamed to "cmux-tui"; update your config.';
+
+/** Multiplexer diagnostics are emitted at most once per process. */
+export type MultiplexerDiagnosticKind = 'invalid-value' | 'renamed-type';
+
+const emittedMultiplexerDiagnostics = new Set<MultiplexerDiagnosticKind>();
+
+/**
+ * Test seam: clears the once-per-process multiplexer diagnostic gate.
+ * Production code never calls this.
+ */
+export function resetMultiplexerDiagnostics(): void {
+  emittedMultiplexerDiagnostics.clear();
+}
+
+function emitMultiplexerDiagnostic(
+  kind: MultiplexerDiagnosticKind,
+  message: string,
+): void {
+  if (emittedMultiplexerDiagnostics.has(kind)) {
+    return;
+  }
+  emittedMultiplexerDiagnostics.add(kind);
+  console.warn(`[oh-my-opencode-slim] ${message}`);
+}
+
+function isPlainConfigObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function invalidMultiplexerKeys(config: Record<string, unknown>): string[] {
+  const invalid: string[] = [];
+  if (
+    'type' in config &&
+    !MultiplexerTypeSchema.safeParse(config.type).success
+  ) {
+    invalid.push('type');
+  }
+  if (
+    'layout' in config &&
+    !MultiplexerLayoutSchema.safeParse(config.layout).success
+  ) {
+    invalid.push('layout');
+  }
+  if (
+    'main_pane_size' in config &&
+    !MultiplexerMainPaneSizeSchema.safeParse(config.main_pane_size).success
+  ) {
+    invalid.push('main_pane_size');
+  }
+  if (
+    'cmux_tui_binary' in config &&
+    !MultiplexerCmuxTuiBinarySchema.optional().safeParse(config.cmux_tui_binary)
+      .success
+  ) {
+    invalid.push('cmux_tui_binary');
+  }
+  if (
+    'viewer' in config &&
+    !MultiplexerViewerSchema.safeParse(config.viewer).success
+  ) {
+    invalid.push('viewer');
+  }
+  return invalid;
+}
+
+/**
+ * Pre-parse normalization for the raw `multiplexer` block.
+ *
+ * Semantics (spec "配置面"):
+ * - an invalid `type` / `layout` / `main_pane_size` / `cmux_tui_binary` / `viewer`
+ *   value (or a non-object `multiplexer` value) disables pane management
+ *   (`type: "none"`) with a once-per-process diagnostic instead of failing
+ *   the whole plugin config;
+ * - the old `cmux` type value is a hard rename to `cmux-tui` (no alias): it
+ *   goes through the same invalid-value path, plus a specific
+ *   once-per-process diagnostic naming the replacement.
+ */
+export function sanitizeMultiplexerConfig(value: unknown): unknown {
+  if (value === undefined) {
+    return value;
+  }
+  if (!isPlainConfigObject(value)) {
+    emitMultiplexerDiagnostic(
+      'invalid-value',
+      `${MULTIPLEXER_INVALID_VALUE_MESSAGE} (multiplexer)`,
+    );
+    return { type: 'none' };
+  }
+
+  let sanitized: Record<string, unknown> = value;
+  if (sanitized.type === 'cmux') {
+    // Hard rename, no alias: `cmux` stays invalid, but the user gets a
+    // specific hint instead of only the generic invalid-value message.
+    emitMultiplexerDiagnostic('renamed-type', MULTIPLEXER_RENAMED_TYPE_MESSAGE);
+  }
+
+  const invalid = invalidMultiplexerKeys(sanitized);
+  if (invalid.length > 0) {
+    emitMultiplexerDiagnostic(
+      'invalid-value',
+      `${MULTIPLEXER_INVALID_VALUE_MESSAGE} (invalid: ${invalid.join(', ')})`,
+    );
+    sanitized = { ...sanitized };
+    for (const key of invalid) {
+      delete sanitized[key];
+    }
+    sanitized.type = 'none';
+  }
+
+  return sanitized;
+}
+
+/**
+ * Unsanitized multiplexer object schema. `MultiplexerConfigSchema` is the
+ * runtime entry point and wraps this with `sanitizeMultiplexerConfig`, which
+ * rewrites invalid values to `type: "none"` before validation. Diagnostic
+ * surfaces (doctor) validate with this schema instead, so invalid
+ * `multiplexer.*` values stay visible rather than being silently sanitized
+ * away. "Strict" here means "not sanitized" — unknown keys are still
+ * stripped.
+ */
+export const MultiplexerConfigStrictSchema = z.object({
   type: MultiplexerTypeSchema.default('none'),
   layout: MultiplexerLayoutSchema.default('main-vertical'),
-  main_pane_size: z.number().min(20).max(80).default(60), // percentage for main pane
-  zellij_pane_mode: ZellijPaneModeSchema.default('agent-tab'),
+  main_pane_size: MultiplexerMainPaneSizeSchema.default(
+    MULTIPLEXER_MAIN_PANE_SIZE_DEFAULT,
+  ), // percentage
+  cmux_tui_binary: MultiplexerCmuxTuiBinarySchema.optional().describe(
+    'Explicit path to the cmux-tui binary. When unset, the adapter probes ' +
+      'PATH for `cmux-tui` first and falls back to `cmux`.',
+  ),
+  viewer: MultiplexerViewerSchema.optional().describe(
+    'Which opencode TUI surface subagent panes open. Defaults to "tui" on ' +
+      'OpenCode v1 and "mini" on v2. "mini" uses `attach ... --mini` on v1 ' +
+      '(requires OpenCode >= 1.17.10) and `opencode mini` on v2; "tui" runs ' +
+      'the full interface.',
+  ),
+  zellij_pane_mode: z
+    .never({ error: 'multiplexer.zellij_pane_mode was removed' })
+    .optional(),
 });
+
+// Multiplexer integration configuration (new unified config)
+export const MultiplexerConfigSchema = z.preprocess(
+  sanitizeMultiplexerConfig,
+  MultiplexerConfigStrictSchema,
+);
 
 export type MultiplexerConfig = z.infer<typeof MultiplexerConfigSchema>;
 
@@ -147,15 +328,106 @@ export type AgentOverrideConfig = z.infer<typeof AgentOverrideConfigSchema>;
 /** Normalized model entry with optional per-model variant. */
 export type ModelEntry = { id: string; variant?: string };
 
-export const PresetSchema = z.record(z.string(), AgentOverrideConfigSchema);
+/** The agent entries in a preset after inheritance has been resolved. */
+export const PresetAgentsSchema = z.record(
+  z.string(),
+  AgentOverrideConfigSchema,
+);
 
-export type Preset = z.infer<typeof PresetSchema>;
+export type Preset = z.infer<typeof PresetAgentsSchema>;
+
+const MarketplacePackageIdsSchema = z
+  .array(MarketplacePackageIdSchema)
+  .superRefine((ids, ctx) => {
+    if (new Set(ids).size !== ids.length) {
+      ctx.addIssue({ code: 'custom', message: 'Package IDs must be unique' });
+    }
+  });
+
+export const MarketplaceActivationSchema = z
+  .object({
+    agents: MarketplacePackageIdsSchema.optional(),
+    agents_add: MarketplacePackageIdsSchema.optional().describe(
+      'Package IDs to add to the inherited marketplace agents list after optional agents replacement.',
+    ),
+    agents_remove: MarketplacePackageIdsSchema.optional().describe(
+      'Package IDs to remove after additions; removal wins over addition.',
+    ),
+  })
+  .strict();
+
+export type MarketplaceActivation = z.infer<typeof MarketplaceActivationSchema>;
+
+const MARKETPLACE_ACTIVATION_KEYS = [
+  'agents',
+  'agents_add',
+  'agents_remove',
+] as const;
+
+/**
+ * Flat presets historically allowed an agent named `marketplace`. Treat the
+ * value as activation only when it contains an explicit activation directive;
+ * an empty object remains a valid empty agent override.
+ */
+export function hasMarketplaceActivationDirectives(
+  value: unknown,
+): value is Record<(typeof MARKETPLACE_ACTIVATION_KEYS)[number], unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    MARKETPLACE_ACTIVATION_KEYS.some((key) => Object.hasOwn(value, key))
+  );
+}
+
+const FlatMarketplaceValueSchema = z.union([
+  MarketplaceActivationSchema,
+  AgentOverrideConfigSchema,
+]);
+
+/**
+ * Structured preset syntax. The `agents` wrapper is the preferred syntax for
+ * new presets; the loader also accepts the inline form below so adding an
+ * `extends` key does not require moving existing agent entries.
+ */
+export const PresetDefinitionSchema = z
+  .object({
+    extends: z.string().min(1).optional(),
+    agents: PresetAgentsSchema,
+    marketplace: MarketplaceActivationSchema.optional(),
+  })
+  .strict();
+
+const InlinePresetDefinitionSchema = z
+  .object({
+    extends: z.string().min(1),
+    marketplace: FlatMarketplaceValueSchema.optional(),
+  })
+  .catchall(AgentOverrideConfigSchema);
+
+const FlatPresetSchema = z
+  .object({
+    marketplace: FlatMarketplaceValueSchema.optional(),
+  })
+  .catchall(AgentOverrideConfigSchema);
+
+/** Raw preset syntax accepted in configuration files. */
+export const PresetSchema = z.xor(
+  [PresetDefinitionSchema, InlinePresetDefinitionSchema, FlatPresetSchema],
+  {
+    error:
+      'Preset syntax is ambiguous: use a non-colliding custom agent name instead of an agents wrapper collision.',
+  },
+);
+
+export type PresetDefinition = z.infer<typeof PresetDefinitionSchema>;
+export type PresetInput = z.infer<typeof PresetSchema>;
 
 // MCP names
 export const McpNameSchema = z.enum(['context7', 'gh_grep']);
 export type McpName = z.infer<typeof McpNameSchema>;
 
-const InterviewOutputFolderSchema = z
+export const InterviewOutputFolderSchema = z
   .string()
   .trim()
   .min(1)
@@ -175,6 +447,12 @@ export const InterviewConfigSchema = z.object({
     ),
   port: z.number().int().min(0).max(65535).default(0),
   dashboard: z.boolean().default(false),
+  printState: z
+    .boolean()
+    .default(false)
+    .describe(
+      'When true, the interview model prints the full <interview_state> block in the TUI instead of submitting state through the interview_submit_state tool.',
+    ),
 });
 
 export type InterviewConfig = z.infer<typeof InterviewConfigSchema>;
@@ -216,26 +494,38 @@ export type BackgroundTaskConcurrencyConfig = z.infer<
   typeof BackgroundTaskConcurrencyConfigSchema
 >;
 
-export const BackgroundJobsConfigSchema = z.object({
+export const BackgroundJobsConfigStrictSchema = z.object({
   strategy: z
-    .enum(['latest', 'checkpoint-compatible'])
-    .default('latest')
-    .describe(
-      'Board injection strategy. "latest" replaces prior board messages; "checkpoint-compatible" preserves them and appends only changed board snapshots.',
-    ),
+    .never({
+      error:
+        'backgroundJobs.strategy was removed; board placement is change-only with frozen replay',
+    })
+    .optional(),
   maxSessionsPerAgent: z.number().int().min(1).max(10).default(2),
-  maxContextLines: z.number().int().min(0).max(500_000).default(50_000),
-  readContextMinLines: z.number().int().min(0).max(1000).default(10),
-  readContextMaxFiles: z.number().int().min(0).max(50).default(8),
+  maxContextLines: z
+    .never({
+      error:
+        'backgroundJobs.maxContextLines was removed; reusability is state-based',
+    })
+    .optional(),
+  readContextMinLines: z
+    .never({
+      error:
+        'backgroundJobs.readContextMinLines was removed; the read-context list is path-only',
+    })
+    .optional(),
+  readContextMaxFiles: z
+    .never({
+      error:
+        'backgroundJobs.readContextMaxFiles was removed; the display cap is internal',
+    })
+    .optional(),
   maxRetainedSnapshots: z
-    .number()
-    .int()
-    .min(1)
-    .max(100)
-    .default(DEFAULT_MAX_RETAINED_SNAPSHOTS)
-    .describe(
-      'Maximum board snapshots retained per checkpoint cache epoch (1–100). Exceeding the limit starts a new epoch with the current snapshot and intentionally creates one cache miss.',
-    ),
+    .never({
+      error:
+        'backgroundJobs.maxRetainedSnapshots was removed; the frozen-replay map is session-bounded',
+    })
+    .optional(),
   orchestratorWake: z
     .object({
       enabled: z
@@ -259,8 +549,36 @@ export const BackgroundJobsConfigSchema = z.object({
         .describe(
           'Wake-condition source. "auto" uses todo-gating on v1 hosts and children-driven degraded mode on v2 hosts (no todo surface there); "todo" or "children" pin one mode, degrading to children when the host lacks the todo API. Default "auto".',
         ),
+      periodicWakeEnabled: z
+        .boolean()
+        .default(true)
+        .describe(
+          'When false, the periodic idle evaluation never runs; only event-driven wakes (stopped-job recovery, terminal-publication rev>1, child-input) still deliver. Failed event wakes keep their timer-based retry path. Default enabled on v1 hosts; v2 hosts never run the periodic evaluation (the native background notifier delivers first terminal publications).',
+        ),
+      wakeOnTerminalPublication: z
+        .boolean()
+        .default(true)
+        .describe(
+          'When true, a terminal completed/error publication wakes an idle parent orchestrator immediately (bounded by publicationWakeMinIntervalMs) instead of waiting for the next periodic evaluation. Busy parents are skipped: the native steer already delivered the completion. Default enabled.',
+        ),
+      publicationWakeMinIntervalMs: z
+        .number()
+        .int()
+        .min(1_000)
+        .max(2_147_483_647)
+        .default(30_000)
+        .describe(
+          'Per-parent minimum spacing between terminal-publication wakes (1,000–2,147,483,647ms; 0 is invalid at the config layer). Default 30,000 (30 seconds). A burst of publications collapses into one wake.',
+        ),
     })
-    .default({ enabled: true, intervalMs: 300_000, mode: 'auto' })
+    .default({
+      enabled: true,
+      intervalMs: 300_000,
+      mode: 'auto',
+      periodicWakeEnabled: true,
+      wakeOnTerminalPublication: true,
+      publicationWakeMinIntervalMs: 30_000,
+    })
     .describe(
       'Periodic orchestrator wake scheduler for idle sessions. v1: requires host session APIs (session.get, todo, children, status, promptAsync) and wakes while incomplete todos remain. v2: runs in children-driven degraded mode (requires session.list + promptAsync) and wakes while un-finished child sessions remain. Default enabled at a 5-minute interval.',
     ),
@@ -279,6 +597,15 @@ export const BackgroundJobsConfigSchema = z.object({
     .describe(
       'Grace period after a wall-clock deadline while OpenCode confirms the child terminal state (1,000–60,000ms).',
     ),
+  stopConfirmationMs: z
+    .number()
+    .int()
+    .min(1_000)
+    .max(60_000)
+    .default(5_000)
+    .describe(
+      'Terminal-gate grace period the background-job terminal gate waits for stop confirmation evidence before publishing a stopped job (1,000–60,000ms). Default 5,000 (5 seconds).',
+    ),
   concurrency: BackgroundTaskConcurrencyConfigSchema,
   sameProviderPolicy: z
     .record(z.string().min(1), z.literal('foreground'))
@@ -292,78 +619,212 @@ export const BackgroundJobsConfigSchema = z.object({
     .describe(
       'When true, intercept wait_for_user calls made while background tasks are still running and the orchestrator wake scheduler is enabled, returning guidance to end the turn instead of blocking on manual input. Default enabled.',
     ),
+  // Preserved for V1 compatibility. Structurally ignored in V2.
+  boardInjection: z
+    .boolean()
+    .default(true)
+    .describe(
+      'When false on v1 hosts, the Background Job Board is never injected into prompts — tracking, wake, and task_status keep working, and terminal retirement runs through prompt-shape consumption (covering cancelled, which has no native delivery). Default enabled. On v2 hosts the key is ignored with a warning: the native background notifier and inbox delivery replace the passive board.',
+    ),
+  childInputWake: z
+    .boolean()
+    .default(true)
+    .describe(
+      'When true, a background child ask wakes its parent with the ask content. Default enabled.',
+    ),
+  childInputWakeKinds: z
+    .object({
+      permission: z.boolean().default(false).catch(false),
+      question: z.boolean().default(true).catch(true),
+    })
+    .catch({ ...DEFAULT_CHILD_INPUT_WAKE_KINDS })
+    .describe(
+      'Which background child ask kinds may wake the parent. Permission asks default off (#1504): their replies carry no host wake and are resolved by the UI or an external responder, so a parent turn is wasted. Question asks default on.',
+    ),
+  pruneEvictedSessions: z
+    .boolean()
+    .default(false)
+    .describe(
+      'When true, removes the host child session when a retention trim evicts its terminal or retained-stopped record, only for background children this plugin launched itself (never foreground, unattributed placeholder, adopted, or restored sessions) and only after a host read confirms the session still belongs to the record parent. Never fires for parent deletion or explicit drops. v1 hosts only for now (v2 has no live session-status map, so every prune is skipped). Default disabled.',
+    ),
+  continueOnIdle: z
+    .never({
+      error:
+        'backgroundJobs.continueOnIdle was removed; use backgroundJobs.orchestratorWake.enabled',
+    })
+    .optional(),
 });
+
+export const BACKGROUND_JOBS_INVALID_VALUE_MESSAGE =
+  'Invalid backgroundJobs config value; offending keys are dropped and defaults apply.';
+
+/** BackgroundJobs diagnostics are emitted at most once per process. */
+let backgroundJobsDiagnosticEmitted = false;
+
+/** Test seam: clears the once-per-process diagnostic gate. */
+export function resetBackgroundJobsDiagnostics(): void {
+  backgroundJobsDiagnosticEmitted = false;
+}
+
+function emitBackgroundJobsDiagnostic(message: string): void {
+  if (backgroundJobsDiagnosticEmitted) return;
+  backgroundJobsDiagnosticEmitted = true;
+  console.warn(`[oh-my-opencode-slim] ${message}`);
+}
+
+/** Unwraps `.default()` layers; returns the shape when the schema is an object schema. */
+function objectShapeOf(
+  schema: z.ZodTypeAny,
+): Record<string, z.ZodTypeAny> | undefined {
+  let current = schema;
+  while (current instanceof z.ZodDefault) {
+    current = current.unwrap() as z.ZodTypeAny;
+  }
+  return current instanceof z.ZodObject
+    ? (current.shape as Record<string, z.ZodTypeAny>)
+    : undefined;
+}
+
+/**
+ * Drops invalid keys, recursing into object-typed keys so one bad nested
+ * value never discards its valid siblings. Two intentional bounds: `z.record`
+ * fields (providerConcurrency / modelConcurrency / sameProviderPolicy) stay
+ * atomic — one bad entry drops the whole record, not the entry; and inside a
+ * `.strict()` object an unknown key is not dropped at this level — the parent
+ * safeParse fails and the whole nested block is dropped. The shape argument
+ * keeps validation and sanitization on one shared definition (zero drift),
+ * and the own-property guard keeps inherited names (`constructor`, …) from
+ * being mistaken for schema keys.
+ */
+function sanitizeRecordByShape(
+  config: Record<string, unknown>,
+  shape: Record<string, z.ZodTypeAny>,
+): { result: Record<string, unknown>; dropped: string[] } {
+  const dropped: string[] = [];
+  let out = config;
+  const copyOnce = () => {
+    if (out === config) out = { ...config };
+  };
+  for (const [key, value] of Object.entries(config)) {
+    if (!Object.hasOwn(shape, key)) continue;
+    const keySchema = shape[key];
+    // Removed keys declared as `z.never()` must reach the parser so the
+    // config is rejected with a "was removed" error; dropping them here
+    // would silently strip the key instead of rejecting it.
+    let unwrapped: z.ZodTypeAny = keySchema;
+    while (
+      unwrapped instanceof z.ZodOptional ||
+      unwrapped instanceof z.ZodDefault
+    ) {
+      unwrapped = unwrapped.unwrap() as z.ZodTypeAny;
+    }
+    if (unwrapped instanceof z.ZodNever) continue;
+    let next = value;
+    let nestedDropped: string[] = [];
+    if (isPlainConfigObject(value)) {
+      const nestedShape = objectShapeOf(keySchema);
+      if (nestedShape) {
+        const nested = sanitizeRecordByShape(value, nestedShape);
+        nestedDropped = nested.dropped;
+        if (nested.result !== value) {
+          copyOnce();
+          next = nested.result;
+          out[key] = next;
+        }
+      }
+    }
+    if (!keySchema.safeParse(next).success) {
+      dropped.push(key);
+      copyOnce();
+      delete out[key];
+    } else {
+      for (const k of nestedDropped) dropped.push(`${key}.${k}`);
+    }
+  }
+  return { result: out, dropped };
+}
+
+/** Issue #1291: drop invalid `backgroundJobs` keys instead of rejecting the whole config layer. */
+export function sanitizeBackgroundJobsConfig(value: unknown): unknown {
+  if (value === undefined) return value;
+  if (!isPlainConfigObject(value)) {
+    emitBackgroundJobsDiagnostic(
+      `${BACKGROUND_JOBS_INVALID_VALUE_MESSAGE} (backgroundJobs)`,
+    );
+    return {};
+  }
+  const { result, dropped } = sanitizeRecordByShape(
+    value,
+    BackgroundJobsConfigStrictSchema.shape as Record<string, z.ZodTypeAny>,
+  );
+  if (dropped.length === 0) return value;
+  emitBackgroundJobsDiagnostic(
+    `${BACKGROUND_JOBS_INVALID_VALUE_MESSAGE} (dropped backgroundJobs keys: ${dropped.join(', ')})`,
+  );
+  return result;
+}
+
+export const BackgroundJobsConfigSchema = z.preprocess(
+  sanitizeBackgroundJobsConfig,
+  BackgroundJobsConfigStrictSchema,
+);
 
 export type BackgroundJobsConfig = z.infer<typeof BackgroundJobsConfigSchema>;
 
-/**
- * Fallback config fields accepted by versions before 2.3.x but no longer
- * meaningful. Kept only so that existing user/project configs containing
- * them still parse: the loader emits a deprecation warning and these keys
- * are stripped before strict validation. Without this, a stale field would
- * make the whole config file fail and drop all the user's settings.
- */
-export const LEGACY_FALLBACK_KEYS = [
-  'timeoutMs',
-  'retry_on_empty',
-  'runtimeOverride',
-] as const;
-
-function stripLegacyFallbackKeys(value: unknown): unknown {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return value;
-  }
-  const record = value as Record<string, unknown>;
-  const hasLegacy = LEGACY_FALLBACK_KEYS.some((key) => key in record);
-  if (!hasLegacy) {
-    return value;
-  }
-  const cleaned: Record<string, unknown> = {};
-  for (const [key, val] of Object.entries(record)) {
-    if (!(LEGACY_FALLBACK_KEYS as readonly string[]).includes(key)) {
-      cleaned[key] = val;
-    }
-  }
-  return cleaned;
-}
-
-export const FailoverConfigSchema = z.preprocess(
-  stripLegacyFallbackKeys,
-  z
-    .object({
-      enabled: z.boolean().default(true),
-      maxRetries: z
-        .number()
-        .int()
-        .min(0)
-        .default(3)
-        .describe(
-          'Number of consecutive 429/rate-limit responses tolerated on the ' +
-            'same model before aborting (or swapping to the next fallback ' +
-            'model when a chain is configured).',
-        ),
-      initialRetryDelayMs: z
-        .number()
-        .int()
-        .min(0)
-        .default(0)
-        .describe(
-          'Delay in milliseconds before triggering the first fallback on a ' +
-            'failover-worthy error. Gives intercepting plugins time to recover ' +
-            'the current model before the fallback chain advances. 0 disables.',
-        ),
-      retryDelayMs: z
-        .number()
-        .int()
-        .min(0)
-        .default(500)
-        .describe(
-          'Delay in milliseconds between consecutive fallback attempts ' +
-            'after the initial trigger. 0 disables.',
-        ),
-    })
-    .strict(),
-);
+export const FailoverConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    maxRetries: z
+      .number()
+      .int()
+      .min(0)
+      .default(3)
+      .describe(
+        'Number of current-model retries allowed before Slim switches to ' +
+          'the next fallback model (or aborts when no chain is configured). ' +
+          'The budget is shared across the whole fallback chain and is not ' +
+          'reset by a model switch; it resets only on a successful ' +
+          'assistant response, session deletion, or a new user turn. 0 ' +
+          'switches immediately.',
+      ),
+    initialRetryDelayMs: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Delay in milliseconds before triggering the first fallback on a ' +
+          'failover-worthy error. Gives intercepting plugins time to recover ' +
+          'the current model before the fallback chain advances. 0 disables.',
+      ),
+    retryDelayMs: z
+      .number()
+      .int()
+      .min(0)
+      .default(500)
+      .describe(
+        'Delay in milliseconds between consecutive fallback attempts ' +
+          'after the initial trigger. 0 disables.',
+      ),
+    continuationPolicy: z
+      .enum(['retry-primary', 'stick-to-fallback'])
+      .default('retry-primary')
+      .describe(
+        'Model policy for unpinned OpenCode v1 internal continuations ' +
+          '(for example, background completion and lifecycle wakes) after ' +
+          'a confirmed fallback. "retry-primary" lets the host try the ' +
+          'configured primary again; "stick-to-fallback" keeps the ' +
+          'confirmed fallback until a new external user turn.',
+      ),
+    timeoutMs: z.never({ error: 'fallback.timeoutMs was removed' }).optional(),
+    retry_on_empty: z
+      .never({ error: 'fallback.retry_on_empty was removed' })
+      .optional(),
+    runtimeOverride: z
+      .never({ error: 'fallback.runtimeOverride was removed' })
+      .optional(),
+  })
+  .strict();
 
 export type FailoverConfig = z.infer<typeof FailoverConfigSchema>;
 
@@ -410,11 +871,6 @@ export const WebfetchConfigSchema = z
       .describe(
         'When false, skip registering this enhanced webfetch so OpenCode uses its built-in version.',
       ),
-    model: AgentOverrideConfigSchema.shape.model.describe(
-      'Dedicated model(s) for smartfetch secondary-model summarization. ' +
-        'Same shape as agent model config (string, array of strings/objects with id+variant). ' +
-        'Takes priority over small_model, agents.explorer.model, and agents.librarian.model.',
-    ),
   })
   .strict();
 
@@ -469,7 +925,32 @@ function rejectOrchestratorPromptOnOrchestrator(
   }
 }
 
-export const PluginConfigSchema = z
+/** Valid `disabled_hooks` entries; single source for the enum and the loader. */
+export const DISABLED_HOOKS_VALUES = [
+  'phase-reminder',
+  'foreground-fallback',
+  'deepwork-guard',
+  'deepwork-goal',
+  'chat-headers',
+  'cache-monitor',
+  'json-error-recovery',
+  'tool-loop-guard',
+  'search-path-guard',
+  'absolute-path-rescue',
+  'apply-patch',
+  'council-inject',
+] as const;
+
+/** Valid `disabled_commands` entries; single source for the enum and the loader. */
+export const DISABLED_COMMANDS_VALUES = [
+  'implement',
+  'interview',
+  'deepwork',
+  'reflect',
+  'loop',
+] as const;
+
+export const RawPluginConfigSchema = z
   .object({
     preset: z.string().optional(),
     setDefaultAgent: z.boolean().optional(),
@@ -484,6 +965,12 @@ export const PluginConfigSchema = z
       .optional()
       .describe(
         'When true, omit orchestrator.model and orchestrator.variant from the SDK config so OpenCode uses the session model selected with /model after subagent dispatch. An explicitly selected preset that sets orchestrator.model is preserved. Defaults to false.',
+      ),
+    routingBlock: z
+      .boolean()
+      .optional()
+      .describe(
+        "When false, removes the <Agents> routing block from the built-in orchestrator prompt. The host's native subagent roster (appended to the subagent tool description) still lists every enabled agent, but it carries no Delegate/Don't routing criteria — set false only to drop stock routing claims that drift against custom agent prompts, or to trim tokens. No effect when an orchestrator.md override already replaces the whole prompt. Defaults to true.",
       ),
     autoUpdate: z
       .boolean()
@@ -513,6 +1000,16 @@ export const PluginConfigSchema = z
           'nudging delegation to @observer. "direct": always passes ' +
           'attachments to the orchestrator untouched.',
       ),
+    deepworkGuardMode: z
+      .enum(['shadow', 'enforce'])
+      .optional()
+      .describe(
+        'Deepwork guard mode. "shadow" (default) records receipts and claim ' +
+          'markers under .slim/deepwork/.runtime/ but never blocks; ' +
+          '"enforce" additionally blocks completion writes whose tombstone ' +
+          'references artifacts with no recorded receipt. The guard itself ' +
+          'is disabled by listing "deepwork-guard" in disabled_hooks.',
+      ),
     disabled_mcps: z
       .array(z.string())
       .optional()
@@ -532,6 +1029,22 @@ export const PluginConfigSchema = z
       .describe(
         'Skill names to disable completely. Disabled skills are not granted to agents, even when referenced by presets or agent overrides.',
       ),
+    disabled_hooks: z
+      .array(z.enum(DISABLED_HOOKS_VALUES))
+      .optional()
+      .describe(
+        'Hook names to disable completely. Valid values: ' +
+          DISABLED_HOOKS_VALUES.join(', ') +
+          '. "phase-reminder" is not registered, so orchestrator phase reminders are never injected; "foreground-fallback" marks the fallback manager inert: it is still constructed but never triggers automatic intervention, same effect as fallback.enabled = false; "chat-headers" is not registered, so the Copilot x-initiator header is never stamped (v1 chat.headers and the v2 model.request bridge); "cache-monitor" stops the prompt-cache bust watchdog, so cache warnings are never logged; the on-demand tool guards ("json-error-recovery", "tool-loop-guard", "search-path-guard", "absolute-path-rescue", "apply-patch") stop intercepting tool calls entirely, so malformed output, repeated identical calls, and invalid or guessed paths surface raw to the model; "council-inject" is not registered, so the keyword-triggered Council Mode injection is never appended to orchestrator messages. Unknown values are stripped with a warning when the config loads. A value consisting only of unknown names is treated as unset, so a lower config layer\'s list still applies.',
+      ),
+    disabled_commands: z
+      .array(z.enum(DISABLED_COMMANDS_VALUES))
+      .optional()
+      .describe(
+        'Slash-command names to disable completely. Valid values: ' +
+          DISABLED_COMMANDS_VALUES.join(', ') +
+          '. Disabled commands are neither registered nor intercepted at execution time, so a user-defined command with the same name is left untouched. The /reflect command is also disabled when "reflect" is listed in disabled_skills. Unknown values are stripped with a warning when the config loads. A value consisting only of unknown names is treated as unset, so a lower config layer\'s list still applies.',
+      ),
     // Multiplexer config
     multiplexer: MultiplexerConfigSchema.optional(),
     interview: InterviewConfigSchema.optional(),
@@ -541,6 +1054,9 @@ export const PluginConfigSchema = z
     companion: CompanionConfigSchema.optional(),
     webfetch: WebfetchConfigSchema.optional(),
     acpAgents: AcpAgentsConfigSchema.optional(),
+    tmux: z
+      .never({ error: 'tmux config was removed; use multiplexer.*' })
+      .optional(),
   })
   .superRefine((value, ctx) => {
     if (value.agents) {
@@ -549,15 +1065,53 @@ export const PluginConfigSchema = z
 
     if (value.presets) {
       for (const [presetName, preset] of Object.entries(value.presets)) {
-        rejectOrchestratorPromptOnOrchestrator(preset, ctx, [
-          'presets',
-          presetName,
-        ]);
+        const presetRecord = preset as Record<string, unknown>;
+        const overrides =
+          typeof presetRecord.agents === 'object' &&
+          presetRecord.agents !== null &&
+          !Array.isArray(presetRecord.agents)
+            ? presetRecord.agents
+            : Object.fromEntries(
+                Object.entries(presetRecord).filter(
+                  ([name, entry]) =>
+                    name !== 'extends' &&
+                    !(
+                      name === 'marketplace' &&
+                      hasMarketplaceActivationDirectives(entry)
+                    ),
+                ),
+              );
+        rejectOrchestratorPromptOnOrchestrator(
+          overrides as Record<
+            string,
+            z.infer<typeof AgentOverrideConfigSchema>
+          >,
+          ctx,
+          ['presets', presetName],
+        );
       }
     }
   });
 
-export type PluginConfig = z.infer<typeof PluginConfigSchema>;
+/** Configuration shape returned by the schema before preset resolution. */
+export type RawPluginConfig = z.infer<typeof RawPluginConfigSchema>;
+
+/**
+ * Public parsed-file type. Presets intentionally remain raw here: the schema
+ * validates file syntax, while the loader resolves inheritance separately.
+ */
+export type PluginConfig = RawPluginConfig;
+
+/** Configuration shape consumed by RuntimeConfig after preset resolution. */
+export type ResolvedPluginConfig = Omit<RawPluginConfig, 'presets'> & {
+  presets?: Record<string, Preset>;
+  /** Fully inherited marketplace activation data retained for status reads. */
+  marketplacePresets?: Record<string, MarketplaceActivation>;
+};
+
+// PluginConfigSchema describes the parsed file shape. It must not claim to
+// return resolved presets: doing so would make the schema output unsound.
+export const PluginConfigSchema = RawPluginConfigSchema;
 
 // Agent names - re-exported from constants for convenience
 export type { AgentName } from './constants';

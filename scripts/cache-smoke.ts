@@ -10,7 +10,7 @@
  * `prompt_tokens_details.cached_tokens`).
  *
  * The scenarios are designed to trigger this plugin's payload-touching
- * machinery on purpose — phase reminders, the post-file-tool nudge, todo
+ * machinery on purpose — phase reminders, direct file reads, todo
  * churn, background job board injection/reconciliation, repeated specialist
  * delegation with session reuse — so each injection path is validated
  * against a real provider, including the subagent child sessions it spawns.
@@ -28,9 +28,6 @@
  *                       (default: plain,tools — the cheap probe).
  *   --turn-timeout-ms N Per-turn timeout (default 300000).
  *   --keep-sessions     Don't delete the probe sessions afterwards.
- *   --board-strategy S  Pin backgroundJobs.strategy ("latest" or
- *                       "checkpoint-compatible") via a scratch project
- *                       config — for A/B-ing issue #874. Spawned server only.
  *
  * Exit codes: 0 caching works · 1 bust detected · 2 inconclusive (provider
  * reported no cache telemetry) · 3 setup/runtime error.
@@ -42,7 +39,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -55,8 +52,6 @@ interface Args {
   scenarios: string[];
   turnTimeoutMs: number;
   keepSessions: boolean;
-  /** Force backgroundJobs.strategy via a scratch project config (issue #874 A/B). */
-  boardStrategy?: 'latest' | 'checkpoint-compatible';
 }
 
 interface Turn {
@@ -140,8 +135,8 @@ const SCENARIOS: Scenario[] = [
   },
   {
     name: 'nudge',
-    description: 'direct file read arms the post-file-tool nudge',
-    triggers: 'post-file-tool-nudge injection, then phase-reminder equilibrium',
+    description: 'direct file read followed by phase reminders',
+    triggers: 'direct file read, phase reminder across subsequent turns',
     turns: (nonce) => [
       {
         text: `Cache smoke probe ${nonce}. Do not delegate: use your read tool yourself on package.json and reply with only its "name" value.`,
@@ -289,9 +284,56 @@ const SCENARIOS: Scenario[] = [
 const CHEAP_SET = ['plain', 'tools'];
 const EXTENSIVE_SET = SCENARIOS.map((scenario) => scenario.name);
 
+let shuttingDown = false;
+let spawnedServe:
+  | { child: ReturnType<typeof spawn>; scratch?: string }
+  | undefined;
+
+function stopSpawnedServe(
+  spawned: { child: ReturnType<typeof spawn> } | undefined,
+  signal: NodeJS.Signals,
+): void {
+  const pid = spawned?.child.pid;
+  if (!pid) return;
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      spawned.child.kill(signal);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+function cleanupSpawnedServe(): void {
+  shuttingDown = true;
+  const spawned = spawnedServe;
+  spawnedServe = undefined;
+  if (!spawned) return;
+  // The record is passed explicitly: the module global is already cleared,
+  // and reading it here would skip both signals and orphan the serve group.
+  stopSpawnedServe(spawned, 'SIGTERM');
+  stopSpawnedServe(spawned, 'SIGKILL');
+  if (spawned.scratch) {
+    try {
+      rmSync(spawned.scratch, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+  }
+}
+
 function fail(message: string): never {
   console.error(`\ncache-smoke: ${message}`);
+  cleanupSpawnedServe();
   process.exit(3);
+}
+
+function installInterruptHandlers(): void {
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.on(signal, () => fail(`interrupted (${signal})`));
+  }
 }
 
 function parseArgs(argv: string[]): Args {
@@ -344,25 +386,12 @@ function parseArgs(argv: string[]): Args {
       case '--keep-sessions':
         args.keepSessions = true;
         break;
-      case '--board-strategy': {
-        const strategy = value();
-        if (strategy !== 'latest' && strategy !== 'checkpoint-compatible') {
-          fail('--board-strategy must be "latest" or "checkpoint-compatible"');
-        }
-        args.boardStrategy = strategy;
-        break;
-      }
       default:
         fail(`unknown flag ${flag}`);
     }
   }
   if (!!args.provider !== !!args.model) {
     fail('--provider and --model must be given together');
-  }
-  if (args.boardStrategy && args.server) {
-    fail(
-      '--board-strategy requires a spawned server (it writes a scratch project config); drop --server',
-    );
   }
   if (!Number.isFinite(args.turnTimeoutMs) || args.turnTimeoutMs <= 0) {
     fail('--turn-timeout-ms must be a positive number');
@@ -667,10 +696,10 @@ async function runScenario(
 }
 
 async function main(): Promise<void> {
+  installInterruptHandlers();
   const args = parseArgs(process.argv.slice(2));
 
   let base = args.server;
-  let child: ReturnType<typeof spawn> | undefined;
   let scratch: string | undefined;
 
   if (!base) {
@@ -685,43 +714,25 @@ async function main(): Promise<void> {
       path.join(scratch, 'package.json'),
       `${JSON.stringify({ name: 'cache-smoke-fixture', version: '0.0.0' }, null, 2)}\n`,
     );
-    if (args.boardStrategy) {
-      // Project-local plugin config overrides the user config, pinning the
-      // board strategy for this run regardless of global settings.
-      mkdirSync(path.join(scratch, '.opencode'), { recursive: true });
-      writeFileSync(
-        path.join(scratch, '.opencode', 'oh-my-opencode-slim.json'),
-        `${JSON.stringify(
-          {
-            backgroundJobs: {
-              strategy: args.boardStrategy,
-              maxRetainedSnapshots: 20,
-            },
-          },
-          null,
-          2,
-        )}\n`,
-      );
-      console.log(
-        `board strategy pinned via project config: ${args.boardStrategy}`,
-      );
-    }
     const port = await getFreePort();
     base = `http://127.0.0.1:${port}`;
     console.log(`starting opencode serve on ${base} (cwd: ${scratch})`);
-    child = spawn(
+    const child = spawn(
       binary,
       ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
       {
         cwd: scratch,
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
       },
     );
+    spawnedServe = { child, scratch };
     const stderrChunks: string[] = [];
     child.stderr?.on('data', (chunk: Buffer) => {
       stderrChunks.push(String(chunk));
     });
     child.once('exit', (code) => {
+      if (shuttingDown) return;
       if (code !== null && code !== 0) {
         console.error(stderrChunks.join('').slice(-2000));
         fail(`opencode serve exited early with code ${code}`);
@@ -729,11 +740,6 @@ async function main(): Promise<void> {
     });
     await waitForHealth(base);
   }
-
-  const cleanup = () => {
-    child?.kill('SIGTERM');
-    if (scratch) rmSync(scratch, { recursive: true, force: true });
-  };
 
   try {
     const scenarios = SCENARIOS.filter((scenario) =>
@@ -755,7 +761,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
     } else if (verdicts.includes('plateau')) {
       console.log(
-        'RESULT: ⚠️ cache-read plateau detected — the reusable prefix stopped growing (issue #874). Compare board strategies with --board-strategy latest vs checkpoint-compatible.',
+        'RESULT: ⚠️ cache-read plateau detected — the reusable prefix stopped growing (issue #874). See docs/cache-verification.md.',
       );
       process.exitCode = 1;
     } else if (verdicts.every((verdict) => verdict === 'inconclusive')) {
@@ -769,7 +775,7 @@ async function main(): Promise<void> {
       );
     }
   } finally {
-    cleanup();
+    cleanupSpawnedServe();
   }
 }
 
