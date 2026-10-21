@@ -1,9 +1,6 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 import { getClient } from './opencode-client';
 
-/** Platform timer handle; fake harnesses may return bare numeric ids. */
-type TimerHandle = Timer;
-
 interface TimerFns {
   setTimeout(callback: () => void, delay: number): unknown;
   clearTimeout(timer: unknown): void;
