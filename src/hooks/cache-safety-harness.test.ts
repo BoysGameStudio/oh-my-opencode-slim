@@ -139,11 +139,7 @@ export function createPipeline(options: PipelineOptions = {}): Pipeline {
       {} as never,
       output as never,
     );
-    await taskSessionManagerHook.injectBackgroundJobBoard(
-      {} as never,
-      output as never,
-    );
-    // Trailing-most volatile message, after the board (src/index.ts order).
+    // Trailing-most volatile message (src/index.ts order).
     await deepworkGoal['experimental.chat.messages.transform'](
       {} as never,
       output as never,

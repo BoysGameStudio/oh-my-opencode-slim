@@ -22,9 +22,7 @@ import { PHASE_REMINDER } from '../config/constants';
 import {
   buildHistory,
   createPipeline,
-  FIXTURE_NOW,
   renderTurn,
-  SESSION_ID,
 } from './cache-safety-harness.test';
 
 describe('cache-impact snapshots (update deliberately — see file header)', () => {
@@ -41,14 +39,9 @@ describe('cache-impact snapshots (update deliberately — see file header)', () 
   });
 
   test('transformed payload for the canonical conversation fixture', async () => {
+    // No job-board fixture: the board is never rendered (issue #1647), so
+    // the canonical payload carries no board bytes at all.
     const pipeline = createPipeline({ goalPointer: true });
-    pipeline.board.registerLaunch({
-      taskID: 'task-snapshot',
-      parentSessionID: SESSION_ID,
-      agent: 'explorer',
-      description: 'snapshot fixture job',
-      now: FIXTURE_NOW,
-    });
 
     const history = buildHistory();
     const output = await renderTurn(pipeline, history, history.length - 1);
