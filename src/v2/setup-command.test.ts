@@ -633,7 +633,7 @@ describe('createSessionContextHandler (merged context hook seam)', () => {
 });
 
 describe('context bridge: transcript identity enrichment', () => {
-  test('board changes wait for all tool results without splitting pairs', async () => {
+  test('job launches never touch the payload and never split tool pairs', async () => {
     const pipeline = createPipeline();
     const launch = (taskID: string) =>
       pipeline.board.registerLaunch({
@@ -677,7 +677,9 @@ describe('context bridge: transcript identity enrichment', () => {
         }),
       ]);
     const initial = await transform();
-    expect(boards(initial)).toHaveLength(1);
+    // The job board is never rendered (issue #1647): no launch ever adds a
+    // byte to the payload.
+    expect(boards(initial)).toHaveLength(0);
     launch('ses_second_child');
     history.push({
       id: 'assistant-call',
@@ -690,7 +692,7 @@ describe('context bridge: transcript identity enrichment', () => {
       })),
     });
     const pending = await transform();
-    expect(boards(pending)).toHaveLength(1);
+    expect(boards(pending)).toHaveLength(0);
     expect(projection(pending).slice(0, initial.length)).toEqual(
       projection(initial),
     );
@@ -707,10 +709,9 @@ describe('context bridge: transcript identity enrichment', () => {
         ],
       });
       const current = await transform();
-      // Change-only: a tool-result tail is not a user anchor, so the
-      // launch's board defers to the next genuine user tail; the frozen
-      // initial board replays meanwhile and every prefix stays stable.
-      expect(boards(current)).toHaveLength(1);
+      // A tool-result tail changes nothing: no board, no payload churn, and
+      // every prefix stays stable.
+      expect(boards(current)).toHaveLength(0);
       expect(projection(current).slice(0, pending.length)).toEqual(
         projection(pending),
       );
@@ -733,7 +734,7 @@ describe('context bridge: transcript identity enrichment', () => {
     }
   });
 
-  test('board survives completion followed by tool-result continuations', async () => {
+  test('a completion changes nothing in the payload across tool continuations', async () => {
     const pipeline = createPipeline();
     pipeline.board.registerLaunch({
       taskID: 'ses_remaining_child',
@@ -772,7 +773,7 @@ describe('context bridge: transcript identity enrichment', () => {
           isTaggedPart(part, BACKGROUND_JOB_BOARD_METADATA_KEY),
         ),
       );
-    expect(boardMessages(completion)).toHaveLength(1);
+    expect(boardMessages(completion)).toHaveLength(0);
     let previous = providerContent(completion.messages);
 
     for (let step = 1; step <= 2; step++) {
@@ -807,7 +808,7 @@ describe('context bridge: transcript identity enrichment', () => {
         sessionID: SESSION_ID,
       });
       await handler(continuation);
-      expect(boardMessages(continuation)).toHaveLength(1);
+      expect(boardMessages(continuation)).toHaveLength(0);
       const current = providerContent(continuation.messages);
       expect(current.slice(0, previous.length)).toEqual(previous);
       previous = current;
