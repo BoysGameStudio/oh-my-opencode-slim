@@ -1,4 +1,4 @@
-# ADR-002: Consolidate Eval CLI into a Single Entry Point
+# ADR-003: Consolidate Eval CLI into a Single Entry Point
 
 **Date:** 2026-08-29
 **Status:** Accepted; implementation details amended 2026-10-21
