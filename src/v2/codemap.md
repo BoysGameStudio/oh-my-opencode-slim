@@ -75,7 +75,6 @@ The v2 runtime surface and plugin contracts are adapted through the following da
 ## Integration Points
 
 - `src/index.ts`: imports `createV2Setup` for the dual `default` export (`{ id, server, setup }` — no `tui` key; hosts validate that a server module's `tui` field is a function and never coexists with `server`) and exports `OhMyOpenCodeLite` (named) for the adapter to wrap.
-- `src/tools/smartfetch/secondary-model.ts`: consumes the `experimental_v2.generateText` channel threaded by `setup` for one-shot summaries; absent channel → secondary-model summaries are unavailable (logged) — the v2 shim has no `session.create`/`tool.ids`, so the v1 session pipeline cannot substitute.
 - Build: `build:v2` bundles `src/index.ts` (which pulls in `src/v2/`) into `dist/server/index.js` (self-contained except `jsdom`) — the directory entrypoint 2.x hosts require, also served via the
   `./server` package subpath (the exports map resolves it directly);
   `build:tui` bundles `src/v2/tui.ts` into `dist/tui2.js`.

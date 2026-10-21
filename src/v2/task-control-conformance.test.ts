@@ -59,10 +59,11 @@ function harness(
     synthetic: mock(async () => ({})),
     ...options.session,
   };
-  const generateText = mock(async (text: string) => ({ text }));
-  const input = buildPluginInput({ session: host } as unknown as V2Context, {
-    generateText,
-  }) as unknown as PluginInput & { experimental_v2?: ExperimentalV2 };
+  const input = buildPluginInput({
+    session: host,
+  } as unknown as V2Context) as unknown as PluginInput & {
+    experimental_v2?: ExperimentalV2;
+  };
   const board = new BackgroundJobBoard();
   board.registerLaunch({
     taskID: 'ses_child',
@@ -129,7 +130,6 @@ function harness(
     baseline,
     register,
     onLaunch,
-    generateText,
     tracker,
     gate,
     onTerminal,
@@ -498,9 +498,6 @@ describe('task controls through the real v2 client shim', () => {
       expect(typeof h.input.experimental_v2?.waitForSessionIdle).toBe(
         'function',
       );
-      expect(await h.input.experimental_v2?.generateText?.('ping')).toEqual({
-        text: 'ping',
-      });
       const pending = h.revive.execute(reviveArgs, context);
       await entered.promise;
       expect(wait.mock.calls).toEqual([[{ sessionID: 'ses_child' }]]);
@@ -659,9 +656,6 @@ describe('task controls through the real v2 client shim', () => {
       const h = harness({ running, session: { wait: wait as never } });
       expect(h.input.client.session.status).toBeUndefined();
       expect(h.input.experimental_v2?.waitForSessionIdle).toBeUndefined();
-      expect(await h.input.experimental_v2?.generateText?.('ping')).toEqual({
-        text: 'ping',
-      });
       await expect(h.revive.execute(reviveArgs, context)).rejects.toThrow(
         /idle-verification capability unavailable/,
       );

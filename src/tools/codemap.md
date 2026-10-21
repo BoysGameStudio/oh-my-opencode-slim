@@ -6,7 +6,7 @@ Centralized tool factory and registry for the OpenCode plugin system. This direc
 
 - **Task lifecycle tools**: Background task communication, cancellation, status (with live-status policy), results, revival, and HITL continuation control
 - **Code intelligence tools**: AST-grep pattern matching and transformation across languages
-- **Web capabilities**: Smart web fetching with caching and secondary model processing
+- **Web capabilities**: Smart web fetching with caching and content extraction
 - **ACP integration**: External agent protocol execution
 - **Preset switching**: On-disk preset persistence helpers used by the TUI `/preset` managers (v1 and v2); the pure editor domain lives in `src/preset-editor-domain.ts`
 - **Interview state**: `interview-submit-state.ts` persists quiet interview
@@ -153,7 +153,6 @@ Each tool is implemented as a factory function that returns a `ToolDefinition` r
    ├─> Validates URL and configuration
    ├─> Checks cache for fresh content
    ├─> If cache miss, fetches via network with timeout
-   ├─> Optionally processes with secondary model
    ├─> Caches result for future requests
    └─> Returns extracted content to agent
 ```
@@ -208,7 +207,7 @@ Tools Layer → AST-grep Layer
 └─> Returns typed AST matches and edit results
 
 Tools Layer → Web Layer
-└─ webfetch tool → Network utilities with caching and model processing
+└─ webfetch tool → Network utilities with caching and content extraction
 ```
 
 ### Configuration Integration
@@ -274,7 +273,7 @@ Preset switching is not a tool: `preset-switch.ts` exposes on-disk helpers
 
 #### Webfetch (smartfetch/)
 - Implements caching with configurable TTL
-- Supports secondary model processing for content extraction
+- Extracts main content from HTML (Readability) with llms.txt probing
 - Handles redirects, timeouts, and error recovery
 
 ## Testing Strategy

@@ -22,7 +22,6 @@
  * renderer. Adapters and the lifecycle core are injected (NFR-3).
  */
 
-import { SMARTFETCH_SECONDARY_SESSION_TITLE } from '../../config/constants';
 import { loadPluginConfig } from '../../config/loader';
 import {
   type MultiplexerConfig,
@@ -425,7 +424,6 @@ export function projectSessionEvent(
       : undefined;
 
   if (type === 'session.created') {
-    if (info?.title === SMARTFETCH_SECONDARY_SESSION_TITLE) return null;
     return {
       kind: 'created',
       sessionId,
@@ -1164,7 +1162,6 @@ function createSessionListReader(
         for (const entry of data) {
           if (!isRecord(entry)) continue;
           if (typeof entry.id !== 'string') continue;
-          if (entry.title === SMARTFETCH_SECONDARY_SESSION_TITLE) continue;
           const subagentType =
             typeof entry.agent === 'string' && entry.agent.length > 0
               ? entry.agent

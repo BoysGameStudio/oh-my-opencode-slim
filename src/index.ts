@@ -34,7 +34,6 @@ import { deepMerge, loadPluginConfig, type Preset } from './config';
 import {
   BUILTIN_OPENCODE_SUBAGENTS_TO_DISABLE,
   DEFAULT_MAX_SESSION_METADATA_ENTRIES,
-  SMARTFETCH_SECONDARY_SESSION_TITLE,
   TOAST_DURATION_MS,
 } from './config/constants';
 import type { ConfigLoadWarningKind } from './config/loader';
@@ -115,7 +114,6 @@ import {
   createWebfetchTool,
   resolveFinalizedOrchestratorIdentities,
 } from './tools';
-import { pickAgentModelRef } from './tools/smartfetch/secondary-model';
 import {
   applyActivityEvent,
   resolveEventSessionID,
@@ -438,9 +436,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     },
   });
   const compactingSessionIds = new Set<string>();
-  // smartfetch's temporary secondary-model sessions run under the default
-  // agent; they must never reach the sidebar, metadata or session hooks.
-  const internalSessionIds = new Set<string>();
   const ownedTuiActivitySessions = new Map<string, string>();
   // #1079: lifecycle continuations (orchestrator wake, terminal
   // notifications) resolve the session's CURRENT agent/model at send
@@ -870,32 +865,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       Object.keys(runtime.acpAgents ?? {}).length > 0
         ? { acp_run: createAcpRunTool(runtime.acpAgents) }
         : {};
-    const webfetchModel = runtime.webfetch?.model;
-    const webfetchModels = (() => {
-      if (!webfetchModel) return undefined;
-      const entries = Array.isArray(webfetchModel)
-        ? webfetchModel
-        : [webfetchModel];
-      type ModelRefInput = string | { id: string; variant?: string };
-      const models: Array<{ id: string; variant?: string }> = [];
-      for (const entry of entries as ModelRefInput[]) {
-        const id = typeof entry === 'string' ? entry : entry.id;
-        if (!id) continue;
-        models.push({
-          id,
-          ...(typeof entry === 'object' && entry.variant
-            ? { variant: entry.variant }
-            : {}),
-        });
-      }
-      return models.length > 0 ? models : undefined;
-    })();
     webfetch = createWebfetchTool(ctx, {
       binaryDir: undefined,
-      imageRouting: () => runtime.imageRouting,
-      webfetchModels,
-      explorerModel: pickAgentModelRef(runtime.agent('explorer')?.model),
-      smallModelRef: () => runtime.smallModel(),
     });
     backgroundJobBoard = new BackgroundJobBoard({
       maxReusablePerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
@@ -2339,17 +2310,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // message id in info.id and the session id in info.sessionID. Resolve
       // by session so child activity refreshes the correct stuck timer.
       const eventSessionID = resolveEventSessionID(event);
-      if (
-        eventSessionID &&
-        event.type === 'session.created' &&
-        event.properties?.info?.title === SMARTFETCH_SECONDARY_SESSION_TITLE
-      ) {
-        internalSessionIds.add(eventSessionID);
-      }
-      if (eventSessionID && internalSessionIds.has(eventSessionID)) {
-        if (event.type !== 'session.deleted') return;
-        internalSessionIds.delete(eventSessionID);
-      }
       if (!runtime.disabledHooks.has('cache-monitor')) {
         await cacheMonitor.event(input);
       }
@@ -2804,7 +2764,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         parts?: unknown[];
       },
     ) => {
-      if (internalSessionIds.has(input.sessionID)) return;
       // A fresh user message proves no compaction transform is coming for a
       // pending mark (the host runs compacting → transform back to back):
       // drop it so a stale mark can never strip reminders from an ordinary

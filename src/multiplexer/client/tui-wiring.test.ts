@@ -1599,24 +1599,6 @@ describe('FR-7 reconcile trigger', () => {
     await h.wiring.dispose();
   });
 
-  test('never opens a pane for a smartfetch secondary session', async () => {
-    const title = 'smartfetch-secondary';
-    const state = createClientState({
-      statuses: { [CHILD]: { type: 'busy' } },
-      sessions: [{ id: CHILD, parentID: PARENT, title }],
-    });
-    const h = await createHarness({ state });
-    await flush();
-    const created = createdEvent();
-    h.bus.emit('session.created', {
-      ...created,
-      properties: { info: { ...created.properties.info, title } },
-    });
-    await flush();
-    expect(h.adapters.get('tmux')?.spawns).toHaveLength(0);
-    await h.wiring.dispose();
-  });
-
   test('reconciles once at startup and again on the periodic cadence', async () => {
     const h = await createHarness({ reconcileIntervalMs: 30_000 });
     await flush();

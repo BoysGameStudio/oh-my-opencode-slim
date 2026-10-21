@@ -2,10 +2,6 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { BinaryFetch } from './types';
 
-export function base64Size(byteLength: number) {
-  return 4 * Math.ceil(byteLength / 3);
-}
-
 export function fitUtf8(text: string, maxBytes: number, maxUnits = Infinity) {
   let base = '';
   let bytes = 0;
@@ -36,7 +32,10 @@ export function buildBinaryResultMessage(
 ) {
   const subject = fetchResult.binaryKind.toUpperCase();
   if (savedPath) return `${subject} content saved to ${savedPath}`;
-  return `${subject} content omitted because it exceeds the download limit.`;
+  const bytes = fetchResult.data?.byteLength ?? fetchResult.contentLength;
+  const size = typeof bytes === 'number' ? ` (${bytes} bytes)` : '';
+  if (fetchResult.data) return `${subject} content fetched${size}.`;
+  return `${subject} content omitted because it exceeds the download limit${size}.`;
 }
 
 export async function saveBinary(

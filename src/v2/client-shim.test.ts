@@ -1112,20 +1112,6 @@ describe('v2 client shim delegation', () => {
     });
   });
 
-  test('preserves the Phase 1 generateText channel', async () => {
-    const generateText = async (prompt: string) => ({ text: prompt });
-    const input = buildPluginInput(makeCtx({}), { generateText });
-    const channel = (
-      input as {
-        experimental_v2?: {
-          generateText?: (p: string) => Promise<{ text: string }>;
-        };
-      }
-    ).experimental_v2?.generateText;
-    expect(typeof channel).toBe('function');
-    expect(await channel?.('ping')).toEqual({ text: 'ping' });
-  });
-
   test('omits experimental_v2 entirely without extras', () => {
     const input = buildPluginInput(makeCtx({}));
     expect('experimental_v2' in (input as Record<string, unknown>)).toBe(false);
