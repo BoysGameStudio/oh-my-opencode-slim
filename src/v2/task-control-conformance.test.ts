@@ -407,48 +407,30 @@ describe('task controls through the real v2 client shim', () => {
     },
   );
 
-  test.each(
-    (['reject', 'error response'] as const).flatMap((failure) =>
-      (['queue', 'steer'] as const).map((delivery) => ({
-        failure,
-        delivery,
-      })),
-    ),
-  )(
+  test.each(['reject', 'error response'] as const)(
     'does not report queued or retry when the host returns %j',
-    async ({ failure, delivery }) => {
+    async (failure) => {
       const prompt = mock(async () => {
         if (failure === 'reject') throw new Error('host refused');
         return { error: 'host refused' };
       });
       const h = harness({ running: true, session: { prompt } });
-      const args =
-        delivery === 'steer'
-          ? { ...messageArgs, delivery: 'steer' as const }
-          : messageArgs;
-      await expect(h.message.execute(args, context)).rejects.toThrow(
+      await expect(h.message.execute(messageArgs, context)).rejects.toThrow(
         'host refused',
       );
       expect(prompt).toHaveBeenCalledTimes(1);
       expect(prompt).toHaveBeenCalledWith({
         sessionID: 'ses_child',
         text: 'Update',
-        delivery,
+        delivery: 'queue',
         resume: false,
       });
     },
   );
 
-  test.each(
-    (['resolve', 'reject'] as const).flatMap((settlement) =>
-      (['queue', 'steer'] as const).map((delivery) => ({
-        settlement,
-        delivery,
-      })),
-    ),
-  )(
+  test.each(['resolve', 'reject'] as const)(
     'quarantines an admitted write until late %j without a second send',
-    async ({ settlement, delivery }) => {
+    async (settlement) => {
       const send = Promise.withResolvers<unknown>();
       const prompt = mock(() => send.promise);
       const h = harness({
@@ -457,11 +439,7 @@ describe('task controls through the real v2 client shim', () => {
         messageTimeoutMs: 5,
       });
       const release = spyOn(h.board, 'releaseLease');
-      const args =
-        delivery === 'steer'
-          ? { ...messageArgs, delivery: 'steer' as const }
-          : messageArgs;
-      await expect(h.message.execute(args, context)).rejects.toThrow(
+      await expect(h.message.execute(messageArgs, context)).rejects.toThrow(
         'transport timed out',
       );
       expect(release).not.toHaveBeenCalled();
@@ -475,7 +453,7 @@ describe('task controls through the real v2 client shim', () => {
       expect(prompt).toHaveBeenCalledWith({
         sessionID: 'ses_child',
         text: 'Update',
-        delivery,
+        delivery: 'queue',
         resume: false,
       });
       const lease = h.board.acquireMessageLease('ses_child', 1);
@@ -668,41 +646,33 @@ describe('task controls through the real v2 client shim', () => {
     },
   );
 
-  test('explicit steer reaches the host with delivery steer', async () => {
+  test('v2 messaging is queue-only: no steer parameter reaches the host', async () => {
     const h = harness({ running: true });
     const shimPrompt = spyOn(h.input.client.session, 'prompt');
+    expect(Object.keys(h.message.args)).not.toContain('delivery');
     const output = String(
       await h.message.execute(
-        { task_id: 'ses_child', message: 'Update', delivery: 'steer' },
+        { task_id: 'ses_child', message: 'Update' },
         context,
       ),
     );
-    expect(shimPrompt.mock.calls[0]?.[0].body).toMatchObject({
-      noReply: true,
-      delivery: 'steer',
-    });
-    expect(h.host.prompt).toHaveBeenCalledTimes(1);
     expect(h.host.prompt).toHaveBeenCalledWith({
       sessionID: 'ses_child',
       text: 'Update',
-      delivery: 'steer',
+      delivery: 'queue',
       resume: false,
     });
-    expect(h.host.interrupt).not.toHaveBeenCalled();
-    expect(h.host.switchAgent).not.toHaveBeenCalled();
-    expect(h.host.switchModel).not.toHaveBeenCalled();
-    expect(h.host.synthetic).not.toHaveBeenCalled();
-    expect(h.host.wait).not.toHaveBeenCalled();
-    expect(h.host.get).not.toHaveBeenCalled();
-    expect(h.host.context).not.toHaveBeenCalled();
-    expect(output).toMatch(/steer/i);
-    expect(output).not.toMatch(/read|applied|acknowledged/i);
+    expect(shimPrompt.mock.calls[0]?.[0].body).not.toHaveProperty(
+      'delivery',
+      'steer',
+    );
+    expect(output).toMatch(/queued/i);
   });
 
-  test('explicit queue mirrors the default host call', async () => {
+  test('queue mirror omits the removed delivery argument', async () => {
     const h = harness({ running: true });
     await h.message.execute(
-      { task_id: 'ses_child', message: 'Update', delivery: 'queue' },
+      { task_id: 'ses_child', message: 'Update' },
       context,
     );
     expect(h.host.prompt).toHaveBeenCalledWith({

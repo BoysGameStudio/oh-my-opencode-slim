@@ -360,7 +360,6 @@ test('task_cancel and task_revive succeed when orchestrator runs under a display
       },
     },
     {
-      hostFlavor: 'v2',
       agent: 'mira',
       config: {
         presets: {

@@ -223,7 +223,12 @@ export function createTaskReplyTool(options: {
         throw new Error(`Unknown task ID or alias: ${identity}`);
       }
       if (!job) {
-        throw unknownTaskRefError(identity, delegation.resumeParam);
+        throw unknownTaskRefError(
+          identity,
+          delegation.resumeParam,
+          undefined,
+          typeof hostFlavor === 'string' ? hostFlavor : undefined,
+        );
       }
       if (job.state !== 'running') {
         throw new Error(

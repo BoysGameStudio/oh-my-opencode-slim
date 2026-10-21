@@ -2947,7 +2947,7 @@ describe('createV2Setup e2e', () => {
     expect(logText).toContain('[v2] v1 dispose hook invoked (abort path)');
   }, 20_000);
 
-  test('root dispose during a paused v2 revive read does not send or import', async () => {
+  test('root dispose during a paused v2 native-resume read does not send or import', async () => {
     const { ctx, calls } = makeMockV2Context(projectDir);
     let releaseRead: (value: Record<string, unknown>) => void = () => {};
     let started: () => void = () => {};
@@ -2987,12 +2987,27 @@ describe('createV2Setup e2e', () => {
           },
         ],
       });
-      const revive = calls.toolAdds.find((tool) => tool.name === 'task_revive');
-      expect(revive).toBeDefined();
-      const pending = revive?.execute(
-        { task_id: 'ses_child', prompt: 'continue' },
-        { sessionID: 'ses_parent' },
-      );
+      // v2 retires task_revive: retained sessions resume through the native
+      // delegation tool, and the same disposal fence must hold there.
+      expect(
+        calls.toolAdds.find((tool) => tool.name === 'task_revive'),
+      ).toBeUndefined();
+      const beforeHook = calls.toolBeforeCb;
+      if (!beforeHook) throw new Error('tool:execute.before not captured');
+      const pending = beforeHook({
+        tool: 'subagent',
+        sessionID: 'ses_parent',
+        agent: 'orchestrator',
+        messageID: 'msg_parent',
+        id: 'call_resume',
+        input: {
+          agent: 'fixer',
+          description: 'resume the retained child',
+          prompt: 'continue',
+          background: true,
+          sessionID: 'ses_child',
+        },
+      });
       await seen;
       await cleanup();
       releaseRead({

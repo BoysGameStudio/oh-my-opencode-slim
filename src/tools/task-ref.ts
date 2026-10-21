@@ -4,6 +4,7 @@ import type { BackgroundJobRecord } from '../utils/background-job-board';
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import { SESSION_ID_PATTERN } from '../utils/session';
 import { controlParamName } from '../v2/adapters';
+import { v2ResumeCall } from '../v2/delegation';
 
 export type { CanonicalTaskReference };
 
@@ -118,11 +119,16 @@ export function unknownTaskRefError(
   identity: string,
   resumeParam: string,
   recent?: string,
+  hostFlavor?: string,
 ): Error {
+  const continueHint =
+    hostFlavor === 'v2'
+      ? `continue it with ${v2ResumeCall(identity)}`
+      : `continue it with task_revive and ${resumeParam}: "${identity}"`;
   return new Error(
     withRecentTaskHandles(
       SESSION_ID_PATTERN.test(identity)
-        ? `Unknown task ID or alias: ${identity} (not tracked: records are evicted by retention limits or lost on a host restart; a settled session can still exist on the host). If it is a settled session you own, continue it with task_revive and ${resumeParam}: "${identity}"; do not launch a duplicate.`
+        ? `Unknown task ID or alias: ${identity} (not tracked: records are evicted by retention limits or lost on a host restart; a settled session can still exist on the host). If it is a settled session you own, ${continueHint}; do not launch a duplicate.`
         : `Unknown task ID or alias: ${identity}`,
       recent,
     ),

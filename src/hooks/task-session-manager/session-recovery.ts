@@ -46,6 +46,7 @@ import {
   parseTaskIdFromTaskOutput,
   parseTaskStatusOutput,
 } from '../../utils/task';
+import { v2ResumeCall } from '../../v2/delegation';
 
 const DEFAULT_STABLE_STOPPED_MS = 300;
 /** A hung alias pairing read refuses instead of blocking the tool call. */
@@ -170,7 +171,9 @@ async function recoverRetainedSession(
         );
       } catch {
         return refuse(
-          `${prefix}. A host-session prune is in progress for this task; retry task_revive.`,
+          options.hostFlavor === 'v2'
+            ? `${prefix}. A host-session prune is in progress for this task; retry with ${v2ResumeCall(sessionID)}.`
+            : `${prefix}. A host-session prune is in progress for this task; retry task_revive.`,
         );
       }
       hosted = await readHostSession(client, directory, sessionID);
@@ -375,8 +378,8 @@ async function recoverRetainedSession(
         // after a restart, so a guessed stop import would lie.
         return refuse(
           textUnreadable
-            ? `Task ${sessionID} host outcome is terminal but its answer text is not readable yet; nothing was imported. Retry task_status later, or use task_revive with a new prompt. No prompt was sent`
-            : `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or use task_revive with a new prompt. No prompt was sent`,
+            ? `Task ${sessionID} host outcome is terminal but its answer text is not readable yet; nothing was imported. Retry task_status later, or continue it with ${v2ResumeCall(sessionID)}. No prompt was sent`
+            : `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or continue it with ${v2ResumeCall(sessionID)}. No prompt was sent`,
         );
       }
       // Identity adoption still requires a decipherable latest input; the
