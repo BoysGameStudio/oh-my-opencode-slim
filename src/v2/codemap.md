@@ -13,6 +13,9 @@ v2 registrations. v1 behavior is unchanged.
 `client-shim.ts` treats a named `session.prompt` agent as an owning-identity
 assertion against the persisted session agent, not a selection override;
 unverified identity and model/variant overrides fail before prompt admission.
+Task messages also supply a local synchronous `beforeSend` guard so their
+existing disposal/lease/owner checks run again after that identity read and
+immediately before native admission; it is never forwarded to the host.
 
 ## Entry Points
 

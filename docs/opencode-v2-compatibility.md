@@ -370,6 +370,12 @@ unreadable identity fails closed without a write or selection switch. `task_mess
 explicitly inherits persisted selection on v2; other noReply callers, including
 interview notifications, retain the same no-resume semantics.
 
+After the asynchronous identity read, `task_message` revalidates its existing
+disposal, message lease, running generation, and owning-agent conditions at the
+shim's synchronous pre-admission boundary. The local `beforeSend` guard is not
+forwarded to the host and cannot switch selection; invalidation during the read
+therefore rejects without queuing a message.
+
 `experimental_v2.waitForSessionIdle(sessionID)` exists only when the host provides
 `session.wait({sessionID})`. It delegates that method; it fabricates neither a
 status map nor board state.

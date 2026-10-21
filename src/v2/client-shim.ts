@@ -581,7 +581,9 @@ export function buildPluginInput(
       // markStatusUncertain branch.
       list: createSessionListShim(s),
       prompt: s.prompt
-        ? async (args: Record<string, unknown>) => {
+        ? async (
+            args: Record<string, unknown> & { beforeSend?: () => void },
+          ) => {
             const body = isRecord(args.body) ? args.body : {};
             if (['model', 'variant'].some((key) => body[key] !== undefined)) {
               throw new Error(
@@ -616,6 +618,10 @@ export function buildPluginInput(
             // while `resume` decides waking; both are independent.
             // An explicit body.delivery of 'steer' opts a noReply
             // write into steering; anything else stays queued.
+            // Local callers may hold a task lease or disposal fence. Agent
+            // validation above suspended: revalidate immediately before the
+            // native write, with no further await or selection mutation.
+            if (typeof args.beforeSend === 'function') args.beforeSend();
             return s.prompt?.({
               sessionID: sessionIDOf(args),
               text: textFromBody(args),
