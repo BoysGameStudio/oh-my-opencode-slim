@@ -75,7 +75,9 @@ caching them.
 For documentation sites, `webfetch` automatically probes for `/llms-full.txt`
 then `/llms.txt` before falling back to the page itself. Probing happens only
 when the domain looks documentation-adjacent (suffixes like `.readthedocs.io`,
-`.gitbook.io`, `docs.rs`; prefixes like `docs.`, `developer.`, `dev.`, `wiki.`).
+`.gitbook.io`, `docs.rs`; prefixes like `docs.`, `developer.`, `dev.`, `wiki.`)
+and the requested format is `markdown` or `text` — `format: html` skips the
+probe, since llms.txt is plain text rather than the raw page.
 
 The probe respects cross-origin redirect policy (same origin only). If the
 `llms.txt` response is HTML or a login page, the probe is rejected. To force

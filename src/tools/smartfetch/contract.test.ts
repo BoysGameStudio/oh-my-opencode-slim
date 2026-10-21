@@ -348,4 +348,48 @@ describe('smartfetch/contract', () => {
       }),
     );
   });
+
+  test('format html skips llms.txt probing and returns the raw page on docs hosts', async () => {
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith('/llms-full.txt') || url.endsWith('/llms.txt')) {
+        return new Response('LLMSTOKEN', {
+          headers: { 'content-type': 'text/plain' },
+        });
+      }
+      return new Response(
+        '<html><body><article>RAWPAGETOKEN</article></body></html>',
+        { headers: { 'content-type': 'text/html' } },
+      );
+    }) as typeof fetch;
+    const result = await createWebfetchTool({ client: {} } as any).execute(
+      { url: 'https://docs.example.com/page', format: 'html' },
+      createExecutionContext(),
+    );
+    expect(result).toContain('RAWPAGETOKEN');
+    expect(result).not.toContain('LLMSTOKEN');
+    expect(result).not.toContain('---\n');
+  });
+
+  test('an oversized binary with save_binary already on states the limit without an impossible retry hint', async () => {
+    globalThis.fetch = mock(
+      async () =>
+        new Response(Uint8Array.of(137, 80, 78, 71), {
+          headers: {
+            'content-type': 'image/png',
+            'content-length': String(10 * 1024 * 1024 + 1),
+          },
+        }),
+    ) as typeof fetch;
+    const result = await createWebfetchTool({ client: {} } as any).execute(
+      { url: 'https://example.com/huge.png', save_binary: true },
+      createExecutionContext(),
+    );
+    expect(typeof result).toBe('string');
+    expect(result).toContain(
+      'IMAGE content omitted because it exceeds the download limit (10485761 bytes).',
+    );
+    expect(result).not.toContain('Re-run with save_binary=true');
+    expect(result).toContain('The active limit is 10485760 bytes');
+  });
 });

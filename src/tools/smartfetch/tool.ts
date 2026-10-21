@@ -130,7 +130,9 @@ export function createWebfetchTool(
         ...cacheOptions,
         format: undefined,
       });
-      const shouldProbeLlmsTxt = isDocsLikeUrl(url);
+      // llms.txt is plain text, not the raw page: probing only makes sense
+      // when the caller asked for extracted markdown/text output.
+      const shouldProbeLlmsTxt = args.format !== 'html' && isDocsLikeUrl(url);
       const permissionPatterns = buildPermissionPatterns(
         normalized,
         shouldProbeLlmsTxt,
@@ -439,16 +441,22 @@ export function createWebfetchTool(
         });
 
         if ('binary' in fetchResult) {
-          if (!args.save_binary || !fetchResult.data) {
-            return `${buildBinaryResultMessage(fetchResult)} Re-run with save_binary=true to persist it.`;
+          if (fetchResult.data && args.save_binary) {
+            const savedPath = await saveBinary(
+              binaryDir,
+              fetchResult.data,
+              fetchResult.contentType,
+              fetchResult.filename,
+            );
+            return buildBinaryResultMessage(fetchResult, savedPath);
           }
-          const savedPath = await saveBinary(
-            binaryDir,
-            fetchResult.data,
-            fetchResult.contentType,
-            fetchResult.filename,
-          );
-          return buildBinaryResultMessage(fetchResult, savedPath);
+          const message = buildBinaryResultMessage(fetchResult);
+          if (!args.save_binary) {
+            return `${message} Re-run with save_binary=true to persist it.`;
+          }
+          // Saving is already on: repeating the request cannot succeed, so
+          // state the active limit and point at a smaller source instead.
+          return `${message} The active limit is ${MAX_RESPONSE_BYTES} bytes; fetch a smaller or more specific source.`;
         }
 
         const content = pickContent(fetchResult, args.format);

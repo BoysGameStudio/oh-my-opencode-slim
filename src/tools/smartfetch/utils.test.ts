@@ -119,6 +119,7 @@ describe('smartfetch/utils', () => {
       const result = await extractFromHtml(
         CSS_TREE_WARNING_HTML,
         'https://example.com/',
+        false,
       );
 
       const cssTreeWarnings = warnCalls.filter((args) =>
@@ -154,7 +155,11 @@ describe('smartfetch/utils', () => {
   test('restores the original console.warn after extraction', async () => {
     const originalWarn = console.warn;
     try {
-      await extractFromHtml(CSS_TREE_WARNING_HTML, 'https://example.com/');
+      await extractFromHtml(
+        CSS_TREE_WARNING_HTML,
+        'https://example.com/',
+        false,
+      );
 
       expect(console.warn).toBe(originalWarn);
     } finally {
@@ -170,6 +175,7 @@ describe('smartfetch/utils', () => {
       const result = await extractFromHtml(
         CSS_PARSING_ERROR_HTML,
         'https://example.com/',
+        true,
       );
       expect(result.text).toContain('Hello');
       expect(errorCalls).toEqual([]);
@@ -196,7 +202,7 @@ describe('smartfetch/utils', () => {
 
   test('skips Readability for documents with over 15k elements', async () => {
     const html = `<html><body><article><h1>Large page</h1><p>Content</p>${'<span>x</span>'.repeat(15_001)}</article></body></html>`;
-    const result = await extractFromHtml(html, 'https://example.com/');
+    const result = await extractFromHtml(html, 'https://example.com/', true);
     expect(result.extractedMain).toBe(false);
     expect(result.html).toBe(html);
     expect(result.text).toContain('Content');

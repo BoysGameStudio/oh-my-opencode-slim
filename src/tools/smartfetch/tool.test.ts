@@ -95,7 +95,7 @@ describe('smartfetch/tool', () => {
     expect(accepts[1]).toStartWith('text/html');
   });
 
-  test('llms.txt retains its own Accept header under every requested format', async () => {
+  test('llms.txt retains its own Accept header under every extracted format', async () => {
     const accepts: string[] = [];
     globalThis.fetch = mock(
       async (_url: string | URL | Request, init?: RequestInit) => {
@@ -106,7 +106,7 @@ describe('smartfetch/tool', () => {
       },
     ) as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    for (const format of ['markdown', 'text', 'html'] as const) {
+    for (const format of ['markdown', 'text'] as const) {
       CACHE.clear();
       expect(
         await webfetch.execute(
@@ -116,18 +116,26 @@ describe('smartfetch/tool', () => {
       ).toContain('# Docs');
     }
     expect(accepts).toEqual(
-      Array(3).fill('text/plain, text/markdown;q=0.9, */*;q=0.1'),
+      Array(2).fill('text/plain, text/markdown;q=0.9, */*;q=0.1'),
     );
   });
 
-  test('one llms.txt probe serves html, markdown and text formats', async () => {
+  test('one llms.txt probe serves markdown and text; html fetches the raw page', async () => {
     const requests: Array<[string, string | null]> = [];
     globalThis.fetch = mock(
       async (input: string | URL | Request, init?: RequestInit) => {
         const url = String(input);
         requests.push([url, new Headers(init?.headers).get('Accept')]);
-        if (url !== 'https://docs.example.com/llms-full.txt') {
+        if (
+          url !== 'https://docs.example.com/llms-full.txt' &&
+          url !== 'https://docs.example.com/page'
+        ) {
           throw new Error(`Unexpected URL: ${url}`);
+        }
+        if (url.endsWith('/page')) {
+          return new Response('<html><body>RAWPAGE</body></html>', {
+            headers: { 'content-type': 'text/html' },
+          });
         }
         return new Response('# Shared llms docs', {
           headers: { 'content-type': 'text/plain' },
@@ -135,24 +143,27 @@ describe('smartfetch/tool', () => {
       },
     ) as typeof fetch;
     const webfetch = createWebfetchTool({ client: {} } as any);
-    const outputs = [];
-    for (const format of ['html', 'markdown', 'text'] as const) {
-      outputs.push(
-        await webfetch.execute(
-          { url: 'https://docs.example.com/page', format },
-          createExecutionContext(),
-        ),
-      );
-    }
-    for (const result of outputs)
-      expect(result).toContain('# Shared llms docs');
-    expect(requests).toEqual([
-      [
-        'https://docs.example.com/llms-full.txt',
-        'text/plain, text/markdown;q=0.9, */*;q=0.1',
-      ],
+    const markdown = await webfetch.execute(
+      { url: 'https://docs.example.com/page' },
+      createExecutionContext(),
+    );
+    const text = await webfetch.execute(
+      { url: 'https://docs.example.com/page', format: 'text' },
+      createExecutionContext(),
+    );
+    const html = await webfetch.execute(
+      { url: 'https://docs.example.com/page', format: 'html' },
+      createExecutionContext(),
+    );
+    expect(markdown).toContain('# Shared llms docs');
+    expect(text).toContain('# Shared llms docs');
+    expect(html).toContain('RAWPAGE');
+    expect(html).not.toContain('# Shared llms docs');
+    expect(requests.map(([url]) => url)).toEqual([
+      'https://docs.example.com/llms-full.txt',
+      'https://docs.example.com/page',
     ]);
-    expect(CACHE.size).toBe(1);
+    expect(CACHE.size).toBe(2);
   });
 
   test('no-llms docs pages keep per-format Accept and representations', async () => {
