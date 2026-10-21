@@ -3,7 +3,7 @@
  *
  * - `parseModelRef`: "provider/model" string → v2 Model.Ref.
  * - `adaptPermissions`: v1 permission map → v2 Rule[] (with v2 permissive base +
- *   `task`→`subagent`, `bash`→`execute` mapping).
+ *   `task`→`subagent`, `bash`→`shell` mapping).
  * - `delegationVocabulary`: native per-flavor delegation tool/param names for
  *   prompt-build sites (v2 `subagent`/`agent` vs v1 `task`/`subagent_type`).
  * - `controlParamName`: native per-flavor identifier param for the control
@@ -50,14 +50,16 @@ const V2_DEFAULT_PERMISSIONS = [
 
 /** Map a v1 permission key (the tool) to v2 (action, resource). The host
  * evaluator matches the tool against `action` and the path/pattern against
- * `resource`. v1 `task` is v2 `subagent`; v1 `bash` is v2 `execute`. */
+ * `resource`. v1 `task` is v2 `subagent`; v1 `bash` is v2 `shell`.
+ * CodeMode `execute` is a separate capability. Keep the legacy `bash`
+ * spelling too, but never infer CodeMode access from a shell permission. */
 export function v1PermKeyToV2(
   key: string,
 ): Array<{ action: string; resource: string }> {
   if (key === 'task') return [{ action: 'subagent', resource: '*' }];
   if (key === 'bash')
     return [
-      { action: 'execute', resource: '*' },
+      { action: 'shell', resource: '*' },
       { action: 'bash', resource: '*' },
     ];
   return [{ action: key, resource: '*' }];

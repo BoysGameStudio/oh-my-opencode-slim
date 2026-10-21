@@ -1653,7 +1653,7 @@ describe('finalized existing-agent registry', () => {
     ).toBe('deny');
   });
 
-  test('maps admitted bash to native execute and resolves inherited model policies', () => {
+  test('maps admitted bash to native shell and resolves inherited model policies', () => {
     const runtime = runtimeFor({
       agents: {
         orchestrator: { model: 'provider/orchestrator', variant: 'orch-v' },
@@ -1694,9 +1694,9 @@ describe('finalized existing-agent registry', () => {
       },
       marketplaceOptions(Object.keys(packages), marketplaceStore(packages)),
     );
-    expect(
-      registry.nativePolicies['writer-agent']?.decide('execute', '*'),
-    ).toBe('allow');
+    expect(registry.nativePolicies['writer-agent']?.decide('shell', '*')).toBe(
+      'allow',
+    );
     expect(registry.finalAgentConfig['follows-orchestrator']).toMatchObject({
       model: 'host/orchestrator',
       variant: 'host-orch-v',
@@ -2033,6 +2033,193 @@ describe('child permission payload stance tail', () => {
       .decide;
   }
 
+  test('MCP namespace deny preserves its explicit read-only action exception in children', () => {
+    const registry = build(
+      runtimeFor({
+        agents: {
+          explorer: {
+            permission: {
+              'research_*': 'deny',
+              research_lookup: 'allow',
+              edit: 'deny',
+              bash: 'deny',
+              execute: 'allow',
+              task: 'deny',
+            },
+          },
+        },
+      }),
+      { mcp: { research: { type: 'local' } } },
+      { hostFlavor: 'v2' },
+    );
+    const baseline = registry.nativePolicies.explorer.rules;
+    expect(decideOf(baseline)('research_lookup', '*')).toBe('allow');
+    for (const hostTail of [[], [USER_GLOBAL_ALLOW]]) {
+      const payload = [...baseline, ...hostTail];
+      const compiled = registry.compileChildPermissions('explorer', payload);
+      const decide = decideOf(compiled);
+      expect(decide('research_lookup', '*')).toBe('allow');
+      expect(decide('research_mutate', '*')).toBe('deny');
+      expect(decide('shell', 'echo blocked')).toBe('deny');
+      expect(decide('execute', '*')).toBe('allow');
+      expect(decide('edit', 'src/index.ts')).toBe('deny');
+      expect(decide('subagent', 'explorer')).toBe('deny');
+      expect(registry.compileChildPermissions('explorer', compiled)).toEqual(
+        compiled,
+      );
+      for (const effect of ['deny', 'ask'] as const) {
+        const restricted = registry.compileChildPermissions('explorer', [
+          ...payload,
+          { action: 'research_lookup', resource: 'private/*', effect },
+        ]);
+        expect(
+          decideOf(restricted)('research_lookup', 'private/document'),
+        ).toBe(effect);
+        expect(decideOf(restricted)('research_lookup', 'public/document')).toBe(
+          'allow',
+        );
+      }
+    }
+  });
+
+  test('writer and custom planner helper routes remain Explorer-only and v1 maps stay native', () => {
+    for (const name of ['fixer', 'planner']) {
+      const runtime = runtimeFor({
+        agents: {
+          [name]: {
+            model: 'provider/test',
+            permission: {
+              task: { '*': 'deny', explorer: 'allow' },
+              bash: { '*': 'deny', 'git status*': 'allow' },
+              execute: 'allow',
+            },
+          },
+        },
+      });
+      for (const hostFlavor of [undefined, 'v2']) {
+        const registry = build(runtime, {}, { hostFlavor });
+        const sdk = registry.getSdkAgentProjection()[name];
+        expect(sdk.permission).toMatchObject({
+          bash: { '*': 'deny', 'git status*': 'allow' },
+          execute: 'allow',
+          task: { '*': 'deny', explorer: 'allow' },
+        });
+        expect(sdk.permission).not.toHaveProperty('shell');
+        const payload = [
+          ...registry.nativePolicies[name].rules,
+          USER_GLOBAL_ALLOW,
+        ];
+        const child = decideOf(registry.compileChildPermissions(name, payload));
+        expect(child('subagent', 'explorer')).toBe('allow');
+        expect(child('subagent', 'fixer')).toBe('deny');
+        expect(child('subagent', 'planner')).toBe('deny');
+        expect(child('shell', 'echo blocked')).toBe('deny');
+        expect(child('shell', 'git status --short')).toBe('allow');
+        expect(child('execute', '*')).toBe('allow');
+      }
+    }
+  });
+
+  test('shell alias exceptions do not discard an earlier broader command denial', () => {
+    const registry = build(
+      runtimeFor({
+        agents: {
+          explorer: {
+            permission: {
+              bash: { 'git *': 'deny' },
+              'shel*': { 'git status': 'deny' },
+              shell: { 'git status': 'allow' },
+            },
+          },
+        },
+      }),
+      {},
+      { hostFlavor: 'v2' },
+    );
+    const baseline = registry.nativePolicies.explorer.rules;
+    expect(decideOf(baseline)('shell', 'git diff')).toBe('deny');
+    expect(decideOf(baseline)('shell', 'git status')).toBe('allow');
+    const compiled = registry.compileChildPermissions('explorer', [
+      ...baseline,
+      USER_GLOBAL_ALLOW,
+    ]);
+    expect(decideOf(compiled)('shell', 'git diff')).toBe('deny');
+    expect(decideOf(compiled)('shell', 'git status')).toBe('allow');
+  });
+
+  test('overlapping action denies never reopen baseline or host restrictions', () => {
+    type Permission = Record<
+      string,
+      'allow' | 'deny' | Record<string, 'allow' | 'deny'>
+    >;
+    const entries: [string, Permission[string]][] = [
+      ['research_*', 'deny'],
+      ['research_l*', { '*': 'deny', 'public/*': 'allow' }],
+      ['research_lookup', { '*': 'allow', 'private/*': 'deny' }],
+      ['*_lookup', { 'public/blocked': 'deny' }],
+    ];
+    function permutations<T>(items: T[]): T[][] {
+      if (items.length === 0) return [[]];
+      return items.flatMap((item, index) =>
+        permutations(items.filter((_, other) => other !== index)).map(
+          (rest) => [item, ...rest],
+        ),
+      );
+    }
+    const resources = [
+      '*',
+      'public/document',
+      'public/blocked',
+      'private/document',
+    ];
+    const actions = [
+      'research_lookup',
+      'research_list',
+      'research_mutate',
+      'other_lookup',
+    ];
+    for (const ordered of permutations(entries)) {
+      const registry = build(
+        runtimeFor({
+          agents: {
+            explorer: {
+              permission: Object.fromEntries(ordered),
+            },
+          },
+        }),
+        {},
+        { hostFlavor: 'v2' },
+      );
+      const baseline = registry.nativePolicies.explorer.rules;
+      for (const effect of ['allow', 'ask', 'deny'] as const) {
+        const payload: V2PermissionRule[] = [
+          ...baseline,
+          USER_GLOBAL_ALLOW,
+          { action: '*_lookup', resource: 'public/document', effect },
+        ];
+        const compiled = registry.compileChildPermissions('explorer', payload);
+        for (const action of actions) {
+          expectNeverLooser(payload, compiled, action, resources);
+          const child = decideOf(compiled);
+          const declared = decideOf(baseline);
+          for (const resource of resources) {
+            if (declared(action, resource) === 'deny') {
+              expect({
+                ordered,
+                action,
+                resource,
+                effect: child(action, resource),
+              }).toEqual({ ordered, action, resource, effect: 'deny' });
+            }
+          }
+        }
+        expect(registry.compileChildPermissions('explorer', compiled)).toEqual(
+          compiled,
+        );
+      }
+    }
+  });
+
   test('no-nested stance agent: trailing global */* allow cannot defeat subagent deny', () => {
     const runtime = runtimeFor({ disabled_agents: [] });
     const registry = build(runtime, {}, { hostFlavor: 'v2' });
@@ -2353,7 +2540,7 @@ describe('child permission payload stance tail', () => {
     const compiled = registry.compileChildPermissions('explorer', payload);
     const decide = decideOf(compiled);
     expect(decide('bash', 'git add -A')).toBe('deny');
-    expect(decide('execute', 'git add -A')).toBe('deny');
+    expect(decide('shell', 'git add -A')).toBe('deny');
     expect(decide('bash', 'rm -rf /tmp/scratch')).toBe('deny');
     expect(decide('bash', 'git log')).toBe('allow');
   });
