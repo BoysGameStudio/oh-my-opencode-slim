@@ -533,6 +533,8 @@ Skill 分配即权限授予——智能体只能激活被授予的 Skill。请�
 
 ## 🖥️ Companion
 
+原生源码和发布版本已迁移至 **[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion)**。插件保留安装器、更新器和状态集成，现有命令与配置不变。
+
 可选的 Companion 是一个用于展示实时智能体活动的浮动桌面状态窗口。它显示当前会话状态和哪些智能体正在运行，让后台工作一目了然。
 
 <div align="center">

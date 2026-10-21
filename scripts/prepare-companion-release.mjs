@@ -1,112 +1,77 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import {
+  COMPANION_REPOSITORY,
+  companionArchiveNames,
+  validateCompanionManifest,
+} from './check-companion-release.mjs';
 
-const versionFlag = process.argv.find((arg) => arg.startsWith('--version='));
-const assetsFlag = process.argv.find((arg) => arg.startsWith('--assets-dir='));
-const version = versionFlag?.slice('--version='.length);
-
-if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
-  throw new Error('Specify a numeric --version=X.Y.Z.');
-}
-
-function replaceRequired(text, pattern, replacement, label) {
-  if (!pattern.test(text)) {
-    throw new Error(`Could not locate ${label}`);
+export function writeCompanionManifests(manifest, root = '.') {
+  validateCompanionManifest(manifest);
+  const updaterPath = join(root, 'src/companion/updater.ts');
+  const updater = readFileSync(updaterPath, 'utf8');
+  const pattern =
+    /export const COMPANION_MANIFEST: CompanionManifest = \{[\s\S]*?\n\};/;
+  if (!pattern.test(updater)) {
+    throw new Error(
+      'Could not locate Companion fallback manifest in updater.ts',
+    );
   }
-  return text.replace(pattern, replacement);
+  const fallback = [
+    'export const COMPANION_MANIFEST: CompanionManifest = {',
+    `  version: '${manifest.version}',`,
+    `  tag: '${manifest.tag}',`,
+    `  repo: '${manifest.repo}',`,
+    '  checksums: {',
+    ...Object.entries(manifest.checksums).flatMap(([archive, sha]) => [
+      `    '${archive}':`,
+      `      '${sha}',`,
+    ]),
+    '  },',
+    '};',
+  ].join('\n');
+  writeFileSync(
+    join(root, 'src/companion/companion-manifest.json'),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  );
+  writeFileSync(updaterPath, updater.replace(pattern, fallback));
 }
 
-const cargoPath = 'companion/Cargo.toml';
-const cargo = readFileSync(cargoPath, 'utf8');
-writeFileSync(
-  cargoPath,
-  replaceRequired(
-    cargo,
-    /^version\s*=\s*"[^"]+"/m,
-    `version = "${version}"`,
-    'package version in Cargo.toml',
-  ),
-);
-
-const lockPath = 'companion/Cargo.lock';
-const lock = readFileSync(lockPath, 'utf8');
-const lockPackagePattern =
-  /(\[\[package\]\]\r?\nname = "oh-my-opencode-slim-companion"\r?\nversion = ")[^"]+(")/;
-writeFileSync(
-  lockPath,
-  replaceRequired(
-    lock,
-    lockPackagePattern,
-    (_match, prefix, suffix) => `${prefix}${version}${suffix}`,
-    'Companion package in Cargo.lock',
-  ),
-);
-
-if (!assetsFlag) {
-  console.log(`Prepared native Companion build version ${version}`);
-  process.exit(0);
-}
-
-const assetsDir = assetsFlag.slice('--assets-dir='.length);
-const targets = [
-  'aarch64-apple-darwin',
-  'aarch64-unknown-linux-gnu',
-  'x86_64-apple-darwin',
-  'x86_64-pc-windows-msvc',
-  'x86_64-unknown-linux-gnu',
-];
-const checksums = {};
-for (const target of targets) {
-  const extension = target.includes('windows') ? 'zip' : 'tar.gz';
-  const archive = `oh-my-opencode-slim-companion-v${version}-${target}.${extension}`;
-  const path = join(assetsDir, archive);
-  if (!existsSync(path)) {
-    throw new Error(`Missing published Companion release asset: ${archive}`);
+export function prepareCompanionRelease(version, assetsDir, root = '.') {
+  if (!assetsDir)
+    throw new Error('Specify --assets-dir with published archives.');
+  const checksums = {};
+  for (const archive of companionArchiveNames(version)) {
+    checksums[archive] = createHash('sha256')
+      .update(readFileSync(join(assetsDir, archive)))
+      .digest('hex');
   }
-  checksums[archive] = createHash('sha256')
-    .update(readFileSync(path))
-    .digest('hex');
+  writeCompanionManifests(
+    {
+      version,
+      tag: `companion-v${version}`,
+      repo: COMPANION_REPOSITORY,
+      checksums,
+    },
+    root,
+  );
 }
 
-const manifestPath = 'src/companion/companion-manifest.json';
-const currentManifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-const manifest = {
-  version,
-  tag: `companion-v${version}`,
-  repo: currentManifest.repo,
-  checksums,
-};
-if (manifest.repo !== 'alvinunreal/oh-my-opencode-slim') {
-  throw new Error('Unexpected Companion release repository.');
+if (
+  process.argv[1] &&
+  pathToFileURL(resolve(process.argv[1])).href === import.meta.url
+) {
+  const version = process.argv
+    .find((arg) => arg.startsWith('--version='))
+    ?.slice('--version='.length);
+  const assetsDir = process.argv
+    .find((arg) => arg.startsWith('--assets-dir='))
+    ?.slice('--assets-dir='.length);
+  prepareCompanionRelease(version, assetsDir);
+  console.log(
+    `Synchronized Companion ${version} from five published archives.`,
+  );
 }
-writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-
-const updaterPath = 'src/companion/updater.ts';
-const updater = readFileSync(updaterPath, 'utf8');
-const fallback = [
-  'export const COMPANION_MANIFEST: CompanionManifest = {',
-  `  version: '${version}',`,
-  `  tag: 'companion-v${version}',`,
-  `  repo: '${manifest.repo}',`,
-  '  checksums: {',
-  ...Object.entries(checksums).flatMap(([archive, sha]) => [
-    `    '${archive}':`,
-    `      '${sha}',`,
-  ]),
-  '  },',
-  '};',
-].join('\n');
-writeFileSync(
-  updaterPath,
-  replaceRequired(
-    updater,
-    /export const COMPANION_MANIFEST: CompanionManifest = \{[\s\S]*?\n\};/,
-    fallback,
-    'Companion fallback manifest in updater.ts',
-  ),
-);
-console.log(
-  `Synchronized Companion ${version} from ${targets.length} actual release assets.`,
-);
