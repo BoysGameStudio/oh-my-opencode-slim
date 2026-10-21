@@ -568,7 +568,10 @@ channels would duplicate that delivery, so on v2 they are **structurally off**
 Event-driven wakes keep working on both flavors: stopped-job recovery, later
 terminal publications of the same run (for example a child that
 self-continued), and child-input asks still wake an idle parent, and their
-SDK-error retries still use the idle timer. On v2, terminal retirement is
+SDK-error retries still use the idle timer. A failed publication retry survives
+parent busy/idle transitions, including when periodic wakes are disabled.
+Deletion clears the retry. This does not add restart persistence or retry
+publications skipped by the throttle. On v2, terminal retirement is
 observation-based: the plugin watches the host's native `<subagent>`
 deliveries in the parent's transcript and retires the matching record, with a
 timestamp fallback for a missed observation. On v1, `boardInjection: false`
