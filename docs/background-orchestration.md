@@ -108,6 +108,10 @@ untracked child owned by the calling parent, then
 continues it with the new prompt.
 Recovery verifies the original agent and latest delivered round before importing
 a retained terminal row. This cache-only import does not launch or notify.
+On V2, `session.execution.interrupted` with reason `shutdown` is suspension,
+not a terminal idle transition. OMO preserves the raw event without synthesizing
+idle/status events; the host retains execution and first-notification ownership.
+This does not restore process-local board entries or prove restart recovery.
 `task_cancel` still cannot abort a run launched before the restart — the board
 has no live handle to it (tracked in #1387).
 The production board numbers a parent's children only when the host's creation

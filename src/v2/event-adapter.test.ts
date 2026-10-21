@@ -121,6 +121,21 @@ function createHookCtx(): never {
 }
 
 describe('mapV2EventToV1', () => {
+  test('shutdown interruption preserves a suspended round without synthesizing idle', () => {
+    // v2.1.2 execution/restart.ts resumes the claim; message-updater.ts and
+    // projector.ts deliberately do not publish an idle for shutdown.
+    const event = {
+      id: 'evt_shutdown',
+      created: 100,
+      type: 'session.execution.interrupted',
+      durable: { aggregateID: 'ses_child', seq: 1, version: 1 },
+      data: { sessionID: 'ses_child', reason: 'shutdown' },
+    };
+    const events = mapV2EventToV1(event);
+    expect(events).toEqual([event]);
+    expect(events[0]).toBe(event);
+  });
+
   test('passes unknown events through unchanged (raw reference first)', () => {
     const ev = { type: 'permission.asked', properties: { sessionID: 's' } };
     const out = mapV2EventToV1(ev);
