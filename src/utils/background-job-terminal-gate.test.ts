@@ -15,6 +15,7 @@ import {
 import { BackgroundTaskConcurrency } from './background-task-concurrency';
 import { classifyTerminalEvidence } from './child-transcript';
 import * as loggerModule from './logger';
+import { readHostSessionInfo } from './session-info-read';
 import { COMPLETED_WITHOUT_TEXT_DIAGNOSTIC } from './task';
 import { createTimerHarness, tick } from './test-timers';
 
@@ -386,6 +387,98 @@ describe('terminal gate', () => {
       state: 'completed',
       terminalRevision: 1,
       resultSummary: 'Host reported outcome: succeeded.',
+    });
+  });
+  test('a foreign probe holding the raw read defers the outcome check without burning retries', async () => {
+    let resolveProbe: (value: unknown) => void = () => {};
+    let calls = 0;
+    const get = mock(() => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise((resolve) => {
+          resolveProbe = resolve;
+        });
+      }
+      return Promise.resolve({
+        data: { outcome: 'succeeded', time: { idle: 50 } },
+      });
+    });
+    const probeInput = { client: { session: { get } } };
+    const h = harness({
+      hostOutcomeClock: 'shared-unix-ms',
+      baselineFor: () => undefined,
+      readTerminalEvidence: async () => undefined,
+      input: probeInput as never,
+    });
+    h.observe('quiescent');
+    h.advance(61);
+    // A plain task_status probe occupies the shared slot with its own
+    // identity before the gate's outcome read.
+    const probe = readHostSessionInfo(probeInput as never, {
+      taskID: 'ses_child',
+      identity: 'standalone:ses_child',
+    });
+    await h.gate.reconcile(h.run);
+    // Blocked before the deadline race: no gate read, no retry burn, and
+    // a repeated blocked reconcile coalesces into one follow-up.
+    expect(calls).toBe(1);
+    expect(h.board.get(h.run.taskID)).toMatchObject({ state: 'running' });
+    await h.gate.reconcile(h.run);
+    expect(calls).toBe(1);
+    resolveProbe({ data: { outcome: 'succeeded', time: { idle: 50 } } });
+    await probe;
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'completed',
+      terminalRevision: 1,
+      resultSummary: 'Host reported outcome: succeeded.',
+    });
+    // Exactly one gate read followed the probe.
+    expect(calls).toBe(2);
+  });
+  test('a slow foreign occupant never exhausts the outcome retry budget', async () => {
+    let resolveProbe: (value: unknown) => void = () => {};
+    let calls = 0;
+    const get = mock(() => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise((resolve) => {
+          resolveProbe = resolve;
+        });
+      }
+      return Promise.resolve({
+        data: { outcome: 'succeeded', time: { idle: 50 } },
+      });
+    });
+    const probeInput = { client: { session: { get } } };
+    const h = harness({
+      hostOutcomeClock: 'shared-unix-ms',
+      baselineFor: () => undefined,
+      readTerminalEvidence: async () => undefined,
+      input: probeInput as never,
+    });
+    h.observe('quiescent');
+    h.advance(61);
+    const probe = readHostSessionInfo(probeInput as never, {
+      taskID: 'ses_child',
+      identity: 'standalone:ses_child',
+    });
+    await h.gate.reconcile(h.run);
+    // Advance the wall clock and fire every scheduled timer while the
+    // foreign occupant stays unsettled: deferral must be delay-neutral,
+    // not a slow retry exhaustion (the bot's exact scenario).
+    h.advance(200_000);
+    await h.timers.advance(200_000);
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    expect(
+      String(h.board.get(h.run.taskID)?.resultSummary ?? ''),
+    ).not.toContain(EVIDENCE_UNAVAILABLE_DIAGNOSTIC);
+    resolveProbe({ data: { outcome: 'succeeded', time: { idle: 50 } } });
+    await probe;
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    expect(h.board.get(h.run.taskID)).toMatchObject({
+      state: 'completed',
+      terminalRevision: 1,
     });
   });
   test('accepts OpenCode V2 idleOutcome for a successful child', async () => {

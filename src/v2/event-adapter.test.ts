@@ -507,12 +507,124 @@ describe('mapV2EventToV1 live wire shape (payload under `data`)', () => {
     const out = mapV2EventToV1(ev);
     expect(out).toHaveLength(3);
     expect(out[0]).toBe(ev);
+    // The terminal idle carries the host envelope `created` exactly like
+    // the busy status: a delayed delivery must keep the host activity
+    // boundary (the terminal gate attributes the run's idle with it).
     expect(out.slice(1)).toEqual([
       {
         type: 'session.status',
-        properties: { sessionID: 'ses_live', status: { type: 'idle' } },
+        properties: {
+          sessionID: 'ses_live',
+          status: { type: 'idle' },
+          activityAt: 1_788_961_637_000,
+        },
       },
       { type: 'session.idle', properties: { sessionID: 'ses_live' } },
+    ]);
+  });
+
+  test.each([
+    'session.execution.succeeded',
+    'session.execution.failed',
+    'session.execution.interrupted',
+  ])(
+    'live %s carries the envelope `created` onto the synthesized idle status',
+    (type) => {
+      const ev = liveEvent(type, { sessionID: 'ses_live' });
+      const out = mapV2EventToV1(ev);
+      const idle = out.find(
+        (entry) =>
+          entry.type === 'session.status' &&
+          (entry.properties as { status?: { type?: string } }).status?.type ===
+            'idle',
+      );
+      expect(idle).toEqual({
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_live',
+          status: { type: 'idle' },
+          activityAt: 1_788_961_637_000,
+        },
+      });
+      // The documentation pins the exact consumer bytes; keep them honest.
+      expect(out[out.length - 1]).toEqual({
+        type: 'session.idle',
+        properties: { sessionID: 'ses_live' },
+      });
+    },
+  );
+
+  test('terminal idle without a usable `created` carries no activityAt', () => {
+    for (const created of [
+      undefined,
+      null,
+      'nope',
+      -1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+    ]) {
+      const ev = {
+        ...liveEvent('session.execution.succeeded', {
+          sessionID: 'ses_live',
+        }),
+        created,
+      };
+      const out = mapV2EventToV1(ev);
+      expect(out[1]).toEqual({
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_live',
+          status: { type: 'idle' },
+        },
+      });
+      expect(out[2]).toEqual({
+        type: 'session.idle',
+        properties: { sessionID: 'ses_live' },
+      });
+    }
+  });
+
+  test('live execution.failed keeps error-before-idle with the terminal activityAt', () => {
+    const ev = liveEvent('session.execution.failed', {
+      sessionID: 'ses_live',
+      error: { message: 'rate limited' },
+    });
+    const out = mapV2EventToV1(ev);
+    expect(out).toHaveLength(4);
+    expect(out[1]).toEqual({
+      type: 'session.error',
+      properties: {
+        sessionID: 'ses_live',
+        error: { message: 'rate limited' },
+      },
+    });
+    expect(out[2]).toEqual({
+      type: 'session.status',
+      properties: {
+        sessionID: 'ses_live',
+        status: { type: 'idle' },
+        activityAt: 1_788_961_637_000,
+      },
+    });
+    expect(out[3]).toEqual({
+      type: 'session.idle',
+      properties: { sessionID: 'ses_live' },
+    });
+  });
+
+  test('legacy `properties` spellings without `created` stay byte-identical', () => {
+    // The regression baseline: shapes synthesized from a payload that has
+    // no envelope timestamp must not grow an activityAt field.
+    const out = mapV2EventToV1({
+      type: 'session.execution.succeeded',
+      properties: { sessionID: 'ses_exec' },
+    });
+    expect(out.slice(1)).toEqual([
+      {
+        type: 'session.status',
+        properties: { sessionID: 'ses_exec', status: { type: 'idle' } },
+      },
+      { type: 'session.idle', properties: { sessionID: 'ses_exec' } },
     ]);
   });
 

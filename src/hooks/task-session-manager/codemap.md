@@ -12,8 +12,9 @@ The directory follows a **Facade + Strategy** pattern where `index.ts` acts as t
   Historical-task recovery and injected completions admit already-managed parents
   regardless of agent name; stale Orchestrator mapping repair stays specific to
   Orchestrator turns and does not promote unmanaged Build/custom parents.
-- **session-recovery.ts**: On-demand recovery of untracked host children: verifies parent/agent, triages v2 rounds by the `session.get` outcome/idleAt projection (terminal rounds import their true state only when their answer text is readable — a textless success stays pending per incident 1115, rounds without a terminal outcome are refused unless an explicit queued continuation adopts identity, partial or unverifiable evidence fails closed, and no round is imported as stopped on a guess), and imports terminal rows into the board.
+- **session-recovery.ts**: On-demand recovery of untracked host children: verifies parent/agent, triages v2 rounds by the `session.get` outcome/idleAt projection (successful rounds require readable answer text per incident 1115; textless failures and interruptions retain their host-proven terminal state, rounds without a terminal outcome are refused unless an explicit queued continuation adopts identity, partial or unverifiable evidence fails closed, and no round is imported as stopped on a guess), and imports terminal rows into the board.
 - **revived-run-tracker.ts**: Logs terminal notification transport acceptance and failure with the captured transport-attempt number (including late acceptance after a timeout), lease deferral, and once-only ownership release to the fallback publication wake.
+- **Host transcript attribution**: Recovery and untracked status/result reads share `attributeHostRoundToTranscript` from `../../utils/child-transcript.ts`; newer assistant creation/completion invalidates an older host idle outcome, missing assistant timestamps fail closed, and explicit queued continuation can adopt a newer incomplete round without importing a terminal row. `hostRoundStateOf` and `composeHostRound` remain the parser/composer.
 - **../../utils/background-job-terminal-gate.ts**: Shared execution/observation gate for every terminal publication. Runtime quiescence and attributable result evidence authorize one board commit; busy withdraws terminal publications. Grace, bounded retries and single-open reads are shared across adapters.
 - **input-wait-tracker.ts**: Provides the single `hasInputWait()` seam used by idle reconciliation and continuation evaluation. It combines local question/permission waits with the process-global explicit user-wait latch.
 - **child-input-wait.ts**: Tracks pending child requests and formats their details/guidance for both wakes and `task_status`. V2 forms carry summaries and host-UI/wait/cancel guidance; v1 questions retain answer options.
@@ -144,4 +145,3 @@ The original monolithic module was split to improve:
 - **Scalability**: Capped data structures prevent unbounded memory growth.
 
 Each submodule adheres to the **Single Responsibility Principle** while collaborating through the facade to provide a cohesive user experience.
-

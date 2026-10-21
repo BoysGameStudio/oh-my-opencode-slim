@@ -4,6 +4,7 @@ import type { BackgroundJobRecord } from '../utils/background-job-board';
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import { SESSION_ID_PATTERN } from '../utils/session';
 import { controlParamName } from '../v2/adapters';
+import { v2ResumeCall } from '../v2/delegation';
 
 export type { CanonicalTaskReference };
 
@@ -65,6 +66,44 @@ export type CanonicalTaskResolver = (
   requested: string,
 ) => Promise<CanonicalTaskReference>;
 
+/** How many tracked handles an unknown-handle error enumerates. */
+export const RECENT_TASK_HANDLE_LIMIT = 5;
+
+/**
+ * Parent-scoped enumeration of the most recently launched tracked handles,
+ * appended to unknown-handle errors so the model can retry with a live alias
+ * instead of guessing one. Alias + agent + effective state only — never
+ * objectives; adopted records carry their session ID as the alias. The line
+ * is prefixed `recent: ` so the
+ * tool-loop-guard's taskID/state parsers (anchored on `task_id:`/
+ * `sessionID:`/`Task (`/`state:`) can never capture it.
+ */
+export function recentTaskHandles(
+  board: BackgroundJobStore,
+  parentSessionID: string,
+): string | undefined {
+  const recent = board.list(parentSessionID).slice(-RECENT_TASK_HANDLE_LIMIT);
+  if (recent.length === 0) return undefined;
+  return `recent: ${recent
+    .map(
+      (job) =>
+        `${job.alias} ${job.agent} ${
+          job.state === 'reconciled'
+            ? (job.terminalState ?? job.state)
+            : job.state
+        }`,
+    )
+    .join('; ')}`;
+}
+
+/** Append the enumeration line to an error message when one exists. */
+export function withRecentTaskHandles(
+  message: string,
+  recent: string | undefined,
+): string {
+  return recent === undefined ? message : `${message}\n${recent}`;
+}
+
 /**
  * The shared board-miss error. A miss proves only that the in-memory board
  * does not track the ref — records are evicted by retention limits or lost
@@ -72,15 +111,27 @@ export type CanonicalTaskResolver = (
  * session-shaped IDs get the settled-session guidance (continue the same
  * session via task_revive; never a duplicate) while board-scoped aliases,
  * which have no host existence, keep the bare unknown error.
+ *
+ * `recent` (from `recentTaskHandles`) enumerates the parent's live handles
+ * so an alias typo is recoverable from the error itself.
  */
 export function unknownTaskRefError(
   identity: string,
   resumeParam: string,
+  recent?: string,
+  hostFlavor?: string,
 ): Error {
+  const continueHint =
+    hostFlavor === 'v2'
+      ? `continue it with ${v2ResumeCall(identity)}`
+      : `continue it with task_revive and ${resumeParam}: "${identity}"`;
   return new Error(
-    SESSION_ID_PATTERN.test(identity)
-      ? `Unknown task ID or alias: ${identity} (not tracked: records are evicted by retention limits or lost on a host restart; a settled session can still exist on the host). If it is a settled session you own, continue it with task_revive and ${resumeParam}: "${identity}"; do not launch a duplicate.`
-      : `Unknown task ID or alias: ${identity}`,
+    withRecentTaskHandles(
+      SESSION_ID_PATTERN.test(identity)
+        ? `Unknown task ID or alias: ${identity} (not tracked: records are evicted by retention limits or lost on a host restart; a settled session can still exist on the host). If it is a settled session you own, ${continueHint}; do not launch a duplicate.`
+        : `Unknown task ID or alias: ${identity}`,
+      recent,
+    ),
   );
 }
 

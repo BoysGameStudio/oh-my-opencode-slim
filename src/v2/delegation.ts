@@ -84,6 +84,18 @@ export function delegationWording(
   return { tool, agentParam, resumeParam };
 }
 
+/** v2 native resume call form for model-visible guidance: v2 retired
+ * `task_revive`, so a retained session is continued through the native
+ * delegation tool's resume parameter. `taskID` omitted renders the literal
+ * placeholder form used in static prompt copy. */
+export function v2ResumeCall(taskID?: string): string {
+  const { tool, resumeParam } = delegationVocabulary('v2');
+  return `${tool}(${resumeParam}: "${taskID ?? '...'}", prompt: "...")`;
+}
+
+/** Static literal v2 resume call for prompt copy without a concrete id. */
+export const V2_RESUME_CALL = v2ResumeCall();
+
 /** Rewritten native `subagent` description for the background-default flip
  * (v2 only): the native prose anchors the omitted-parameter default to the
  * foreground ("Foreground (default)…", "Use background only for…") and

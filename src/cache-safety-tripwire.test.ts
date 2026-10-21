@@ -84,6 +84,10 @@ const ALLOWLIST = new Map<string, string>([
     'Date.now()/Math.random() compose a per-run temp token for install bookkeeping; it names local directories and never reaches the prompt prefix.',
   ],
   [
+    'hooks/task-session-manager/tool-execute-hooks.ts',
+    'Date.now() stamps the internal markReconciled acknowledgement before a native continuation; the value is board bookkeeping and is never formatted into prompt content (the hook writes tool args and board state only).',
+  ],
+  [
     'hooks/deepwork-guard/index.ts',
     'Date.now() timestamps claim markers and receipts under .slim/deepwork/.runtime/ (machine-owned bookkeeping the workflow never reads); the completion gate deny message carries only slugs and paths, never timestamps.',
   ],

@@ -64,9 +64,9 @@ conservatively passes the path through. Disable with
 |------|-------------|
 | `task` | Start a specialist task and return its task ID |
 | `task_status` | Check the status of a task; `result: true` retrieves its result |
-| `task_message` | Send a non-interrupting message and return `queued` (v2: steering acceptance with `delivery: "steer"`) |
+| `task_message` | Send a non-interrupting message and return `queued` (queue-only: no wake, no steer channel) |
 | `task_cancel` | Stop a generation while retaining its session |
-| `task_revive` | Resume a retained session with a new instruction |
+| `task_revive` | Resume a retained session with a new instruction (v1 only; on v2 continue with `subagent(sessionID, prompt)`) |
 | `wait_for_user` | Pause automatic orchestrator wake prompts until the next distinct external user message (v1 only; not registered on v2 — use the native `question` tool there) |
 
 The task controls use the task ID or Background Job Board alias for the task being
@@ -120,28 +120,12 @@ of reading and pinning selection per call. On v1 it pins the newest valid user o
 assistant model/variant in the bounded transcript, skipping compaction summaries;
 the session's saved selection can predate a hook rewrite. No valid identity means
 no message is sent.
-The v2 write accepts an optional `delivery` parameter (`"queue"` | `"steer"`,
-default `"queue"`; the parameter does not exist on v1 hosts). Both modes send
-a real, non-synthetic `noReply` prompt with `resume: false` in the same child
-session: no wake, no new run, no interrupt, no agent/model/variant switch.
-
-| Mode | Consumption boundary | Result text |
-|------|----------------------|-------------|
-| `queue` (default) | waits for an idle boundary; consumption is not confirmed | `Message queued for … without launching or resuming it.` |
-| `steer` | offered at the next supported model-step boundary of the current run, after the current step's tool executions finish | `Message accepted for steering … at the next supported step boundary; … consumption is not confirmed.` |
-
-```text
-task_message(sessionID: "<id>", message: "<concise amendment>", delivery: "steer")
-```
-
-Message lease and timeout protections are unchanged in both modes.
-For a queued v2 `task_revive`, steering is refused until the continuation's
-exact user-message ID appears in the host transcript. Queue admission and a
-`running` job-board state do not establish that the continuation has started;
-otherwise steering could reach the preceding execution. A failed or timed-out
-transcript read sends no message and releases the message lease. Use
-`task_status` to inspect the continuation before retrying. Default queue delivery
-does not require this check.
+The write sends a real, non-synthetic `noReply` prompt with `resume: false` and
+`delivery: "queue"` in the same child session: no wake, no new run, no interrupt,
+and no agent/model/variant switch. There is no model-facing steering channel —
+the native delegation tool already steers a running child on v2, and v1 messages
+are queued. Queue consumption waits for an idle boundary and is not confirmed:
+`Message queued for … without launching or resuming it.`
 
 A success response confirms only transport acceptance, not consumption: the host
 admitted the input, with no proof the child read it. Consumption timing is
@@ -178,7 +162,14 @@ V2 untracked adoption uses a different result boundary: it queues a caller-ID
 input after verifying parent ownership, agent evidence, and readable history,
 without requiring status/idle APIs. Host-proven aliases retain the upstream
 ambiguity and ownership checks. Recovery consults the session's host outcome:
-terminal rounds are imported, work without a terminal outcome (still running,
+successful rounds require nonempty answer text; textless failed or interrupted
+rounds retain their proven error or stopped state. Host terminal outcomes must
+cover the latest delivered input and all subsequent assistant activity: an
+assistant created or completed after the host's `time.idle` keeps the round
+unconfirmed, while unreadable assistant timestamps fail closed. No transcript
+idle marker is required. Explicit queued continuation may still adopt a newer
+incomplete round without importing the older outcome or partial answer.
+Work without a terminal outcome (still running,
 or awaiting restart resume) is refused except for explicit queued
 continuation, and partial or unverifiable state fails closed.
 The new generation is registered before the write and is not replaced by late
@@ -210,10 +201,11 @@ The delegation tool (`task()` on v1, `subagent()` on v2) refuses an explicit
 resume id (`task_id` on v1, `sessionID` on v2) it cannot resume instead of
 dropping it and spawning another session. On v1, an id the local board does
 not know is not a cue to omit `task_id` and start another session. Call
-`task_revive` with that same id directly. On v2, a completed session
-continues with `subagent(sessionID)` even when it is not listed; an unknown
+`task_revive` with that same id directly on v1. On v2, a completed session
+continues with `subagent(sessionID, prompt)` even when it is not listed; an unknown
 id is read from the host and imported before that native call. Cancelled,
-errored, and stopped sessions still use `task_revive`. A failed lookup keeps
+errored, and stopped sessions resume the same way on v2 (the plugin retires
+`task_revive` there). A failed lookup keeps
 the id and does not start another child. It verifies the original host
 session and continues there. A `task_status` result read only retrieves a
 finished result and is not required before that continuation.

@@ -15,13 +15,14 @@
 /**
  * Minimum expected registrations for a healthy plugin load.
  *
- * On v2 hosts `wait_for_user` is unregistered (the native
- * `question` tool covers the blocking boundary), so the v2 floor drops
- * by one.
+ * On v2 hosts `wait_for_user` and `task_revive` are unregistered (the native
+ * `question` tool covers the blocking boundary, and retained sessions resume
+ * through native `subagent(sessionID, prompt)`), so the v2 floor drops by
+ * two relative to the v1 baseline.
  */
 export const HEALTH_CHECK = {
   minAgents: 5,
-  // Default tool set when council and ACP agents are not configured:
+  // Default v1 tool set when council and ACP agents are not configured:
   // task_cancel, task_message, task_revive, task_status,
   // task_reply, wait_for_user, webfetch, ast_grep_search, ast_grep_replace.
   minTools: 9,
@@ -48,16 +49,20 @@ const BASELINE_TOOL_NAMES = new Set([
  *   values (which should never occur post-validation, but are not trusted at
  *   runtime) are treated as "nothing disabled".
  * @param webfetchEnabled - Whether the enhanced webfetch tool is registered.
- * @param waitForUserEnabled - Whether the wait_for_user tool is registered
- *   (false on v2 hosts; the native `question` tool covers the
- *   blocking boundary there).
+ * @param hostFlavor - 'v2' on OpenCode v2 hosts; anything else renders the
+ *   v1 baseline. v2 unregisters wait_for_user and task_revive, so both leave
+ *   the baseline and must not lower the floor when the user lists them under
+ *   disabled_tools.
  * @returns The adjusted minimum expected tool count
  */
 export function minimumExpectedToolCount(
   disabledTools: readonly string[] = [],
   webfetchEnabled = true,
-  waitForUserEnabled = true,
+  hostFlavor?: string,
 ): number {
+  const v2 = hostFlavor === 'v2';
+  const waitForUserEnabled = !v2;
+  const taskReviveEnabled = !v2;
   // Config values come from user-edited JSON/JSONC (and can be re-derived
   // via runtime preset switches); never trust the declared type at
   // runtime. Fall back to "no disabled tools" instead of crashing plugin
@@ -68,15 +73,18 @@ export function minimumExpectedToolCount(
       (toolName) =>
         BASELINE_TOOL_NAMES.has(toolName) &&
         (toolName !== 'webfetch' || webfetchEnabled) &&
-        (toolName !== 'wait_for_user' || waitForUserEnabled),
+        (toolName !== 'wait_for_user' || waitForUserEnabled) &&
+        (toolName !== 'task_revive' || taskReviveEnabled),
     ),
   );
   const webfetchAdjustment = webfetchEnabled ? 0 : 1;
   const waitForUserAdjustment = waitForUserEnabled ? 0 : 1;
+  const taskReviveAdjustment = taskReviveEnabled ? 0 : 1;
   return (
     HEALTH_CHECK.minTools -
     webfetchAdjustment -
     waitForUserAdjustment -
+    taskReviveAdjustment -
     disabledBaselineTools.size
   );
 }

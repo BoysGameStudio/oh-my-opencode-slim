@@ -156,37 +156,29 @@ describe('v2 historical context', () => {
     });
   });
 
-  test('a host terminal outcome without readable answer text refuses as pending', async () => {
-    // Incident 1115: the gate trusts restored rows without rereading the
-    // transcript, so a textless succeeded import would make later result
-    // reads permanently empty. Plain recovery keeps the round pending;
-    // only an explicit queued revive may adopt identity.
-    const board = new BackgroundJobBoard();
-    const input = host({
-      context: (args) =>
-        args.sessionID === CHILD
-          ? [
-              {
-                id: 'msg_user',
-                type: 'user',
-                time: { created: 10 },
-                text: 'ask',
-              },
-            ]
-          : round(),
-    });
-    const refused = await createSessionRecovery({
-      input: input as never,
-      backgroundJobBoard: board,
-      hostFlavor: 'v2',
-      stableStoppedMs: 0,
-    })({ parentSessionID: PARENT, requested: CHILD });
-    expect(refused.kind).toBe('refused');
-    if (refused.kind === 'refused') {
-      expect(refused.reason).toContain('answer text is not readable yet');
-    }
-    expect(board.get(CHILD)).toBeUndefined();
-  });
+  test.each([false, true])(
+    'textless success stays pending (assistant present: %j)',
+    async (withAssistant) => {
+      const board = new BackgroundJobBoard();
+      const input = host({
+        context: (args) =>
+          args.sessionID === CHILD
+            ? round('').slice(0, withAssistant ? 2 : 1)
+            : round(),
+      });
+      const refused = await createSessionRecovery({
+        input: input as never,
+        backgroundJobBoard: board,
+        hostFlavor: 'v2',
+        stableStoppedMs: 0,
+      })({ parentSessionID: PARENT, requested: CHILD });
+      expect(refused.kind).toBe('refused');
+      if (refused.kind === 'refused') {
+        expect(refused.reason).toContain('answer text is not readable yet');
+      }
+      expect(board.get(CHILD)).toBeUndefined();
+    },
+  );
 
   test('a textless succeeded outcome still adopts identity for a queued revive', async () => {
     // The P1 companion: adoption returns verified identity without
@@ -219,6 +211,92 @@ describe('v2 historical context', () => {
     expect(adopted).toMatchObject({ kind: 'adoptable', taskID: CHILD });
     expect(board.get(CHILD)).toBeUndefined();
   });
+
+  test.each([
+    ['failed', 'error', false],
+    ['failed', 'error', true],
+    ['interrupted', 'stopped', false],
+    ['interrupted', 'stopped', true],
+  ] as const)(
+    'textless %s recovers %s (assistant present: %j)',
+    async (outcome, state, withAssistant) => {
+      const board = new BackgroundJobBoard();
+      const input = host({
+        get: () => ({
+          id: CHILD,
+          parentID: PARENT,
+          agent: 'fixer',
+          outcome,
+          time: { created: 9, idle: 13 },
+        }),
+        context: (args) =>
+          args.sessionID === CHILD
+            ? round('').slice(0, withAssistant ? 2 : 1)
+            : round(),
+      });
+      const result = await createSessionRecovery({
+        input: input as never,
+        backgroundJobBoard: board,
+        hostFlavor: 'v2',
+        stableStoppedMs: 0,
+      })({ parentSessionID: PARENT, requested: CHILD });
+      expect(result).toEqual({ kind: 'recovered', taskID: CHILD });
+      expect(board.get(CHILD)?.state).toBe(state);
+      if (outcome === 'failed') {
+        expect(board.get(CHILD)?.resultSummary).toBe(
+          'The historical round failed before an assistant result.',
+        );
+      }
+    },
+  );
+
+  test.each(['succeeded', 'failed', 'interrupted'] as const)(
+    'newer assistant activity blocks an older %s outcome',
+    async (outcome) => {
+      for (const time of [{ created: 14 }, { created: 11, completed: 14 }]) {
+        const board = new BackgroundJobBoard();
+        const input = host({
+          get: () => ({
+            id: CHILD,
+            parentID: PARENT,
+            agent: 'fixer',
+            outcome,
+            time: { created: 9, idle: 13 },
+          }),
+          context: () => [
+            ...round(),
+            {
+              id: 'new-answer',
+              type: 'assistant',
+              agent: 'fixer',
+              time,
+              content: [{ type: 'text', text: 'PARTIAL' }],
+            },
+          ],
+        });
+        const recover = createSessionRecovery({
+          input: input as never,
+          backgroundJobBoard: board,
+          hostFlavor: 'v2',
+        });
+        expect(
+          (await recover({ parentSessionID: PARENT, requested: CHILD })).kind,
+        ).toBe('refused');
+        expect(board.get(CHILD)).toBeUndefined();
+        // An explicit queued continuation may adopt identity, never import
+        // the obsolete terminal or newer partial answer as a settled row.
+        expect(
+          await recover({
+            parentSessionID: PARENT,
+            requested: CHILD,
+            purpose: 'revive',
+            allowQueuedContinuation: true,
+          }),
+        ).toMatchObject({ kind: 'adoptable', taskID: CHILD });
+        expect(board.get(CHILD)).toBeUndefined();
+      }
+    },
+  );
 
   test('a newer synthetic blocks an older succeeded outcome', async () => {
     // Host-state triage: the succeeded outcome predates the newest input
@@ -281,7 +359,7 @@ describe('v2 historical context', () => {
 });
 
 describe('v2 native resume through the setup bridge', () => {
-  test('an unacknowledged completed session continues without a result read or an early ack', async () => {
+  test('an unacknowledged completed session reconciles its old round and continues without a result read', async () => {
     const board = new FixtureBoard();
     board.registerLaunch({
       taskID: CHILD,
@@ -313,16 +391,20 @@ describe('v2 native resume through the setup bridge', () => {
     );
     await bridges.beforeBridge(input);
     expect(input.input.sessionID).toBe(CHILD);
+    // The old round is acknowledged by the resume path itself (the retired
+    // task_revive used to do it), so the terminal result is consumed exactly
+    // once and the same generation keeps its identity.
     expect(board.get(CHILD)).toMatchObject({
-      state: 'completed',
+      state: 'reconciled',
+      terminalState: 'completed',
       resultSummary: 'OLD',
-      terminalUnreconciled: true,
+      terminalUnreconciled: false,
       generation: before?.generation,
       terminalRevision: before?.terminalRevision,
     });
   });
 
-  test('an unknown completed child is imported and then resumed, and failures do not create a child', async () => {
+  test('an unknown completed child is imported, reconciled, and then resumed, and failures do not create a child', async () => {
     const board = new BackgroundJobBoard();
     const input = host();
     const event = {
@@ -343,7 +425,8 @@ describe('v2 native resume through the setup bridge', () => {
     );
     await bridges.beforeBridge(event);
     expect(board.get(CHILD)).toMatchObject({
-      state: 'completed',
+      state: 'reconciled',
+      terminalState: 'completed',
       agent: 'fixer',
       resultSummary: 'LAB-MARKER',
       parentSessionID: PARENT,
@@ -403,8 +486,52 @@ describe('v2 native resume through the setup bridge', () => {
           description: 'next',
         },
       }),
-    ).rejects.toThrow(/different parent/);
+    ).rejects.toThrow(/cannot resolve this sessionID/);
     expect(board.get(CHILD)).toBeUndefined();
+  });
+
+  test('an untracked incomplete session is adopted instead of refused', async () => {
+    // A seat that was running when the plugin restarted has no board row.
+    // Without adoption the seat is a permanent [no response] placeholder, so
+    // the delegation path adopts the verified host session and resumes it.
+    const board = new BackgroundJobBoard();
+    const input = host({
+      get: () => ({
+        id: CHILD,
+        parentID: PARENT,
+        agent: 'fixer',
+        time: { created: 9 },
+      }),
+    });
+    const event = {
+      tool: 'subagent',
+      sessionID: PARENT,
+      id: 'call_adopt',
+      input: {
+        agent: 'fixer',
+        sessionID: CHILD,
+        prompt: 'again',
+        description: 'again',
+      },
+    };
+    await createToolExecuteBridges(
+      (hookInput, output) =>
+        handleToolExecuteBefore(hookInput, output, deps(board, input)),
+      undefined,
+    ).beforeBridge(event);
+
+    // The adopted row represents recovered host work until a continuation is
+    // accepted, and it is tracked under the calling parent.
+    const adopted = board.get(CHILD);
+    expect(adopted).toMatchObject({
+      parentSessionID: PARENT,
+      agent: 'fixer',
+      externalOrigin: true,
+      recoveredWithoutPrompt: true,
+    });
+    expect(event.input.sessionID).toBe(CHILD);
+    // One row only: adoption never spawns a second child.
+    expect(board.list(PARENT)).toHaveLength(1);
   });
 });
 
@@ -432,13 +559,13 @@ test('host state that cannot be verified fails closed', async () => {
   expect(board.get(CHILD)).toBeUndefined();
 });
 
-test('an unfinished (shutdown-interrupted) session is refused as pending and task_revive queues one continuation', async () => {
+test('an unfinished (shutdown-interrupted) session is refused as pending and the delegation path adopts it', async () => {
   // Shutdown preserves the execution claim on purpose and the host may resume
-  // the round after a restart, so neither plain recovery nor the subagent
-  // continuation may import it or prompt it. Only the explicit queued revive
-  // adopts identity and lets the host admit the input at an idle boundary.
+  // the round after a restart, so plain recovery must not import it as
+  // terminal. The delegation path (purpose revive + queued continuation)
+  // adopts the verified identity instead, so a seat that was running at
+  // restart is not a permanent unresolved placeholder.
   const board = new BackgroundJobBoard();
-  let promptCalls = 0;
   const input = host({
     get: () => ({
       id: CHILD,
@@ -446,10 +573,6 @@ test('an unfinished (shutdown-interrupted) session is refused as pending and tas
       agent: 'fixer',
       time: { created: 9 },
     }),
-    prompt: async () => {
-      promptCalls += 1;
-      return { id: 'msg_host_1' };
-    },
   });
   const refused = await createSessionRecovery({
     input: input as never,
@@ -460,7 +583,8 @@ test('an unfinished (shutdown-interrupted) session is refused as pending and tas
   expect(refused.kind).toBe('refused');
   if (refused.kind === 'refused') {
     expect(refused.reason).toContain('no terminal outcome');
-    expect(refused.reason).toContain('task_revive');
+    expect(refused.reason).toContain('subagent(sessionID: "ses_child"');
+    expect(refused.reason).not.toContain('task_revive');
   }
   expect(board.get(CHILD)).toBeUndefined();
 
@@ -475,53 +599,19 @@ test('an unfinished (shutdown-interrupted) session is refused as pending and tas
       description: 'again',
     },
   };
-  await expect(
-    createToolExecuteBridges(
-      (hookInput, output) =>
-        handleToolExecuteBefore(hookInput, output, deps(board, input)),
-      undefined,
-    ).beforeBridge(event),
-  ).rejects.toThrow(/no terminal outcome/);
-  expect(board.get(CHILD)).toBeUndefined();
-
-  const { createRevivedRunTracker } = await import(
-    '../hooks/task-session-manager/revived-run-tracker'
-  );
-  const { createTaskReviveTool } = await import('../tools/task-revive');
-  const { createBackgroundJobTerminalGate } = await import(
-    '../utils/background-job-terminal-gate'
-  );
-  const gate = createBackgroundJobTerminalGate({
-    backgroundJobBoard: board,
-    input: input as never,
+  await createToolExecuteBridges(
+    (hookInput, output) =>
+      handleToolExecuteBefore(hookInput, output, deps(board, input)),
+    undefined,
+  ).beforeBridge(event);
+  // Adopted, not refused: one tracked row, no silent re-dispatch.
+  expect(board.list(PARENT)).toHaveLength(1);
+  expect(board.get(CHILD)).toMatchObject({
+    parentSessionID: PARENT,
+    agent: 'fixer',
+    recoveredWithoutPrompt: true,
   });
-  const tracker = createRevivedRunTracker({
-    input: input as never,
-    backgroundJobBoard: board,
-    terminalGate: gate,
-  });
-  const revive = createTaskReviveTool({
-    input: input as never,
-    backgroundJobBoard: board,
-    shouldManageSession: () => true,
-    terminalGate: gate,
-    revivedRunTracker: tracker,
-    recoverRetainedSession: createSessionRecovery({
-      input: input as never,
-      backgroundJobBoard: board,
-      hostFlavor: 'v2',
-      stableStoppedMs: 0,
-    }),
-    baselineTimeoutMs: 1_000,
-  }).task_revive;
-  const output = await revive.execute(
-    { sessionID: CHILD, prompt: 'continue' },
-    { sessionID: PARENT, agent: 'orchestrator' } as never,
-  );
-  expect(String(output)).toContain('status: started');
-  expect(promptCalls).toBe(1);
-  gate.dispose();
-  tracker.dispose();
+  expect(event.input.sessionID).toBe(CHILD);
 });
 
 test('real parent context pairs an alias through the shim', async () => {
@@ -636,17 +726,15 @@ test('real parent context pairs an alias through the shim', async () => {
   expect(description.length).toBeGreaterThan(0);
 });
 
-test('host outcome triage: interrupted stops, failed errors, and a terminal outcome imports the newest assistant', async () => {
-  // Host-state triage imports the interrupted round without an assistant
-  // and, for a newer unclosed assistant, retains stopped rather than
-  // trusting an older idle.
+test('host outcome triage: interrupted stops, failed errors, and newer assistant activity prevents import', async () => {
+  // A host terminal covers assistant activity only up to its idle time.
   const interruptedInput = host({
     get: () => ({
       id: CHILD,
       parentID: PARENT,
       agent: 'fixer',
       outcome: 'interrupted',
-      time: { created: 9, idle: 11 },
+      time: { created: 9, idle: 13 },
     }),
   });
   const interruptedBoard = new BackgroundJobBoard();
@@ -666,7 +754,7 @@ test('host outcome triage: interrupted stops, failed errors, and a terminal outc
       parentID: PARENT,
       agent: 'fixer',
       outcome: 'failed',
-      time: { created: 9, idle: 11 },
+      time: { created: 9, idle: 13 },
     }),
   });
   const failedBoard = new BackgroundJobBoard();
@@ -717,18 +805,15 @@ test('host outcome triage: interrupted stops, failed errors, and a terminal outc
         : round(),
   });
   const newerBoard = new BackgroundJobBoard();
-  await createSessionRecovery({
+  const newerResult = await createSessionRecovery({
     input: newerAssistantInput as never,
     backgroundJobBoard: newerBoard,
     hostFlavor: 'v2',
     stableStoppedMs: 0,
   })({ parentSessionID: PARENT, requested: CHILD });
-  // Host state is authoritative: the succeeded outcome after the latest
-  // input imports as completed, and the newest assistant text is the result.
-  expect(newerBoard.get(CHILD)).toMatchObject({
-    state: 'completed',
-    resultSummary: 'ANSWER-B',
-  });
+  // The older success cannot certify ANSWER-B, even without a newer input.
+  expect(newerResult.kind).toBe('refused');
+  expect(newerBoard.get(CHILD)).toBeUndefined();
 });
 
 // A completed compaction cut the context (page.complete false): an older

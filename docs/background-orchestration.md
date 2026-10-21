@@ -37,7 +37,7 @@ The task API and background-control tools are:
 | `task(..., background: true)` | Start a specialist in the background and immediately return a task ID |
 | hook-driven completion | OpenCode injects terminal background task results automatically |
 | `task_status` | Check a tracked task (read-only fallback for owned untracked sessions after a restart); `result: true` retrieves its result |
-| `task_message` | Send a non-interrupting message and return `queued` (v2: steering acceptance with `delivery: "steer"`) |
+| `task_message` | Send a non-interrupting message and return `queued` (queue-only: no wake, no steer channel) |
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction |
 | `wait_for_user` | Plugin-provided orchestrator tool (v1 only) that pauses automatic orchestrator wakes while the user performs external manual work; not registered on v2, where the native `question` tool is the blocking boundary |
@@ -249,18 +249,20 @@ The orchestrator should use background completion events to:
 Use `task_status` to inspect a task and `task_status` with `result: true` to collect its result.
 A result read is a read, not a required step before every continuation.
 `task_message` sends a non-interrupting message and does not stop the current
-generation. On v2 it accepts an optional `delivery`: the default `"queue"`
-waits for an idle boundary — `resume: false` never wakes the child, so
-consumption is not confirmed — while `"steer"` offers an amendment to a
-running lane at the next supported step boundary of the current run. On v1
-the parameter does not exist and the message is simply queued, returning
-`queued`. On either host, acceptance does not mean the child read it —
-report acceptance without claiming consumption, reconcile the amendment
+generation. It is queue-only: a real, non-synthetic `noReply` prompt with
+`resume: false` and `delivery: "queue"` waits for an idle boundary, so
+consumption is not confirmed. It never wakes, steers, resumes, or interrupts the
+child — a running child is continued through the native delegation call
+(`subagent(sessionID, prompt)` on v2). On v1 the message is simply queued
+and returns `queued`. On either host, acceptance does not mean the child read
+it — report acceptance without claiming consumption, reconcile the amendment
 against the child's eventual result, and never resume, cancel, or relaunch
-the running child just to deliver an amendment. Use `task_cancel` to stop a generation while
+the running child just to deliver an amendment. Use `task_cancel` to stop a
+generation while
 retaining its session, then inspect and reconcile any partial file changes before
 launching replacement work. On v1, continue an existing session with
-`task_revive` even when it is missing from Reusable Sessions. A new task still
+`task_revive` even when it is missing from Reusable Sessions; v2 retires that
+tool and continues through the native delegation call. A new task still
 uses `task()` without an id. `task_revive` verifies the host session and
 continues in that same child; it does not spawn a replacement.
 
@@ -576,8 +578,16 @@ terminal publications of the same run (for example a child that
 self-continued), and child-input asks still wake an idle parent, and their
 SDK-error retries still use the idle timer. A failed publication retry survives
 parent busy/idle transitions, including when periodic wakes are disabled.
-Deletion clears the retry. This does not add restart persistence or retry
-publications skipped by the throttle. On v2, terminal retirement is
+Deletion clears the retry. On v2, later-result wakes carry explicit
+`task_status { sessionID: "<child>", result: true }` pointers for every queued
+publishing child, rather than asking the parent to guess from delegation
+history. Failed sends and throttled bursts retain those identities; only the
+occurrences accepted by transport are retired, so a child publishing during
+the send survives for a later wake. The pointers live in a newly appended,
+tagged volatile message through the cache-safe injection helper; historical
+messages, frozen prompts, and tool definitions are not rewritten. The shared
+input-wait, parent-busy, and no-progress gates still apply. This does not add
+restart persistence; v1's throttle behavior is unchanged. On v2, terminal retirement is
 observation-based: the plugin watches the host's native `<subagent>`
 deliveries in the parent's transcript and retires the matching record, with a
 timestamp fallback for a missed observation. On v1, `boardInjection: false`
@@ -679,7 +689,8 @@ confirmation grace and keeps the job `running, status uncertain`. Repeat
 non-busy evidence after that grace records `stopped, unreconciled` rather than
 `completed`: it means execution ended before a native terminal task result was
 delivered, not that the task succeeded. Stopped sessions are never reusable
-through `task()` and stay visible to the parent for recovery with `task_revive`.
+through `task()` and stay visible to the parent for recovery with `task_revive`
+on v1 (v2 resumes them through the native delegation call).
 A later live `busy` observation can revive an unreconciled stopped job. After
 the parent has been woken and the stop acknowledged, stale busy cannot flip the
 job back to running; the session remains listed under Retained / Recovery until

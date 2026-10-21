@@ -20,6 +20,7 @@ import {
 } from '../../utils/background-job-store';
 import { STOP_CONFIRMATION_GRACE_MS } from '../../utils/background-job-terminal-gate';
 import {
+  attributeHostRoundToTranscript,
   classifyCurrentDeliveredRound,
   fetchChildTranscript,
   latestInputAtOf,
@@ -45,6 +46,7 @@ import {
   parseTaskIdFromTaskOutput,
   parseTaskStatusOutput,
 } from '../../utils/task';
+import { v2ResumeCall } from '../../v2/delegation';
 
 const DEFAULT_STABLE_STOPPED_MS = 300;
 /** A hung alias pairing read refuses instead of blocking the tool call. */
@@ -169,7 +171,9 @@ async function recoverRetainedSession(
         );
       } catch {
         return refuse(
-          `${prefix}. A host-session prune is in progress for this task; retry task_revive.`,
+          options.hostFlavor === 'v2'
+            ? `${prefix}. A host-session prune is in progress for this task; retry with ${v2ResumeCall(sessionID)}.`
+            : `${prefix}. A host-session prune is in progress for this task; retry task_revive.`,
         );
       }
       hosted = await readHostSession(client, directory, sessionID);
@@ -343,14 +347,19 @@ async function recoverRetainedSession(
   let queuedAdoption = false;
   if (options.hostFlavor === 'v2') {
     const latestInputAt = latestInputAtOf(childTranscript);
-    const hostState = hostRoundStateOf(hosted.hostInfo);
+    const hostState = attributeHostRoundToTranscript(
+      hostRoundStateOf(hosted.hostInfo),
+      childTranscript,
+    );
     let verdict = hostRoundVerdict(hostState, latestInputAt);
-    // Incident 1115: a succeeded host outcome without readable answer text
-    // must not import an empty completed row — the gate trusts restored
-    // rows, so later result reads would stay empty. Keep the round pending
-    // until the answer is readable; queued revival may still adopt identity.
+    const text = terminalTextOf(childTranscript);
+    // Do not freeze an empty success (incident 1115). Failure/interruption
+    // can legitimately have no answer; their composed terminal state stays.
     const textUnreadable =
-      verdict === 'terminal' && !terminalTextOf(childTranscript);
+      verdict === 'terminal' &&
+      hostState.kind === 'terminal' &&
+      hostState.outcome === 'succeeded' &&
+      !text;
     if (textUnreadable) verdict = 'pending';
     if (verdict === 'unknown') {
       const reason =
@@ -369,8 +378,8 @@ async function recoverRetainedSession(
         // after a restart, so a guessed stop import would lie.
         return refuse(
           textUnreadable
-            ? `Task ${sessionID} host outcome is terminal but its answer text is not readable yet; nothing was imported. Retry task_status later, or use task_revive with a new prompt. No prompt was sent`
-            : `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or use task_revive with a new prompt. No prompt was sent`,
+            ? `Task ${sessionID} host outcome is terminal but its answer text is not readable yet; nothing was imported. Retry task_status later, or continue it with ${v2ResumeCall(sessionID)}. No prompt was sent`
+            : `Task ${sessionID} has no terminal outcome after its latest input; the host may still be resuming it after a restart. Wait for its result, or continue it with ${v2ResumeCall(sessionID)}. No prompt was sent`,
         );
       }
       // Identity adoption still requires a decipherable latest input; the
@@ -382,13 +391,8 @@ async function recoverRetainedSession(
       }
     }
     round = composeHostRound(hostState, latestInputAt);
-    if (verdict === 'terminal') {
-      round.text = terminalTextOf(childTranscript);
-    }
-    // A downgraded (textless) round composes as pending under
-    // queuedAdoption: identity is returned below without an import, so
-    // task_revive owns the continuation. Every other unreadable shape
-    // refuses here.
+    if (verdict === 'terminal' && text) round.text = text;
+    // Queued adoption returns identity below without importing this round.
     if (round.verdict === 'unreadable' && !queuedAdoption) {
       return refuse(
         `Task ${sessionID} transcript could not be classified (${round.reason ?? 'unreadable'}); no prompt was sent`,

@@ -1205,6 +1205,95 @@ describe('native task refusal and child ref suffix', () => {
     expect(args.task_id).toBe(CHILD);
   });
 
+  test('a v2 running child is continued by native steer without a lease', async () => {
+    const board = new BackgroundJobBoard();
+    const run = board.registerLaunch({
+      taskID: CHILD,
+      parentSessionID: PARENT,
+      agent: 'fixer',
+      background: true,
+      now: 1,
+    });
+    const steerConcurrency = { acquire: mock(() => ({})) };
+    const added: Array<{
+      resumedTaskId?: string;
+      relaunchLease?: unknown;
+    }> = [];
+    const args = {
+      subagent_type: 'fixer',
+      task_id: CHILD,
+      prompt: 'continue',
+      description: 'continue',
+      background: true,
+    };
+    await handleToolExecuteBefore(
+      { tool: 'task', sessionID: PARENT, callID: 'call_5' },
+      { args },
+      {
+        shouldManageSession: () => true,
+        backgroundJobBoard: board,
+        pendingCallTracker: {
+          add: (call: { resumedTaskId?: string; relaunchLease?: unknown }) =>
+            added.push(call),
+          take: () => undefined,
+          pendingCallId: () => 'call_5',
+        },
+        taskContextTracker: { pendingManagedTaskIds: new Set() },
+        hostFlavor: 'v2',
+        backgroundTaskConcurrency: steerConcurrency,
+      },
+    );
+    // The host owns the running timeline: no new generation, no lease, and
+    // the row is not consumed (no markUsed).
+    expect(board.get(CHILD)).toMatchObject({
+      generation: run.generation,
+      state: 'running',
+      lastUsedAt: run.lastUsedAt,
+    });
+    // The pending is still fenced as a resumed call so the after-hook drops
+    // the steer acknowledgement instead of registering a launch.
+    expect(added[0]?.resumedTaskId).toBe(CHILD);
+    expect(added[0]?.relaunchLease).toBeUndefined();
+    // A steer adds no run: the running child already owns its admission
+    // slot, so queueing the steer behind it would deadlock the amendment.
+    expect(steerConcurrency.acquire).not.toHaveBeenCalled();
+  });
+
+  test('a v2 running child still refuses an agent switch', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: CHILD,
+      parentSessionID: PARENT,
+      agent: 'fixer',
+      background: true,
+      now: 1,
+    });
+    await expect(
+      handleToolExecuteBefore(
+        { tool: 'task', sessionID: PARENT, callID: 'call_5' },
+        {
+          args: {
+            subagent_type: 'explorer',
+            task_id: CHILD,
+            prompt: 'continue',
+            description: 'continue',
+          },
+        },
+        {
+          shouldManageSession: () => true,
+          backgroundJobBoard: board,
+          pendingCallTracker: {
+            add() {},
+            take: () => undefined,
+            pendingCallId: () => 'call_5',
+          },
+          taskContextTracker: { pendingManagedTaskIds: new Set() },
+          hostFlavor: 'v2',
+        },
+      ),
+    ).rejects.toThrow(/agent is fixer, not explorer/);
+  });
+
   test('v2 keeps the omit-to-start-a-new-session refusal', async () => {
     await expect(
       handleToolExecuteBefore(
