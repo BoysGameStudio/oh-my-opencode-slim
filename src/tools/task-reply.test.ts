@@ -9,15 +9,30 @@ import {
 } from '../hooks/task-session-manager/child-input-wait';
 import { resetUserWaitGateForTests } from '../hooks/task-session-manager/user-wait-gate';
 import { BackgroundJobBoard } from '../utils/background-job-board';
+import { createBackgroundJobTerminalGate } from '../utils/background-job-terminal-gate';
 import { buildPluginInput } from '../v2/client-shim';
 import { mapV2EventToV1 } from '../v2/event-adapter';
 import type { V2Context } from '../v2/types';
 import { createTaskReplyTool } from './task-reply';
-import { createTaskStatusTool } from './task-status';
+import { createTaskStatusTool as createTaskStatusToolImpl } from './task-status';
+
+const cleanups: Array<() => void | Promise<void>> = [];
+
+function createTaskStatusTool(
+  options: Parameters<typeof createTaskStatusToolImpl>[0],
+) {
+  const terminalGate = createBackgroundJobTerminalGate({
+    input: options.input,
+    backgroundJobBoard: options.backgroundJobBoard,
+  });
+  cleanups.push(() => terminalGate.dispose());
+  return createTaskStatusToolImpl({ ...options, terminalGate });
+}
 
 // The child-input wait registry and user-wait gate are process-global; a
 // leftover entry leaks into later files (task_status reads it).
-afterEach(() => {
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   resetChildInputWaitForTests();
   resetUserWaitGateForTests();
 });
@@ -70,7 +85,7 @@ function makeV2Ctx(permissionReply?: (args: never) => Promise<unknown>) {
 }
 
 function createInputWaitHook(board: BackgroundJobBoard) {
-  return createTaskSessionManagerHook(
+  const hook = createTaskSessionManagerHook(
     {
       client: statusClient(),
       directory: '/test',
@@ -85,6 +100,12 @@ function createInputWaitHook(board: BackgroundJobBoard) {
       runtimeStatusReconcileDelayMs: 0,
     },
   );
+  // Permission replies arm the zero-delay runtime reconciliation loop. Resetting
+  // the wait registry alone does not stop that loop or its terminal gate.
+  cleanups.push(() =>
+    hook.event({ event: { type: 'server.instance.disposed' } }),
+  );
+  return hook;
 }
 
 async function routeMappedV2Event(

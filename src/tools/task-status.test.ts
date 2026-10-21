@@ -909,7 +909,16 @@ describe('task_status result mode', () => {
           ],
         },
       } as never) as never;
-      const tool = createTaskStatusTool({ input, backgroundJobBoard: board });
+      const terminalGate = createBackgroundJobTerminalGate({
+        input,
+        backgroundJobBoard: board,
+      });
+      statusGates.push(terminalGate);
+      const tool = createTaskStatusTool({
+        input,
+        backgroundJobBoard: board,
+        terminalGate,
+      });
       const context = { sessionID: 'parent-1' } as never;
       const status = await tool.task_status.execute(
         { task_id: 'ses_child1' },
