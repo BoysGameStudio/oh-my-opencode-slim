@@ -19,7 +19,7 @@ import {
 import { marketplaceConfigFingerprint } from '../marketplace/config-identity';
 import { MARKETPLACE_TOOL_NAMES } from '../marketplace/schemas';
 import { normalizeAgentName } from '../utils/agent-variant';
-import { adaptPermissions } from '../v2/adapters';
+import { adaptPermissions, v1PermKeyToV2 } from '../v2/adapters';
 import {
   compilePermissionPolicy,
   type PermissionCeilings,
@@ -278,8 +278,7 @@ function marketplacePermissionCeilings(
   const actions: Record<string, 'allow' | 'deny'> = {};
   for (const tool of tools) {
     if (tool === 'bash') {
-      actions.execute = 'allow';
-      actions.bash = 'allow';
+      for (const { action } of v1PermKeyToV2(tool)) actions[action] = 'allow';
     } else if ((MARKETPLACE_TOOL_NAMES as readonly string[]).includes(tool)) {
       actions[tool] = 'allow';
     }
@@ -336,7 +335,8 @@ function denyCeilingTail(
     // projection open with `'*': 'deny'`).
     if (rule.effect !== 'deny' || rule.action === '*') continue;
     // Exceptions ride with the deny in baseline order. A same-action
-    // later allow is the exception of the LAST deny with the same target
+    // or exact-action allow inside a denied namespace is the exception of
+    // the LAST same-action deny with the same resource target
     // whose resource does not strictly swallow it (an equal-target re-allow
     // rides too, so the factory task stances keep their deny→exception
     // adjacency). An ask-only shadow means the exception is a consent gate,
@@ -349,9 +349,18 @@ function denyCeilingTail(
       laterIndex += 1
     ) {
       const later = baselineRules[laterIndex];
-      if (later.action !== rule.action || later.effect !== 'allow') continue;
+      if (
+        later.effect !== 'allow' ||
+        (later.action !== rule.action &&
+          (/[*?]/.test(later.action) ||
+            !resourcePatternCovers(rule.action, later.action)))
+      )
+        continue;
       for (let denyIndex = laterIndex - 1; denyIndex >= index; denyIndex -= 1) {
         const peer = baselineRules[denyIndex];
+        // Keep ownership within this action's chain. A namespace denial must
+        // not steal an exact action's exception and cause its broader deny
+        // to be dropped by the shadow check below.
         if (peer.action !== rule.action || peer.effect !== 'deny') continue;
         if (
           peer.resource === rule.resource ||
@@ -361,7 +370,14 @@ function denyCeilingTail(
         ) {
           if (peer === rule && !seen.has(laterIndex)) {
             seen.add(laterIndex);
-            exceptions.push(later);
+            // Cross-action replay must respect the FINAL declared policy,
+            // not revive an allow superseded by a later resource denial.
+            // Keep partial grants with their narrower restrictions too.
+            exceptions.push(
+              ...(later.action === rule.action
+                ? [later]
+                : boundGrantByHost(baselineRules, later)),
+            );
           }
           break;
         }
@@ -1646,7 +1662,8 @@ export function buildResolvedAgentRegistry(
       // the host granted, so it is always safe; wildcard-action denies stay
       // out because replaying the default floor last would erase the declared
       // allow exceptions behind it, and each replayed deny rides with those
-      // same-action exceptions. Ask rules never enter either: an appended
+      // declared exceptions (including exact actions under namespace denies).
+      // Ask rules never enter either: an appended
       // ask parks a background child on input no one can answer. An ALLOW tail
       // is a capability grant: appended last it would silently outrank a
       // stricter host decision (deny/ask) for the same target — the guest
