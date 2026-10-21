@@ -39,6 +39,7 @@ Centralized utilities and shared abstractions used across the oh-my-opencode-sli
 ### Session & Task Utilities
 
 - **Session** (`session.ts`): Timeout handling, session abort coordination, and model reference parsing
+- **Prompt Agent** (`prompt-agent.ts`): Resolves explicit v1 prompt identity from safe hints, session records, or a bounded user-message tail; rejects internal system agents and suppresses unresolved targets. `withAgent` never constructs an agent-less body; the adjacent test scans v1 prompt call sites.
 - **Task** (`task.ts`): XML-inspired task output parsing for extracting task IDs, states, and results from tool output strings
 - **Agent Variant** (`agent-variant.ts`): Agent name normalization (trim/@ prefix) and display name rewriting utilities
 

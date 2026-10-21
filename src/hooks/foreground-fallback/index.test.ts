@@ -69,6 +69,7 @@ function createMockClient(overrides?: {
   messageData?: unknown;
   postImpl?: (args: unknown) => Promise<unknown>;
   includePostClient?: boolean;
+  getData?: unknown;
 }) {
   const promptAsync = mock(async (args: unknown) => {
     if (overrides?.promptAsyncImpl) return overrides.promptAsyncImpl(args);
@@ -94,6 +95,12 @@ function createMockClient(overrides?: {
     return true;
   });
   const session: Record<string, unknown> = {
+    get: mock(async (args: { path: { id: string } }) => ({
+      data:
+        overrides && 'getData' in overrides
+          ? overrides.getData
+          : { id: args.path.id, agent: 'orchestrator' },
+    })),
     abort,
     messages,
     message,
@@ -268,6 +275,61 @@ function makeManager({
   };
 }
 
+describe('foreground fallback agent identity', () => {
+  test('ignores assistant identities and uses the user-requested agent', async () => {
+    const { mocks } = createMockClient();
+    const manager = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as never);
+    for (const agent of ['compaction', 'build']) {
+      await manager.handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: { sessionID: 'identity', role: 'assistant', agent },
+        },
+      });
+    }
+    await manager.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: { sessionID: 'identity', role: 'user', agent: 'explorer' },
+      },
+    });
+    await manager.handleEvent(redoEvents.error('identity'));
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.agent).toBe('explorer');
+  });
+
+  test('preflight resolves a cold child without replaying before bookkeeping', async () => {
+    const { mocks } = createMockClient({
+      getData: { id: 'cold-child', parentID: 'parent', agent: 'explorer' },
+    });
+    const manager = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as never);
+    const event = redoEvents.error('cold-child');
+    await manager.preflightEvent(event);
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+    expect(manager.willAttemptFallback('cold-child')).toBe(true);
+    await manager.handleEvent(event);
+    expect(mocks.promptAsync.mock.calls[0]?.[0].body.agent).toBe('explorer');
+  });
+
+  test('does not revive identity after disposal during a probe', async () => {
+    const probe = deferred<unknown>();
+    const { mocks } = createMockClient();
+    if (currentMockSession) currentMockSession.get = () => probe.promise;
+    const manager = new ForegroundFallbackManager(makeChains(), true, {
+      directory: '/test',
+    } as never);
+    const pending = manager.preflightEvent(redoEvents.error('disposed-probe'));
+    manager.dispose();
+    probe.resolve({ data: { id: 'disposed-probe', agent: 'explorer' } });
+    await pending;
+    expect((manager as any).sessionAgent.has('disposed-probe')).toBe(false);
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+  });
+});
+
 describe('foreground fallback redo harness', () => {
   beforeEach(() => {
     jest.useFakeTimers();
@@ -277,8 +339,10 @@ describe('foreground fallback redo harness', () => {
 
   test('host-ordered error replay selects the next model', async () => {
     const { manager, mocks } = makeManager();
+    manager.registerSessionAgent('harness', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('harness'));
     await manager.handleEvent(redoEvents.error('harness'));
+    manager.registerSessionAgent('harness', 'orchestrator');
     await manager.handleEvent(
       redoEvents.assistant('harness', 'a', { message: 'rate limit' }),
     );
@@ -299,6 +363,7 @@ describe('foreground fallback redo harness', () => {
     ];
     const { manager, mocks } = makeManager({ chain });
     const sessionID = 'content-filter-chain-walk';
+    manager.registerSessionAgent(sessionID, 'orchestrator');
     await manager.handleEvent({
       type: 'message.updated',
       properties: {
@@ -603,6 +668,7 @@ describe('foreground fallback redo harness', () => {
       data: { statusCode: 429 },
       message: 'provider quota exhausted for request 17',
     };
+    manager.registerSessionAgent('error-correlation', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('error-correlation'));
     await manager.handleEvent({
       type: 'session.error',
@@ -627,6 +693,7 @@ describe('foreground fallback redo harness', () => {
 
   test('a separate user turn is not suppressed by failure deduplication', async () => {
     const { manager, mocks } = makeManager({ maxRetries: 0 });
+    manager.registerSessionAgent('turn-dedup', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('turn-dedup'));
     await manager.handleEvent(redoEvents.error('turn-dedup'));
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
@@ -656,6 +723,7 @@ describe('foreground fallback redo harness', () => {
     });
 
     await manager.handleEvent(hostUserMessage('user-turn-1'));
+    manager.registerSessionAgent('stale-user-model', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('stale-user-model', 'a'));
     await manager.handleEvent(redoEvents.error('stale-user-model'));
     expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
@@ -665,6 +733,7 @@ describe('foreground fallback redo harness', () => {
     // The host can re-emit the original user message after the fallback
     // replay. Its original model must not replace the current fallback model.
     await manager.handleEvent(hostUserMessage('user-turn-1'));
+    manager.registerSessionAgent('stale-user-model', 'orchestrator');
     await manager.handleEvent(
       redoEvents.assistant('stale-user-model', 'b', { message: 'rate limit' }),
     );
@@ -765,6 +834,7 @@ describe('foreground fallback redo harness', () => {
       0,
     );
 
+    manager.registerSessionAgent('v1-info-only-replay', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('v1-info-only-replay'));
     await manager.handleEvent(redoEvents.error('v1-info-only-replay'));
 
@@ -825,6 +895,7 @@ describe('foreground fallback redo harness', () => {
       0,
     );
 
+    manager.registerSessionAgent('external-turn-fence', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('external-turn-fence'));
     await manager.handleEvent(redoEvents.error('external-turn-fence'));
 
@@ -937,6 +1008,7 @@ describe('foreground fallback redo harness', () => {
     );
     const sessionID = 'internal-does-not-fence';
 
+    manager.registerSessionAgent(sessionID, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sessionID));
     const externalTurn = manager.handleEvent({
       type: 'message.updated',
@@ -982,7 +1054,9 @@ describe('foreground fallback redo harness', () => {
     );
     const sessionID = 'delayed-inline-410';
 
+    manager.registerSessionAgent(sessionID, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sessionID));
+    manager.registerSessionAgent(sessionID, 'orchestrator');
     await manager.handleEvent(
       redoEvents.assistant(sessionID, 'a', {
         data: { statusCode: 410 },
@@ -999,8 +1073,10 @@ describe('foreground fallback redo harness', () => {
   test('permanent billing failure bypasses the configured initial delay', async () => {
     const { manager, mocks } = makeManager({ initialRetryDelayMs: 1_000 });
     const sessionID = 'permanent-billing-no-delay';
+    manager.registerSessionAgent(sessionID, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sessionID));
 
+    manager.registerSessionAgent(sessionID, 'orchestrator');
     await manager.handleEvent(
       redoEvents.assistant(sessionID, 'a', {
         statusCode: 402,
@@ -1018,6 +1094,7 @@ describe('foreground fallback redo harness', () => {
       retryDelayMs: 100,
     });
     const sessionID = 'single-initial-delay';
+    manager.registerSessionAgent(sessionID, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sessionID));
     await manager.handleEvent(redoEvents.error(sessionID));
     jest.advanceTimersByTime(1_000);
@@ -1043,6 +1120,7 @@ describe('foreground fallback redo harness', () => {
   test('a new external turn clears prior consecutive-fallback backoff', async () => {
     const { manager, mocks } = makeManager({ retryDelayMs: 1_000 });
     const sessionID = 'turn-clears-backoff';
+    manager.registerSessionAgent(sessionID, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sessionID));
     await manager.handleEvent(redoEvents.error(sessionID));
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
@@ -1058,6 +1136,7 @@ describe('foreground fallback redo harness', () => {
 
   test('a new external turn resets the retry budget before any model switch', async () => {
     const { manager, mocks } = makeManager({ maxRetries: 1 });
+    manager.registerSessionAgent('early-turn-reset', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('early-turn-reset'));
     await manager.handleEvent(redoEvents.retry('early-turn-reset', 1));
     expect(mocks.promptAsync).not.toHaveBeenCalled();
@@ -1089,6 +1168,7 @@ describe('foreground fallback redo harness', () => {
     );
     const sessionID = 'overlapping-host-retry';
 
+    manager.registerSessionAgent(sessionID, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sessionID));
     const fallback = manager.handleEvent(redoEvents.error(sessionID));
     await started.promise;
@@ -1128,6 +1208,7 @@ describe('foreground fallback redo harness', () => {
     );
     chains.orchestrator = ['test/a', { id: 'test/new', variant: 'fast' }];
 
+    manager.registerSessionAgent('live-chain', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('live-chain'));
     await manager.handleEvent(redoEvents.error('live-chain'));
 
@@ -1164,6 +1245,7 @@ describe('foreground fallback redo harness', () => {
     const abort = deferred<unknown>();
     const { manager, mocks } = makeManager({ maxRetries: 0 });
     mocks.abort.mockImplementation(() => abort.promise);
+    manager.registerSessionAgent('abort-race', 'orchestrator');
     const pending = manager.handleEvent(redoEvents.retry('abort-race'));
     await Promise.resolve();
     await Promise.resolve();
@@ -1213,6 +1295,7 @@ describe('foreground fallback redo harness', () => {
       type: 'session.created',
       properties: { info: { id: 'busy-race', parentID: 'parent' } },
     });
+    manager.registerSessionAgent('busy-race', 'orchestrator');
     const pending = manager.handleEvent(redoEvents.error('busy-race'));
     await Promise.resolve();
     await Promise.resolve();
@@ -1227,6 +1310,7 @@ describe('foreground fallback redo harness', () => {
 
   test('a newer turn during fallback backoff fences the delayed replay', async () => {
     const { manager, mocks } = makeManager({ retryDelayMs: 500 });
+    manager.registerSessionAgent('backoff-race', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('backoff-race'));
     await manager.handleEvent(redoEvents.error('backoff-race'));
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
@@ -1253,6 +1337,7 @@ describe('foreground fallback redo: host retry budget', () => {
 
   test('identical retry attempts are deduplicated before charging the budget', async () => {
     const { manager, mocks } = makeManager({ maxRetries: 1 });
+    manager.registerSessionAgent('retry-attempt-dedup', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('retry-attempt-dedup'));
     const next = Date.now() + 30 * 60_000;
     await manager.handleEvent(redoEvents.retry('retry-attempt-dedup', 1, next));
@@ -1269,6 +1354,7 @@ describe('foreground fallback redo: host retry budget', () => {
   test('v1 skips a day-long host retry wait before spending the retry budget', async () => {
     const { manager, mocks } = makeManager();
     const sid = 'long-host-wait';
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     const retry = redoEvents.retry(
       sid,
@@ -1316,6 +1402,7 @@ describe('foreground fallback redo: host retry budget', () => {
       maxRetries: 0,
       initialRetryDelayMs: 1_000,
     });
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     await manager.handleEvent(redoEvents.retry(sid));
     jest.advanceTimersByTime(600);
@@ -1340,6 +1427,7 @@ describe('foreground fallback redo: host retry budget', () => {
       maxRetries: 0,
       initialRetryDelayMs: 1_000,
     });
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     await manager.handleEvent(redoEvents.retry(sid));
     jest.advanceTimersByTime(300);
@@ -1359,6 +1447,7 @@ describe('foreground fallback redo: host retry budget', () => {
       maxRetries: 1,
       initialRetryDelayMs: 1_000,
     });
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     await manager.handleEvent(redoEvents.error(sid));
     jest.advanceTimersByTime(300);
@@ -1382,6 +1471,7 @@ describe('foreground fallback redo: host retry budget', () => {
       maxRetries: 0,
       initialRetryDelayMs: 1_000,
     });
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     await manager.handleEvent(redoEvents.error(sid));
     await manager.handleEvent(redoEvents.retry(sid));
@@ -1399,6 +1489,7 @@ describe('foreground fallback redo: host retry budget', () => {
     async (maxRetries) => {
       const sid = `budget-${maxRetries}`;
       const { manager, mocks } = makeManager({ maxRetries });
+      manager.registerSessionAgent(sid, 'orchestrator');
       await manager.handleEvent(redoEvents.assistant(sid));
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         await manager.handleEvent(redoEvents.retry(sid, attempt));
@@ -1411,6 +1502,7 @@ describe('foreground fallback redo: host retry budget', () => {
       expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
         body: { model: { providerID: 'test', modelID: 'b' } },
       });
+      manager.registerSessionAgent(sid, 'orchestrator');
       await manager.handleEvent(redoEvents.assistant(sid, 'b'));
       await manager.handleEvent(redoEvents.retry(sid, 1));
       expect(mocks.abort).toHaveBeenCalledTimes(2);
@@ -1433,6 +1525,7 @@ describe('foreground fallback redo: host retry budget', () => {
       for (const source of ['session.error', 'message.updated'] as const) {
         const sid = `terminal-${_label}-${source}`;
         const { manager, mocks } = makeManager();
+        manager.registerSessionAgent(sid, 'orchestrator');
         await manager.handleEvent(redoEvents.assistant(sid));
         const fail = () =>
           source === 'session.error'
@@ -1441,6 +1534,7 @@ describe('foreground fallback redo: host retry budget', () => {
         await manager.handleEvent(fail());
         // The host re-emits the failed assistant after session.error. Its
         // model identifies the original incident even after the replay switch.
+        manager.registerSessionAgent(sid, 'orchestrator');
         await manager.handleEvent(redoEvents.assistant(sid, 'a', error));
         expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
         expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
@@ -1454,6 +1548,7 @@ describe('foreground fallback redo: host retry budget', () => {
   test('T3: serial and concurrent observations of one failure replay only once', async () => {
     const sid = 'duplicate-observation';
     const { manager, mocks } = makeManager();
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     await Promise.all([
       manager.handleEvent(redoEvents.error(sid)),
@@ -1461,6 +1556,7 @@ describe('foreground fallback redo: host retry budget', () => {
         redoEvents.assistant(sid, 'a', { message: 'rate limit' }),
       ),
     ]);
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(
       redoEvents.assistant(sid, 'a', { message: 'rate limit' }),
     );
@@ -1474,10 +1570,12 @@ describe('foreground fallback redo: host retry budget', () => {
       chain: ['test/a', 'test/b'],
       maxRetries: 2,
     });
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     for (let attempt = 1; attempt <= 3; attempt++)
       await manager.handleEvent(redoEvents.retry(sid, attempt));
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid, 'b'));
     await manager.handleEvent(redoEvents.error(sid));
     jest.setSystemTime(1_006_000);
@@ -1486,6 +1584,7 @@ describe('foreground fallback redo: host retry budget', () => {
     expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
 
     jest.setSystemTime(1_012_000);
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     await manager.handleEvent(redoEvents.retry(sid, 1));
     await manager.handleEvent(redoEvents.retry(sid, 2));
@@ -1499,6 +1598,7 @@ describe('foreground fallback redo: host retry budget', () => {
   test('S1: success on the fallback restores the full host retry budget', async () => {
     const sid = 'success-rearms-budget';
     const { manager, mocks } = makeManager({ maxRetries: 2 });
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     for (let attempt = 1; attempt <= 3; attempt++)
       await manager.handleEvent(redoEvents.retry(sid, attempt));
@@ -1524,8 +1624,10 @@ describe('foreground fallback redo: host retry budget', () => {
       chain: ['test/a', 'test/b'],
       maxRetries: 0,
     });
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     await manager.handleEvent(redoEvents.error(sid));
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid, 'b'));
     jest.setSystemTime(1_006_000);
     await manager.handleEvent(redoEvents.error(sid));
@@ -1538,6 +1640,7 @@ describe('foreground fallback redo: host retry budget', () => {
     );
 
     jest.setSystemTime(1_018_000);
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid, 'b'));
     await manager.handleEvent(redoEvents.retry(sid));
     expect(mocks.abort).toHaveBeenCalledTimes(1);
@@ -1614,6 +1717,7 @@ describe('foreground fallback redo: host retry budget', () => {
     expect(exhausted.decision).toEqual({ retry: false });
     expect(switchModel).toHaveBeenCalledTimes(2);
 
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid, 'a'));
     for (let attempt = 0; attempt < 2; attempt++) {
       const host = retryEvent(sid, 'a', { retry: true, delay: 77 });
@@ -1797,6 +1901,7 @@ describe('foreground fallback redo: host retry budget', () => {
   test('T7: mapped v2 failed execution prompts once without charging host retries', async () => {
     const sid = 'v2-failed-execution';
     const { manager, mocks } = makeManager({ maxRetries: 2 });
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
     for (const mapped of mapV2EventToV1({
       type: 'session.execution.failed',
@@ -1825,6 +1930,7 @@ describe('foreground fallback redo: host retry budget', () => {
         chain: ['test/a', { id: 'test/b', variant: 'fast' }],
         hostFlavor,
       });
+      manager.registerSessionAgent(sid, 'orchestrator');
       await manager.handleEvent(redoEvents.assistant(sid));
       await manager.handleEvent(redoEvents.error(sid));
       expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
@@ -1858,6 +1964,7 @@ describe('foreground fallback redo: host retry budget', () => {
         chain: ['test/a', 'test/b'],
         hostFlavor,
       });
+      manager.registerSessionAgent(sid, 'orchestrator');
       await manager.handleEvent(redoEvents.assistant(sid));
       await manager.handleEvent(redoEvents.error(sid));
       const call = mocks.promptAsync.mock.calls[0]?.[0] as {
@@ -2708,7 +2815,9 @@ describe('ForegroundFallbackManager spent allowance (issue #966)', () => {
       (manager as any).quotaExhaustedProviders.get(sid) as Set<string>;
     // Message-tied errors: distinct message IDs are distinct incidents.
     const tied = 'spent-cascade-tied';
+    manager.registerSessionAgent(tied, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(tied, 'a'));
+    manager.registerSessionAgent(tied, 'orchestrator');
     await manager.handleEvent({
       type: 'message.updated',
       properties: {
@@ -2738,6 +2847,7 @@ describe('ForegroundFallbackManager spent allowance (issue #966)', () => {
     mocks.promptAsync.mockClear();
     jest.advanceTimersByTime(6_000);
     const seeded = 'spent-cascade-uncorrelated';
+    manager.registerSessionAgent(seeded, 'orchestrator');
     await manager.handleEvent({
       type: 'message.updated',
       properties: {
@@ -2762,6 +2872,7 @@ describe('ForegroundFallbackManager spent allowance (issue #966)', () => {
     });
     expect(prompted(mocks)).toEqual(['p2/b']);
     expect(exhausted(seeded)).toEqual(new Set(['p1']));
+    manager.registerSessionAgent(seeded, 'orchestrator');
     await manager.handleEvent({
       type: 'message.updated',
       properties: {
@@ -2867,6 +2978,7 @@ describe('ForegroundFallbackManager spent allowance (issue #966)', () => {
     expect(prompted(mocks)).toEqual(['p2/b']);
     expect(mocks.abort).not.toHaveBeenCalled();
     // Once p2 has emitted a message, its own spent quota moves on to p3.
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent({
       type: 'message.updated',
       properties: {
@@ -3038,6 +3150,7 @@ describe('ForegroundFallbackManager spent allowance (issue #966)', () => {
     await manager.handleEvent(failed(sid, 'p1/a', SPENT));
     expect(prompted(mocks)).toEqual(['p2/c']);
     await manager.handleEvent(redoEvents.success(sid, 'c'));
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent({
       type: 'message.updated',
       properties: {
@@ -3110,13 +3223,16 @@ describe('ForegroundFallbackManager spent allowance (issue #966)', () => {
   test('spent quota cancels a queued initial fallback when it surfaces', async () => {
     const { manager, mocks } = makeManager({ initialRetryDelayMs: 1_000 });
     const sid = 'spent-cancels-queued-delay';
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(
       redoEvents.assistant(sid, 'a', {
         message: 'rate limit, try again in 20s',
       }),
     );
     expect(jest.getTimerCount()).toBe(1);
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(
       redoEvents.assistant(sid, 'b', {
         message: 'Monthly usage limit reached. Resets in X days.',
@@ -3131,7 +3247,9 @@ describe('ForegroundFallbackManager spent allowance (issue #966)', () => {
   test('short-horizon quota keeps the configured initial delay', async () => {
     const { manager, mocks } = makeManager({ initialRetryDelayMs: 1_000 });
     const sid = 'short-horizon-keeps-delay';
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(redoEvents.assistant(sid));
+    manager.registerSessionAgent(sid, 'orchestrator');
     await manager.handleEvent(
       redoEvents.assistant(sid, 'a', {
         message: 'quota exceeded, retry after 20s',
@@ -3854,6 +3972,7 @@ describe('ForegroundFallbackManager session.error', () => {
       () => 1,
     );
     try {
+      mgr.registerSessionAgent('retry-notice', 'orchestrator');
       await mgr.handleEvent(redoEvents.assistant('retry-notice'));
       await mgr.handleEvent(redoEvents.retry('retry-notice'));
       expect(mocks.abort).toHaveBeenCalledTimes(1);
@@ -4294,6 +4413,7 @@ describe('ForegroundFallbackManager session.error', () => {
       hostFlavor: 'v2',
     } as any);
     mgr.registerSessionAgent('sess-no-chain', 'orchestrator');
+    mgr.registerSessionAgent('sess-no-chain', 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -4528,6 +4648,7 @@ describe('ForegroundFallbackManager session.error', () => {
       { directory: '/test' } as any,
     );
 
+    mgr.registerSessionAgent('sess-spaced-model-id', 'explorer');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -4597,6 +4718,7 @@ describe('ForegroundFallbackManager message.updated', () => {
     } as any);
 
     // explorer message with its model
+    mgr.registerSessionAgent('sess-3', 'explorer');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -4636,6 +4758,7 @@ describe('ForegroundFallbackManager message.updated', () => {
       },
     };
 
+    mgr.registerSessionAgent(sessionID, 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -4651,6 +4774,7 @@ describe('ForegroundFallbackManager message.updated', () => {
         },
       },
     });
+    mgr.registerSessionAgent(sessionID, 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -5115,6 +5239,7 @@ describe('ForegroundFallbackManager v1 abort protection for live children', () =
     const { mocks } = createMockClient();
     const mgr = manager(undefined, { orchestrator: ['openai/model-y'] });
     live.add('sess-exhaust');
+    mgr.registerSessionAgent('sess-exhaust', 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -5137,6 +5262,7 @@ describe('ForegroundFallbackManager v1 abort protection for live children', () =
     const mgr = manager(undefined, {
       orchestrator: ['openai/gpt-b', 'openai/gpt-c'],
     });
+    mgr.registerSessionAgent('sess-loop', 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -6273,6 +6399,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
     } as any);
     const sessionID = 'sess-turns';
 
+    mgr.registerSessionAgent(sessionID, 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -6303,6 +6430,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
         }),
       );
 
+      mgr.registerSessionAgent(sessionID, 'orchestrator');
       await mgr.handleEvent({
         type: 'message.updated',
         properties: {
@@ -6316,6 +6444,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
           },
         },
       });
+      mgr.registerSessionAgent(sessionID, 'orchestrator');
       await mgr.handleEvent({
         type: 'message.updated',
         properties: {
@@ -6356,6 +6485,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
     );
     const sessionID = 'sess-recover-after-abort';
 
+    mgr.registerSessionAgent(sessionID, 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -6392,6 +6522,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
 
       // Deliberately omit time.completed: this is not a successful response;
       // recovery must come from the fresh descent reset instead.
+      mgr.registerSessionAgent(sessionID, 'orchestrator');
       await mgr.handleEvent({
         type: 'message.updated',
         properties: {
@@ -6427,6 +6558,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
     } as any);
     const sessionID = 'sess-off-chain';
 
+    mgr.registerSessionAgent(sessionID, 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -6449,6 +6581,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
         type: 'session.error',
         properties: { sessionID, error: { message: 'rate limit exceeded' } },
       });
+      mgr.registerSessionAgent(sessionID, 'orchestrator');
       await mgr.handleEvent({
         type: 'message.updated',
         properties: {
@@ -6572,6 +6705,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
     } as any);
 
     // Session A: current model is model-x, which IS in the chain → picks model-y ✓
+    mgr.registerSessionAgent('sess-exhaust', 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -6595,6 +6729,7 @@ describe('ForegroundFallbackManager chain exhaustion', () => {
       true,
       { directory: '/test' } as any,
     );
+    mgr2.registerSessionAgent('sess-exhaust-2', 'orchestrator');
     await mgr2.handleEvent({
       type: 'message.updated',
       properties: {
@@ -6868,6 +7003,7 @@ describe('ForegroundFallbackManager inherit + fallback chain', () => {
     completed = false,
   ): Promise<void> {
     const [providerID, id] = modelID.split('/');
+    mgr.registerSessionAgent(sessionID, 'oracle');
     return mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -7209,6 +7345,7 @@ describe('ForegroundFallbackManager deduplication', () => {
       },
     });
 
+    mgr.registerSessionAgent('same-model-incidents', 'orchestrator');
     await mgr.handleEvent(redoEvents.assistant('same-model-incidents'));
     await mgr.handleEvent(errorEvent('failure-one'));
     await mgr.handleEvent(errorEvent('failure-two'));
@@ -7348,6 +7485,7 @@ describe('ForegroundFallbackManager session.deleted', () => {
     );
 
     // Populate all maps for this session
+    mgr.registerSessionAgent('sess-del', 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -7364,7 +7502,7 @@ describe('ForegroundFallbackManager session.deleted', () => {
     coordinator.dispatchSessionDeleted('sess-del');
 
     // After deletion, a new rate-limit on the same ID should behave as a fresh
-    // session (no prior model known → uses chain from start, dedup cleared)
+    // session (dedup cleared, agent recovered from the session record).
     await mgr.handleEvent({
       type: 'session.error',
       properties: {
@@ -7374,15 +7512,14 @@ describe('ForegroundFallbackManager session.deleted', () => {
     });
 
     // Should have triggered (dedup was cleared by session.deleted)
-    // and should pick the first chain model (no current model seed after deletion)
+    // and should infer the known agent's primary before choosing its fallback.
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
     const call = mocks.promptAsync.mock.calls[0] as [
       { model: { providerID: string; modelID: string } },
     ];
     // orchestrator chain: ['anthropic/claude-opus-4-5', 'openai/gpt-4o', 'google/gemini-2.5-pro']
-    // no current model → first untried = anthropic/claude-opus-4-5
-    expect(call[0].body.model.providerID).toBe('anthropic');
-    expect(call[0].body.model.modelID).toBe('claude-opus-4-5');
+    expect(call[0].body.model.providerID).toBe('openai');
+    expect(call[0].body.model.modelID).toBe('gpt-4o');
   });
 
   test('ignores session.deleted with no sessionID', async () => {
@@ -7407,6 +7544,7 @@ describe('ForegroundFallbackManager session.deleted', () => {
     );
 
     // Seed state for the session
+    mgr.registerSessionAgent('sess-info-del', 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -7692,6 +7830,7 @@ describe('ForegroundFallbackManager resolveChain cross-agent isolation', () => {
       { directory: '/test' } as any,
     );
 
+    mgr.registerSessionAgent('oracle-sess', 'oracle');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -7715,10 +7854,8 @@ describe('ForegroundFallbackManager resolveChain cross-agent isolation', () => {
     expect(call[0].body.model.modelID).toBe('claude-opus-4-5');
   });
 
-  test('uses cross-agent last-resort only when agent name is unknown', async () => {
-    // When the agent name is genuinely unknown AND current model is not in any
-    // chain, the last-resort flattened chain is acceptable.
-    const { mocks } = createMockClient();
+  test('suppresses fallback when the session agent cannot be resolved', async () => {
+    const { mocks } = createMockClient({ getData: null });
     const mgr = new ForegroundFallbackManager(
       { orchestrator: ['openai/gpt-4o'] },
       true,
@@ -7734,13 +7871,7 @@ describe('ForegroundFallbackManager resolveChain cross-agent isolation', () => {
       },
     });
 
-    // Falls through to last-resort → picks first model from any chain
-    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
-    const call = mocks.promptAsync.mock.calls[0] as [
-      { model: { providerID: string; modelID: string } },
-    ];
-    expect(call[0].body.model.providerID).toBe('openai');
-    expect(call[0].body.model.modelID).toBe('gpt-4o');
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
   });
 
   test('does NOT bleed into other agent chains for non-omos agents without a chain', async () => {
@@ -7754,6 +7885,7 @@ describe('ForegroundFallbackManager resolveChain cross-agent isolation', () => {
       { directory: '/test' } as any,
     );
 
+    mgr.registerSessionAgent('build-sess', 'build');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -7796,6 +7928,7 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
       3,
     );
 
+    mgr.registerSessionAgent('councillor-sess', 'councillor');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -7832,6 +7965,7 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
       directory: '/test',
     } as any);
 
+    mgr.registerSessionAgent('councillor-err', 'councillor');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -7867,6 +8001,7 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
     );
     mgr.disableChain('orchestrator');
 
+    mgr.registerSessionAgent('disabled-status', 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -7899,8 +8034,9 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
     expect(mocks.promptAsync).not.toHaveBeenCalled();
   });
 
-  const seedNoChain = (mgr: ForegroundFallbackManager, sessionID: string) =>
-    mgr.handleEvent({
+  const seedNoChain = (mgr: ForegroundFallbackManager, sessionID: string) => {
+    mgr.registerSessionAgent(sessionID, 'councillor');
+    return mgr.handleEvent({
       type: 'message.updated',
       properties: {
         info: {
@@ -7911,6 +8047,7 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
         },
       },
     });
+  };
 
   const noChainError = (sessionID: string, id: string, error?: unknown) => ({
     type: 'session.error',
@@ -7981,6 +8118,7 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
 
     // A successful response clears the exhaustion; the next incident
     // retries again.
+    mgr.registerSessionAgent('exh-nc', 'councillor');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -8086,18 +8224,20 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
     expect((mgr as any).triggerIncidents.get('unparse-nc')).toBeUndefined();
   });
 
-  test('first error before agent observed retries; construction-time-disabled agent then stays silent', async () => {
+  test('unresolved child is suppressed; construction-time-disabled agent stays silent', async () => {
     // S4 race: the disabled set is construction-time state, so silence
     // applies as soon as the agent name is known — without any
     // disableChain call.
-    const { mocks } = createMockClient();
+    const { mocks } = createMockClient({
+      getData: { id: 's4-nc', parentID: 'parent' },
+    });
     const mgr = new ForegroundFallbackManager(
       { ...makeChains(), victim: [] },
       true,
       { directory: '/test' } as any,
     );
 
-    // No agent or model observed: the last-resort chain path fires.
+    // No agent observed: do not guess another agent's chain.
     await mgr.handleEvent({
       type: 'session.error',
       properties: {
@@ -8105,7 +8245,7 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
         error: { message: 'rate limit exceeded' },
       },
     });
-    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
 
     // The agent is observed as construction-time-disabled: silence, even
     // though disableChain was never called.
@@ -8120,7 +8260,7 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
         error: { message: 'rate limit exceeded' },
       },
     });
-    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
     expect(mocks.abort).not.toHaveBeenCalled();
     expect(mgr.willAttemptFallback('s4-nc')).toBe(false);
   });
@@ -8374,6 +8514,7 @@ describe('ForegroundFallbackManager disableChain', () => {
     mgr.disableChain('orchestrator');
 
     // Seed session with orchestrator model and trigger rate-limit
+    mgr.registerSessionAgent('sess-disabled', 'orchestrator');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -8401,6 +8542,7 @@ describe('ForegroundFallbackManager disableChain', () => {
     mgr.disableChain('orchestrator');
 
     // Explorer session — should still fall back normally
+    mgr.registerSessionAgent('sess-other', 'explorer');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -8605,8 +8747,9 @@ describe('ForegroundFallbackManager same-model retry request scope', () => {
     mgr: ForegroundFallbackManager,
     sessionID: string,
     agent = 'councillor',
-  ) =>
-    mgr.handleEvent({
+  ) => {
+    mgr.registerSessionAgent(sessionID, agent);
+    return mgr.handleEvent({
       type: 'message.updated',
       properties: {
         info: {
@@ -8617,6 +8760,7 @@ describe('ForegroundFallbackManager same-model retry request scope', () => {
         },
       },
     });
+  };
 
   test('explicit policy rejections never replay on the same model', async () => {
     const { client, mocks } = createMockClient();
@@ -8647,8 +8791,9 @@ describe('ForegroundFallbackManager same-model retry request scope', () => {
 });
 
 describe('ForegroundFallbackManager same-model retry hardening', () => {
-  const seed = (mgr: ForegroundFallbackManager, sessionID: string) =>
-    mgr.handleEvent({
+  const seed = (mgr: ForegroundFallbackManager, sessionID: string) => {
+    mgr.registerSessionAgent(sessionID, 'councillor');
+    return mgr.handleEvent({
       type: 'message.updated',
       properties: {
         info: {
@@ -8659,6 +8804,7 @@ describe('ForegroundFallbackManager same-model retry hardening', () => {
         },
       },
     });
+  };
   const streamError = (sessionID: string, id: string, error?: unknown) => ({
     type: 'session.error',
     properties: {
@@ -8732,6 +8878,7 @@ describe('ForegroundFallbackManager same-model retry hardening', () => {
       streamError('det-nc', 'e1', { statusCode: 401, message: 'auth failed' }),
     );
     expect(mgr.willAttemptFallback('det-nc')).toBe(false);
+    mgr.registerSessionAgent('det-nc', 'councillor');
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {

@@ -823,6 +823,7 @@ describe('task_message', () => {
 
     const body = prompt.mock.calls[0]?.[0].body;
     expect(body.noReply).toBe(true);
+    expect(body.agent).toBe('fixer');
     expect(body).not.toHaveProperty('delivery');
     expect(result).toContain('queued');
     expect(result).not.toMatch(/steer/i);

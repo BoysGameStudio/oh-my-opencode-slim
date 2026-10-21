@@ -34,13 +34,20 @@ function makeTool(options: {
     { kind: 'exact'; taskID: string } | { kind: 'refused'; reason: string }
   >;
 }) {
-  return createTaskStatusTool({
-    input: {
-      directory: '/test',
-      client,
-      ...(options.hostFlavor ? { hostFlavor: options.hostFlavor } : {}),
-    } as any,
+  const input = {
+    directory: '/test',
+    client,
+    ...(options.hostFlavor ? { hostFlavor: options.hostFlavor } : {}),
+  } as any;
+  const terminalGate = createBackgroundJobTerminalGate({
+    input,
     backgroundJobBoard: options.board,
+  });
+  statusGates.push(terminalGate);
+  return createTaskStatusTool({
+    input,
+    backgroundJobBoard: options.board,
+    terminalGate,
     now: options.now,
     statusTimeoutMs: options.statusTimeoutMs,
     readTimeoutMs: options.readTimeoutMs,
@@ -932,9 +939,16 @@ describe('task_status result mode', () => {
           context,
         },
       } as never) as never;
+      const board = new BackgroundJobBoard();
+      const terminalGate = createBackgroundJobTerminalGate({
+        input,
+        backgroundJobBoard: board,
+      });
+      statusGates.push(terminalGate);
       const output = await createTaskStatusTool({
         input,
-        backgroundJobBoard: new BackgroundJobBoard(),
+        backgroundJobBoard: board,
+        terminalGate,
       }).task_status.execute({ task_id: 'ses_child1', result: true }, {
         sessionID: 'parent-1',
         agent: 'orchestrator',
@@ -965,7 +979,16 @@ describe('task_status result mode', () => {
           ],
         },
       } as never) as never;
-      const tool = createTaskStatusTool({ input, backgroundJobBoard: board });
+      const terminalGate = createBackgroundJobTerminalGate({
+        input,
+        backgroundJobBoard: board,
+      });
+      statusGates.push(terminalGate);
+      const tool = createTaskStatusTool({
+        input,
+        backgroundJobBoard: board,
+        terminalGate,
+      });
       const context = { sessionID: 'parent-1' } as never;
       const status = await tool.task_status.execute(
         { task_id: 'ses_child1' },

@@ -1,7 +1,7 @@
 # Diagnosis: "build agent empty input" after orchestrator output
 
-**Status:** Resolved for interview injections.
-**Date:** 2026-08-10
+**Status:** Explicit v1 prompt identity enforced repo-wide.
+**Date:** 2026-08-10; updated 2026-10-21
 **Related PR:** #818 (`fix/preset-tui-slash-command`) — same root class as the original `/preset` fix.
 **Suspected sibling bug reported by user:** During `superpowers` / `brainstorm` skill conversations, when the orchestrator asks for confirmation or work is interrupted (subagent completes, background task finishes), a `build` agent turn sometimes appears with an empty user input.
 
@@ -11,9 +11,10 @@
 
 The `build` agent turn with empty input is **the same class of bug** as the original `/preset` issue fixed in #818: a plugin hook calls `sessionSdk.promptAsync({ body: { parts: [createInternalAgentTextPart(...)] } })` **without specifying an `agent` field**. opencode then resolves the agent via `agents.defaultInfo()`, which falls back to the built-in `build` agent whenever `default_agent` is unset, user-overridden, or not effectively applied. The `synthetic: true` flag hides the injected text from the TUI, so the user perceives the `build` turn as having "empty input."
 
-**Update:** the incomplete-todo continuation path passes `agent: 'orchestrator'`,
-and interview injections now use the interview-only runtime boundary, which
-always targets the orchestrator. Smartfetch remains a separate call site.
+**Update:** v1 interview notifications preserve the session's own agent;
+fallback replays and task messages always name their agent. Unresolved
+identities suppress the prompt rather than letting the host choose `build`.
+SmartFetch's secondary-model session path was removed in #1638.
 
 ## Root cause (causal chain, cross-validated)
 
@@ -45,17 +46,17 @@ always targets the orchestrator. Smartfetch remains a separate call site.
 |---|---|---|---|
 | `src/hooks/task-session-manager/continuation-evaluator.ts` (`promptAsync`) | `session.idle` / `session.status(idle)` on orchestrator session with incomplete todos when the opt-in beta continuation option was enabled (removed; see configuration.md) | **No** (`agent: 'orchestrator'`) | continuation option (removed), process-local one-attempt gate (reserve→commit), `hasInputWait`, `isCurrentContinuation`, `isFallbackInProgress`, `backgroundJobBoard.hasTerminalUnreconciled`, malformed/active SDK short-circuits |
 | `src/interview/service.ts` | User submits interview input | **No** — uses `InterviewSessionRuntime.continue()` | `sessionBusy` lock, interview active state |
-| `src/interview/service.ts` | Interview URL notification | **No routing ambiguity** — uses `InterviewSessionRuntime.notify()` | none |
-| `src/tools/smartfetch/secondary-model.ts:252` | Smartfetch secondary model query | **Yes** | none |
+| `src/interview/runtime.ts` | Interview URL notification | **No** — resolves the session agent before `notify()` prompts | unresolved identity suppresses notification |
+| `src/tools/smartfetch/secondary-model.ts` (removed in #1638) | Historical secondary model query | Removed | no helper session remains |
 
 ## Correct pattern (for comparison)
 
-`src/hooks/foreground-fallback/index.ts:635-639` explicitly includes the agent:
+`src/hooks/foreground-fallback/index.ts` explicitly includes the resolved agent:
 ```ts
 const promptBody = {
   parts: lastUser.parts,
   model: ref,
-  ...(agentName ? { agent: agentName } : {}),
+  agent: agentName,
 };
 ```
 This is the pattern every `promptAsync` caller in omos should follow.
@@ -85,7 +86,7 @@ The gate exists and works in the common case (see `continuation-evaluator.ts` an
 4. **Continuation path sets `agent: 'orchestrator'`.** The historical missing-
    `agent` misroute on the continuation nudge is fixed in
    `continuation-evaluator.ts`; interview uses its runtime boundary as well.
-   Smartfetch remains outside this interview fix.
+    SmartFetch no longer starts secondary-model sessions (#1638).
 
 ## Why this is the same class as the #818 `/preset` fix
 
@@ -101,6 +102,25 @@ The interview service no longer owns raw session prompt calls. Its narrow
 `InterviewSessionRuntime` boundary routes all continuation prompts to the
 orchestrator. v1 uses the nested SDK client; v2 uses a marker/context bridge and
 the v2 session methods without expanding the global client shim.
+
+`src/utils/prompt-agent.ts` resolves identity from a recorded safe hint,
+the session record, then the newest user message in a bounded 50-message
+tail. Each probe has a five-second timeout. Assistant messages and core
+`compaction`/`summary`/`title` identities are not used. Only a positively
+identified parentless session may fall back to `orchestrator`; unverified
+targets and unresolved children are not prompted. `withAgent()` rejects
+missing or malformed identities before a body can be sent.
+
+Foreground fallback preflights identity before task-error bookkeeping and
+replays afterwards, preserving the current retry budget, model selection,
+generation fences, and background handoff. Both chain and same-model replays
+name the agent; disposal or a newer turn invalidates a suspended probe.
+Task messages retain the owning agent even when no model override is needed.
+
+`src/utils/prompt-agent.test.ts` scans v1 prompt calls, including bound aliases
+and indirect bodies. The v2 flat session API has no per-prompt `agent` field;
+its adapters and preset UI dialogs are documented exceptions, not agent-less
+v1 calls.
 
 ### Hardening (optional, larger scope)
 1. **Input-wait guard on the interview/skill path.** Consult `hasInputWait` (or an equivalent signal) before injecting in `src/interview/service.ts`. Do not inject while the orchestrator is waiting for user input.
@@ -141,10 +161,11 @@ the v2 session methods without expanding the global client shim.
 
 ## Follow-up
 
-1. Smartfetch still has its own secondary-model prompt path and is outside the interview runtime boundary.
-2. Continue keeping cache-sensitive v2 interview rewriting restricted to the trailing marker message.
+1. Continue keeping cache-sensitive v2 interview rewriting restricted to the trailing marker message.
 
 ---
 
-Regression coverage lives in `src/interview/runtime.test.ts`,
-`src/interview/finalization.test.ts`, and `src/v2/interview-bridge.test.ts`.
+Regression coverage lives in `src/utils/prompt-agent.test.ts`,
+`src/hooks/foreground-fallback/index.test.ts`, `src/tools/task-message.test.ts`,
+`src/interview/runtime.test.ts`, `src/interview/finalization.test.ts`, and
+`src/v2/interview-bridge.test.ts`.

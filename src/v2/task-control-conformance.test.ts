@@ -42,12 +42,13 @@ function harness(
     session?: Partial<V2Context['session']>;
     waitForIdleTimeoutMs?: number;
     messageTimeoutMs?: number;
+    isDisposed?: () => boolean;
   } = {},
 ) {
   const host = {
     get: mock(async () => ({
       outcome: 'interrupted',
-      agent: 'persisted-agent',
+      agent: 'explorer',
       model: { id: 'persisted-model', providerID: 'provider', variant: 'high' },
     })),
     context: mock(async () => []),
@@ -120,6 +121,7 @@ function harness(
     input,
     backgroundJobBoard: board,
     messageTimeoutMs: options.messageTimeoutMs,
+    isDisposed: options.isDisposed,
   }).task_message;
   return {
     input,
@@ -137,6 +139,122 @@ function harness(
 }
 
 describe('task controls through the real v2 client shim', () => {
+  test.each([
+    'disposed',
+    'lease released',
+    'agent changed',
+    'current',
+  ] as const)(
+    'revalidates task authorization after the deferred agent lookup: %s',
+    async (change) => {
+      const entered = Promise.withResolvers<void>();
+      const lookup = Promise.withResolvers<{ agent: string }>();
+      let disposed = false;
+      const get = mock(() => {
+        entered.resolve();
+        return lookup.promise;
+      });
+      const h = harness({
+        running: true,
+        session: { get },
+        isDisposed: () => disposed,
+      });
+      const acquire = spyOn(h.board, 'acquireMessageLease');
+      const pending = h.message.execute(messageArgs, context);
+      const settled = pending.then(
+        (value) => ({ value, error: undefined }),
+        (error: unknown) => ({ value: undefined, error }),
+      );
+      await entered.promise;
+      expect(h.host.prompt).not.toHaveBeenCalled();
+      const lease = acquire.mock.results[0]?.value;
+      if (!lease) throw new Error('Expected a held message lease');
+
+      if (change === 'disposed') disposed = true;
+      if (change === 'lease released') h.board.releaseLease(lease);
+      if (change === 'agent changed') {
+        const job = h.board.get('ses_child');
+        if (!job) throw new Error('Expected a tracked task');
+        job.agent = 'fixer';
+      }
+      const failure = {
+        disposed: /disposed/,
+        'lease released': /message lease is no longer valid/,
+        'agent changed': /agent changed while preparing/,
+      };
+      lookup.resolve({ agent: 'explorer' });
+      const result = await settled;
+      if (change === 'current') {
+        expect(result.error).toBeUndefined();
+        expect(String(result.value)).toContain('queued');
+        expect(h.host.prompt).toHaveBeenCalledTimes(1);
+        expect(h.host.prompt).toHaveBeenCalledWith({
+          sessionID: 'ses_child',
+          text: 'Update',
+          delivery: 'queue',
+          resume: false,
+        });
+      } else {
+        expect(result.error).toBeInstanceOf(Error);
+        expect((result.error as Error).message).toMatch(failure[change]);
+        expect(h.host.prompt).not.toHaveBeenCalled();
+      }
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(h.host.switchAgent).not.toHaveBeenCalled();
+      expect(h.host.switchModel).not.toHaveBeenCalled();
+      expect(h.host.interrupt).not.toHaveBeenCalled();
+      const nextLease = h.board.acquireMessageLease('ses_child', 1);
+      expect(nextLease).toBeDefined();
+      if (nextLease) h.board.releaseLease(nextLease);
+    },
+  );
+
+  test.each([
+    { agent: 'other-agent' },
+    {},
+    { error: 'lookup failed' },
+    undefined,
+  ])(
+    'refuses an unverified owning agent before writing: %j',
+    async (record) => {
+      const h = harness({
+        session: { get: mock(async () => record) as never },
+      });
+      await expect(
+        h.input.client.session.prompt({
+          path: { id: 'ses_child' },
+          body: {
+            agent: 'explorer',
+            noReply: true,
+            parts: [{ type: 'text', text: 'Update' }],
+          },
+        }),
+      ).rejects.toThrow('agent must match');
+      expect(h.host.prompt).not.toHaveBeenCalled();
+      expect(h.host.switchAgent).not.toHaveBeenCalled();
+      expect(h.host.switchModel).not.toHaveBeenCalled();
+    },
+  );
+
+  test('does not write if owning-agent lookup rejects or is unavailable', async () => {
+    for (const get of [
+      undefined,
+      mock(async () => {
+        throw new Error('lookup failed');
+      }),
+    ]) {
+      const h = harness({ session: { get } });
+      await expect(
+        h.input.client.session.prompt({
+          path: { id: 'ses_child' },
+          body: { agent: 'explorer', noReply: true, parts: [] },
+        }),
+      ).rejects.toThrow();
+      expect(h.host.prompt).not.toHaveBeenCalled();
+      expect(h.host.switchAgent).not.toHaveBeenCalled();
+    }
+  });
+
   test.each(
     ['v2', 'v1-idle', 'v1-absent'].flatMap((route) =>
       [
@@ -327,9 +445,10 @@ describe('task controls through the real v2 client shim', () => {
           }),
         );
       } else {
-        expect(h.host.get).not.toHaveBeenCalled();
+        expect(h.host.get).toHaveBeenCalledWith({ sessionID: 'ses_child' });
         expect(h.host.context).not.toHaveBeenCalled();
         expect(shimPrompt.mock.calls[0]?.[0].body).toEqual({
+          agent: 'explorer',
           noReply: true,
           parts: [{ type: 'text', text: 'Update' }],
         });
@@ -662,10 +781,16 @@ describe('task controls through the real v2 client shim', () => {
       delivery: 'queue',
       resume: false,
     });
-    expect(shimPrompt.mock.calls[0]?.[0].body).not.toHaveProperty(
-      'delivery',
-      'steer',
-    );
+    expect(h.host.interrupt).not.toHaveBeenCalled();
+    expect(h.host.switchAgent).not.toHaveBeenCalled();
+    expect(h.host.switchModel).not.toHaveBeenCalled();
+    expect(h.host.synthetic).not.toHaveBeenCalled();
+    expect(h.host.wait).not.toHaveBeenCalled();
+    expect(h.host.get).toHaveBeenCalledWith({ sessionID: 'ses_child' });
+    expect(h.host.context).not.toHaveBeenCalled();
+    expect(output).not.toMatch(/read|applied|acknowledged/i);
+    expect(shimPrompt.mock.calls[0]?.[0].body.agent).toBe('explorer');
+    expect(shimPrompt.mock.calls[0]?.[0].body).not.toHaveProperty('delivery');
     expect(output).toMatch(/queued/i);
   });
 

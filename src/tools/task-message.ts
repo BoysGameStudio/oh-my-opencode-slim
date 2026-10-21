@@ -128,14 +128,18 @@ export function createTaskMessageTool(options: {
 
       let keepLeaseUntilSettled = false;
       try {
-        assertMessageLease(options.backgroundJobBoard, lease, requested);
-        getCurrentTaskMessageJob(
-          options.backgroundJobBoard,
-          parentSessionID,
-          lease.taskID,
-          lease.generation,
-          delegation,
-        );
+        const assertCurrentMessage = () => {
+          assertMessageLease(options.backgroundJobBoard, lease, requested);
+          if (options.isDisposed?.()) throw new Error(pluginDisposedMessage());
+          return getCurrentTaskMessageJob(
+            options.backgroundJobBoard,
+            parentSessionID,
+            lease.taskID,
+            lease.generation,
+            delegation,
+          );
+        };
+        assertCurrentMessage();
 
         const session = getClient(options.input).session;
         const prompt = session.prompt.bind(session);
@@ -182,20 +186,12 @@ export function createTaskMessageTool(options: {
           options.backgroundJobBoard,
           lease,
           () => {
-            assertMessageLease(options.backgroundJobBoard, lease, requested);
-            if (options.isDisposed?.())
-              throw new Error(pluginDisposedMessage());
-            const currentJob = getCurrentTaskMessageJob(
-              options.backgroundJobBoard,
-              parentSessionID,
-              lease.taskID,
-              lease.generation,
-              delegation,
-            );
+            const currentJob = assertCurrentMessage();
+            const expectedAgent = currentJob.agent;
             const body = {
+              agent: expectedAgent,
               ...(modelSelection
                 ? {
-                    agent: currentJob.agent,
                     model: modelSelection.model,
                     variant: modelSelection.variant ?? 'default',
                   }
@@ -207,6 +203,20 @@ export function createTaskMessageTool(options: {
               path: { id: lease.taskID },
               body,
               throwOnError: true,
+              ...(hostFlavor === 'v2'
+                ? {
+                    // The shim awaits owning-agent validation. Recheck the
+                    // same authorization at its final, synchronous admission
+                    // boundary rather than after the host has already queued.
+                    beforeSend: () => {
+                      if (assertCurrentMessage().agent !== expectedAgent) {
+                        throw new Error(
+                          `Task ${requested} agent changed while preparing its message; refusing stale message`,
+                        );
+                      }
+                    },
+                  }
+                : {}),
             });
           },
           remainingTimeoutMs,

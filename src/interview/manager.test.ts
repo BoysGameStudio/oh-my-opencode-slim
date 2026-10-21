@@ -70,6 +70,9 @@ function createMockContext(overrides?: {
   const messagesData = overrides?.messagesData ?? [];
   let sideCount = 0;
   const sessionMock = {
+    get: mock(async (args: { path: { id: string } }) => ({
+      data: { id: args.path.id },
+    })),
     messages: mock(async () => ({ data: messagesData })),
     create: mock(async () => {
       sideCount += 1;

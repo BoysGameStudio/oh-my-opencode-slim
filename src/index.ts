@@ -2534,6 +2534,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         }
       }
 
+      // Resolve identity before task error bookkeeping, but replay afterwards:
+      // prompt admission may synchronously emit a busy event.
+      await foregroundFallback.preflightEvent(input.event);
+
       // Invalidate task continuations before the instance-disposed cleanup
       // (the former multiplexer event handling moved to the client process
       // with the pane lifecycle; the server never touches panes).

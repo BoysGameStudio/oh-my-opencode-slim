@@ -359,12 +359,22 @@ child bridge degrades with a one-time warning.
 ### Task-control prompt and idle-wait contracts
 
 The v1-facing `session.prompt` shim preserves text and file attachments. A
-`noReply: true` write is a real, non-synthetic prompt with `queue` + `resume: false` (or `steer` + `resume: false` when `task_message` passes an explicit v2-only `delivery: "steer"`);
-queue alone would not preserve the no-resume intent. Unsupported per-call
-agent/model/variant overrides are rejected before writing, never silently dropped
-or implemented by non-atomic `switchAgent`/`switchModel` calls. `task_message`
+`noReply: true` task message is a real, non-synthetic prompt with `queue` +
+`resume: false`; `task_message` exposes no delivery/steer parameter.
+Queue alone would not preserve the no-resume intent. Unsupported per-call
+model/variant overrides and agent changes are rejected before writing, never
+silently dropped or implemented by non-atomic `switchAgent`/`switchModel` calls.
+A named owning agent is an identity assertion: the shim verifies it matches
+`session.get().agent` before admitting the prompt. Missing, mismatched, or
+unreadable identity fails closed without a write or selection switch. `task_message`
 explicitly inherits persisted selection on v2; other noReply callers, including
 interview notifications, retain the same no-resume semantics.
+
+After the asynchronous identity read, `task_message` revalidates its existing
+disposal, message lease, running generation, and owning-agent conditions at the
+shim's synchronous pre-admission boundary. The local `beforeSend` guard is not
+forwarded to the host and cannot switch selection; invalidation during the read
+therefore rejects without queuing a message.
 
 `experimental_v2.waitForSessionIdle(sessionID)` exists only when the host provides
 `session.wait({sessionID})`. It delegates that method; it fabricates neither a

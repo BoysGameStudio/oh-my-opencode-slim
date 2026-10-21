@@ -563,6 +563,15 @@ describe('plugin tool registration', () => {
       expect(system.join('\n')).not.toContain('@unselected-agent');
       await hooks.event?.({
         event: {
+          type: 'subagent.session.created',
+          properties: {
+            sessionID: 'marketplace-fallback',
+            agentName: 'SelectedVisible',
+          },
+        },
+      } as never);
+      await hooks.event?.({
+        event: {
           type: 'message.updated',
           properties: {
             info: {
