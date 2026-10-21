@@ -114,6 +114,7 @@ Each tool is implemented as a factory function that returns a `ToolDefinition` r
 1. Agent invokes task_status
    ├─> Resolves task_id to a BackgroundJobBoard entry
    ├─> Reads the bounded live session-status snapshot (session-runtime-status)
+   ├─> On the uncertain branch (plain and result:true) one classifyLiveSession probe feeds an attributable host outcome through the terminal gate's observe/reconcile (interrupted → stopped family, never completed); unknown-handle errors append the parent's last 5 `recent:` handles; unattributable evidence keeps `running (unconfirmed)` with push-not-poll guidance
    ├─> summarizeTaskStatus() (task-policy.ts) prefers the live-confirmed host
    │   status; board state is only reported with explicit uncertainty
    └─> possibly_stuck requires a live-confirmed busy/retry signal beyond the

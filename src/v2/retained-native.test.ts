@@ -156,37 +156,29 @@ describe('v2 historical context', () => {
     });
   });
 
-  test('a host terminal outcome without readable answer text refuses as pending', async () => {
-    // Incident 1115: the gate trusts restored rows without rereading the
-    // transcript, so a textless succeeded import would make later result
-    // reads permanently empty. Plain recovery keeps the round pending;
-    // only an explicit queued revive may adopt identity.
-    const board = new BackgroundJobBoard();
-    const input = host({
-      context: (args) =>
-        args.sessionID === CHILD
-          ? [
-              {
-                id: 'msg_user',
-                type: 'user',
-                time: { created: 10 },
-                text: 'ask',
-              },
-            ]
-          : round(),
-    });
-    const refused = await createSessionRecovery({
-      input: input as never,
-      backgroundJobBoard: board,
-      hostFlavor: 'v2',
-      stableStoppedMs: 0,
-    })({ parentSessionID: PARENT, requested: CHILD });
-    expect(refused.kind).toBe('refused');
-    if (refused.kind === 'refused') {
-      expect(refused.reason).toContain('answer text is not readable yet');
-    }
-    expect(board.get(CHILD)).toBeUndefined();
-  });
+  test.each([false, true])(
+    'textless success stays pending (assistant present: %j)',
+    async (withAssistant) => {
+      const board = new BackgroundJobBoard();
+      const input = host({
+        context: (args) =>
+          args.sessionID === CHILD
+            ? round('').slice(0, withAssistant ? 2 : 1)
+            : round(),
+      });
+      const refused = await createSessionRecovery({
+        input: input as never,
+        backgroundJobBoard: board,
+        hostFlavor: 'v2',
+        stableStoppedMs: 0,
+      })({ parentSessionID: PARENT, requested: CHILD });
+      expect(refused.kind).toBe('refused');
+      if (refused.kind === 'refused') {
+        expect(refused.reason).toContain('answer text is not readable yet');
+      }
+      expect(board.get(CHILD)).toBeUndefined();
+    },
+  );
 
   test('a textless succeeded outcome still adopts identity for a queued revive', async () => {
     // The P1 companion: adoption returns verified identity without
@@ -219,6 +211,92 @@ describe('v2 historical context', () => {
     expect(adopted).toMatchObject({ kind: 'adoptable', taskID: CHILD });
     expect(board.get(CHILD)).toBeUndefined();
   });
+
+  test.each([
+    ['failed', 'error', false],
+    ['failed', 'error', true],
+    ['interrupted', 'stopped', false],
+    ['interrupted', 'stopped', true],
+  ] as const)(
+    'textless %s recovers %s (assistant present: %j)',
+    async (outcome, state, withAssistant) => {
+      const board = new BackgroundJobBoard();
+      const input = host({
+        get: () => ({
+          id: CHILD,
+          parentID: PARENT,
+          agent: 'fixer',
+          outcome,
+          time: { created: 9, idle: 13 },
+        }),
+        context: (args) =>
+          args.sessionID === CHILD
+            ? round('').slice(0, withAssistant ? 2 : 1)
+            : round(),
+      });
+      const result = await createSessionRecovery({
+        input: input as never,
+        backgroundJobBoard: board,
+        hostFlavor: 'v2',
+        stableStoppedMs: 0,
+      })({ parentSessionID: PARENT, requested: CHILD });
+      expect(result).toEqual({ kind: 'recovered', taskID: CHILD });
+      expect(board.get(CHILD)?.state).toBe(state);
+      if (outcome === 'failed') {
+        expect(board.get(CHILD)?.resultSummary).toBe(
+          'The historical round failed before an assistant result.',
+        );
+      }
+    },
+  );
+
+  test.each(['succeeded', 'failed', 'interrupted'] as const)(
+    'newer assistant activity blocks an older %s outcome',
+    async (outcome) => {
+      for (const time of [{ created: 14 }, { created: 11, completed: 14 }]) {
+        const board = new BackgroundJobBoard();
+        const input = host({
+          get: () => ({
+            id: CHILD,
+            parentID: PARENT,
+            agent: 'fixer',
+            outcome,
+            time: { created: 9, idle: 13 },
+          }),
+          context: () => [
+            ...round(),
+            {
+              id: 'new-answer',
+              type: 'assistant',
+              agent: 'fixer',
+              time,
+              content: [{ type: 'text', text: 'PARTIAL' }],
+            },
+          ],
+        });
+        const recover = createSessionRecovery({
+          input: input as never,
+          backgroundJobBoard: board,
+          hostFlavor: 'v2',
+        });
+        expect(
+          (await recover({ parentSessionID: PARENT, requested: CHILD })).kind,
+        ).toBe('refused');
+        expect(board.get(CHILD)).toBeUndefined();
+        // An explicit queued continuation may adopt identity, never import
+        // the obsolete terminal or newer partial answer as a settled row.
+        expect(
+          await recover({
+            parentSessionID: PARENT,
+            requested: CHILD,
+            purpose: 'revive',
+            allowQueuedContinuation: true,
+          }),
+        ).toMatchObject({ kind: 'adoptable', taskID: CHILD });
+        expect(board.get(CHILD)).toBeUndefined();
+      }
+    },
+  );
 
   test('a newer synthetic blocks an older succeeded outcome', async () => {
     // Host-state triage: the succeeded outcome predates the newest input
@@ -636,17 +714,15 @@ test('real parent context pairs an alias through the shim', async () => {
   expect(description.length).toBeGreaterThan(0);
 });
 
-test('host outcome triage: interrupted stops, failed errors, and a terminal outcome imports the newest assistant', async () => {
-  // Host-state triage imports the interrupted round without an assistant
-  // and, for a newer unclosed assistant, retains stopped rather than
-  // trusting an older idle.
+test('host outcome triage: interrupted stops, failed errors, and newer assistant activity prevents import', async () => {
+  // A host terminal covers assistant activity only up to its idle time.
   const interruptedInput = host({
     get: () => ({
       id: CHILD,
       parentID: PARENT,
       agent: 'fixer',
       outcome: 'interrupted',
-      time: { created: 9, idle: 11 },
+      time: { created: 9, idle: 13 },
     }),
   });
   const interruptedBoard = new BackgroundJobBoard();
@@ -666,7 +742,7 @@ test('host outcome triage: interrupted stops, failed errors, and a terminal outc
       parentID: PARENT,
       agent: 'fixer',
       outcome: 'failed',
-      time: { created: 9, idle: 11 },
+      time: { created: 9, idle: 13 },
     }),
   });
   const failedBoard = new BackgroundJobBoard();
@@ -717,18 +793,15 @@ test('host outcome triage: interrupted stops, failed errors, and a terminal outc
         : round(),
   });
   const newerBoard = new BackgroundJobBoard();
-  await createSessionRecovery({
+  const newerResult = await createSessionRecovery({
     input: newerAssistantInput as never,
     backgroundJobBoard: newerBoard,
     hostFlavor: 'v2',
     stableStoppedMs: 0,
   })({ parentSessionID: PARENT, requested: CHILD });
-  // Host state is authoritative: the succeeded outcome after the latest
-  // input imports as completed, and the newest assistant text is the result.
-  expect(newerBoard.get(CHILD)).toMatchObject({
-    state: 'completed',
-    resultSummary: 'ANSWER-B',
-  });
+  // The older success cannot certify ANSWER-B, even without a newer input.
+  expect(newerResult.kind).toBe('refused');
+  expect(newerBoard.get(CHILD)).toBeUndefined();
 });
 
 // A completed compaction cut the context (page.complete false): an older

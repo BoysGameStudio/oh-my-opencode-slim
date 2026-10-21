@@ -688,6 +688,29 @@ describe('task_message', () => {
     expect(prompt).not.toHaveBeenCalled();
   });
 
+  test('a refused alias still enumerates recent handles', async () => {
+    const board = new BackgroundJobBoard();
+    registerRunningChild(board);
+    const prompt = makePrompt();
+    client = { session: { prompt } };
+    const task_message = createTaskMessageTool({
+      input: { directory: '/test', client } as any,
+      backgroundJobBoard: board,
+      resolveCanonicalTaskRef: async () => ({
+        kind: 'refused',
+        reason: 'Unknown task ID or alias: fix-9',
+      }),
+    }).task_message;
+    const error = (await task_message
+      .execute({ task_id: 'fix-9', message: 'go' }, {
+        sessionID: 'parent-1',
+      } as any)
+      .catch((e: Error) => e)) as Error;
+    expect(error.message).toContain('Unknown task ID or alias: fix-9');
+    expect(error.message).toContain('recent:');
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
   test('a disposal landing after the helper check still stops the send', async () => {
     const board = new BackgroundJobBoard();
     registerRunningChild(board);

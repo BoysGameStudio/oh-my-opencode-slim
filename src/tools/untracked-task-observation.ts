@@ -1,5 +1,6 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 import {
+  attributeHostRoundToTranscript,
   classifyTerminalEvidence,
   fetchChildTranscript,
   latestInputAtOf,
@@ -161,13 +162,17 @@ async function readTranscript(
     if (!v2) {
       return { live, round: classifyTerminalEvidence(transcript) };
     }
-    const state = hostRoundStateOf(hostInfo);
+    const state = attributeHostRoundToTranscript(
+      hostRoundStateOf(hostInfo),
+      transcript,
+    );
     const latestInputAt = latestInputAtOf(transcript);
     const round = composeHostRound(state, latestInputAt);
     if (state.kind === 'terminal') {
       const text = terminalTextOf(transcript);
       if (text) round.text = text;
-      else round.reason = 'answer text is not readable yet';
+      else if (state.outcome === 'succeeded')
+        round.reason = 'answer text is not readable yet';
     }
     return { live, round };
   } catch (error) {

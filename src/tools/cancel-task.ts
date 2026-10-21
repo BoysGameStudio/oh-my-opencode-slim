@@ -35,6 +35,7 @@ import {
   type CanonicalTaskResolver,
   idParamFor,
   readTaskRef,
+  recentTaskHandles,
   taskRefArgs,
 } from './task-ref';
 
@@ -95,24 +96,27 @@ Use only for obsolete, wrong, conflicting, or user-requested cancellation. The r
         toolContext,
         'task_cancel',
       );
+      const recentHandles = () =>
+        recentTaskHandles(options.backgroundJobBoard, parentSessionID);
+      const unknownOutput = (taskIDRef: string, message: string) =>
+        unknownTaskOutput(idParam, taskIDRef, message, recentHandles());
       const requested = readTaskRef(args, idParam);
       if (!requested) throw new Error(`task_cancel requires ${idParam}`);
       const canonical = options.resolveCanonicalTaskRef
         ? await options.resolveCanonicalTaskRef(parentSessionID, requested)
         : undefined;
       if (options.isDisposed?.()) {
-        return unknownTaskOutput(idParam, requested, pluginDisposedMessage());
+        return unknownOutput(requested, pluginDisposedMessage());
       }
       if (canonical?.kind === 'refused') {
-        return unknownTaskOutput(idParam, requested, canonical.reason);
+        return unknownOutput(requested, canonical.reason);
       }
       const identity = canonical?.taskID ?? requested;
       const job = canonical
         ? options.backgroundJobBoard.get(identity)
         : options.backgroundJobBoard.resolve(parentSessionID, requested);
       if (job && job.parentSessionID !== parentSessionID) {
-        return unknownTaskOutput(
-          idParam,
+        return unknownOutput(
           identity,
           `Task ${identity} belongs to a different parent session. No action was sent.`,
         );
@@ -128,8 +132,7 @@ Use only for obsolete, wrong, conflicting, or user-requested cancellation. The r
             : options.backgroundJobBoard.resolve(parentSessionID, requested);
           if (restored) {
             if (restored.state === 'running' || restored.statusUncertain) {
-              return unknownTaskOutput(
-                idParam,
+              return unknownOutput(
                 restored.taskID,
                 'The host session is still executing. task_cancel did not take over an untracked busy session, and no abort was sent.',
               );
@@ -148,11 +151,10 @@ Use only for obsolete, wrong, conflicting, or user-requested cancellation. The r
             ].join('\n');
           }
           if (recovery.kind === 'refused') {
-            return unknownTaskOutput(idParam, requested, recovery.reason);
+            return unknownOutput(requested, recovery.reason);
           }
         }
-        return unknownTaskOutput(
-          idParam,
+        return unknownOutput(
           requested,
           await untrackedTaskReason(options, parentSessionID, requested),
         );
@@ -746,6 +748,7 @@ function unknownTaskOutput(
   idParam: string,
   taskID: string,
   message: string,
+  recent?: string,
 ): string {
   return [
     `${idParam}: ${taskID}`,
@@ -753,6 +756,7 @@ function unknownTaskOutput(
     '',
     '<task_error>',
     message,
+    ...(recent ? [recent] : []),
     '</task_error>',
   ].join('\n');
 }

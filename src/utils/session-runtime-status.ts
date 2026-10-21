@@ -2,9 +2,22 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import type { CurrentRoundClassification } from './child-transcript';
 import { isRecord } from './guards';
 import { getClient } from './opencode-client';
+import { raceEvidenceDeadline, readHostSessionInfo } from './session-info-read';
 
 export type RuntimeSessionStatus = 'busy' | 'retry' | 'idle';
 export const DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS = 5_000;
+/** Default bound for the one host-info classification read (v2 hosts). */
+const DEFAULT_LIVE_SESSION_CLASSIFY_TIMEOUT_MS = 1_500;
+
+/**
+ * Injectable timer seam for the bounded reads in this module. Tests wire
+ * `src/utils/test-timers.ts` here instead of binding to real time.
+ */
+interface RuntimeStatusTimers {
+  setTimeout: (callback: () => void, delay: number) => unknown;
+  clearTimeout: (timer: unknown) => void;
+}
+
 const openStatusReads = new WeakMap<object, Promise<void>>();
 
 export interface RuntimeSessionStatusSnapshot {
@@ -111,6 +124,70 @@ export type LiveSession =
   | { kind: RuntimeSessionStatus | 'absent' }
   | { kind: 'unknown'; reason: string };
 
+/** Host terminal outcome literals the classifier surfaces. */
+type HostTerminalOutcome = 'succeeded' | 'failed' | 'interrupted';
+
+const HOST_TERMINAL_OUTCOMES: readonly string[] = [
+  'succeeded',
+  'failed',
+  'interrupted',
+];
+
+/** Reduce a session-info payload to the probe verdict. Parsing is shared
+ *  with recovery triage through `hostRoundStateOf`; the reason strings are
+ *  the classifier's own (they are rendered by task_status). */
+function classifySessionInfo(
+  info: Record<string, unknown>,
+): LiveSessionClassification {
+  const state = hostRoundStateOf(info);
+  if (state.kind === 'terminal') {
+    return { kind: 'outcome', outcome: state.outcome, idleAt: state.idleAt };
+  }
+  if (state.kind === 'pending') {
+    return { kind: 'unknown', reason: 'no host terminal outcome' };
+  }
+  const outcome = info.idleOutcome ?? info.idle_outcome ?? info.outcome;
+  if (outcome === undefined || outcome === null) {
+    return { kind: 'unknown', reason: 'no host terminal outcome' };
+  }
+  return {
+    kind: 'unknown',
+    reason:
+      typeof outcome === 'string' && !HOST_TERMINAL_OUTCOMES.includes(outcome)
+        ? `unrecognized host outcome: ${outcome}`
+        : 'host outcome has no valid idle time',
+  };
+}
+
+/**
+ * One bounded classification of a live child session, reduced to what a
+ * task-status probe can act on. Pure: no tool text, no board writes.
+ */
+type LiveSessionClassification =
+  | { kind: 'running' }
+  | { kind: 'idle' }
+  | { kind: 'outcome'; outcome: HostTerminalOutcome; idleAt?: number }
+  | { kind: 'unknown'; reason: string };
+
+function classificationFromSnapshot(
+  snapshot: RuntimeSessionStatusSnapshot,
+  sessionID: string,
+): LiveSessionClassification {
+  if (
+    snapshot.error !== undefined ||
+    snapshot.malformedSessionIDs.has(sessionID)
+  ) {
+    return {
+      kind: 'unknown',
+      reason: snapshot.error ?? 'malformed entry',
+    };
+  }
+  const status = snapshot.statuses.get(sessionID);
+  return status === 'busy' || status === 'retry'
+    ? { kind: 'running' }
+    : { kind: 'idle' };
+}
+
 /** One fresh read, reduced to what a single session's decision needs. */
 export async function readLiveSession(
   input: PluginInput,
@@ -124,6 +201,93 @@ export async function readLiveSession(
   )
     return { kind: 'unknown', reason: snapshot.error ?? 'malformed entry' };
   return { kind: snapshot.statuses.get(sessionID) ?? 'absent' };
+}
+
+/**
+ * Classify one child session ONCE for a task-status probe.
+ *
+ * Reuses the live session-status map where the host exposes it (v1). On
+ * hosts without that map (v2) one bounded host `session.get` read surfaces
+ * the terminal outcome (`succeeded|failed|interrupted`) together with
+ * `time.idle` — the same host-clock timestamp the terminal gate attributes
+ * against. Anything unreadable or unrecognized stays `unknown`, never a
+ * fabricated state. Callers that already read the session info pass it as
+ * `hostInfo` so the probe never issues a duplicate read.
+ */
+export async function classifyLiveSession(
+  input: PluginInput,
+  sessionID: string,
+  options: {
+    timeoutMs?: number;
+    timers?: RuntimeStatusTimers;
+    /** Reuse a status-map read already performed for this query. */
+    snapshot?: RuntimeSessionStatusSnapshot;
+    /** Reuse a session-info read already performed for this query. */
+    hostInfo?: Record<string, unknown>;
+  } = {},
+): Promise<LiveSessionClassification> {
+  const timeoutMs =
+    options.timeoutMs ?? DEFAULT_LIVE_SESSION_CLASSIFY_TIMEOUT_MS;
+  const client =
+    typeof input.client?.session?.status === 'function'
+      ? input.client
+      : getClient(input);
+  if (typeof client?.session?.status === 'function') {
+    if (options.snapshot) {
+      return classificationFromSnapshot(options.snapshot, sessionID);
+    }
+    const live = await readLiveSession(input, sessionID, { timeoutMs });
+    if (live.kind === 'unknown') {
+      return { kind: 'unknown', reason: live.reason };
+    }
+    return live.kind === 'busy' || live.kind === 'retry'
+      ? { kind: 'running' }
+      : { kind: 'idle' };
+  }
+  if (options.hostInfo !== undefined) {
+    return classifySessionInfo(options.hostInfo);
+  }
+  if (typeof client?.session?.get !== 'function') {
+    return {
+      kind: 'unknown',
+      reason: 'session-status and session-get unavailable on this host',
+    };
+  }
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return { kind: 'unknown', reason: 'Session status lookup timed out' };
+  }
+  // One shared raw read per client+session; the deadline releases only this
+  // waiter, so a stalled host read is never re-issued behind itself.
+  const tagged = readHostSessionInfo(input, {
+    taskID: sessionID,
+    identity: `standalone:${sessionID}`,
+  }).then(
+    (value) => ({ value, failed: false as const }),
+    (error) => ({ error, failed: true as const }),
+  );
+  const raced = await raceEvidenceDeadline(tagged, timeoutMs, options.timers);
+  if (raced === undefined) {
+    return { kind: 'unknown', reason: 'Session status lookup timed out' };
+  }
+  if (raced.failed) {
+    return {
+      kind: 'unknown',
+      reason:
+        raced.error instanceof Error
+          ? raced.error.message
+          : String(raced.error),
+    };
+  }
+  const response = raced.value;
+  if (
+    !isRecord(response) ||
+    (response.error !== undefined && response.error !== null)
+  ) {
+    return { kind: 'unknown', reason: 'invalid session info response' };
+  }
+  return classifySessionInfo(
+    isRecord(response.data) ? response.data : response,
+  );
 }
 
 export function runtimeSessionStatus(
@@ -153,7 +317,7 @@ export type HostRoundState =
 export function hostRoundStateOf(
   info: Record<string, unknown> | undefined,
 ): HostRoundState {
-  const outcome = info?.outcome;
+  const outcome = info?.idleOutcome ?? info?.idle_outcome ?? info?.outcome;
   const time = isRecord(info?.time) ? info.time : undefined;
   const idleAt = time?.idle;
   const outcomePresent = outcome !== undefined && outcome !== null;
@@ -162,6 +326,7 @@ export function hostRoundStateOf(
     !outcomePresent ||
     typeof idleAt !== 'number' ||
     !Number.isFinite(idleAt) ||
+    idleAt < 0 ||
     (outcome !== 'succeeded' &&
       outcome !== 'failed' &&
       outcome !== 'interrupted')
@@ -227,22 +392,29 @@ export function composeHostRound(
 async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
+  timers?: RuntimeStatusTimers,
 ): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error('Session status lookup timed out');
   }
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  const setTimer =
+    timers?.setTimeout ??
+    ((callback: () => void, delay: number) => setTimeout(callback, delay));
+  const clearTimer =
+    timers?.clearTimeout ??
+    ((timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+  let timer: unknown;
   try {
     return await Promise.race([
       promise,
       new Promise<T>((_, reject) => {
-        timer = setTimeout(() => {
+        timer = setTimer(() => {
           reject(new Error('Session status lookup timed out'));
         }, timeoutMs);
-        timer.unref?.();
+        (timer as { unref?: () => void }).unref?.();
       }),
     ]);
   } finally {
-    if (timer) clearTimeout(timer);
+    if (timer !== undefined) clearTimer(timer);
   }
 }
