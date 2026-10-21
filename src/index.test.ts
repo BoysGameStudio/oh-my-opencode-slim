@@ -1876,7 +1876,8 @@ describe('plugin reload generation cleanup', () => {
       });
       const control = await transform(hooks, fixture);
       expect(reminderParts(control.messages)).toHaveLength(1);
-      expect(boardParts(control.messages)).toHaveLength(1);
+      // The job board is never rendered (issue #1647).
+      expect(boardParts(control.messages)).toHaveLength(0);
 
       await hooks['experimental.session.compacting']?.(
         { sessionID },
@@ -1887,9 +1888,7 @@ describe('plugin reload generation cleanup', () => {
       stripTaggedContent(expected.messages, PHASE_REMINDER_METADATA_KEY);
       expect(compacted).toEqual(expected);
       expect(reminderParts(compacted.messages)).toHaveLength(0);
-      expect(boardParts(compacted.messages)).toEqual(
-        boardParts(control.messages),
-      );
+      expect(boardParts(compacted.messages)).toHaveLength(0);
     } finally {
       await hooks.dispose?.();
     }
@@ -2087,7 +2086,13 @@ describe('plugin reload generation cleanup', () => {
         expect(wake).toHaveBeenCalledTimes(kind === 'provisional' ? 0 : 1);
         if (kind !== 'provisional') {
           expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
-          expect(board.formatForPrompt('parent-1')).toContain(launch.taskID);
+          // The machine board keeps the record (the board is never
+          // rendered into a prompt — issue #1647).
+          expect(board.get(launch.taskID)).toMatchObject({
+            taskID: launch.taskID,
+            state: 'stopped',
+            terminalUnreconciled: true,
+          });
         }
       } finally {
         await hooks?.dispose?.();
@@ -4070,7 +4075,14 @@ describe('plugin config model inheritance', () => {
         transcript as never,
       );
       transcript.messages.push({
-        info: { sessionID: 'parent', role: 'assistant' },
+        info: {
+          sessionID: 'parent',
+          role: 'assistant',
+          // The host always stamps a turn; the timestamp is what lets the
+          // stale-terminal fallback see that the parent moved past the
+          // terminal report (issue #1647 — no board, no prompt shape).
+          time: { completed: Date.now() + 1_000 },
+        },
         parts: [{ type: 'text', text: 'completion acknowledged' }],
       });
       await hooks['experimental.chat.messages.transform']?.(
