@@ -27,11 +27,13 @@ import {
 } from 'bun:test';
 import * as loggerModule from '../../utils/logger';
 import { createTimerHarness } from '../../utils/test-timers';
+import { isVolatileTaggedMessage } from '../cache-safe-injection';
 import { resetUserWaitGateForTests } from '../task-session-manager/user-wait-gate';
 import {
   createOrchestratorWakeScheduler,
   ORCHESTRATOR_PUBLICATION_WAKE_TEXT,
   ORCHESTRATOR_WAKE_TEXT,
+  PUBLICATION_WAKE_METADATA_KEY,
   WAKE_ANTI_FORGERY_TEXT,
 } from './index';
 import {
@@ -84,6 +86,7 @@ function createClock() {
   }
 
   return {
+    now: () => now,
     setTimeout: setTimeoutImpl,
     clearTimeout: clearTimeoutImpl,
     async advance(ms: number) {
@@ -150,7 +153,6 @@ function createPublicationScheduler(options: {
   wakeOnTerminalPublication?: boolean;
   periodicWakeEnabled?: boolean;
   publicationWakeMinIntervalMs?: number;
-  periodicWakeEnabled?: boolean;
   sessionClient: SessionClient;
   shouldManageSession?: (id: string) => boolean;
   hasInputWait?: (id: string) => boolean;
@@ -167,6 +169,7 @@ function createPublicationScheduler(options: {
   clearTimeout?: Parameters<
     typeof createOrchestratorWakeScheduler
   >[1]['clearTimeout'];
+  now?: () => number;
 }) {
   const ctx = {
     directory: '/project',
@@ -177,7 +180,6 @@ function createPublicationScheduler(options: {
   const scheduler = createOrchestratorWakeScheduler(ctx, {
     config: {
       enabled: true,
-      periodicWakeEnabled: options.periodicWakeEnabled,
       intervalMs: options.intervalMs ?? 60_000,
       ...(options.wakeOnTerminalPublication === undefined
         ? {}
@@ -203,6 +205,7 @@ function createPublicationScheduler(options: {
       : {}),
     ...(options.setTimeout ? { setTimeout: options.setTimeout } : {}),
     ...(options.clearTimeout ? { clearTimeout: options.clearTimeout } : {}),
+    now: options.now ?? clock.now,
   });
 
   return { scheduler };
@@ -262,6 +265,244 @@ afterEach(() => {
 });
 
 describe('terminal-publication wake', () => {
+  function publicationIDs(promptAsync: ReturnType<typeof mock>, index: number) {
+    const call = promptAsync.mock.calls[index]?.[0] as {
+      body: { parts: Array<{ text: string }> };
+    };
+    return [
+      ...call.body.parts
+        .map((part) => part.text)
+        .join('\n')
+        .matchAll(
+          /Later result: task_status \{ sessionID: "([^"]+)", result: true \}/g,
+        ),
+    ].map((match) => match[1]);
+  }
+
+  test('two completed children produce distinct, tagged trailing result pointers', async () => {
+    const promptAsync = mock(async (_args: unknown) => ({}));
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      now: clock.now,
+      publicationWakeMinIntervalMs: 0,
+      sessionClient: makeV2Client({
+        promptAsync,
+        listChildren: [terminalChild('child-1'), terminalChild('child-2')],
+      }),
+    });
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 2);
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-2', 2);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(publicationIDs(promptAsync, 0)).toEqual(['child-1']);
+    expect(publicationIDs(promptAsync, 1)).toEqual(['child-2']);
+    for (const [call] of promptAsync.mock.calls) {
+      const parts = (call as { body: { parts: unknown[] } }).body.parts;
+      expect(
+        isVolatileTaggedMessage(
+          { info: { role: 'user' }, parts },
+          PUBLICATION_WAKE_METADATA_KEY,
+        ),
+      ).toBe(true);
+      expect((parts[0] as { text: string }).text).toStartWith(
+        ORCHESTRATOR_PUBLICATION_WAKE_TEXT,
+      );
+    }
+    expect(ORCHESTRATOR_PUBLICATION_WAKE_TEXT).not.toContain('child-1');
+    expect(ORCHESTRATOR_PUBLICATION_WAKE_TEXT).not.toContain('child-2');
+  });
+
+  test('coalesced publications retain exactly both affected child IDs', async () => {
+    const heldRead = deferred<{ data: Array<Record<string, unknown>> }>();
+    const promptAsync = mock(async (_args: unknown) => ({}));
+    const client = makeV2Client({ promptAsync });
+    let reads = 0;
+    client.list = mock(async () =>
+      ++reads === 1 ? heldRead.promise : { data: [] },
+    );
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      now: clock.now,
+      sessionClient: client,
+    });
+    const first = scheduler.triggerTerminalPublicationWake('p1', 'child-1', 2);
+    await clock.advance(0);
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-2', 2);
+    heldRead.resolve({
+      data: [
+        terminalChild('child-1'),
+        terminalChild('child-2'),
+        terminalChild('unaffected'),
+      ],
+    });
+    await first;
+    await clock.advance(0);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(publicationIDs(promptAsync, 0)).toEqual(['child-1', 'child-2']);
+  });
+
+  test('child deletion during evaluation cannot send an identity-less publication wake', async () => {
+    const heldRead = deferred<{ data: Array<Record<string, unknown>> }>();
+    const promptAsync = mock(async (_args: unknown) => ({}));
+    const client = makeV2Client({ promptAsync });
+    let reads = 0;
+    client.list = mock(async () =>
+      ++reads === 1 ? heldRead.promise : { data: [] },
+    );
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      now: clock.now,
+      sessionClient: client,
+    });
+    const publication = scheduler.triggerTerminalPublicationWake(
+      'p1',
+      'child-1',
+      2,
+    );
+    await clock.advance(0);
+    await scheduler.event({
+      event: { type: 'session.deleted', properties: { sessionID: 'child-1' } },
+    });
+    heldRead.resolve({ data: [] });
+    await publication;
+    await clock.advance(0);
+    expect(promptAsync).not.toHaveBeenCalled();
+  });
+
+  test('SDK failure and input-wait coalescing retain both IDs for the timer retry', async () => {
+    let fail = true;
+    let waiting = false;
+    const promptAsync = mock(async (_args: unknown) => {
+      if (fail) throw new Error('transport down');
+      return {};
+    });
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      now: clock.now,
+      periodicWakeEnabled: false,
+      hasInputWait: () => waiting,
+      sessionClient: makeV2Client({ promptAsync }),
+    });
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 2);
+    waiting = true;
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-2', 2);
+    waiting = false;
+    fail = false;
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(publicationIDs(promptAsync, 0)).toEqual(['child-1']);
+    expect(publicationIDs(promptAsync, 1)).toEqual(['child-1', 'child-2']);
+  });
+
+  test.each(['child-2', 'child-1'])(
+    '%s publishing during transport survives acceptance and throttling',
+    async (nextChild) => {
+      const heldSend = deferred<unknown>();
+      const promptAsync = mock(async (_args: unknown) => {
+        if (promptAsync.mock.calls.length === 1) return heldSend.promise;
+        return {};
+      });
+      const { scheduler } = createPublicationScheduler({
+        hostFlavor: 'v2',
+        now: clock.now,
+        periodicWakeEnabled: false,
+        publicationWakeMinIntervalMs: 60_000,
+        sessionClient: makeV2Client({ promptAsync }),
+      });
+      const first = scheduler.triggerTerminalPublicationWake(
+        'p1',
+        'child-1',
+        2,
+      );
+      await clock.advance(0);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      await scheduler.triggerTerminalPublicationWake('p1', nextChild, 3);
+      heldSend.resolve({});
+      await first;
+      await clock.advance(0);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      await clock.advance(60_000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      expect(publicationIDs(promptAsync, 0)).toEqual(['child-1']);
+      expect(publicationIDs(promptAsync, 1)).toEqual([nextChild]);
+      const second = promptAsync.mock.calls[1]?.[0] as {
+        body: { parts: Array<{ metadata: { publications: unknown } }> };
+      };
+      expect(second.body.parts[0]?.metadata.publications).toEqual([
+        { taskID: nextChild, generation: 3 },
+      ]);
+    },
+  );
+
+  test('a later terminal revision during transport retains its exact pointer and acknowledgement', async () => {
+    const heldSend = deferred<unknown>();
+    const accepted: Array<Record<string, unknown>> = [];
+    let revision = 1;
+    const promptAsync = mock(async (_args: unknown) =>
+      promptAsync.mock.calls.length === 1 ? heldSend.promise : {},
+    );
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      periodicWakeEnabled: false,
+      publicationWakeMinIntervalMs: 60_000,
+      sessionClient: makeV2Client({ promptAsync }),
+      isPublicationCurrent: (publication) =>
+        publication.terminalRevision === revision,
+      onPublicationAccepted: (publication) => accepted.push(publication),
+    });
+
+    const first = scheduler.triggerTerminalPublicationWake(
+      'p1',
+      'child-1',
+      2,
+      1,
+    );
+    await clock.advance(0);
+    revision = 2;
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 2, 2);
+    heldSend.resolve({});
+    await first;
+    expect(accepted).toEqual([]);
+
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(publicationIDs(promptAsync, 1)).toEqual(['child-1']);
+    const second = promptAsync.mock.calls[1]?.[0] as {
+      body: { parts: unknown[] };
+    };
+    expect(second.body.parts[0]).toMatchObject({
+      metadata: {
+        publications: [
+          { taskID: 'child-1', generation: 2, terminalRevision: 2 },
+        ],
+      },
+    });
+    expect(accepted).toEqual([
+      {
+        sessionID: 'p1',
+        taskID: 'child-1',
+        generation: 2,
+        terminalRevision: 2,
+      },
+    ]);
+  });
+
+  test('a throttled second child is delivered after spacing even with periodic wakes off', async () => {
+    const promptAsync = mock(async (_args: unknown) => ({}));
+    const { scheduler } = createPublicationScheduler({
+      hostFlavor: 'v2',
+      now: clock.now,
+      periodicWakeEnabled: false,
+      publicationWakeMinIntervalMs: 60_000,
+      sessionClient: makeV2Client({ promptAsync }),
+    });
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 2);
+    await scheduler.triggerTerminalPublicationWake('p1', 'child-2', 2);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    await clock.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(publicationIDs(promptAsync, 1)).toEqual(['child-2']);
+  });
+
   test.each([false, true])(
     'a failed publication retries after busy with periodic=%s',
     async (periodicWakeEnabled) => {
@@ -504,7 +745,7 @@ describe('terminal-publication wake', () => {
     expect(call.body.agent).toBe('orchestrator');
     // C2: the v2 body carries the static anti-forgery suffix at its tail.
     expect(call.body.parts[0]?.text).toBe(
-      `${ORCHESTRATOR_PUBLICATION_WAKE_TEXT}\nBackground task results available: child-1.\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
+      `${ORCHESTRATOR_PUBLICATION_WAKE_TEXT}\nBackground task results available: child-1.\nLater result: task_status { sessionID: "child-1", result: true }\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
     // The pointer must teach retrieval, not just resume (rev>1 has no
     // native notifier on v2).
@@ -751,11 +992,12 @@ describe('terminal-publication wake', () => {
 
   test('late failure after busy cannot stamp a retry reason on the new generation', async () => {
     let rejectFirst: ((error: Error) => void) | undefined;
-    const promptAsync = mock(
-      () =>
-        new Promise<unknown>((_resolve, reject) => {
-          rejectFirst = reject;
-        }),
+    const promptAsync = mock(() =>
+      promptAsync.mock.calls.length > 1
+        ? Promise.resolve({})
+        : new Promise<unknown>((_resolve, reject) => {
+            rejectFirst = reject;
+          }),
     );
     const { scheduler } = createPublicationScheduler({
       hostFlavor: 'v2',
@@ -794,9 +1036,8 @@ describe('terminal-publication wake', () => {
       event: { type: 'session.idle', properties: { sessionID: 'p1' } },
     });
     await clock.advance(60_000);
-    // The publication itself is still retained, so the idle reschedule
-    // evaluates it as a publication without a stale reason.
     expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(publicationIDs(promptAsync, 1)).toEqual(['child-1']);
   });
 
   test('P6b: repeated failed publications on an unchanged terminal snapshot keep the backstop alive', async () => {
@@ -922,6 +1163,7 @@ describe('terminal-publication wake', () => {
     expect(bodies).toHaveLength(1);
     expect(bodies[0]).toContain('child-a');
     expect(bodies[0]).not.toContain('child-b');
+    expect(publicationIDs(promptAsync, 0)).toEqual(['child-a']);
 
     // B arrives while A's send is in flight: it was not covered by A's
     // body and must remain pending.
@@ -949,6 +1191,7 @@ describe('terminal-publication wake', () => {
     expect(bodies).toHaveLength(2);
     expect(bodies[1]).toContain('child-b');
     expect(bodies[1]).not.toContain('child-a');
+    expect(publicationIDs(promptAsync, 1)).toEqual(['child-b']);
     expect(accepted.map((entry) => entry.taskID)).toEqual([
       'child-a',
       'child-b',
@@ -1109,6 +1352,16 @@ describe('terminal-publication wake', () => {
     expect(first.body.parts[0]?.text).toContain('child-0');
     expect(first.body.parts[0]?.text).not.toContain('child-256');
     expect(first.body.parts[0]?.text).toContain('1 more pending delivery.');
+    expect(publicationIDs(promptAsync, 0)).toEqual(ids.slice(0, 256));
+    expect(first.body.parts[0]).toMatchObject({
+      metadata: {
+        publications: ids.slice(0, 256).map((taskID) => ({
+          taskID,
+          generation: 1,
+          terminalRevision: 1,
+        })),
+      },
+    });
     expect(accepted).toHaveLength(256);
 
     await clock.advance(1_000);
@@ -1118,6 +1371,14 @@ describe('terminal-publication wake', () => {
     )[1]?.[0] as { body: { parts: Array<{ text: string }> } };
     expect(second.body.parts[0]?.text).toContain('child-256');
     expect(second.body.parts[0]?.text).not.toContain('more pending delivery');
+    expect(publicationIDs(promptAsync, 1)).toEqual(['child-256']);
+    expect(second.body.parts[0]).toMatchObject({
+      metadata: {
+        publications: [
+          { taskID: 'child-256', generation: 1, terminalRevision: 1 },
+        ],
+      },
+    });
     expect(accepted.map((entry) => entry.taskID)).toContain('child-256');
     expect(accepted).toHaveLength(257);
   });

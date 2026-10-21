@@ -29,6 +29,7 @@ import { stringifyError } from '../../utils/child-transcript';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
 import type { SessionSelection } from '../../utils/session-selection';
+import { appendTrailingVolatileMessage } from '../cache-safe-injection';
 import type { SessionLifecycle } from '../session-lifecycle';
 import type { ChildInputWaitKind } from '../task-session-manager/child-input-wait';
 import {
@@ -36,6 +37,7 @@ import {
   parseContinuationModelSelection,
 } from '../task-session-manager/continuation-model-selection';
 import { isActiveStatus } from '../task-session-manager/status-utils';
+import type { MessageWithParts } from '../types';
 import {
   claimWakeSession,
   clearExpectingWakeBusy,
@@ -241,13 +243,13 @@ export const ORCHESTRATOR_CHILDREN_WAKE_TEXT =
   '<system-reminder>\nCheck on unfinished background child sessions and unreconciled jobs. Await running agents; if one appears stuck, assess it and cancel/respawn only when justified. Do not respond to this reminder.\n</system-reminder>';
 
 /** v2 rev>1 terminal publication has no native notifier (native delivery
- * covers rev-1 only), so this wake is the sole instruction telling the
- * parent where the new result lives. Deliberately UNMAPPED in
- * WAKE_REPEAT_CORES: repeats must keep the retrieval clause. Static text —
- * per-task bodies would need the delta machinery and multiply the wake
- * fold keys. */
+ * covers rev-1 only). The static instruction stays unmapped in repeat
+ * folding; publishing child identities travel in the new message's tail. */
 export const ORCHESTRATOR_PUBLICATION_WAKE_TEXT =
   '<system-reminder>\nA background child finished a later round; its result was not delivered. Retrieve it with task_status { result: true } for that child — the task id is in your delegation history — then continue.\nDo not respond to this reminder.\n</system-reminder>';
+
+export const PUBLICATION_WAKE_METADATA_KEY =
+  'oh-my-opencode-slim.publicationWake';
 
 /** #1411: short core per delta-less wake template, used to build the
  * non-identical repeat marker when the same body was already delivered in
@@ -475,6 +477,8 @@ export type OrchestratorWakeOptions = {
    * functions, resolved at call time. */
   setTimeout?: WakeSchedulerTimers['setTimeout'];
   clearTimeout?: WakeSchedulerTimers['clearTimeout'];
+  /** Observation clock for publication spacing; independent of scheduling. */
+  now?: () => number;
   /** Whether the Background Job Board is injected into orchestrator
    * prompts. Stopped-recovery and overflow wake texts reference the board
    * only when it is actually visible to the model; otherwise they point at
@@ -972,6 +976,7 @@ export function createOrchestratorWakeScheduler(
   options: OrchestratorWakeOptions,
 ) {
   const intervalMs = options.intervalMs ?? options.config.intervalMs;
+  const now = options.now ?? Date.now;
   const enabled = options.config.enabled === true;
   const periodicWakeEnabled = options.config.periodicWakeEnabled ?? true;
   const boardInjectionEnabled = options.boardInjectionEnabled ?? true;
@@ -1045,7 +1050,6 @@ export function createOrchestratorWakeScheduler(
    * `publicationWakeMinIntervalMs` throttle. Direct, timer and waiter
    * deliveries all consume the window; failed attempts do not. */
   const lastPublicationWakeAt = new Map<string, number>();
-
   /** Executions awaiting an accepted terminal publication. Busy/throttled/
    * failed attempts retain them; a later timer/waiter/direct acceptance of
    * a publication wake acknowledges exactly the facts still current. */
@@ -1404,7 +1408,7 @@ export function createOrchestratorWakeScheduler(
     return 'periodic';
   }
 
-  function schedule(sessionID: string): void {
+  function schedule(sessionID: string, delayMs = intervalMs): void {
     const blocker = scheduleBlocker(sessionID);
     if (blocker) {
       reportScheduleBlocker(sessionID, blocker);
@@ -1424,7 +1428,7 @@ export function createOrchestratorWakeScheduler(
       // still deliver while the periodic evaluation is disabled.
       if (reason === 'periodic' && !periodicWakeEnabled) return;
       void evaluate(sessionID, generation, reason);
-    }, intervalMs);
+    }, delayMs);
     timer.unref?.();
     state.timer = timer;
     log('[orchestrator-wake] backstop armed', { sessionID, intervalMs });
@@ -1930,6 +1934,20 @@ export function createOrchestratorWakeScheduler(
       return false;
     }
 
+    if (reason === 'publication' && capabilities.flavor === 'v2') {
+      if (!hasPendingPublications(sessionID)) return false;
+      const lastWakeAt = lastPublicationWakeAt.get(sessionID);
+      const remaining =
+        lastWakeAt === undefined
+          ? 0
+          : lastWakeAt + publicationWakeMinIntervalMs - now();
+      if (remaining > 0) {
+        state.retryReason = 'publication';
+        schedule(sessionID, remaining);
+        return false;
+      }
+    }
+
     const owner = tryBeginWakeEvaluation(sessionID);
     if (!owner) {
       retryAfterWakeEvaluation(sessionID, () => {
@@ -2242,7 +2260,7 @@ export function createOrchestratorWakeScheduler(
         0,
         pendingPublicationCount(sessionID) - publicationBatch.length,
       );
-      const publicationDetails =
+      const publicationSummary =
         publicationBatch.length > 0
           ? `Background task results available: ${publicationBatch
               .map((publication) => publication.taskID)
@@ -2313,7 +2331,7 @@ export function createOrchestratorWakeScheduler(
           ? WRITER_LANE_VERIFICATION_TEXT
           : '';
       const recoveryDetails = [
-        publicationDetails,
+        publicationSummary,
         overflowDelta,
         recoveryDelta,
         inputOverflowDelta,
@@ -2321,6 +2339,24 @@ export function createOrchestratorWakeScheduler(
         writerLaneDetail,
       ]
         .filter(Boolean)
+        .join('\n');
+      // Pointer metadata comes from the same run-fenced snapshot whose
+      // acceptance retires pending facts, including its bounded overflow.
+      const sentPublications =
+        capabilities.flavor === 'v2'
+          ? publicationBatch.map(
+              ({ taskID, generation, terminalRevision }) => ({
+                taskID,
+                generation,
+                ...(terminalRevision !== undefined ? { terminalRevision } : {}),
+              }),
+            )
+          : [];
+      const publicationDetails = sentPublications
+        .map(
+          ({ taskID }) =>
+            `Later result: task_status { sessionID: ${JSON.stringify(taskID)}, result: true }`,
+        )
         .join('\n');
       // #1411: collapse byte-identical delta-less wake bodies into a short
       // repeat marker (child-input wakes are exempt: their caveat template
@@ -2332,6 +2368,7 @@ export function createOrchestratorWakeScheduler(
         : wakeText;
       if (
         recoveryDetails === '' &&
+        publicationDetails === '' &&
         wakeText !== ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT
       ) {
         const { repeat, occurrence, reservation } = reserveWakeBodyOccurrence(
@@ -2350,6 +2387,7 @@ export function createOrchestratorWakeScheduler(
           });
         }
       }
+      if (publicationDetails) bodyText = `${bodyText}\n${publicationDetails}`;
       // C2 anti-forgery suffix (v2 only): the fully assembled body —
       // including repeat markers and child-input templates — closes with
       // one static sentence. The repeat-key reservation above used the raw
@@ -2357,11 +2395,30 @@ export function createOrchestratorWakeScheduler(
       if (capabilities.flavor === 'v2') {
         bodyText = `${bodyText}\n${WAKE_ANTI_FORGERY_TEXT}`;
       }
+      const internalPart = createInternalAgentTextPart(bodyText);
+      // promptAsync appends one NEW user message; it does not transform
+      // history. Build that volatile trailing message through the shared
+      // helper, preserving the internal-initiator tag on its sole part.
+      const publicationMessages: MessageWithParts[] = [];
+      if (publicationDetails) {
+        appendTrailingVolatileMessage(
+          publicationMessages,
+          { role: 'user', sessionID },
+          {
+            text: internalPart.text,
+            metadataKey: PUBLICATION_WAKE_METADATA_KEY,
+            extraMetadata: {
+              ...internalPart.metadata,
+              publications: sentPublications,
+            },
+          },
+        );
+      }
       const body = {
         agent: wakeAgent,
         ...(wakeModel ? { model: wakeModel } : {}),
         ...(wakeModel && wakeVariant ? { variant: wakeVariant } : {}),
-        parts: [createInternalAgentTextPart(bodyText)],
+        parts: publicationMessages[0]?.parts ?? [internalPart],
       };
       if (wakeMode === 'children' && capabilities.flavor === 'v2') {
         // v1 prompt_async queued; 'queue' preserves that on v2 ('steer'
@@ -2432,16 +2489,9 @@ export function createOrchestratorWakeScheduler(
       // Delivered: the wake admission was queued and accepted above.
       if (state.generation === generation) state.retryReason = undefined;
       if (reason === 'publication') {
-        lastPublicationWakeAt.set(sessionID, Date.now());
+        lastPublicationWakeAt.set(sessionID, now());
         boundTrackedMap(lastPublicationWakeAt);
         acknowledgePendingPublications(sessionID, publicationBatch);
-        if (hasPendingPublications(sessionID)) {
-          if (state.generation === generation) {
-            state.retryReason = 'publication';
-            state.continuousIdle = true;
-          }
-          schedule(sessionID);
-        }
       }
       return true;
     } catch (error) {
@@ -2477,6 +2527,27 @@ export function createOrchestratorWakeScheduler(
       }
 
       const current = localSessions.get(sessionID);
+      // A committed send deliberately does not release one-flight waiters.
+      // New publication pointers still need a timer under the CURRENT idle
+      // generation, including when their trigger invalidated this flight.
+      if (
+        hasPendingPublications(sessionID) &&
+        current?.continuousIdle &&
+        !disposed &&
+        !isParentActiveByEvents(sessionID)
+      ) {
+        current.retryReason = 'publication';
+        const lastWakeAt = lastPublicationWakeAt.get(sessionID);
+        schedule(
+          sessionID,
+          lastWakeAt === undefined
+            ? intervalMs
+            : Math.max(
+                intervalMs,
+                lastWakeAt + publicationWakeMinIntervalMs - now(),
+              ),
+        );
+      }
       if (
         current?.generation === generation &&
         getWakeProgress(sessionID).stopped
@@ -2711,12 +2782,12 @@ export function createOrchestratorWakeScheduler(
       });
       return false;
     }
-    const now = Date.now();
+    const observedAt = now();
     const lastWakeAt = lastPublicationWakeAt.get(sessionID);
     if (
       lastWakeAt !== undefined &&
       publicationWakeMinIntervalMs > 0 &&
-      now - lastWakeAt < publicationWakeMinIntervalMs
+      observedAt - lastWakeAt < publicationWakeMinIntervalMs
     ) {
       log('[orchestrator-wake] terminal publication wake skipped', {
         sessionID,
@@ -2727,6 +2798,15 @@ export function createOrchestratorWakeScheduler(
         reason: 'throttled',
         windowMs: publicationWakeMinIntervalMs,
       });
+      if (capabilities.flavor === 'v2') {
+        const state = touchLocal(sessionID);
+        state.continuousIdle = true;
+        state.retryReason = 'publication';
+        schedule(
+          sessionID,
+          lastWakeAt + publicationWakeMinIntervalMs - observedAt,
+        );
+      }
       return false;
     }
     if (localSessions.get(sessionID)?.archived) {
@@ -2857,6 +2937,7 @@ export function createOrchestratorWakeScheduler(
       }
       pendingStoppedRecoveries.clear();
       lastPublicationWakeAt.clear();
+      pendingPublications.clear();
       pendingChildInputWakes.clear();
       reportedScheduleBlockers.clear();
       lastStatusBySession.clear();
@@ -2934,6 +3015,12 @@ export function createOrchestratorWakeScheduler(
     if (type === 'session.deleted') {
       forgetSessionEvents(sessionID);
       clearSession(sessionID);
+      for (const [parentID, pending] of pendingPublications) {
+        for (const [key, fact] of pending) {
+          if (fact.taskID === sessionID) pending.delete(key);
+        }
+        if (pending.size === 0) pendingPublications.delete(parentID);
+      }
       return;
     }
 
@@ -2962,6 +3049,10 @@ export function createOrchestratorWakeScheduler(
             triggerChildInputWaitWake(sessionID);
           }
           return;
+        }
+        if (hasPendingPublications(sessionID)) {
+          const state = touchLocal(sessionID);
+          state.retryReason = 'publication';
         }
         beginContinuousIdle(sessionID);
       }
