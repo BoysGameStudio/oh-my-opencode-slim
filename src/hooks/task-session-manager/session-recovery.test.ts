@@ -1214,6 +1214,7 @@ describe('native task refusal and child ref suffix', () => {
       background: true,
       now: 1,
     });
+    const steerConcurrency = { acquire: mock(() => ({})) };
     const added: Array<{
       resumedTaskId?: string;
       relaunchLease?: unknown;
@@ -1223,6 +1224,7 @@ describe('native task refusal and child ref suffix', () => {
       task_id: CHILD,
       prompt: 'continue',
       description: 'continue',
+      background: true,
     };
     await handleToolExecuteBefore(
       { tool: 'task', sessionID: PARENT, callID: 'call_5' },
@@ -1238,6 +1240,7 @@ describe('native task refusal and child ref suffix', () => {
         },
         taskContextTracker: { pendingManagedTaskIds: new Set() },
         hostFlavor: 'v2',
+        backgroundTaskConcurrency: steerConcurrency,
       },
     );
     // The host owns the running timeline: no new generation, no lease, and
@@ -1251,6 +1254,9 @@ describe('native task refusal and child ref suffix', () => {
     // the steer acknowledgement instead of registering a launch.
     expect(added[0]?.resumedTaskId).toBe(CHILD);
     expect(added[0]?.relaunchLease).toBeUndefined();
+    // A steer adds no run: the running child already owns its admission
+    // slot, so queueing the steer behind it would deadlock the amendment.
+    expect(steerConcurrency.acquire).not.toHaveBeenCalled();
   });
 
   test('a v2 running child still refuses an agent switch', async () => {

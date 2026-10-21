@@ -439,6 +439,9 @@ describe('terminal-publication wake', () => {
     expect(call.body.parts[0]?.text).toBe(
       `${ORCHESTRATOR_PUBLICATION_WAKE_TEXT}\n${WAKE_ANTI_FORGERY_TEXT}\n<!-- SLIM_INTERNAL_INITIATOR -->`,
     );
+    // The pointer must teach retrieval, not just resume (rev>1 has no
+    // native notifier on v2).
+    expect(ORCHESTRATOR_PUBLICATION_WAKE_TEXT).toContain('task_status');
   });
 
   test('idle parent + error publication on v1 uses the periodic wake text', async () => {

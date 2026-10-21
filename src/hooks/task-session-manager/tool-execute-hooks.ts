@@ -175,6 +175,18 @@ function isNativeResumable(
   return job.agent === agentType;
 }
 
+/** A v2 native steer: a resumed call with no relaunch lease — the after-
+ * hook's resumed-output guard identifies it the same way. Shared with the
+ * two admission sites so the steer contract has one source of truth. */
+function isSteeredCall(pending: {
+  resumedTaskId?: string;
+  relaunchLease?: unknown;
+}): boolean {
+  return (
+    pending.resumedTaskId !== undefined && pending.relaunchLease === undefined
+  );
+}
+
 function refuseKnownTaskResume(
   requested: string,
   job: ResumeRefusalJob,
@@ -729,11 +741,13 @@ export async function handleToolExecuteBefore(
       // Nested orchestration exemption: a session that is itself a managed
       // task already holds an admission slot. Waiting for another one while
       // the queue is saturated would deadlock — this session could never
-      // finish, so its own slot could never be released.
+      // finish, so its own slot could never be released. A native steer of
+      // a running child adds no run either: the child owns its slot, and
+      // queueing the steer behind it would deadlock the amendment.
       const isManagedTask = deps.backgroundJobBoard
         .taskIDs()
         .has(input.sessionID);
-      if (!isManagedTask) {
+      if (!isManagedTask && !isSteeredCall(pendingCall)) {
         const ticket = deps.backgroundTaskConcurrency.acquire({
           model: deps.getModelForAgent?.(
             agentType,
@@ -947,7 +961,14 @@ export async function handleToolExecuteAfter(
       // the same ticket a native background launch holds. No ready-await
       // — the child is already running; registration below binds the
       // ticket and the terminal path releases it.
-      if (deps.backgroundTaskConcurrency && !pending.concurrencyTicket) {
+      if (
+        deps.backgroundTaskConcurrency &&
+        !pending.concurrencyTicket &&
+        // A host-promoted steer must not double-bind the running child's
+        // existing admission slot: bind() would replace it, and the
+        // terminal releaseTask frees only the newer entry.
+        !isSteeredCall(pending)
+      ) {
         const isManagedTask = deps.backgroundJobBoard
           .taskIDs()
           .has(pending.parentSessionId);
