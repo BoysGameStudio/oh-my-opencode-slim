@@ -178,11 +178,11 @@ bun run build
   "preset": "openai",
   "presets": {
     "openai": {
-      "orchestrator": { "model": "openai/gpt-6-sol", "variant": "high", "skills": ["*"] },
-      "oracle": { "model": "openai/gpt-6-astra", "variant": "high", "skills": ["simplify"] },
+      "orchestrator": { "model": "openai/gpt-6.1-sol", "variant": "medium", "skills": ["*"] },
+      "oracle": { "model": "openai/gpt-6.1-sol", "variant": "high", "skills": ["simplify"] },
       "explorer": { "model": "openai/gpt-6-luna", "variant": "low", "skills": [] },
       "designer": { "model": "openai/gpt-6-luna", "variant": "medium", "skills": [] },
-      "fixer": { "model": "openai/gpt-6-luna", "variant": "high", "skills": [] }
+      "fixer": { "model": "openai/gpt-6.1-sol", "variant": "low", "skills": [] }
     }
   }
 }
@@ -266,7 +266,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>기본 모델:</b> <code>openai/gpt-6-sol (medium)</code>
+      <b>기본 모델:</b> <code>openai/gpt-6.1-sol (medium)</code>
     </td>
   </tr>
   <tr>
@@ -348,7 +348,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>기본 모델:</b> <code>openai/gpt-6-astra (high)</code>
+      <b>기본 모델:</b> <code>openai/gpt-6.1-sol (high)</code>
     </td>
   </tr>
   <tr>
@@ -483,7 +483,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>기본 모델:</b> <code>openai/gpt-6-luna</code>
+      <b>기본 모델:</b> <code>openai/gpt-6.1-sol (low)</code>
     </td>
   </tr>
   <tr>
@@ -589,6 +589,8 @@ ping all agents
 
 ## 🖥️ Companion
 
+네이티브 소스와 릴리스는 **[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion)** 저장소로 분리되었습니다. 설치, 업데이트, 상태 연동은 플러그인에 남으며 기존 명령과 설정은 변경되지 않습니다.
+
 Companion은 선택적으로 사용하는 데스크톱 플로팅 상태 창입니다.
 현재 세션 상태와 작업 중인 에이전트를 실시간으로 표시하므로,
 백그라운드 작업을 한눈에 파악할 수 있습니다.
@@ -602,7 +604,7 @@ Companion은 선택적으로 사용하는 데스크톱 플로팅 상태 창입�
 자동 설치에서는 다음 옵션으로 활성화하세요.
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
 
 설정, 위치, 크기, 설치에 관한 자세한 내용은 **[Companion 문서](docs/companion.md)**를 참고하세요.

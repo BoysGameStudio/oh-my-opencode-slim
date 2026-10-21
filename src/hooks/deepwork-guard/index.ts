@@ -5,7 +5,6 @@ import {
   readFileSync,
   statSync,
   unlinkSync,
-  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 
@@ -20,9 +19,12 @@ const RUNTIME_DIR = '.runtime';
 const WRITE_TOOLS = new Set(['write', 'edit']);
 const MAX_CAPTURED = 256;
 const HEAD_BYTES = 64;
-/** The tombstone flip: the SKILL.md contract's completion shape (single
- * source, pinned by the SSoT fixture test). */
-const COMPLETED_FLIP = /^status:\s*completed\b/;
+/** The tombstone flip: the SKILL.md contract's completion shape (first
+ * line `status: completed`), single machine implementation shared by the
+ * guard and the goal pointer. Pinned by the SSoT fixture test. */
+export function isCompletedFlip(text: string): boolean {
+  return /^status:\s*completed\b/.test(text.trimStart());
+}
 
 interface CapturedWrite {
   slug: string;
@@ -116,59 +118,6 @@ export function taskSlug(
   const first = rel.split(path.sep)[0];
   if (!first || first === RUNTIME_DIR) return null;
   return first;
-}
-
-/** Record occupancy: the first writer of a task directory owns the claim
- * marker and the owner refreshes it. Pure increment — never blocks, never
- * denies, foreign claims are left untouched (enforcement is a later,
- * evidence-gated phase). */
-export function recordClaim(
-  deepworkRoot: string,
-  slug: string,
-  sessionID: string,
-  now: number = Date.now(),
-): 'created' | 'refreshed' | 'foreign' | 'unrecorded' {
-  try {
-    const claimsDir = path.join(deepworkRoot, RUNTIME_DIR, 'claims');
-    mkdirSync(claimsDir, { recursive: true });
-    const claimPath = path.join(claimsDir, `${slug}.json`);
-    try {
-      writeFileSync(
-        claimPath,
-        JSON.stringify({ owner: sessionID, since: now, lastActive: now }),
-        { flag: 'wx' },
-      );
-      return 'created';
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      const claim = JSON.parse(readFileSync(claimPath, 'utf-8')) as {
-        owner?: string;
-        since?: number;
-        lastActive?: number;
-      };
-      if (claim.owner === sessionID) {
-        writeFileSync(
-          claimPath,
-          JSON.stringify({
-            owner: claim.owner,
-            since: claim.since ?? now,
-            lastActive: now,
-          }),
-        );
-        return 'refreshed';
-      }
-      // Foreign write on a claimed task: record-only (enforcement is a
-      // later, evidence-gated phase). A corrupt claim also lands here —
-      // fail toward not-stealing: never overwrite an unreadable owner.
-      return 'foreign';
-    }
-  } catch (error) {
-    log('[deepwork-guard] claim recording failed', {
-      slug,
-      error: String(error),
-    });
-    return 'unrecorded';
-  }
 }
 
 /** Record a receipt for a completed write: path, size, first-bytes hash.
@@ -272,10 +221,9 @@ export function unreceiptedArtifacts(
 }
 
 /** Deepwork guard: machine evidence for the contract's acceptance protocol.
- * Receipts witness every write into a task directory; claim markers record
- * occupancy; the completion gate validates receipts at the only transaction
- * boundary the contract names. Silent when passing — the cost is code, not
- * context. */
+ * Receipts witness every write into a task directory; the completion gate
+ * validates receipts at the only transaction boundary the contract names.
+ * Silent when passing — the cost is code, not context. */
 export function createDeepworkGuardHook(ctx: PluginInput): {
   'tool.execute.before': (
     input: BeforeInput,
@@ -309,17 +257,6 @@ export function createDeepworkGuardHook(ctx: PluginInput): {
         .relative(ctx.directory, filePath)
         .split(path.sep)
         .join('/');
-      const claimState = recordClaim(deepworkRoot, slug, input.sessionID);
-      if (claimState === 'foreign') {
-        // Shadow evidence for the enforcement phase's graduation criteria:
-        // legal delegated sub-sessions and true foreign claims are
-        // distinguishable only with this line recorded.
-        log('[deepwork-guard] foreign write on claimed task (shadow)', {
-          slug,
-          sessionID: input.sessionID,
-          path: refPath,
-        });
-      }
 
       // Capture the before-state: the after phase uses it to tell a landed
       // write from a failed one, and a completion flip from a re-edit.
@@ -337,7 +274,7 @@ export function createDeepworkGuardHook(ctx: PluginInput): {
         mtimeBefore = info.mtimeMs;
         if (isProgress && existedBefore) {
           currentContent = readFileSync(filePath, 'utf-8');
-          wasCompleted = COMPLETED_FLIP.test(currentContent.trimStart());
+          wasCompleted = isCompletedFlip(currentContent);
         }
       } catch {
         // No file yet — first write.
@@ -367,7 +304,7 @@ export function createDeepworkGuardHook(ctx: PluginInput): {
           }
         }
       }
-      if (resulting !== null && COMPLETED_FLIP.test(resulting.trimStart())) {
+      if (resulting !== null && isCompletedFlip(resulting)) {
         const missing = unreceiptedArtifacts(deepworkRoot, slug, resulting);
         if (missing.length > 0) {
           if (options.mode === 'shadow') {
@@ -439,26 +376,23 @@ export function createDeepworkGuardHook(ctx: PluginInput): {
       // receipts on pass; on missing, keep them as evidence and surface the
       // alert on the tool output — an after-hook throw would be swallowed
       // by the per-hook error isolation.
-      if (
-        content !== null &&
-        !write.wasCompleted &&
-        COMPLETED_FLIP.test(content.trimStart())
-      ) {
+      if (content !== null && !write.wasCompleted && isCompletedFlip(content)) {
         const missing = unreceiptedArtifacts(deepworkRoot, write.slug, content);
         if (missing.length === 0) {
-          // Pass: prune the receipts and release the claim — the task is
-          // complete, its evidence served its purpose, and a released claim
-          // lets a later session adopt the tombstone directory (Trellis
-          // clears the sessions pointing at a task it archives).
-          for (const leaf of [
-            path.join(RUNTIME_DIR, 'receipts', `${write.slug}.jsonl`),
-            path.join(RUNTIME_DIR, 'claims', `${write.slug}.json`),
-          ]) {
-            try {
-              unlinkSync(path.join(deepworkRoot, leaf));
-            } catch {
-              // Nothing to prune.
-            }
+          // Pass: prune the receipts — the task is complete and its
+          // evidence served its purpose. A later session can adopt the
+          // tombstone directory.
+          try {
+            unlinkSync(
+              path.join(
+                deepworkRoot,
+                RUNTIME_DIR,
+                'receipts',
+                `${write.slug}.jsonl`,
+              ),
+            );
+          } catch {
+            // Nothing to prune.
           }
         } else {
           log('[deepwork-guard] completion without receipts', {

@@ -8,7 +8,6 @@ import {
   manualBackgroundSubagentsInstructions,
   writeBackgroundSubagentsBlock,
 } from './background-subagents';
-import { installCompanion } from './companion';
 import {
   addPluginToOpenCodeConfig,
   addPluginToOpenCodeTuiConfig,
@@ -65,10 +64,6 @@ function printSuccess(message: string): void {
 
 function printError(message: string): void {
   console.log(`${SYMBOLS.cross} ${RED}${message}${RESET}`);
-}
-
-function printWarning(message: string): void {
-  console.log(`${SYMBOLS.warn} ${YELLOW}${message}${RESET}`);
 }
 
 function printInfo(message: string): void {
@@ -247,45 +242,6 @@ export async function configureBackgroundSubagents(
   return { enabledNow: false, configuredTarget: target };
 }
 
-export async function shouldInstallCompanion(
-  config: InstallConfig,
-): Promise<boolean> {
-  if (config.companion === 'yes') {
-    return true;
-  }
-  if (config.companion === 'no') return false;
-
-  if (config.dryRun) {
-    printInfo(
-      'Dry run mode - would ask to install the desktop companion (default: no).',
-    );
-    config.companion = 'no';
-    return false;
-  }
-
-  if (!process.stdin.isTTY) {
-    printInfo(
-      'Skipped desktop companion prompt in non-TTY mode. Use --companion=yes to install it.',
-    );
-    config.companion = 'no';
-    return false;
-  }
-
-  console.log();
-  printInfo('The optional desktop companion shows live agent activity.');
-  const shouldInstall = await confirm(
-    'Install and enable the desktop companion?',
-    false,
-  );
-  config.companion = shouldInstall ? 'yes' : 'no';
-
-  if (!shouldInstall) {
-    printInfo('Desktop companion install skipped.');
-  }
-
-  return shouldInstall;
-}
-
 function handleStepResult(
   result: ConfigMergeResult,
   successMsg: string,
@@ -300,31 +256,13 @@ function handleStepResult(
   return true;
 }
 
-function handleOptionalCompanionResult(result: ConfigMergeResult): void {
-  if (result.success) {
-    printSuccess(
-      `Companion installed ${SYMBOLS.arrow} ${DIM}${result.configPath}${RESET}`,
-    );
-    return;
-  }
-
-  printWarning(`Desktop companion install skipped: ${result.error}`);
-  printInfo(
-    'The desktop companion is optional; continuing plugin installation without it.',
-  );
-}
-
 async function runInstall(config: InstallConfig): Promise<number> {
   const detected = detectCurrentConfig();
   const isUpdate = detected.isInstalled;
 
   printHeader(isUpdate);
 
-  const companionInstall = await shouldInstallCompanion(config);
-
-  let totalSteps = 6;
-  if (companionInstall) totalSteps += 1;
-  totalSteps += 1;
+  const totalSteps = 7;
 
   let step = 1;
 
@@ -379,13 +317,6 @@ async function runInstall(config: InstallConfig): Promise<number> {
 
   printStep(step++, totalSteps, 'Configuring OpenCode background subagents...');
   const backgroundSubagents = await configureBackgroundSubagents(config);
-
-  if (companionInstall) {
-    printStep(step++, totalSteps, 'Installing desktop companion binary...');
-    const companionResult = await installCompanion(config);
-    handleOptionalCompanionResult(companionResult);
-    if (!companionResult.success) config.companion = 'no';
-  }
 
   printStep(step++, totalSteps, 'Writing oh-my-opencode-slim configuration...');
   if (config.dryRun) {
@@ -455,6 +386,11 @@ async function runInstall(config: InstallConfig): Promise<number> {
   console.log('  5. Verify the agents are responding:');
   console.log(`     ${BLUE}> ping all agents${RESET}`);
   console.log();
+  console.log(
+    `${DIM}Optional: install the desktop companion with ` +
+      `bunx oh-my-opencode-slim companion install${RESET}`,
+  );
+  console.log();
 
   const modelsInfo =
     config.preset && config.preset !== 'openai'
@@ -482,7 +418,6 @@ export async function install(args: InstallArgs): Promise<number> {
     reset: args.reset ?? false,
     backgroundSubagents: args.backgroundSubagents ?? 'ask',
     backgroundSubagentsTarget: args.backgroundSubagentsTarget,
-    companion: args.companion,
   };
 
   return runInstall(config);

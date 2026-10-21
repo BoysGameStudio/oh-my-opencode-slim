@@ -158,11 +158,11 @@ bun run build
   "preset": "openai",
   "presets": {
     "openai": {
-      "orchestrator": { "model": "openai/gpt-6-sol", "variant": "high", "skills": ["*"] },
-      "oracle": { "model": "openai/gpt-6-astra", "variant": "high", "skills": ["simplify"] },
+      "orchestrator": { "model": "openai/gpt-6.1-sol", "variant": "medium", "skills": ["*"] },
+      "oracle": { "model": "openai/gpt-6.1-sol", "variant": "high", "skills": ["simplify"] },
       "explorer": { "model": "openai/gpt-6-luna", "variant": "low", "skills": [] },
       "designer": { "model": "openai/gpt-6-luna", "variant": "medium", "skills": [] },
-      "fixer": { "model": "openai/gpt-6-luna", "variant": "high", "skills": [] }
+      "fixer": { "model": "openai/gpt-6.1-sol", "variant": "low", "skills": [] }
     },
     "opencode-go": {
       "orchestrator": { "model": "opencode-go/minimax-m3", "variant": "thinking" },
@@ -239,7 +239,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-6-sol (medium)</code>
+      <b>Default Model:</b> <code>openai/gpt-6.1-sol (medium)</code>
     </td>
   </tr>
   <tr>
@@ -321,7 +321,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-6-astra (high)</code>
+      <b>Default Model:</b> <code>openai/gpt-6.1-sol (high)</code>
     </td>
   </tr>
   <tr>
@@ -452,7 +452,7 @@ ping all agents
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-6-luna (medium)</code>
+      <b>Default Model:</b> <code>openai/gpt-6.1-sol (low)</code>
     </td>
   </tr>
   <tr>
@@ -538,6 +538,8 @@ ping all agents
 
 ## 🖥️ Companion
 
+ネイティブのソースとリリースは **[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion)** に移りました。インストーラー、更新、状態連携はプラグインに残り、既存のコマンドと設定は変わりません。
+
 任意の Companion は、ライブのエージェント活動を表示するフローティングデスクトップステータスウィンドウです。現在のセッション状態と稼働中のエージェントを表示するため、バックグラウンド作業を一目で追いやすくなります。
 
 <div align="center">
@@ -548,7 +550,7 @@ ping all agents
 対話式インストールでは、インストーラーが Companion を有効にするか尋ね、デフォルトは `no` です。自動化では明示的に有効化できます:
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
 
 設定、位置、サイズ、インストール詳細は **[Companion](docs/companion.md)** を参照してください。

@@ -360,7 +360,12 @@ claimed crash-atomic. A missing or idle child is a stop candidate: after a
 child remains running; status lookup failures remain uncertain rather than
 being treated as completion. A listed child without a terminal host outcome is
 classified from its transcript: an incomplete latest round proves it is still
-running, while an unreadable transcript is skipped rather than adopted. When
+pending even if the session retains an older terminal outcome. A succeeded
+round without readable answer text also stays pending. Terminal history that
+predates the current persisted or board run fence cannot settle that run.
+On v2, a session outcome without a readable terminal boundary cannot settle
+a persisted run either. An unreadable transcript is skipped rather than
+adopted. When
 the host client exposes `session.get`, each newly recovered task is also probed
 for existence: a session deleted while the plugin was down is tombstoned and
 torn down instead of resurrecting as a forever-running ghost, and a session
@@ -649,7 +654,10 @@ prompt-shape consumption instead.
 
 Child-input wakes wait 250 ms before notifying the parent, on both host
 versions. Per-kind policy applies: by default only question asks wake the
-parent; permission asks do not (#1504). Requests answered during that window by
+parent; permission asks do not (#1504). Built-in subagents no longer receive
+the `question` tool by default (`question` defaults to `deny` for every
+non-orchestrator agent), so question wakes fire only for agents with an
+explicit `question` allow/ask override. Requests answered during that window by
 the host, a UI auto-replier, or another caller are discarded. Requests still
 open are checked again before delivery. Duplicate events enrich the queued
 notice without restarting the deadline. Stopped-job recovery and

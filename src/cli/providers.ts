@@ -9,11 +9,11 @@ export const GENERATED_PRESETS = ['openai', 'opencode-go'] as const;
 // Model mappings by provider/preset.
 export const MODEL_MAPPINGS = {
   openai: {
-    orchestrator: { model: 'openai/gpt-6-sol', variant: 'high' },
-    oracle: { model: 'openai/gpt-6-astra', variant: 'high' },
+    orchestrator: { model: 'openai/gpt-6.1-sol', variant: 'medium' },
+    oracle: { model: 'openai/gpt-6.1-sol', variant: 'high' },
     explorer: { model: 'openai/gpt-6-luna', variant: 'low' },
     designer: { model: 'openai/gpt-6-luna', variant: 'medium' },
-    fixer: { model: 'openai/gpt-6-luna', variant: 'high' },
+    fixer: { model: 'openai/gpt-6.1-sol', variant: 'low' },
   },
   kimi: {
     orchestrator: { model: 'kimi-for-coding/k2p5', variant: 'max' },
@@ -118,18 +118,6 @@ export function generateLiteConfig(
   const presets = config.presets as Record<string, unknown>;
   for (const presetName of GENERATED_PRESETS) {
     presets[presetName] = buildPreset(presetName);
-  }
-
-  if (installConfig.companion === 'yes') {
-    config.companion = {
-      enabled: true,
-      position: 'bottom-right',
-      size: 'medium',
-      gifPack: 'default',
-      loopStyle: 'classic',
-      speed: 1,
-      debug: false,
-    };
   }
 
   return config;

@@ -15,8 +15,8 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import {
   createDeepworkGuardHook,
   guardOptionsFrom,
+  isCompletedFlip,
   missingReceipts,
-  recordClaim,
   recordReceipt,
   referencedArtifacts,
   taskSlug,
@@ -87,29 +87,6 @@ describe('deepwork guard', () => {
       enabled: true,
       mode: 'shadow',
     });
-  });
-
-  test('claim: first writer owns, owner refreshes, foreign untouched', () => {
-    const root = makeRoot();
-    const deepworkRoot = path.join(root, '.slim', 'deepwork');
-    recordClaim(deepworkRoot, 't1', 'ses-a', 1000);
-    const claimPath = path.join(deepworkRoot, '.runtime', 'claims', 't1.json');
-    expect(JSON.parse(readFileSync(claimPath, 'utf-8'))).toMatchObject({
-      owner: 'ses-a',
-      since: 1000,
-    });
-    recordClaim(deepworkRoot, 't1', 'ses-a', 2000);
-    expect(JSON.parse(readFileSync(claimPath, 'utf-8'))).toMatchObject({
-      owner: 'ses-a',
-      since: 1000,
-      lastActive: 2000,
-    });
-    recordClaim(deepworkRoot, 't1', 'ses-b', 3000);
-    expect(JSON.parse(readFileSync(claimPath, 'utf-8'))).toMatchObject({
-      owner: 'ses-a',
-      lastActive: 2000,
-    });
-    clean(root);
   });
 
   test('receipt: records path, bytes, session; missing file records nothing', () => {
@@ -367,7 +344,7 @@ describe('deepwork guard', () => {
     clean(root);
   });
 
-  test('hook: task writes record claim + receipt; completion prunes', () => {
+  test('hook: task writes record receipts; completion prunes', () => {
     const root = makeRoot();
     const hook = createDeepworkGuardHook(makeCtx(root));
     const deepworkRoot = path.join(root, '.slim', 'deepwork');
@@ -383,9 +360,6 @@ describe('deepwork guard', () => {
       { tool: 'write', sessionID: 'ses-a', callID: 'c1' },
       {},
     );
-    expect(
-      existsSync(path.join(deepworkRoot, '.runtime', 'claims', 't1.json')),
-    ).toBe(true);
     expect(
       existsSync(path.join(deepworkRoot, '.runtime', 'receipts', 't1.jsonl')),
     ).toBe(true);
@@ -408,11 +382,6 @@ describe('deepwork guard', () => {
     );
     expect(
       existsSync(path.join(deepworkRoot, '.runtime', 'receipts', 't1.jsonl')),
-    ).toBe(false);
-    // The claim is released with the receipts: the completed task is
-    // cleanly adoptable (Trellis clears pointers at archive).
-    expect(
-      existsSync(path.join(deepworkRoot, '.runtime', 'claims', 't1.json')),
     ).toBe(false);
     clean(root);
   });
@@ -478,5 +447,11 @@ describe('deepwork guard', () => {
       'utf-8',
     );
     expect(skill).toContain('`status: completed`');
+    // The shared predicate matches the first line only: a completed
+    // status below the first line is not a flip (the goal hook's old
+    // multiline regex matched it — the drift this fixture pins shut).
+    expect(isCompletedFlip('status: completed')).toBe(true);
+    expect(isCompletedFlip('notes:\nstatus: completed')).toBe(false);
+    expect(isCompletedFlip('status: completed_x')).toBe(false);
   });
 });

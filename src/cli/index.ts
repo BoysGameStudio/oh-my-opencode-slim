@@ -1,30 +1,24 @@
 #!/usr/bin/env node
+import { runCompanionCommand } from './companion';
 import { doctor, parseDoctorArgs } from './doctor';
 import { install } from './install';
 import { runMarketplaceCommand } from './marketplace';
 import { getGeneratedPresetNames, isGeneratedPresetName } from './providers';
-import type {
-  BackgroundSubagentsArg,
-  CompanionArg,
-  InstallArgs,
-} from './types';
+import type { BackgroundSubagentsArg, InstallArgs } from './types';
 
 export function parseArgs(args: string[]): InstallArgs {
   const result: InstallArgs = {
     tui: true,
-    companion: 'ask',
   };
 
   for (const arg of args) {
     if (arg === '--no-tui') {
       result.tui = false;
-    } else if (arg.startsWith('--companion=')) {
-      const mode = arg.split('=')[1] as CompanionArg;
-      if (!['ask', 'yes', 'no'].includes(mode)) {
-        console.error('Unsupported --companion value: use ask, yes, or no');
-        process.exit(1);
-      }
-      result.companion = mode;
+    } else if (arg.startsWith('--companion')) {
+      console.warn(
+        'The --companion option was removed from install. ' +
+          'Run "bunx oh-my-opencode-slim companion install" instead.',
+      );
     } else if (arg.startsWith('--preset=')) {
       const preset = arg.split('=')[1];
       if (!isGeneratedPresetName(preset)) {
@@ -68,10 +62,9 @@ Usage:
   bunx oh-my-opencode-slim install [OPTIONS]
   bunx oh-my-opencode-slim doctor [OPTIONS]
   bunx oh-my-opencode-slim marketplace <command> [target]
+  bunx oh-my-opencode-slim companion install [--dry-run]
 
 Options:
-  --companion=ask|yes|no Install desktop companion binary and enable config
-                         (default: ask; prompt defaults to no)
   --preset=<name>        Active generated config preset (default: openai)
   --background-subagents=ask|yes|no
                           Persist required OpenCode background subagent env
@@ -99,6 +92,7 @@ Examples:
   bunx oh-my-opencode-slim install --preset=opencode-go
   bunx oh-my-opencode-slim install --reset
   bunx oh-my-opencode-slim doctor
+  bunx oh-my-opencode-slim companion install
 `);
 }
 
@@ -114,6 +108,8 @@ async function main(): Promise<void> {
     const doctorArgs = parseDoctorArgs(args.slice(1));
     const exitCode = await doctor(doctorArgs);
     process.exit(exitCode);
+  } else if (args[0] === 'companion') {
+    process.exit(await runCompanionCommand(args.slice(1)));
   } else if (args[0] === 'marketplace') {
     process.exit(await runMarketplaceCommand(args.slice(1)));
   } else if (args[0] === '-h' || args[0] === '--help') {

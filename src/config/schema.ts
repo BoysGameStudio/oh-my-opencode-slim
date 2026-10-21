@@ -871,11 +871,6 @@ export const WebfetchConfigSchema = z
       .describe(
         'When false, skip registering this enhanced webfetch so OpenCode uses its built-in version.',
       ),
-    model: AgentOverrideConfigSchema.shape.model.describe(
-      'Dedicated model(s) for smartfetch secondary-model summarization. ' +
-        'Same shape as agent model config (string, array of strings/objects with id+variant). ' +
-        'Takes priority over small_model and agents.explorer.model.',
-    ),
   })
   .strict();
 

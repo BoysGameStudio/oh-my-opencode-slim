@@ -10,8 +10,6 @@ import type { BinaryFetch, CachedFetch } from './types';
 
 const cacheOptions = {
   format: 'markdown' as const,
-  extract_main: true,
-  prefer_llms_txt: 'auto' as const,
   save_binary: false,
 };
 
@@ -77,8 +75,6 @@ describe('smartfetch/cache', () => {
     const url = 'https://example.com/docs#sec1';
     const base = buildCacheKey(url, cacheOptions);
     for (const variant of [
-      { ...cacheOptions, extract_main: false },
-      { ...cacheOptions, prefer_llms_txt: 'always' as const },
       { ...cacheOptions, save_binary: true },
       { ...cacheOptions, format: 'html' as const },
     ]) {
@@ -151,7 +147,6 @@ describe('smartfetch/cache', () => {
 function makeCached(overrides: Partial<CachedFetch>): CachedFetch {
   return {
     finalUrl: 'https://example.com/',
-    statusCode: 200,
     contentType: 'text/plain',
     rawContent: '',
     markdown: '',
@@ -160,8 +155,6 @@ function makeCached(overrides: Partial<CachedFetch>): CachedFetch {
     extractedMain: false,
     usedLlmsTxt: false,
     sourceKind: 'text',
-    upgradedToHttps: false,
-    redirectChain: [],
     truncated: false,
     wordCount: 0,
     ...overrides,
@@ -171,10 +164,7 @@ function makeCached(overrides: Partial<CachedFetch>): CachedFetch {
 function makeBinary(data?: Uint8Array): BinaryFetch {
   return {
     finalUrl: 'https://example.com/file',
-    statusCode: 200,
     contentType: 'application/pdf',
-    redirectChain: [],
-    upgradedToHttps: false,
     truncated: false,
     binary: true,
     binaryKind: 'pdf',

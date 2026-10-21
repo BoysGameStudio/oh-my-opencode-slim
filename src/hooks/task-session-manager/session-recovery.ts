@@ -741,6 +741,25 @@ export async function recoverSubagentSessionsAtStartup(
       options.hostFlavor,
     );
     if (state.kind === 'unknown') continue;
+    // A run can already have relaunched before this scan starts, while the
+    // host transcript still exposes the previous terminal round. Matching
+    // the board generation across the read is necessary but not sufficient:
+    // the terminal evidence must also reach the persisted/current run fence.
+    // V2's session-level outcome alone has no such boundary and cannot prove
+    // which run ended when the transcript is unavailable.
+    const expectedRunStartedAt = latestFence(
+      candidate.persisted?.launchedAt,
+      scanStartRun?.runStartedAt,
+    );
+    if (
+      state.kind === 'terminal' &&
+      expectedRunStartedAt !== undefined &&
+      ((state.completedAt === undefined && options.hostFlavor === 'v2') ||
+        (state.completedAt !== undefined &&
+          state.completedAt < expectedRunStartedAt))
+    ) {
+      continue;
+    }
     if (options.isDisposed?.()) return recovered;
     if (
       ledger.tombstones.has(taskID) ||
@@ -1053,7 +1072,10 @@ async function classifyStartupChild(
           : {}),
       };
     }
-    if (round.verdict === 'incomplete' && terminalFromOutcome === undefined) {
+    if (round.verdict === 'incomplete') {
+      // Session-level outcomes can outlive the round they describe. They
+      // cannot override positive evidence of an unfinished latest input (or
+      // a succeeded round whose answer is not readable yet).
       return {
         kind: 'running',
         ...(round.startedAt !== undefined

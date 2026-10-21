@@ -108,9 +108,6 @@ export const DEFAULT_CHILD_INPUT_WAKE_KINDS = {
  */
 export const DEFAULT_MAX_SESSION_METADATA_ENTRIES = 1000;
 
-/** Title of smartfetch's temporary secondary-model sessions (v1 hosts). */
-export const SMARTFETCH_SECONDARY_SESSION_TITLE = 'smartfetch-secondary';
-
 export type ImageRouting = 'auto' | 'direct';
 
 /** Permission keys that accept only a scalar action — never a pattern map.

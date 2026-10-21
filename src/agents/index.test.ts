@@ -1213,6 +1213,66 @@ describe('tool permissions', () => {
     }
   });
 
+  test('subagents are denied access to question by default', () => {
+    const agents = createAgents(runtimeFor());
+
+    // Every role-builtin previously defaulted to allow: factory maps
+    // carry only the task stance; the read-only matrix belongs to
+    // councillors/council, not explorer/oracle. Observer shares this but
+    // is disabled in the default runtime (vision-gated).
+    for (const name of ['fixer', 'designer', 'explorer', 'oracle'] as const) {
+      const agent = agents.find((candidate) => candidate.name === name);
+      expect(
+        (agent as { config: { permission: Record<string, unknown> } }).config
+          .permission.question,
+      ).toBe('deny');
+    }
+  });
+
+  test('custom subagents follow the question deny default; explicit config wins', () => {
+    const config: PluginConfig = {
+      agents: {
+        reviewer: { model: 'openai/gpt-5.5', prompt: 'You are a reviewer.' },
+        asker: {
+          model: 'openai/gpt-5.5',
+          prompt: 'You ask.',
+          permission: { question: 'allow' },
+        },
+        verifier: {
+          model: 'openai/gpt-5.5',
+          prompt: 'You verify.',
+          permission: { question: 'ask' },
+        },
+      },
+    };
+    const agents = createAgents(runtimeFor(config));
+    const permissionOf = (name: string) =>
+      (
+        agents.find((a) => a.name === name) as {
+          config: { permission: Record<string, unknown> };
+        }
+      ).config.permission;
+    expect(permissionOf('reviewer').question).toBe('deny');
+    expect(permissionOf('asker').question).toBe('allow');
+    expect(permissionOf('verifier').question).toBe('ask');
+  });
+
+  test('orchestrator explicit question deny is preserved', () => {
+    const agents = createAgents(
+      runtimeFor({
+        agents: { orchestrator: { permission: { question: 'deny' } } },
+      }),
+    );
+    const orchestrator = agents.find((a) => a.name === 'orchestrator');
+    expect(
+      (
+        orchestrator as {
+          config: { permission: Record<string, unknown> };
+        }
+      ).config.permission.question,
+    ).toBe('deny');
+  });
+
   test('council agent has synthesis-only (deny-all) permissions', () => {
     const agents = createAgents(
       runtimeFor({

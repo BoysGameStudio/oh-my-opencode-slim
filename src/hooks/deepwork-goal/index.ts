@@ -62,6 +62,7 @@ import {
   stripTaggedContent,
 } from '../cache-safe-injection';
 import { routerHeadAnnouncement } from '../deepwork';
+import { isCompletedFlip } from '../deepwork-guard';
 import { BACKGROUND_JOB_BOARD_METADATA_KEY } from '../task-session-manager/board-injection';
 import {
   findLatestUserMessage,
@@ -70,9 +71,6 @@ import {
 } from '../types';
 
 export const GOAL_POINTER_METADATA_KEY = 'oh-my-opencode-slim.deepworkGoal';
-
-/** The head's tombstone flip (SKILL.md contract; mirrors deepwork-guard). */
-const COMPLETED_FLIP = /^status:\s*completed\b/m;
 
 /** Bound on the mtime cache (FIFO eviction), mirroring the prompt bridge. */
 const MAX_TRACKED_HEADS = 256;
@@ -110,7 +108,7 @@ export function createDeepworkHeadGate(
 
     let active = true;
     try {
-      active = !COMPLETED_FLIP.test(readFileSync(headPath, 'utf8'));
+      active = !isCompletedFlip(readFileSync(headPath, 'utf8'));
     } catch {
       active = true; // read doubt → fail open
     }

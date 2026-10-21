@@ -316,9 +316,6 @@ not an optional-degradation path.
       plugin context exposes `permission.reply`, but not a supported
       `form.reply`/`question.reply` API, so `task_reply` can answer v2
       permissions and must honestly reject v2 form-question replies.
-   - `generate.text` → one-shot generation channel probed on `ctx.generate`
-     and threaded as `experimental_v2.generateText`, powering the webfetch
-     secondary-model summaries without a temp session
    - `dispose` → returned cleanup
 
 Agent/tool/command domain-transform bridges are independently
@@ -346,8 +343,8 @@ explicitly inherits persisted selection on v2; other noReply callers, including
 interview notifications, retain the same no-resume semantics.
 
 `experimental_v2.waitForSessionIdle(sessionID)` exists only when the host provides
-`session.wait({sessionID})`. It delegates that method alongside the unchanged
-`generateText` channel; it fabricates neither a status map nor board state.
+`session.wait({sessionID})`. It delegates that method; it fabricates neither a
+status map nor board state.
 `session.status` remains absent. Historical `session.get` outcomes cannot authorize
 revive. The official 2.0.5 prompt intent fields and wait signature are pinned in
 `mirror-conformance.ts`, and tool→shim→host contracts have dedicated tests.
@@ -411,7 +408,6 @@ side cannot be observed.
 | Event handling (session tracking, lifecycle, cache telemetry) | ✅ | ✅ event pump + additive v2→v1 synthesis | — |
 | Tool execute hooks (apply-patch recovery, task-session, json-recovery) | ✅ | ✅ `createToolExecuteBridges` with subagent→task normalization | — |
 | Built-in MCPs (context7, gh_grep) auto-registered | ✅ | ✅ `ctx.mcp.transform` | `ctx.mcp.transform` is present in all v2.0.x stable hosts; the runtime capability probe is belt-and-suspenders |
-| webfetch secondary-model summaries | ✅ | ✅ via `ctx.generate.text` | host without `ctx.generate` → summaries unavailable (logged) |
 | Background-job state persistence (tombstones, deletion epochs) | ➖ process-local | ✅ via `ctx.storage` | optional domain; absent → pure in-memory fallback, zero behavior change (see [Background job state](#background-job-state-rehydrate-probe-and-persistence)) |
 | Foreground model fallback (rate-limit failover) | ✅ | ❌ disabled pending an atomic turn-conditional host switch | v2's non-atomic `session.switchModel` + steer replay could alter/replay a newer turn |
 | `/preset` (preset manager) | ✅ | ✅ TUI plugin entry (`./tui` → `dist/tui2.js`): sidebar (incl. clickable active-preset row) + the same three-level manager as v1 on bare `/preset`, or `/preset <name>` fast path | The layer registers from an `append: "app"` slot render because the host's `keymap.layer` is provider-scoped (calling it from plugin `setup` throws `Keymap.Provider is missing`); the command carries an `id` and `slash.arguments`; host needs `ui.slot` + `keymap.layer`; the manager needs `ui.dialog.select` + `prompt` + `confirm` (without them the sidebar preset row is informational-only, but `/preset <name>` still applies); feedback uses `ui.toast.show`; config-file `preset` still applies at load. Config edits (manual, manager saves, `/preset`) are watched over `.json` + `.jsonc` candidates (user + project, including files/directories created later, arbitrary `OPENCODE_CONFIG_DIR` names, and nested missing ancestors; ~300 ms debounce) and hot-applied **only** as inference profiles: `model`/`variant` via `session.switchModel` and `temperature`/`options` on the captured child session's request options, plus the sidebar's tui-state model entries. Capture is awaited on the `session.prompt` request path (the `session.created` event consumer is only a prewarm) so a first child request cannot race the event pump. Agent definitions, prompts, tools, permissions, skills, and MCPs stay frozen for the session lifetime; the host registry is never reloaded. The TUI **requests** this refresh and reports `Saved … Live refresh requested`; it cannot observe the server-side watcher (separate process, no safe plugin RPC bridge on the supported host), which logs its own failure cause. A malformed config (`invalid-json`/`invalid-schema`/`read-error`) is rejected before any swap — the last-known-good profiles/sidebar stay — and the fix-and-reload fallback applies |
@@ -529,8 +525,7 @@ currently break this plugin:
   ruleset instead of keeping the parent's inherited session rules;
   triggered on plugin-managed child
   `session.created` and fail-soft with a one-time warning on reduced
-  hosts without the method); the `generate` session hook (not the
-  `ctx.generate` text channel the webfetch summaries use), the `title`
+  hosts without the method); the `generate` session hook, the `title`
   hook, and the `tabs` methods are not used. On the client SDK,
   `server.status` is named `server.info` (the plugin never calls it),
   and the `location.reload` / `fs.write` endpoints and the Form

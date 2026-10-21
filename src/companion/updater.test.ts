@@ -295,17 +295,10 @@ describe('companion updater', () => {
     );
   });
 
-  test('bundled companion manifest matches the Rust crate version', () => {
-    const packageRoot = path.resolve(import.meta.dir, '..', '..');
-    const cargoToml = readFileSync(
-      path.join(packageRoot, 'companion', 'Cargo.toml'),
-      'utf8',
+  test('bundled companion manifest pins the standalone native release', () => {
+    expect(COMPANION_MANIFEST.repo).toBe(
+      'alvinunreal/oh-my-opencode-companion',
     );
-    const cargoVersion = cargoToml.match(
-      /\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m,
-    )?.[1];
-
-    expect(cargoVersion).toBe(COMPANION_MANIFEST.version);
     expect(COMPANION_MANIFEST.tag).toBe(
       `companion-v${COMPANION_MANIFEST.version}`,
     );
