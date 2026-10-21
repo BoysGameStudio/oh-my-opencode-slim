@@ -1,11 +1,13 @@
 import { type CrossSpawnResult, crossSpawn } from '../../utils/compat';
 
 type RewriteProcess = Pick<CrossSpawnResult, 'exited' | 'stderr' | 'kill'>;
+// Host overloads can return object handles or numeric IDs; the harness uses IDs.
+type TimerHandle = ReturnType<typeof setTimeout> | number;
 
 interface RewriteDependencies {
   spawn?: (...args: Parameters<typeof crossSpawn>) => RewriteProcess;
-  setTimeout?: (callback: () => void, delay: number) => Timer;
-  clearTimeout?: (timer: Timer) => void;
+  setTimeout?: (callback: () => void, delay: number) => TimerHandle;
+  clearTimeout?: (timer: TimerHandle) => void;
 }
 
 export async function applyRewrites(
@@ -17,7 +19,7 @@ export async function applyRewrites(
   const spawn = dependencies.spawn ?? crossSpawn;
   const setTimer = dependencies.setTimeout ?? setTimeout;
   const clearTimer = dependencies.clearTimeout ?? clearTimeout;
-  let timer: Timer | undefined;
+  let timer: TimerHandle | undefined;
 
   try {
     const proc = spawn([cliPath, 'run', '--update-all', ...args], {
