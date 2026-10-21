@@ -36,11 +36,11 @@ function fixture() {
       ) => {},
     ),
   };
-  const run = () =>
+  const run = (prompt = 'prompt', agent = 'orchestrator') =>
     runWithSession(
       client,
-      'orchestrator',
-      'prompt',
+      agent,
+      prompt,
       'test',
       1,
       '/checkout',
@@ -50,6 +50,54 @@ function fixture() {
     );
   return { client, deps, run, promptAsync };
 }
+
+test('dispatch explicitly preserves the selected agent and mention parts', async () => {
+  const cases: Array<{
+    prompt: string;
+    agent: string;
+    expected: Parameters<
+      EvalSessionClient['session']['promptAsync']
+    >[0]['body'];
+  }> = [
+    {
+      prompt: 'prompt',
+      agent: 'orchestrator',
+      expected: {
+        parts: [{ type: 'text', text: 'prompt' }],
+        agent: 'orchestrator',
+      },
+    },
+    {
+      prompt: '@FiXeR implement',
+      agent: 'orchestrator',
+      expected: {
+        parts: [
+          { type: 'agent', name: 'fixer' },
+          { type: 'text', text: 'implement' },
+        ],
+        agent: 'fixer',
+      },
+    },
+    {
+      prompt: '@oracle',
+      agent: 'orchestrator',
+      expected: { parts: [{ type: 'agent', name: 'oracle' }], agent: 'oracle' },
+    },
+    {
+      prompt: '@not-installed do work',
+      agent: 'explorer',
+      expected: {
+        parts: [{ type: 'text', text: '@not-installed do work' }],
+        agent: 'explorer',
+      },
+    },
+  ];
+  for (const entry of cases) {
+    const { run, promptAsync } = fixture();
+    await run(entry.prompt, entry.agent);
+    expect(promptAsync.mock.calls[0][0].body).toEqual(entry.expected);
+  }
+});
 
 test('success is not published until the owned subtree has stopped', async () => {
   const { client, deps, run } = fixture();

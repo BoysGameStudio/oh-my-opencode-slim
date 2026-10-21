@@ -110,7 +110,10 @@ export async function runWithSession(
     const dispatch = client.session
       .promptAsync({
         path: { id: sid },
-        body: promptBody,
+        body: {
+          parts: promptBody.parts,
+          agent: promptBody.agent,
+        },
         query: { directory },
       })
       .finally(() => {
