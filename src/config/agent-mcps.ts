@@ -1,5 +1,6 @@
-import { AGENT_ALIASES, type AgentName } from './constants';
+import type { AgentName } from './constants';
 import type { RuntimeConfig } from './runtime';
+import { lookupWithAliases } from './utils';
 
 /** Default MCPs per agent - "*" means all MCPs, "!item" excludes specific MCPs */
 
@@ -7,8 +8,7 @@ export const DEFAULT_AGENT_MCPS: Record<AgentName, string[]> = {
   orchestrator: ['*', '!context7'],
   designer: [],
   oracle: [],
-  librarian: ['context7', 'gh_grep'],
-  explorer: [],
+  explorer: ['context7', 'gh_grep'],
   fixer: [],
   observer: [],
   council: [],
@@ -18,7 +18,10 @@ export const DEFAULT_AGENT_MCPS: Record<AgentName, string[]> = {
 /**
  * Parse a list with wildcard and exclusion syntax.
  */
-export function parseList(items: string[], allAvailable: string[]): string[] {
+export function parseList(
+  items: readonly string[],
+  allAvailable: readonly string[],
+): string[] {
   if (!items || items.length === 0) {
     return [];
   }
@@ -48,13 +51,7 @@ export function getAgentMcpList(
   runtime: RuntimeConfig,
 ): string[] {
   const agents = runtime.agents();
-  const agentConfig =
-    agents[agentName] ??
-    agents[
-      Object.keys(AGENT_ALIASES).find(
-        (key) => AGENT_ALIASES[key] === agentName,
-      ) ?? ''
-    ];
+  const agentConfig = lookupWithAliases(agents, agentName);
   if (agentConfig?.mcps !== undefined) {
     return agentConfig.mcps;
   }

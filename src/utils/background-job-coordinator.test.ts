@@ -1,6 +1,7 @@
-import { describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard } from './background-job-board';
+import { describe, expect, mock, spyOn, test } from 'bun:test';
 import { BackgroundJobCoordinator } from './background-job-coordinator';
+import { BackgroundJobBoard, boardFixture } from './background-job-fixture';
+import * as loggerModule from './logger';
 
 function createMockBoard(isRunning = false) {
   return {
@@ -184,11 +185,17 @@ describe('BackgroundJobCoordinator', () => {
     if (!lease) throw new Error('cancellation lease was not acquired');
     expect(coordinator.validateLease(lease)).toBe(true);
     expect(
-      coordinator.markCancelled(first.taskID, 'wrong generation', Date.now(), {
-        force: true,
-        expectedGeneration: first.generation + 1,
-        cancellationLease: lease,
-      })?.state,
+      boardFixture.markCancelled(
+        coordinator,
+        first.taskID,
+        'wrong generation',
+        Date.now(),
+        {
+          force: true,
+          expectedGeneration: first.generation + 1,
+          cancellationLease: lease,
+        },
+      )?.state,
     ).toBe('running');
     expect(coordinator.releaseLease(lease)).toBe(true);
     expect(coordinator.validateLease(lease)).toBe(false);
@@ -247,5 +254,121 @@ describe('BackgroundJobCoordinator', () => {
     ).toBeUndefined();
     if (!lease) throw new Error('terminal notification lease was not acquired');
     expect(coordinator.releaseLease(lease)).toBe(true);
+  });
+
+  test('notifies launch identity on accepted register, drop, and clearParent', () => {
+    const board = new BackgroundJobBoard();
+    const coordinator = new BackgroundJobCoordinator(board);
+    const events: Array<{ kind: string; taskID: string; alias: string }> = [];
+    coordinator.addLaunchIdentityListener((event) => {
+      events.push({
+        kind: event.kind,
+        taskID: event.taskID,
+        alias: event.alias,
+      });
+    });
+
+    const first = coordinator.registerLaunch({
+      taskID: 'ses_ora_1',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+    });
+    expect(events).toEqual([
+      { kind: 'registered', taskID: 'ses_ora_1', alias: first.alias },
+    ]);
+
+    coordinator.drop('ses_ora_1');
+    expect(events.at(-1)).toEqual({
+      kind: 'removed',
+      taskID: 'ses_ora_1',
+      alias: first.alias,
+    });
+
+    const sibling = coordinator.registerLaunch({
+      taskID: 'ses_ora_2',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+    });
+    coordinator.clearParent('parent-1');
+    expect(events.at(-1)).toEqual({
+      kind: 'removed',
+      taskID: 'ses_ora_2',
+      alias: sibling.alias,
+    });
+    expect(board.list('parent-1')).toEqual([]);
+  });
+
+  test('does not notify identity for a rejected launch, and a throwing listener does not fail the launch', () => {
+    const board = new BackgroundJobBoard();
+    const coordinator = new BackgroundJobCoordinator(board);
+    const first = coordinator.registerLaunch({
+      taskID: 'ses_busy',
+      parentSessionID: 'parent-1',
+      agent: 'oracle',
+    });
+    const lease = coordinator.acquireMessageLease(
+      first.taskID,
+      first.generation,
+    );
+    expect(lease).toBeDefined();
+
+    const events: string[] = [];
+    coordinator.addLaunchIdentityListener(() => {
+      throw new Error('identity listener failed');
+    });
+    coordinator.addLaunchIdentityListener((event) => {
+      events.push(`${event.kind}:${event.taskID}`);
+    });
+
+    expect(() =>
+      coordinator.registerLaunch({
+        taskID: 'ses_busy',
+        parentSessionID: 'parent-1',
+        agent: 'oracle',
+      }),
+    ).toThrow();
+    expect(events).toEqual([]);
+
+    const accepted = coordinator.registerLaunch({
+      taskID: 'ses_ok',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+    });
+    expect(accepted.taskID).toBe('ses_ok');
+    expect(events).toEqual(['registered:ses_ok']);
+  });
+
+  test('logs the terminal state dispatch with record identity', () => {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    try {
+      const board = new BackgroundJobBoard();
+      const coordinator = new BackgroundJobCoordinator(board);
+      const job = coordinator.registerLaunch({
+        taskID: 'ses_dispatch_log',
+        parentSessionID: 'parent-1',
+        agent: 'fixer',
+      });
+      board.updateStatus({ taskID: job.taskID, state: 'running' });
+      expect(coordinator.deferIfRunning(job.taskID)).toBe(false);
+      board.updateStatus({ taskID: job.taskID, state: 'completed' });
+      const dispatch = entries.find(
+        (entry) =>
+          entry.message === '[job-coordinator] terminal state dispatch',
+      );
+      expect(dispatch?.data).toMatchObject({
+        taskID: job.taskID,
+        generation: job.generation,
+        state: 'completed',
+        parentSessionID: 'parent-1',
+        deferredClose: true,
+      });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

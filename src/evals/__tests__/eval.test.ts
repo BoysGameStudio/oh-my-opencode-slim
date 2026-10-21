@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { checkAssertion } from '../assertions';
 import { formatResult } from '../display';
-import type { Transcript } from '../schema';
+import type { Assertion, Transcript } from '../schema';
 import { EvalSuiteSchema } from '../schema';
 import { executeEvalCase, executeSuite } from '../scoring';
 import { loadEvalSuite, loadEvalSuites } from '../suites';
@@ -94,6 +94,8 @@ describe('result formatting', () => {
           prompt: 'test a',
           runs: 1,
           passRate: 1,
+          passAtK: 1,
+          passKk: 1,
           passed: true,
           assertions: [],
         },
@@ -102,6 +104,8 @@ describe('result formatting', () => {
           prompt: 'test b',
           runs: 1,
           passRate: 1,
+          passAtK: 1,
+          passKk: 1,
           passed: true,
           assertions: [],
         },
@@ -110,6 +114,8 @@ describe('result formatting', () => {
           prompt: 'test c',
           runs: 1,
           passRate: 0,
+          passAtK: 0,
+          passKk: 0,
           passed: false,
           assertions: [
             {
@@ -135,7 +141,7 @@ describe('result formatting', () => {
 
   describe('checkAssertion', () => {
     test('contains passes when substring present', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'contains',
         value: 'hello',
         description: 'test',
@@ -144,7 +150,7 @@ describe('result formatting', () => {
       expect((await checkAssertion(assertion, output)).passed).toBe(true);
     });
     test('contains fails when substring absent', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'contains',
         value: 'hello',
         description: 'test',
@@ -156,7 +162,7 @@ describe('result formatting', () => {
       );
     });
     test('not_contains passes when substring absent', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'not_contains',
         value: 'hello',
         description: 'test',
@@ -165,7 +171,7 @@ describe('result formatting', () => {
       expect((await checkAssertion(assertion, output)).passed).toBe(true);
     });
     test('not_contains fails when substring present', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'not_contains',
         value: 'hello',
         description: 'test',
@@ -177,12 +183,20 @@ describe('result formatting', () => {
       );
     });
     test('regex passes when pattern matches', async () => {
-      const assertion = { type: 'regex', value: '\\d+', description: 'test' };
+      const assertion: Assertion = {
+        type: 'regex',
+        value: '\\d+',
+        description: 'test',
+      };
       const output = 'there are 123 items';
       expect((await checkAssertion(assertion, output)).passed).toBe(true);
     });
     test('regex fails when pattern does not match', async () => {
-      const assertion = { type: 'regex', value: '\\d+', description: 'test' };
+      const assertion: Assertion = {
+        type: 'regex',
+        value: '\\d+',
+        description: 'test',
+      };
       const output = 'no numbers here';
       expect((await checkAssertion(assertion, output)).passed).toBe(false);
       expect((await checkAssertion(assertion, output)).evidence).toBe(
@@ -190,7 +204,7 @@ describe('result formatting', () => {
       );
     });
     test('structure passes when pattern present', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'structure',
         value: 'name',
         description: 'test',
@@ -199,12 +213,12 @@ describe('result formatting', () => {
       expect((await checkAssertion(assertion, output)).passed).toBe(true);
     });
     test('references_read passes when a read targets the reference path', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'references_read',
         value: 'references/full-guide.md',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [
           {
             role: 'assistant',
@@ -224,12 +238,12 @@ describe('result formatting', () => {
       ).toBe(true);
     });
     test('references_read fails when no read targets the reference path', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'references_read',
         value: 'references/full-guide.md',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [
           {
             role: 'assistant',
@@ -253,7 +267,7 @@ describe('result formatting', () => {
       ).toBe(false);
     });
     test('references_read fails when value is empty', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'references_read',
         value: '',
         description: 'test',
@@ -264,12 +278,12 @@ describe('result formatting', () => {
       );
     });
     test('agent_routed passes when agent in transcript', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'agent_routed',
         value: 'fixer',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [
           {
             role: 'assistant',
@@ -284,12 +298,12 @@ describe('result formatting', () => {
       );
     });
     test('agent_routed fails when agent not in transcript', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'agent_routed',
         value: 'fixer',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [],
         agentInvocations: [{ agent: 'librarian' }],
       };
@@ -301,12 +315,12 @@ describe('result formatting', () => {
       ).toContain('librarian');
     });
     test('agent_not_routed passes when agent absent from transcript', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'agent_not_routed',
         value: 'fixer',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [],
         agentInvocations: [{ agent: 'librarian' }],
       };
@@ -315,12 +329,12 @@ describe('result formatting', () => {
       );
     });
     test('agent_not_routed fails when agent in transcript', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'agent_not_routed',
         value: 'fixer',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [],
         agentInvocations: [{ agent: 'fixer' }],
       };
@@ -332,12 +346,12 @@ describe('result formatting', () => {
       ).toContain('incorrectly invoked');
     });
     test('tool_used checks transcript not text', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'tool_used',
         value: 'read',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [
           {
             role: 'assistant',
@@ -355,7 +369,7 @@ describe('result formatting', () => {
       ).toBe(false);
     });
     test('file_contains requires filePath', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'file_contains',
         value: 'x',
         description: 'test',
@@ -366,7 +380,7 @@ describe('result formatting', () => {
       );
     });
     test('file_contains passes when file under eval root contains value', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'file_contains',
         value: 'eval',
         filePath: 'src/cli/eval.ts',
@@ -375,7 +389,7 @@ describe('result formatting', () => {
       expect((await checkAssertion(assertion, '')).passed).toBe(true);
     });
     test('file_contains fails when file lacks value', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'file_contains',
         value: '__no_such_marker__',
         filePath: 'src/cli/eval.ts',
@@ -387,7 +401,7 @@ describe('result formatting', () => {
       );
     });
     test('file_contains fails for missing file', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'file_contains',
         value: 'x',
         filePath: 'src/evals/__tests__/does-not-exist.txt',
@@ -399,12 +413,12 @@ describe('result formatting', () => {
       );
     });
     test('background_task_completed passes on completed task call', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'background_task_completed',
         value: '',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [
           {
             role: 'assistant',
@@ -425,12 +439,12 @@ describe('result formatting', () => {
       );
     });
     test('background_task_completed fails for errored task', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'background_task_completed',
         value: '',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [
           {
             role: 'assistant',
@@ -451,12 +465,12 @@ describe('result formatting', () => {
       );
     });
     test('background_task_completed fails when task still running', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'background_task_completed',
         value: '',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [
           {
             role: 'assistant',
@@ -470,12 +484,12 @@ describe('result formatting', () => {
       );
     });
     test('background_task_completed filters by agent name', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'background_task_completed',
         value: 'fixer',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [
           {
             role: 'assistant',
@@ -496,12 +510,12 @@ describe('result formatting', () => {
       );
     });
     test('cost_under passes when total cost under cap', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'cost_under',
         value: '0.05',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [],
         agentTokens: {
           orchestrator: { input: 1000, output: 500, cost: 0.01 },
@@ -513,12 +527,12 @@ describe('result formatting', () => {
       );
     });
     test('cost_under fails when total cost over cap', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'cost_under',
         value: '0.05',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [],
         agentTokens: {
           orchestrator: { input: 1000, output: 500, cost: 0.06 },
@@ -532,12 +546,12 @@ describe('result formatting', () => {
       ).toContain('exceeded cap');
     });
     test('cost_under gates a single agent via JSON', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'cost_under',
         value: '{"agent": "orchestrator", "max": 0.02}',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [],
         agentTokens: {
           orchestrator: { input: 1000, output: 500, cost: 0.05 },
@@ -549,12 +563,12 @@ describe('result formatting', () => {
       );
     });
     test('model_switches passes when count within threshold', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'model_switches',
         value: '1',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [],
         modelSwitches: [{ from: 'primary', to: 'fallback' }],
       };
@@ -563,12 +577,12 @@ describe('result formatting', () => {
       );
     });
     test('model_switches fails when count exceeds threshold', async () => {
-      const assertion = {
+      const assertion: Assertion = {
         type: 'model_switches',
         value: '0',
         description: 'test',
       };
-      const transcript = {
+      const transcript: Transcript = {
         messages: [],
         modelSwitches: [{ from: 'primary', to: 'fallback' }],
       };
@@ -583,6 +597,8 @@ describe('executeEvalCase', () => {
   const evalCase = {
     id: 'test',
     prompt: 'say hello',
+    agent: 'orchestrator',
+    tags: [],
     assertions: [
       {
         type: 'contains' as const,

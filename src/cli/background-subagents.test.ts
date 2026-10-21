@@ -148,20 +148,16 @@ describe('parseArgs background subagents', () => {
 });
 
 describe('parseArgs companion', () => {
-  test('defaults companion install to ask', () => {
-    expect(parseArgs([]).companion).toBe('ask');
-  });
-
-  test('parses companion mode override', () => {
-    expect(parseArgs(['--companion=yes']).companion).toBe('yes');
-    expect(parseArgs(['--companion=no']).companion).toBe('no');
-    expect(parseArgs(['--companion=ask']).companion).toBe('ask');
-  });
-});
-
-describe('parseArgs skills', () => {
-  test('parses force skill synchronization mode', () => {
-    expect(parseArgs(['--skills=force']).skills).toBe('force');
+  test('ignores the removed --companion install option', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(parseArgs(['--companion=yes'])).not.toHaveProperty('companion');
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('companion install'),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -199,7 +195,6 @@ describe('configureBackgroundSubagents', () => {
 
       try {
         const result = await configureBackgroundSubagents({
-          installCustomSkills: false,
           promptForStar: false,
           reset: false,
           backgroundSubagents: 'yes',
@@ -232,7 +227,6 @@ describe('configureBackgroundSubagents', () => {
 
       try {
         const result = await configureBackgroundSubagents({
-          installCustomSkills: false,
           promptForStar: false,
           reset: false,
           backgroundSubagents: 'yes',
@@ -261,7 +255,6 @@ describe('configureBackgroundSubagents', () => {
 
     try {
       const result = await configureBackgroundSubagents({
-        installCustomSkills: false,
         promptForStar: false,
         reset: false,
         backgroundSubagents: 'yes',
@@ -297,7 +290,6 @@ describe('configureBackgroundSubagents', () => {
 
     try {
       const result = await configureBackgroundSubagents({
-        installCustomSkills: false,
         promptForStar: false,
         reset: false,
         backgroundSubagents: 'yes',

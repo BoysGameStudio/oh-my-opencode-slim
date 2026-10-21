@@ -24,6 +24,7 @@ The folder implements an **OpenCode plugin hook** that observes the `session.cre
 |--------|---------|------------------|
 | `index.ts` | Main hook factory and update orchestrator | `createAutoUpdateCheckerHook()`, `runBackgroundUpdateCheck()` |
 | `checker.ts` | Version checking and compatibility logic | `getLatestCompatibleVersion()`, `extractChannel()`, version parsing and comparison |
+| `cache.ts` | Install-dir resolution, staging/publish, cross-process install lock | `resolveInstallContext()`, `preparePackageUpdate()`, `publishPackageUpdate()`, `acquirePackageUpdateLock()` |
 | `constants.ts` | Configuration constants and paths | `PACKAGE_NAME`, `NPM_REGISTRY_URL`, `CACHE_DIR` |
 | `types.ts` | TypeScript interfaces and types | `AutoUpdateCheckerOptions`, `CompatibleVersionResult`, `PluginEntryInfo` |
 | `skill-sync.ts` | Skill synchronization from package updates | `syncBundledSkillsFromPackage()`, atomic staging with rename |
@@ -36,7 +37,7 @@ The system implements multiple safety checks:
 2. **Channel Extraction**: Parses version strings to determine channel (latest, alpha, beta, rc, canary, next)
 3. **Major Version Blocking**: Prevents auto-updates that cross major versions; surfaces as manual migration notice
 4. **Pinned Version Detection**: Respects pinned versions in user configuration
-5. **Timeout Protection**: Uses 60-second timeout for `bun install` to prevent stalling OpenCode
+5. **Timeout Protection**: Uses a 300-second timeout for the package-manager install (OpenCode's embedded bun, bun, or npm) to prevent stalling OpenCode
 6. **Atomic Skill Sync**: Uses staging directories with rename for atomic skill synchronization
 
 ### Data Flow
@@ -64,7 +65,7 @@ Decision: Auto-update enabled? → No: Notify user
     ↓
 Action: Prepare package update (download + extract)
     ↓
-Action: Run bun install in isolated directory
+Action: Run package-manager install (OpenCode's embedded bun, bun, or npm) in isolated directory
     ↓
 Sync: Bundled skills to OpenCode config/skills/
     ↓
@@ -97,13 +98,20 @@ Notify: Success/failure via OpenCode TUI toast
 8. If current == latest: Log and exit
 9. If pinned: Show pinned version notification
 10. If auto-update disabled: Show notification only
-11. Prepare package update in cache directory
-12. Run bun install with 60s timeout
-13. If install succeeds:
+11. Acquire the cross-process install lock for the target install dir
+    (PID-guarded dir lock, async wait up to install timeout + slack);
+    skip quietly on timeout
+12. Under the lock: re-verify the target install dir; if another process
+    already installed the version, redirect installer-managed configs
+    (surfacing redirect errors) and show the restart toast
+13. Prepare package update in cache directory
+14. Run package-manager install (OpenCode's embedded bun, bun, or npm) with 300s timeout
+15. Release the install lock (finally)
+16. If install succeeds:
     - Sync bundled skills from package
     - Update companion if enabled
     - Show success toast with version diff and changes
-14. If install fails: Show error toast
+17. If install fails: Show error toast
 ```
 
 ### Skill Synchronization Flow (skill-sync.ts)
@@ -137,7 +145,7 @@ Notify: Success/failure via OpenCode TUI toast
 | `@opencode-ai/plugin` | OpenCode plugin SDK types |
 | `@opencode-ai/sdk` | OpenCode AI SDK |
 | `node:fs`, `node:path` | File system operations |
-| `node:os` | Platform detection for cache paths |
+| `node:os` | Home-directory fallback for the cache path |
 | External: NPM registry | Version lookup and compatibility checking |
 
 ### Configuration Integration
@@ -156,7 +164,7 @@ The system reads from OpenCode configuration files:
 ### Cache Integration
 
 Uses OpenCode's plugin cache directory:
-- Platform-specific: `~/.cache/opencode/` (Linux/macOS) or `%LOCALAPPDATA%\opencode` (Windows)
+- `XDG_CACHE_HOME` (when set) or `~/.cache`, then `opencode`, on every platform
 - Plugin cache: `node_modules/oh-my-opencode-slim/`
 - Package updates are installed to isolated cache directories
 
@@ -165,7 +173,7 @@ Uses OpenCode's plugin cache directory:
 ### Failure Modes
 
 1. **Network Timeout**: Uses 5s timeout for NPM registry requests
-2. **Install Timeout**: Uses 60s timeout for `bun install` to prevent stalling
+2. **Install Timeout**: Uses 300s timeout for the package-manager install to prevent stalling
 3. **Version Parsing**: Handles unparseable versions gracefully (shows notification)
 4. **File Operations**: Atomic operations with staging directories prevent partial updates
 5. **Concurrent Access**: Uses memoization (`cachedPackageVersion`) to avoid repeated file reads

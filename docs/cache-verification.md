@@ -42,9 +42,19 @@ mistakes that have not been made before:
 - `src/cache-safety-tripwire.test.ts` — scans prompt-assembly directories
   for volatile-input patterns (`Date.now`, `new Date`, `Math.random`,
   `randomUUID`, `performance.now`) outside a justified allowlist.
+- `src/v2/setup-command.test.ts` — runs the checkpoint pipeline through the
+  V2 context bridge across a completion notification and tool-result
+  continuations, asserting retained boards and unchanged prior content.
+  Real tool-call batches also verify that changed boards wait for all results
+  and never separate calls from their results.
 
 All hook injections must go through `src/hooks/cache-safe-injection.ts`; see
 the Prompt Cache Safety section in `AGENTS.md` for the authoring rules.
+
+Interview history collapse is a deliberate, gated rewrite: it runs only for a
+session with an active interview and collapses the kickoff spec once, causing
+one intentional cache miss per interview. The cache-safety harness covers the
+composition and the property suite's drift guard pins the gating call.
 
 ## Live cache smoke (`bun run cache:smoke`)
 
@@ -61,7 +71,7 @@ Each scenario is designed to fire specific plugin payload machinery:
 |---|---|---|
 | `plain` | phase reminder, skills filter, system transform | ✅ |
 | `tools` | tool-result growth across steps | ✅ |
-| `nudge` | post-file-tool nudge injection, phase-reminder equilibrium | extensive |
+| `nudge` | direct file read, phase reminder across subsequent turns | extensive |
 | `todos` | todowrite churn (create/update/complete across turns) | extensive |
 | `long` | sliding cache breakpoints over a six-turn history | extensive |
 | `board` | job-board trailing injection, injected completion, reconcile | extensive |
@@ -75,10 +85,6 @@ bun run cache:smoke -- --scenario extensive  # full matrix, several minutes
 bun run cache:smoke -- --scenario board,agents
 bun run cache:smoke -- --provider anthropic --model claude-sonnet-5
 bun run cache:smoke -- --server http://127.0.0.1:4096   # reuse a running server
-
-# Issue #874 A/B: pin the board strategy via a scratch project config
-bun run cache:smoke -- --scenario board-churn --board-strategy latest
-bun run cache:smoke -- --scenario board-churn --board-strategy checkpoint-compatible
 ```
 
 Two failure signatures are detected, plus an inconclusive case:
@@ -117,8 +123,6 @@ logs three warning shapes (observation only, to the plugin log):
   consecutive requests while ≥50K uncached input tokens accumulate (once per
   plateau; re-arms when the read value changes). The issue #874 signature:
   the reusable prefix has stopped growing even though nothing reads zero.
-  The warning suggests trying `backgroundJobs.strategy`
-  `"checkpoint-compatible"`.
 
 This is the field safety net for provider-side behavior no offline test can
 model.
@@ -156,8 +160,10 @@ It asserts the deterministic request shape, including:
 - stable system, tool, and option projections across those requests;
 - append-only, prefix-stable conversation input and historical transformed user
   prompts;
-- exactly one phase reminder in each eligible user projection, with no reminder
-  marker in system instructions;
+- exactly one phase reminder across the session view, anchored on the first
+  eligible user projection with none on later eligible projections (this
+  supersedes PR #790's per-message form), and no reminder marker in system
+  instructions;
 - availability and transcript execution results for `read` and `todowrite`.
 
 Passing this check demonstrates payload stability under the fixture. It does
@@ -196,7 +202,8 @@ coverage failure, and assistant/provider errors all invalidate a session.
 
 ### Zen free example
 
-For OpenCode Zen free routing, use provider `opencode` and model `hy3-free`.
+For OpenCode Zen free routing, use provider `opencode` and model
+`nemotron-3.5-lightning-free` (or check `opencode models` for the current free model).
 Keep credentials outside the repository, in the environment of an isolated
 server process. In the isolated OpenCode configuration, make model selection
 explicit and disable title generation so its separate small-model request does
@@ -204,12 +211,11 @@ not confound the run:
 
 ```json
 {
-  "preset": "opencode-zen-free",
   "default_agent": "orchestrator",
-  "model": "opencode/hy3-free",
-  "small_model": "opencode/hy3-free",
+  "model": "opencode/nemotron-3.5-lightning-free",
+  "small_model": "opencode/nemotron-3.5-lightning-free",
   "agent": {
-    "orchestrator": { "model": "opencode/hy3-free" },
+    "orchestrator": { "model": "opencode/nemotron-3.5-lightning-free" },
     "title": { "disable": true }
   }
 }
@@ -221,11 +227,11 @@ With that isolated server running, a live invocation is:
 bun scripts/benchmark-opencode-cache.ts \
   --server http://127.0.0.1:4096 \
   --provider opencode \
-  --model hy3-free \
+  --model nemotron-3.5-lightning-free \
   --runs 12 \
   --arm current \
   --plugin-build "$(git rev-parse HEAD)" \
-  --output /tmp/opencode-zen-hy3-current.json
+  --output /tmp/opencode-zen-nemotron-current.json
 ```
 
 ## Report interpretation
@@ -265,8 +271,10 @@ not a portable performance claim.
 ## Observed #784 controlled Zen HY3 result
 
 The following is an **environment-specific** controlled observation, not a
-guarantee. It used isolated OpenCode `1.18.2` hosts, preset
-`opencode-zen-free`, title generation disabled, `opencode/hy3-free` routing,
+guarantee. The `hy3-free` model it routed through has since been retired from
+the Zen free tier; the example command above uses the current free model. It
+used isolated OpenCode `1.18.2` hosts, an all-agents-on-free-model config,
+title generation disabled, `opencode/hy3-free` routing,
 the fixed tool trace, and 12 independent eligible sessions per arm.
 
 | Metric | Baseline `67e2a556` | Current `08e9fa5` |
@@ -281,7 +289,8 @@ the fixed tool trace, and 12 independent eligible sessions per arm.
 | Prompt-loop latency p50 ms (95% CI) | 3216.77 [3072.35, 3255.93] | 2267.81 [2248.48, 3012.78] |
 
 Every eligible session completed `read` and `todowrite`; observed routing was
-`orchestrator` / `opencode` / `hy3-free`. Repeat the controlled procedure
+`orchestrator` / `opencode` / `hy3-free` (now retired; the live model is
+`nemotron-3.5-lightning-free`). Repeat the controlled procedure
 before drawing conclusions under a different provider account, host, model
 revision, or cache policy.
 

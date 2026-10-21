@@ -21,7 +21,7 @@ import { loadEvalSuite } from './suites';
 
 export interface RunSuiteOptions {
   suiteName: string;
-  client: EvalSessionClient;
+  client?: EvalSessionClient;
   smoke: boolean;
   outputsFile?: string;
   excludeStr?: string;
@@ -30,7 +30,20 @@ export interface RunSuiteOptions {
 // ── Execution ───────────────────────────────────────────────────────
 
 /** Run a single eval suite: collect, score, save, return exit code. */
-export async function runSuite(opts: RunSuiteOptions): Promise<number> {
+const suiteDependencies = {
+  collectSuite,
+  stashChanges,
+  restoreAfterEvals,
+  loadEvalSuite,
+  executeSuite,
+  saveResults,
+  formatResult,
+};
+
+export async function runSuite(
+  opts: RunSuiteOptions,
+  deps = suiteDependencies,
+): Promise<number> {
   const {
     suiteName,
     client,
@@ -43,39 +56,47 @@ export async function runSuite(opts: RunSuiteOptions): Promise<number> {
   const concurrency = Number(process.env.EVAL_CONCURRENCY ?? 3);
   const cwd = process.cwd();
   const timeoutMs = 300_000;
+  const suite = deps.loadEvalSuite(suiteName);
+  if (!suite) {
+    console.error(`Suite "${suiteName}" not found`);
+    return 1;
+  }
+  if (!outputsFileOpt && !client) {
+    throw new Error('Live eval collection requires an OpenCode client');
+  }
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error('EVAL_CONCURRENCY must be a positive integer');
+  }
 
   let outputs: Record<string, string | string[]> = {};
   let outputsFile = outputsFileOpt;
-  let stashed = false;
+  let stash: string | null = null;
+  let collectionStarted = false;
+  let result: EvalSuiteResult | undefined;
 
-  if (!outputsFile) {
-    const out = `/tmp/${suiteName}.json`;
-    console.log('Stashing working tree for clean eval run...');
-    stashed = stashChanges(`${suiteName}-eval-prestash`);
+  // Validate before stashing; every path after a successful stash restores.
+  try {
+    if (!outputsFile) {
+      const out = `/tmp/${suiteName}.json`;
+      console.log('Stashing working tree for clean eval run...');
+      stash = deps.stashChanges(`${suiteName}-eval-prestash`, cwd);
+      collectionStarted = true;
 
-    const suite = loadEvalSuite(suiteName);
-    if (!suite) {
-      console.error(`Suite "${suiteName}" not found`);
-      return 1;
-    }
-
-    const effectiveRuns = smoke ? 1 : runs;
-    const effectiveExclude = new Set(exclude);
-    if (smoke) {
-      for (const c of suite.evals) {
-        if (!c.smoke) effectiveExclude.add(c.id);
+      const effectiveRuns = smoke ? 1 : runs;
+      const effectiveExclude = new Set(exclude);
+      if (smoke) {
+        for (const c of suite.evals) {
+          if (!c.smoke) effectiveExclude.add(c.id);
+        }
       }
-    }
 
-    if (effectiveExclude.size > 0) {
-      suite.evals = suite.evals.filter((e) => !effectiveExclude.has(e.id));
-    }
-
-    try {
       console.log(`Collecting fresh eval outputs for ${suiteName}...`);
-      const collected = await collectSuite({
-        suite,
-        client,
+      const collected = await deps.collectSuite({
+        suite: {
+          ...suite,
+          evals: suite.evals.filter((e) => !effectiveExclude.has(e.id)),
+        },
+        client: client as EvalSessionClient,
         runs: effectiveRuns,
         concurrency,
         directory: cwd,
@@ -87,16 +108,9 @@ export async function runSuite(opts: RunSuiteOptions): Promise<number> {
       console.log(
         `\nLoaded ${Object.keys(outputs).length} eval outputs from ${out}`,
       );
-    } catch (err) {
-      console.log('Restoring working tree after collection failure...');
-      restoreAfterEvals(stashed);
-      throw err;
+    } else {
+      outputs = JSON.parse(await Bun.file(outputsFile).text());
     }
-  }
-
-  let result: EvalSuiteResult | undefined;
-
-  try {
     let transcripts: Record<string, Transcript[]> | undefined;
     if (outputsFile) {
       const transcriptPath = outputsFile.replace(
@@ -112,11 +126,17 @@ export async function runSuite(opts: RunSuiteOptions): Promise<number> {
       }
     }
 
-    result = await executeSuite(
+    const scoringExclude = new Set(exclude);
+    if (smoke) {
+      for (const c of suite.evals) {
+        if (!c.smoke) scoringExclude.add(c.id);
+      }
+    }
+    result = await deps.executeSuite(
       suiteName,
       outputs,
       transcripts,
-      exclude ?? new Set(),
+      scoringExclude,
     );
 
     try {
@@ -134,7 +154,7 @@ export async function runSuite(opts: RunSuiteOptions): Promise<number> {
       // git unavailable
     }
 
-    console.log(formatResult(result));
+    console.log(deps.formatResult(result));
 
     if (transcripts) {
       const agentUsage = new Map<
@@ -167,19 +187,20 @@ export async function runSuite(opts: RunSuiteOptions): Promise<number> {
     }
 
     if (result.totalEvals > 0) {
-      const resultsFile = saveResults(suiteName, result);
+      const resultsFile = deps.saveResults(suiteName, result);
       console.log(`\nResults saved to ${resultsFile}`);
     }
   } finally {
-    if (stashed) {
+    if (collectionStarted) {
       console.log('Cleaning eval artifacts and restoring working tree...');
-      restoreAfterEvals(stashed);
+      deps.restoreAfterEvals(stash, cwd);
     }
   }
 
   if (!result) return 1;
 
-  let exitCode = result.failed > 0 ? 1 : 0;
+  let exitCode =
+    result.failed > 0 || result.skipped > 0 || result.totalEvals === 0 ? 1 : 0;
   const flaky = result.results.filter(
     (r) => r.passAtK === 1 && r.passKk === 0 && r.runs >= 3,
   );

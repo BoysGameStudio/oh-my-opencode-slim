@@ -16,8 +16,7 @@ from `index.ts`) that returns the hook points OpenCode invokes.
   `image-hook`, `session-lifecycle`, `types`). `src/index.ts` imports from here
   rather than individual files.
 - **SessionLifecycle** (`session-lifecycle.ts`): Coordinator that owns
-  `session.deleted` cleanup-callback registration and a pending-session
-  signaling channel with consume-once semantics. Stateful hooks register
+  `session.deleted` cleanup-callback registration. Stateful hooks register
   cleanup callbacks instead of implementing their own `session.deleted`
   handlers.
 - **Cache-safe injection** (`cache-safe-injection.ts`): The single supported
@@ -39,12 +38,11 @@ from `index.ts`) that returns the hook points OpenCode invokes.
 
 | Category | Factories | Hook points |
 |---|---|---|
-| Prompt transforms | `createPhaseReminderHook`, `createPostFileToolNudgeHook`, `createChatHeadersHook`, task-session-manager board injection, `processImageAttachments` | `experimental.chat.messages.transform`, `chat.headers` |
-| Tool interception | `createApplyPatchHook` (tool), task-session-manager | `tool.execute.before` / `tool.execute.after` |
+| Prompt transforms | `createPhaseReminderHook`, `createCouncilInjectHook`, `createChatHeadersHook`, task-session-manager board injection, `processImageAttachments` | `experimental.chat.messages.transform`, `chat.headers` |
+| Tool interception | `createApplyPatchHook` (tool), `createSearchPathGuardHook`, task-session-manager | `tool.execute.before` / `tool.execute.after` |
 | Error recovery | `createJsonErrorRecoveryHook`, `createAutoUpdateCheckerHook` | message transform, tool-execute after |
 | Lifecycle/event | task-session-manager, `createCacheMonitorHook`, `createOrchestratorWakeScheduler` | `event` |
 | Runtime commands | `createDeepworkCommandHook`, `createReflectCommandHook`, `createLoopCommandHook` | `command.execute.before` |
-| Skill visibility | `createFilterAvailableSkillsHook` | message transform |
 | Model fallback | `ForegroundFallbackManager` | event-driven (message.updated/session.error/session.status) |
 
 ## Flow
@@ -54,16 +52,25 @@ from `index.ts`) that returns the hook points OpenCode invokes.
 ```
 1. OpenCode receives chat messages
 2. Plugin's experimental.chat.messages.transform hook is invoked (src/index.ts
-   composes: apply-patch → phase-reminder → filter-available-skills →
+   composes: task-session-manager → phase-reminder → council-inject →
    task-session-manager board injection, in that order)
-3. Task-session-manager first stabilizes still-running task tool parts, then
-   rehydrates historical running tasks, then injects the Background Job Board
-   via cache-safe helpers
+3. Task-session-manager first repairs session mappings; phase-reminder then
+   injects the per-turn scheduler reminder (gated); council-inject then
+   injects the Council Mode block once per transcript, on the first
+   keyword-triggered orchestrator turn (gated); finally task-session-manager
+   injects the Background Job Board via cache-safe helpers
 4. Transformed messages are sent to the model
-5. chat.headers is forwarded to OpenCode's header slot
+5. chat.headers is forwarded to OpenCode's header slot (v1 hosts; on v2
+   hosts the adapter bridges the same decision to
+   `session.hook("model.request")` — see src/v2/codemap.md)
 6. Model responses/events are observed by the cache monitor (telemetry) and
    orchestrator-wake scheduler (idle nudge timing)
 ```
+
+Skill discovery and visibility are handled by native v1/v2 host behavior from
+the finalized agent/session permissions: hidden skills are denied and
+discoverable skills require permission approval. The plugin does not rewrite
+`<available_skills>` in conversation text.
 
 ### Hook Registration
 
@@ -104,19 +111,20 @@ from `index.ts`) that returns the hook points OpenCode invokes.
 
 | Directory | Responsibility |
 |---|---|
+| `absolute-path-rescue/` | Rewrites misguessed absolute tool paths by re-anchoring the longest workspace-suffix match (ENOENT-only, unambiguous candidates only) |
 | `apply-patch/` | Structured `apply_patch` parsing, matching, recovery, rewrite pipeline |
 | `auto-update-checker/` | Startup update detection, cache handling, optional install prompt |
 | `cache-monitor/` | Observation-only prompt-cache telemetry watchdog |
 | `deepwork/` | `/deepwork` runtime command |
-| `filter-available-skills/` | Skill-visibility filtering by agent permission policy |
 | `foreground-fallback/` | Interactive-session model fallback on rate-limit/errors |
 | `json-error-recovery/` | Malformed JSON/tool-output recovery helpers |
 | `loop-command/` | `/loop` iterative retry command |
 | `orchestrator-wake/` | Periodic orchestrator wake scheduler + process-global gate |
 | `phase-reminder/` | Message-transform reminder enforcing orchestrator workflow phases |
-| `post-file-tool-nudge/` | Post-read/write reminder nudging delegation-aware next steps |
 | `reflect/` | `/reflect` runtime command |
+| `search-path-guard/` | Pre-checks `grep`/`glob` `args.path` validity in `tool.execute.before`, using each host tool's path resolution semantics, and fails fast with an actionable error instead of upstream "ripgrep execution failed" noise or silent parent-directory searches |
 | `task-session-manager/` | Resumable task session tracking, job-board injection, reconciliation |
+| `tool-loop-guard/` | Detects byte-identical repeated tool calls: warns at 3, blocks at 5, with task-lifecycle exemptions and per-turn wait-tool counting |
 
 ### Dependencies
 
@@ -136,7 +144,8 @@ from `index.ts`) that returns the hook points OpenCode invokes.
 
 - **Cache safety**: all injection goes through the tagged/volatile helpers to
   preserve provider prompt-cache prefixes.
-- **Debounced cleanup**: image cleanup and runtime-status reconciliation run on
-  timers, not per-event.
+- **Image assets**: auto-routed attachments persist under `.opencode/images/`
+  until the user removes them explicitly; no cleanup timer deletes them.
+- **Runtime status**: reconciliation runs on timers, not per-event.
 - **Bounded state**: cache monitor and wake gate cap tracked sessions; idle
   reconciliation uses per-session tokens to invalidate stale timers.

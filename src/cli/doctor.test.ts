@@ -66,7 +66,10 @@ describe('runDoctorCheck', () => {
   afterEach(() => {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
-    process.env = originalEnv;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
   });
 
   test('no config files returns ok', () => {
@@ -82,6 +85,37 @@ describe('runDoctorCheck', () => {
     expect(result.configs[1].scope).toBe('project');
     expect(result.configs[1].exists).toBe(false);
     expect(result.presetCheck).toBeUndefined();
+  });
+
+  test('checks all inherited layers and resolves presets across them', () => {
+    const workspace = path.join(tempDir, 'workspace');
+    const projectDir = path.join(workspace, 'repo');
+    const nested = path.join(projectDir, 'packages', 'backend');
+    fs.mkdirSync(nested, { recursive: true });
+    const configs = [
+      { directory: workspace, config: { presets: { shared: {} } } },
+      { directory: projectDir, config: { preset: 'shared' } },
+    ];
+    const configPaths = configs.map(({ directory, config }) => {
+      const configDir = path.join(directory, '.opencode');
+      fs.mkdirSync(configDir);
+      const filename = path.join(configDir, 'oh-my-opencode-slim.json');
+      fs.writeFileSync(filename, JSON.stringify(config));
+      return filename;
+    });
+
+    const result = runDoctorCheck(nested);
+    expect(result.ok).toBe(true);
+    expect(result.configs.slice(1).map((config) => config.path)).toEqual(
+      configPaths,
+    );
+    expect(result.presetCheck).toEqual({ preset: 'shared', ok: true });
+
+    fs.writeFileSync(configPaths[0], '{ invalid');
+    const invalid = runDoctorCheck(nested);
+    expect(invalid.ok).toBe(false);
+    expect(invalid.configs[1].error?.kind).toBe('invalid-json');
+    expect(invalid.configs[2].ok).toBe(true);
   });
 
   test('valid project config returns ok', () => {
@@ -267,6 +301,80 @@ describe('runDoctorCheck', () => {
     );
     expect(issuePaths).toContain('agents.oracle.temperature');
     expect(issuePaths).toContain('multiplexer.type');
+    // The sanitizer keeps the invalid value out of the main parse, so the
+    // diagnostic must appear exactly once.
+    expect(issuePaths?.filter((p) => p === 'multiplexer.type')).toHaveLength(1);
+  });
+
+  test('multiplexer-only schema error is reported instead of being sanitized away', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const configDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        agents: { oracle: { model: 'test/model' } },
+        multiplexer: { type: 'unknown' },
+      }),
+    );
+
+    const result = runDoctorCheck(projectDir);
+
+    // The main parse succeeds thanks to runtime sanitization, but doctor
+    // must still fail the config and name the offending path.
+    expect(result.ok).toBe(false);
+    expect(result.configs[1].ok).toBe(false);
+    expect(result.configs[1].error?.kind).toBe('invalid-schema');
+    const issuePaths = result.configs[1].error?.issues?.map((i) =>
+      i.path.join('.'),
+    );
+    expect(issuePaths).toContain('multiplexer.type');
+    expect(issuePaths?.filter((p) => p === 'multiplexer.type')).toHaveLength(1);
+  });
+
+  test('valid multiplexer config returns ok', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const configDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        multiplexer: { type: 'tmux', layout: 'tiled', main_pane_size: 40 },
+      }),
+    );
+
+    const result = runDoctorCheck(projectDir);
+
+    expect(result.ok).toBe(true);
+    expect(result.configs[1].ok).toBe(true);
+    expect(result.configs[1].error).toBeUndefined();
+    expect(result.configs[1].config?.multiplexer).toEqual({
+      type: 'tmux',
+      layout: 'tiled',
+      main_pane_size: 40,
+    });
+  });
+
+  test('non-object multiplexer block is surfaced instead of being skipped', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const configDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(configDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({ multiplexer: 'tmux' }),
+    );
+
+    const result = runDoctorCheck(projectDir);
+
+    // Runtime sanitization rewrites this to `type: "none"`; doctor must still
+    // fail the config and name the block so disabled panes are explainable.
+    expect(result.ok).toBe(false);
+    expect(result.configs[1].ok).toBe(false);
+    expect(result.configs[1].error?.kind).toBe('invalid-schema');
+    const issuePaths = result.configs[1].error?.issues?.map((i) =>
+      i.path.join('.'),
+    );
+    expect(issuePaths).toContain('multiplexer');
   });
 
   test('empty config file returns invalid-json error', () => {
@@ -506,7 +614,10 @@ describe('doctor CLI wrapper', () => {
   afterEach(() => {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
-    process.env = originalEnv;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
   });
 
   test('help exits 0', async () => {

@@ -10,6 +10,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { PluginConfigSchema } from '../src/config/schema';
+import { dropDefaultedRequired } from '../src/config/schema-json';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(__dirname, '..');
@@ -28,6 +29,8 @@ const jsonSchema = {
   description:
     'Configuration schema for oh-my-opencode-slim plugin for OpenCode',
 };
+
+dropDefaultedRequired(jsonSchema);
 
 const json = JSON.stringify(jsonSchema, null, 2);
 writeFileSync(outputPath, `${json}\n`);

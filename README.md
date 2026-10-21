@@ -1,10 +1,10 @@
 <div align="center">
   <a href="https://github.com/alvinunreal/oh-my-opencode-slim/stargazers">
-    <img src="img/v2.jpg" alt="oh-my-opencode-slim V2 Release" style="border-radius: 10px;">
+    <img src="img/v3-marketplace-2.webp" alt="oh-my-opencode-slim V3 Marketplace" style="border-radius: 10px;">
   </a>
   <h3>✨ oh-my-opencode-slim ✨</h3>
 
-  <p><i>Seven divine beings emerged from the dawn of code, each an immortal master of their craft,<br>awaiting your command to forge order from chaos and build what was once thought impossible.</i></p>
+  <p><i>Six divine beings emerged from the dawn of code, each an immortal master of their craft,<br>awaiting your command to forge order from chaos and build what was once thought impossible.</i></p>
 
   <p><b>Opencode Multi Agent Suite</b> · Mix any models · Auto delegate tasks</p>
   <p><sub>by <b>Boring Dystopia Development</b></sub></p>
@@ -15,7 +15,12 @@
   </p>
 
   <p>
-    <b>English</b> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.ja-JP.md">日本語</a> | <a href="README.ko-KR.md">한국어</a>
+    <a href="https://svgdiagram.ai"><img src="img/svgdiagram-logo.svg" alt="svgdiagram.ai" width="40" height="28" align="absmiddle"></a>&nbsp;
+    <a href="https://svgdiagram.ai"><b>svgdiagram.ai</b></a> <sub>· Turn your notes into clean, editable SVG diagrams</sub>
+  </p>
+
+  <p>
+    <b>English</b> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.ja-JP.md">日本語</a> | <a href="README.ko-KR.md">한국어</a> | <a href="README.fa-IR.md">فارسی</a>
   </p>
 
   <p><sub>✦ ✦ ✦</sub></p>
@@ -30,37 +35,26 @@ The main idea is simple: instead of forcing one model to do everything, the plug
 
 ### ✨ Highlights
 
-- **[Seven specialized agents](#meet-the-pantheon)** - Orchestrator, Explorer,
-  Oracle, Council, Librarian, Designer, and Fixer. Each part of the job goes to
-  the agent best suited for it - mix any models across any providers.
-- **[Background orchestration](docs/background-orchestration.md)** - the
-  Orchestrator dispatches specialists as background tasks, tracks them, and
-  reconciles results before continuing - parallel work by default.
-- **[Bundled skills](#skills)** - prompt-based workflows like `deepwork`,
-  `codemap`, `verification-planning`, and `reflect`, assigned per agent.
-- **[Council](docs/council.md)** - run multiple models in parallel on the same
-  question and synthesize a single answer with `@council`.
-- **[Companion](docs/companion.md)** - an optional floating desktop window
-  showing which agents are active, including parallel background specialists.
-- **[Multiplexer integration](docs/multiplexer-integration.md)** - watch agents
-  work live in Tmux, Zellij, Herdr, cmux, or kitty panes.
-- **[Preset switching](docs/preset-switching.md)** - swap the whole team's
-  models at runtime with `/preset`.
-- **[Code intelligence tools](docs/tools.md)** - LSP tools, AST-aware search
-  across 25 languages, and built-in MCPs for docs and GitHub code
-  search.
-- **[Fully customizable](docs/configuration.md)** - custom agents, prompt
-  overrides, per-agent skill/MCP permissions, and
-  [project-local customization](docs/project-local-customization.md).
-
-### OpenAI GPT-5.6
-
-<p align="center">
-  <img src="img/openai-gpt-5-6-pantheon.jpeg" alt="OpenAI GPT-5.6 Pantheon: Terra, Sol, and Luna" width="100%">
-</p>
-
-The default [OpenAI preset](docs/openai-preset.md) maps Terra to Orchestrator,
-Sol to Oracle, and Luna to the fast specialist lanes.
+- **[Deepwork](src/skills/deepwork/SKILL.md)** for heavy programming sessions.
+  Big projects get built in phases, with an Oracle review between each one.
+- **[Agent Marketplace](#marketplace)** is live, and it grows with the
+  community. Suggest an agent or open a PR on
+  [oh-my-opencode-marketplace](https://github.com/alvinunreal/oh-my-opencode-marketplace)
+  to help build it.
+- **[OmniRoute](https://github.com/diegosouzapw/OmniRoute) is your friend.**
+  One free gateway to hundreds of providers and models, with automatic
+  fallback when a quota runs out. Mix models across the team without the
+  account juggling.
+- **Want to use Claude?** Check out [ACP support](docs/acp-agents.md): bring
+  Claude Code in as a subagent the Orchestrator can delegate to.
+- **Make it yours.** oh-my-opencode-slim is built to be customized, globally
+  or [per project](docs/project-local-customization.md): add
+  [new agents](docs/configuration.md#custom-agents), override prompts, and
+  [rewrite the delegation rules](docs/project-local-customization.md#custom-routing-guidance-orchestratorprompt)
+  so the Orchestrator routes work your way.
+- **Own your presets.** Model lineups change fast, so the
+  [example presets](#preset-docs) go stale quickly. Use them for ideas, then
+  build your own around the models you actually have.
 
 ### What Users Say
 
@@ -132,25 +126,6 @@ bun install
 bun run build
 ```
 
-### OpenCode v2 (`opencode2`)
-
-The same package runs on both OpenCode v1 and v2. On v2 you get the full
-agent pantheon, delegation through the host `subagent` tool (bridged into the
-background job board), all built-in tools and slash commands, auto-registered
-MCPs, `/preset` in the TUI, webfetch secondary-model summaries, and
-rate-limit model fallback. Multiplexer panes and the orchestrator-wake
-scheduler stay v1-only by design (v2 renders and notifies subagents natively).
-
-v2 auto-refreshes unpinned plugins on startup, so pin an exact version while
-both v2 and this adapter evolve quickly:
-
-```json
-{ "plugin": ["oh-my-opencode-slim@2.2.17"] }
-```
-
-Details, the feature matrix, and per-feature minimum v2 builds:
-[OpenCode v2 Compatibility](docs/opencode-v2-compatibility.md).
-
 ### Getting Started
 
 The installer generates both OpenAI and OpenCode Go presets, with OpenAI active by default.
@@ -181,7 +156,7 @@ Then:
 > It's **recommended** to understand how background orchestration works. The **[Orchestrator prompt](https://github.com/alvinunreal/oh-my-opencode-slim/blob/master/src/agents/orchestrator.ts#L28)** contains the scheduler rules, specialist routing logic, and thresholds for when work should be assigned to background agents. You can always delegate manually by calling a subagent via: `@agentName <task>`
 
 > [!TIP]
-> Because background agents are now the default workflow, it is **highly recommended** to enable and configure **[Multiplexer Integration](docs/multiplexer-integration.md)**. It automatically opens each agent in a dedicated Tmux, Zellij, Herdr, cmux, or kitty pane, so you can watch specialists work live while the Orchestrator continues coordinating the session.
+> Because background agents are now the default workflow, it is **highly recommended** to enable and configure **[Multiplexer Integration](docs/multiplexer-integration.md)**. It automatically opens each agent in a dedicated Tmux, Zellij, Herdr, cmux, kitty, or WezTerm pane, so you can watch specialists work live while the Orchestrator continues coordinating the session. On OpenCode v2 hosts, panes work with the shared background service or an explicit `--server`; `--standalone` hosts cannot host panes (one diagnostic per process; use v2's native subagent surfaces instead).
 
 The default generated configuration includes both `openai` and `opencode-go` presets.
 
@@ -191,33 +166,48 @@ The default generated configuration includes both `openai` and `opencode-go` pre
   "preset": "openai",
   "presets": {
     "openai": {
-      "orchestrator": { "model": "openai/gpt-5.6-terra", "variant": "high", "skills": ["*"], "mcps": ["*", "!context7"] },
-      "oracle": { "model": "openai/gpt-5.6-sol", "variant": "high", "skills": ["simplify"], "mcps": [] },
-      "librarian": { "model": "openai/gpt-5.6-luna", "variant": "low", "skills": [], "mcps": ["context7", "gh_grep"] },
-      "explorer": { "model": "openai/gpt-5.6-luna", "variant": "low", "skills": [], "mcps": [] },
-      "designer": { "model": "openai/gpt-5.6-luna", "variant": "medium", "skills": [], "mcps": [] },
-      "fixer": { "model": "openai/gpt-5.6-luna", "variant": "high", "skills": [], "mcps": [] }
-    },
-    "opencode-go": {
-      "orchestrator": { "model": "opencode-go/minimax-m3", "variant": "thinking" },
-      "oracle": { "model": "opencode-go/qwen3.7-max", "variant": "max" },
-      "librarian": { "model": "opencode-go/deepseek-v4-flash", "variant": "high" },
-      "explorer": { "model": "opencode-go/deepseek-v4-flash", "variant": "high" },
-      "designer": { "model": "opencode-go/kimi-k2.7-code" },
-      "fixer": { "model": "opencode-go/deepseek-v4-flash", "variant": "high" },
-      "observer": { "model": "opencode-go/mimo-v2.5" }
+      "orchestrator": { "model": "openai/gpt-6.1-sol", "variant": "medium", "skills": ["*"] },
+      "oracle": { "model": "openai/gpt-6.1-sol", "variant": "high", "skills": ["simplify"] },
+      "explorer": { "model": "openai/gpt-6-luna", "variant": "low", "skills": [] },
+      "designer": { "model": "openai/gpt-6-luna", "variant": "medium", "skills": [] },
+      "fixer": { "model": "openai/gpt-6.1-sol", "variant": "low", "skills": [] }
     }
   }
 }
 ```
 
+Presets can inherit from one base preset with `extends`: a `design` preset can
+extend `base` and override only its designer model. Changes are persisted by
+`/preset`. On v2 hosts the saved/applied preset's inference fields (`model`,
+`variant`, `temperature`, `options`) apply to new child dispatches (frozen for
+each child before its first request) and the sidebar once the server-side
+config watcher has refreshed them; a malformed config keeps the last-known-good
+state, and existing sessions plus prompt/tool/policy/skill/MCP changes stay
+frozen until a full reload; on v1 hosts reload OpenCode. See
+[Configuration](docs/configuration.md#preset-inheritance) for the inheritance
+example and precedence rules.
+
 ### Preset Docs
+
+Project settings in `.opencode/oh-my-opencode-slim.json[c]` are inherited from
+ancestor directories, matching the host's discovery: v2 walks to the filesystem
+root; v1 stops at the Git worktree boundary. `OPENCODE_DISABLE_PROJECT_CONFIG`
+disables the project walk.
+Closer settings override matching fields. Prompt files and the optional
+`skills_include_local` grants also search ancestor `.opencode` directories,
+following OpenCode's directory discovery. See
+[Configuration](docs/configuration.md#config-files) for precedence and trust boundaries.
+
+> [!TIP]
+> **Treat these presets as starting points, not recipes.** Models change fast
+> and presets go stale quickly. Build your own from the models you actually
+> have access to rather than copy-pasting one blindly. The bundled
+> `oh-my-opencode-slim` skill can help: ask the Orchestrator to tune your setup.
 
 - **[OpenAI Preset](docs/openai-preset.md)** — the default generated preset; runs all agents on OpenAI models.
 - **[OpenCode Go Preset](docs/opencode-go-preset.md)** — runs the agents on OpenCode Go models; enables the Observer agent for visual analysis since its orchestrator model isn't multimodal.
 - **[Author's Preset](docs/authors-preset.md)** — the exact config the author runs day to day, with third-party skills.
 - **[$30 Preset](docs/thirty-dollars-preset.md)** — a mixed-provider setup built around Codex Plus and GitHub Copilot Pro for about $30/month.
-- **[OpenCode Zen Free Preset](docs/opencode-zen-free-preset.md)** — every agent runs on an opencode free model; no usage cost.
 
 ### For Alternative Providers
 
@@ -274,12 +264,12 @@ If any agent fails to respond, check your provider authentication and config fil
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-terra (medium)</code>
+      <b>Default Model:</b> <code>openai/gpt-6.1-sol (medium)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>claude-fable-5</code> <code>claude-opus-4-8</code> <code>glm-5.2</code> <code>gpt-5.6-terra</code> <code>mimo-v2.5</code> <code>minimax-m3</code> <code>qwen3.7-plus</code>
+      <b>Recommended Models:</b> <code>claude-fable-5</code> <code>claude-opus-4-8</code> <code>glm-5.2</code> <code>gpt-6-sol</code> <code>mimo-v2.5</code> <code>minimax-m3</code> <code>qwen3.7-plus</code>
     </td>
   </tr>
   <tr>
@@ -305,7 +295,7 @@ If any agent fails to respond, check your provider authentication and config fil
   </tr>
   <tr>
     <td colspan="2">
-      <b>Role:</b> <code>Codebase reconnaissance</code>
+      <b>Role:</b> <code>Codebase reconnaissance and external research</code>
     </td>
   </tr>
   <tr>
@@ -315,7 +305,7 @@ If any agent fails to respond, check your provider authentication and config fil
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
+      <b>Default Model:</b> <code>openai/gpt-6-luna</code>
     </td>
   </tr>
   <tr>
@@ -356,12 +346,12 @@ If any agent fails to respond, check your provider authentication and config fil
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-sol (high)</code>
+      <b>Default Model:</b> <code>openai/gpt-6.1-sol (high)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>claude-fable-5</code> <code>claude-opus-4-8</code> <code>deepseek-v4-pro</code> <code>glm-5.2</code> <code>gpt-5.6-sol</code> <code>qwen3.7-max</code>
+      <b>Recommended Models:</b> <code>claude-fable-5</code> <code>claude-opus-4-8</code> <code>deepseek-v4-pro</code> <code>glm-5.2</code> <code>gpt-6-astra</code> <code>qwen3.7-max</code>
     </td>
   </tr>
   <tr>
@@ -376,7 +366,7 @@ If any agent fails to respond, check your provider authentication and config fil
 ### 04. Council: The Chorus of Minds
 
 > [!NOTE]
-> **Why doesn't Orchestrator auto-call Council more often?** This is intentional. Council runs multiple models at once, so automatic delegation is kept strict because it is usually the highest-cost path in the system. In practice, Council is meant to be used manually when you want it, for example: <code>@council compare these two architectures</code>.
+> **Why doesn't Orchestrator auto-call Council more often?** This is intentional. Council runs multiple models at once, so automatic delegation is kept strict because it is usually the highest-cost path in the system. In practice, ask for it in your message — mentioning `council`, `@council`, `consensus`, `共识`, or another trigger word injects the Council Mode procedure once per session (at the first trigger; later triggers don't re-inject it) and the orchestrator dispatches every councillor seat in parallel, for example: <code>run a council on these two architectures</code>. The full procedure is never carried statically: sessions that never ask for a council pay zero tokens for it, and the injection can be turned off entirely with <code>disabled_hooks: ["council-inject"]</code>.
 
 <table>
   <tr>
@@ -422,48 +412,7 @@ If any agent fails to respond, check your provider authentication and config fil
 
 ---
 
-### 05. Librarian: The Weaver of Knowledge
-
-<table>
-  <tr>
-    <td width="30%" align="center" valign="top">
-      <img src="img/librarian.jpg" width="240" style="border-radius: 10px;">
-      <br><sub><i>The weaver of understanding.</i></sub>
-    </td>
-    <td width="70%" valign="top">
-      The Librarian was forged when humanity realized that no single mind could hold all knowledge. They are the weaver who connects disparate threads of information into a tapestry of understanding. They traverse the infinite library of human knowledge, gathering insights from every corner and binding them into answers that transcend mere facts. What they return is not information - it's understanding.
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Role:</b> <code>External knowledge retrieval</code>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Prompt:</b> <a href="src/agents/librarian.ts"><code>librarian.ts</code></a>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Recommended Models:</b> <code>deepseek-v4-flash</code> <code>gpt-5.3-codex</code> <code>mimo-v2.5</code> <code>minimax-m2.7</code>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2">
-      <b>Model Guidance:</b> Choose a fast, low-cost model. Librarian handles research and documentation lookups, so speed and efficiency usually matter more than using your strongest reasoning model.
-    </td>
-  </tr>
-</table>
-
----
-
-### 06. Designer: The Guardian of Aesthetics
+### 05. Designer: The Guardian of Aesthetics
 
 <table>
   <tr>
@@ -487,7 +436,7 @@ If any agent fails to respond, check your provider authentication and config fil
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
+      <b>Default Model:</b> <code>openai/gpt-6-luna</code>
     </td>
   </tr>
   <tr>
@@ -504,7 +453,7 @@ If any agent fails to respond, check your provider authentication and config fil
 
 ---
 
-### 07. Fixer: The Last Builder
+### 06. Fixer: The Last Builder
 
 <table>
   <tr>
@@ -528,12 +477,12 @@ If any agent fails to respond, check your provider authentication and config fil
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code>
+      <b>Default Model:</b> <code>openai/gpt-6.1-sol (low)</code>
     </td>
   </tr>
   <tr>
     <td colspan="2">
-      <b>Recommended Models:</b> <code>claude-sonnet-4-6</code> <code>deepseek-v4-flash</code> <code>gpt-5.6-luna</code> <code>kimi-k2.7-code</code>
+      <b>Recommended Models:</b> <code>claude-sonnet-4-6</code> <code>deepseek-v4-flash</code> <code>gpt-6-luna</code> <code>kimi-k2.7-code</code>
     </td>
   </tr>
   <tr>
@@ -545,12 +494,101 @@ If any agent fails to respond, check your provider authentication and config fil
 
 ---
 
+<a id="marketplace"></a>
+
+## 🛒 Marketplace
+
+<p align="center">
+  <b>The Pantheon is open to newcomers.</b> The Agent Marketplace is live:
+  community-built specialist agents you can install with one command and add
+  to your team.
+</p>
+
+<p align="center">
+  <a href="https://ohmyopencodeslim.com/marketplace"><b>Browse the Marketplace →</b></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/alvinunreal/oh-my-opencode-marketplace#contributing-a-package"><b>Submit your agent →</b></a>
+</p>
+
+<table>
+  <tr>
+    <td width="25%" align="center" valign="top">
+      <a href="https://ohmyopencodeslim.com/marketplace"><img src="img/marketplace/paladin.webp" width="160" alt="Paladin" style="border-radius: 10px;"></a>
+      <br><b>Paladin</b> <sub>by <a href="https://github.com/stevio2d">stevio2d</a></sub>
+      <br><sub>Read-only security review for changes that cross a trust boundary.</sub>
+      <br><code>alvin/paladin</code>
+    </td>
+    <td width="25%" align="center" valign="top">
+      <a href="https://ohmyopencodeslim.com/marketplace"><img src="img/marketplace/arbiter.webp" width="160" alt="Arbiter" style="border-radius: 10px;"></a>
+      <br><b>Arbiter</b> <sub>by <a href="https://github.com/capyBearista">capyBearista</a></sub>
+      <br><sub>Evidence-backed merge-readiness review after real implementation work.</sub>
+      <br><code>capybearista/arbiter</code>
+    </td>
+    <td width="25%" align="center" valign="top">
+      <a href="https://ohmyopencodeslim.com/marketplace"><img src="img/marketplace/hunter.webp" width="160" alt="Hunter" style="border-radius: 10px;"></a>
+      <br><b>Hunter</b> <sub>by <a href="https://github.com/capyBearista">capyBearista</a></sub>
+      <br><sub>Hunts swallowed errors, misleading fallbacks, and hidden retry exhaustion.</sub>
+      <br><code>capybearista/hunter</code>
+    </td>
+    <td width="25%" align="center" valign="top">
+      <a href="https://ohmyopencodeslim.com/marketplace"><img src="img/marketplace/proctor.webp" width="160" alt="Proctor" style="border-radius: 10px;"></a>
+      <br><b>Proctor</b> <sub>by <a href="https://github.com/capyBearista">capyBearista</a></sub>
+      <br><sub>Checks whether a change has enough behavioral tests and ranks the gaps.</sub>
+      <br><code>capybearista/proctor</code>
+    </td>
+  </tr>
+  <tr>
+    <td width="25%" align="center" valign="top">
+      <a href="https://ohmyopencodeslim.com/marketplace"><img src="img/marketplace/janitor.webp" width="160" alt="Janitor" style="border-radius: 10px;"></a>
+      <br><b>Janitor</b> <sub>by <a href="https://github.com/hbollon">hbollon</a></sub>
+      <br><sub>Read-only maintainability audit for when the repo is getting harder to change.</sub>
+      <br><code>alvin/janitor</code>
+    </td>
+    <td width="25%" align="center" valign="top">
+      <a href="https://ohmyopencodeslim.com/marketplace"><img src="img/marketplace/documenter.webp" width="160" alt="Documenter" style="border-radius: 10px;"></a>
+      <br><b>Documenter</b> <sub>by <a href="https://github.com/alvinunreal">Alvin</a></sub>
+      <br><sub>Documentation architect for coherent, source-grounded docs.</sub>
+      <br><code>alvin/documenter</code>
+    </td>
+    <td width="25%" align="center" valign="top">
+      <a href="https://ohmyopencodeslim.com/marketplace"><img src="img/marketplace/chronicler.webp" width="160" alt="Chronicler" style="border-radius: 10px;"></a>
+      <br><b>Chronicler</b> <sub>by <a href="https://github.com/capyBearista">capyBearista</a></sub>
+      <br><sub>Durable docs, changelogs, architecture notes, and migration guides.</sub>
+      <br><code>capybearista/chronicler</code>
+    </td>
+    <td width="25%" align="center" valign="middle">
+      <a href="https://github.com/alvinunreal/oh-my-opencode-marketplace#contributing-a-package"><b>➕ Your agent here</b></a>
+      <br><br><sub>Built a specialist that earns its place? Publish it to the marketplace and let every oh-my-opencode-slim user add it to their team.</sub>
+      <br><br><a href="https://ohmyopencodeslim.com/marketplace"><sub><b>See all agents →</b></sub></a>
+    </td>
+  </tr>
+</table>
+
+**Add one to your team.** Ask the Orchestrator ("install the Paladin agent
+from the marketplace"), or use the CLI from your project directory:
+
+```sh
+bunx oh-my-opencode-slim@latest marketplace install alvin/paladin
+bunx oh-my-opencode-slim@latest marketplace enable alvin/paladin
+```
+
+Restart OpenCode afterwards; new agents join the registry on the next plugin
+load. Installed agents use your session model by default, and the Orchestrator
+routes work to them the same way it routes to the built-in specialists. See
+**[Marketplace packages](docs/marketplace.md)** for the full CLI, preset
+activation, and update flow.
+
+---
+
 ## Optional Agents
 
 ### Observer: The Silent Witness
 
 > [!NOTE]
-> **Why a separate agent?** If your Orchestrator model is not multimodal, enable Observer to handle images, screenshots, and other visual files. Observer is disabled by default and gives the Orchestrator a dedicated multimodal reader without forcing you to change your main reasoning model. Set `disabled_agents: []` and an `observer` model in your configuration. The bundled `opencode-go` install preset does this automatically because its GLM Orchestrator is not multimodal. Omitting `image_routing` preserves existing conditional Observer behavior. Set `image_routing: "auto"` only when Observer is enabled, or `"direct"` to always pass image attachments to the Orchestrator.
+> **Why a separate agent?** If your Orchestrator model is not multimodal, enable Observer to handle images, screenshots, and other visual files. Observer is disabled by default and gives the Orchestrator a dedicated multimodal reader without forcing you to change your main reasoning model. Set `disabled_agents: []` and an `observer` model in your configuration. The bundled `opencode-go` install preset does this automatically because its GLM Orchestrator is not multimodal. Omitting `image_routing` preserves existing conditional Observer behavior. `"auto"` is capability-aware: models that accept image input keep attachments inline for native vision; non-vision chains get attachments saved under `.opencode/images/<session>/` with a delegation nudge by path. `"direct"` always keeps image parts inline. Saved workspace images are not automatically deleted. Remove the whole `.opencode/images/` directory or a single session subdirectory manually when no longer needed (references in old conversations then stop resolving); images from session-less messages are saved at the top level.
+
+> [!TIP]
+> **Subagents reading images.** Advisory subagents (explorer, oracle, designer, councillors) can dispatch `@observer` themselves for image files on disk. On OpenCode v2 hosts this needs one extra hop of nesting, which the host denies by default — set `"experimental": { "subagent_depth": 2 }` in your opencode config to enable it. Fixer, observer itself, and the council synthesizer stay non-spawning by design.
 
 <table>
   <tr>
@@ -564,7 +602,7 @@ If any agent fails to respond, check your provider authentication and config fil
 
 - Images, screenshots, diagrams → `read` tool (native image support)
 - PDFs and binary documents → `read` tool (text + structure extraction)
-- **Disabled by default** - enable with `"disabled_agents": []` and configure a vision-capable model; installing with `--preset=opencode-go` enables it with `opencode-go/mimo-v2.5`. Image attachments route to Observer by default when it is enabled; set `"image_routing": "direct"` to keep them on the Orchestrator.
+- **Disabled by default** - enable with `"disabled_agents": []` and configure a vision-capable model; installing with `--preset=opencode-go` enables it with `opencode-go/mimo-v2.5`. In `"auto"`, attachments ride the turn model's capabilities: vision-capable models read them inline, non-vision chains get them saved as workspace assets and routed to Observer by path; set `"image_routing": "direct"` to always keep them inline.
 
     </td>
   </tr>
@@ -575,7 +613,7 @@ If any agent fails to respond, check your provider authentication and config fil
   </tr>
   <tr>
     <td colspan="2">
-      <b>Default Model:</b> <code>openai/gpt-5.6-luna</code> - <i>configure a vision-capable model to enable</i>
+      <b>Default Model:</b> <code>openai/gpt-6-luna</code> - <i>configure a vision-capable model to enable</i>
     </td>
   </tr>
   <tr>
@@ -599,22 +637,22 @@ If any agent fails to respond, check your provider authentication and config fil
 Skills are prompt-based instructions injected into an agent's system prompt to
 guide decisions, workflows, and tool use. Unlike MCPs (which are running
 servers), a skill runs no process — it is a focused playbook an agent activates
-when the task calls for it. The installer bundles eight skills and keeps them
-updated on plugin auto-update; local customizations are preserved.
-
-> [!TIP]
-> To discard local bundled-skill customizations and receive package updates, run
-> `bunx oh-my-opencode-slim install --skills=force`. This deliberately replaces
-> installed bundled skills with the package versions.
+when the task calls for it. The plugin registers its eight bundled skills
+in-process at load — updates apply on restart, nothing is copied to disk. A
+same-named skill directory under `~/.config/opencode/skills/` overrides the
+bundled version.
 
 | Skill | Purpose | Default agent | How to invoke |
 |:-----:|---------|---------------|---------------|
 | <img src="img/skills/codemap.webp" width="120" alt="Codemap artifact"><br>[`codemap`](src/skills/codemap/SKILL.md) | Hierarchical repository maps so agents understand codebases without re-reading everything | `orchestrator` | `run codemap` |
-| <img src="img/skills/deepwork.webp" width="120" alt="Deepwork artifact"><br>[`deepwork`](src/skills/deepwork/SKILL.md) | Structured workflow for large, risky, multi-phase coding sessions with review gates | `orchestrator` | `/deepwork <task>` |
+| <img src="img/skills/deepwork.webp" width="120" alt="Deepwork artifact"><br>[`deepwork`](src/skills/deepwork/SKILL.md) | Autonomous pass-by-pass workflow (sketch → structure → detail) for large, risky coding sessions, one review gate per pass | `orchestrator` | `/deepwork <task>` |
 | <img src="img/skills/verification-planning.webp" width="120" alt="Verification Planning artifact"><br>[`verification-planning`](src/skills/verification-planning/SKILL.md) | Plans a project-specific evidence path before non-trivial changes | `orchestrator` | automatic before non-trivial work |
 | <img src="img/skills/simplify.webp" width="120" alt="Simplify artifact"><br>[`simplify`](src/skills/simplify/SKILL.md) | Behavior-preserving simplification for readability and maintainability | `oracle` | ask for simplification or during review |
 | <img src="img/skills/worktrees.webp" width="120" alt="Worktrees artifact"><br>[`worktrees`](src/skills/worktrees/SKILL.md) | Git worktrees as safe, isolated coding lanes for risky or parallel work | `orchestrator` | `work in a worktree` |
 | <img src="img/skills/clonedeps.webp" width="120" alt="Clonedeps artifact"><br>[`clonedeps`](src/skills/clonedeps/SKILL.md) | Clones dependency source locally so agents can inspect library internals | `orchestrator` | `clone dependencies` |
+| <img src="img/skills/step-back.webp" width="120" alt="Step Back artifact"><br>[`step-back`](src/skills/step-back/SKILL.md) | Pauses snowballing patches to reassess direction and propose a cleaner path | `orchestrator` | automatic when fixes start stacking |
+| <img src="img/skills/deanchor.webp" width="120" alt="Deanchor artifact"><br>[`deanchor`](src/skills/deanchor/SKILL.md) | Generalizes from examples instead of copying them with light edits | `orchestrator` | automatic when a request includes examples |
+| <img src="img/skills/ai-estimates.webp" width="120" alt="AI Estimates artifact"><br>[`ai-estimates`](src/skills/ai-estimates/SKILL.md) | Estimates task duration for a human working with AI, not alone | `orchestrator` | ask how long something will take |
 | <img src="img/skills/reflect.webp" width="120" alt="Reflect artifact"><br>[`reflect`](src/skills/reflect/SKILL.md) | Turns repeated workflow friction into reusable skills, agents, or config | `orchestrator` | `/reflect` |
 | <img src="img/skills/oh-my-opencode-slim.webp" width="120" alt="oh-my-opencode-slim artifact"><br>[`oh-my-opencode-slim`](src/skills/oh-my-opencode-slim/SKILL.md) | Configures and safely improves the plugin setup itself | `orchestrator` | ask to tune your setup |
 
@@ -633,6 +671,10 @@ illustrated overview at
 
 ## 🖥️ Companion
 
+Native source and releases: **[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion)**.
+The plugin keeps the installer, updater, and state integration; existing commands
+and configuration are unchanged.
+
 The optional Companion is a floating desktop status window for live agent
 activity. It shows the current session state and which agents are active, so
 background work is easier to follow at a glance.
@@ -642,12 +684,15 @@ background work is easier to follow at a glance.
   <p><i>Left bottom visual companion.</i></p>
 </div>
 
-During interactive install, the installer asks whether to enable Companion and
-defaults to `no`. For automation, enable it explicitly with:
+Companion is not part of the regular install. Add it any time after installing
+the plugin:
 
 ```bash
-bunx oh-my-opencode-slim@latest install --companion=yes
+bunx oh-my-opencode-slim@latest companion install
 ```
+
+This downloads the native binary for your platform and sets
+`"companion": { "enabled": true }` in your config. Restart OpenCode to launch it.
 
 See **[Companion](docs/companion.md)** for configuration, positions, sizes, and
 install details.
@@ -664,15 +709,15 @@ Use this section as a map: start with installation, then jump to features, confi
 
 | Doc | What it covers |
 |-----|----------------|
-| **[Council](docs/council.md)** | Run multiple models in parallel and synthesize a single answer with `@council` |
+| **[Council](docs/council.md)** | Run multiple models in parallel and synthesize a single answer — keyword-triggered via the orchestrator's Council Mode procedure |
 | **[Custom Agents](docs/configuration.md#custom-agents)** | Define your own specialists with custom prompts, models, MCP access, and Orchestrator delegation rules |
-| **[ACP Agents](docs/acp-agents.md)** | Connect external ACP-compatible agents such as Claude Code ACP or Gemini ACP as delegatable subagents |
-| **[Multiplexer Integration](docs/multiplexer-integration.md)** | Watch agents work live in Tmux, Zellij, Herdr, cmux, or kitty panes |
+| **[ACP Agents](docs/acp-agents.md)** | Connect external ACP-compatible agents such as Claude Code ACP or Gemini ACP as delegatable subagents; tool and plan progress streams to the TUI while they work |
+| **[Multiplexer Integration](docs/multiplexer-integration.md)** | Watch agents work live in Tmux, Zellij, Herdr, cmux, kitty, or WezTerm panes |
 | **[Codemap](docs/codemap.md)** | Generate hierarchical codemaps to understand large codebases faster |
 | **[Clonedeps](docs/clonedeps.md)** | Clone selected dependency source into an ignored local workspace for inspection |
 | **[Worktrees](docs/worktrees.md)** | Use `.slim/worktrees/` lanes for isolated parallel or risky coding work |
 | **[Preset Switching](docs/preset-switching.md)** | Switch agent model presets at runtime with `/preset` |
-| **[Interview](docs/interview.md)** | Turn rough ideas into a structured markdown spec through a browser-based Q&A flow |
+| **[Interview](docs/interview.md)** | Turn rough ideas into a structured markdown spec through a browser-based Q&A flow, then implement it with `/implement` |
 | **[Companion](docs/companion.md)** | Floating window companion for parsing, help, and types |
 
 ### ⚙️ Config & Reference
@@ -680,12 +725,14 @@ Use this section as a map: start with installation, then jump to features, confi
 | Doc | What it covers |
 |-----|----------------|
 | **[Installation Guide](docs/installation.md)** | Install the plugin, use CLI flags, reset config, and troubleshoot setup |
-| **[OpenCode v2 Compatibility](docs/opencode-v2-compatibility.md)** | Run the same plugin on `opencode2`: feature matrix, minimum v2 builds, version pinning |
+| **[OpenCode v2 Compatibility](docs/opencode-v2-compatibility.md)** | Run the same plugin on `opencode2`: feature matrix, v2.0.x compatibility baseline, version pinning |
 | **[Configuration](docs/configuration.md)** | Config file locations, JSONC support, prompt overrides, and full option reference |
+| **[Marketplace](docs/marketplace.md)** | Install, inspect, activate, and update marketplace agent packages |
 | **[Project Customization](docs/project-local-customization.md)** | Repository-specific custom agents, prompt overrides, per-agent skills, and precedence |
 | **[Background Orchestration](docs/background-orchestration.md)** | Scheduler-first orchestrator model built around native background subagents |
 | **[Maintainer Guide](docs/maintainers.md)** | Issue triage rules, label meanings, support routing, and repo maintenance workflow |
-| **[Skills](docs/skills.md)** | Bundled skills such as `simplify`, `codemap`, `clonedeps`, `deepwork`, `verification-planning`, `reflect`, `worktrees`, and `oh-my-opencode-slim` |
+| **[Developer Evals](docs/evals.md)** | Source-checkout routing/reliability harness, offline scoring, and advisory model judging |
+| **[Skills](docs/skills.md)** | Bundled skills such as `simplify`, `codemap`, `clonedeps`, `deepwork`, `verification-planning`, `step-back`, `deanchor`, `ai-estimates`, `reflect`, `worktrees`, and `oh-my-opencode-slim` |
 | **[MCPs](docs/mcps.md)** | `context7`, `gh_grep`, and how MCP permissions work per agent |
 | **[Tools](docs/tools.md)** | Built-in tool capabilities like `webfetch`, LSP tools, code search, and formatters |
 
@@ -698,7 +745,7 @@ Use this section as a map: start with installation, then jump to features, confi
   <p><sub>Every merged contribution leaves a mark on the realm.</sub></p>
 
   <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-104-orange.svg?style=flat-square)](#contributors-)
+[![All Contributors](https://img.shields.io/badge/all_contributors-138-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 </div>
 
@@ -848,6 +895,50 @@ Use this section as a map: start with installation, then jump to features, confi
     <tr>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/zjm54321"><img src="https://avatars.githubusercontent.com/u/20168947?v=4?s=100" width="100px;" alt="落花有意"/><br /><sub><b>落花有意</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=zjm54321" title="Code">💻</a></td>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/JoJohanse"><img src="https://avatars.githubusercontent.com/u/97782983?v=4?s=100" width="100px;" alt="JoJohanse"/><br /><sub><b>JoJohanse</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=JoJohanse" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/Alfiegerner"><img src="https://avatars.githubusercontent.com/u/596188?v=4?s=100" width="100px;" alt="Alfiegerner"/><br /><sub><b>Alfiegerner</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=Alfiegerner" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/leducmaxime"><img src="https://avatars.githubusercontent.com/u/37900355?v=4?s=100" width="100px;" alt="Maxime Leduc"/><br /><sub><b>Maxime Leduc</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=leducmaxime" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/vmvarela"><img src="https://avatars.githubusercontent.com/u/11040851?v=4?s=100" width="100px;" alt="Victor M. Varela"/><br /><sub><b>Victor M. Varela</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=vmvarela" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/gitslim"><img src="https://avatars.githubusercontent.com/u/24612825?v=4?s=100" width="100px;" alt="gitslim"/><br /><sub><b>gitslim</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=gitslim" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/xiaolf0813"><img src="https://avatars.githubusercontent.com/u/314566924?v=4?s=100" width="100px;" alt="xiaolf0813"/><br /><sub><b>xiaolf0813</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=xiaolf0813" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/BaconDroid"><img src="https://avatars.githubusercontent.com/u/11067111?v=4?s=100" width="100px;" alt="BaconDroid"/><br /><sub><b>BaconDroid</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=BaconDroid" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://sprightly-strudel-e1f939.netlify.app/"><img src="https://avatars.githubusercontent.com/u/277080233?v=4?s=100" width="100px;" alt="Enoch"/><br /><sub><b>Enoch</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=bferanmi806-sketch" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/mxalbert1996"><img src="https://avatars.githubusercontent.com/u/9391933?v=4?s=100" width="100px;" alt="Albert Chang"/><br /><sub><b>Albert Chang</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=mxalbert1996" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/Aveer"><img src="https://avatars.githubusercontent.com/u/84144527?v=4?s=100" width="100px;" alt="Aveer"/><br /><sub><b>Aveer</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=Aveer" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/Amm1rr"><img src="https://avatars.githubusercontent.com/u/480468?v=4?s=100" width="100px;" alt="Mohammad"/><br /><sub><b>Mohammad</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=Amm1rr" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/kumar-shivang"><img src="https://avatars.githubusercontent.com/u/89011717?v=4?s=100" width="100px;" alt="Shivang Kumar"/><br /><sub><b>Shivang Kumar</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=kumar-shivang" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/ScoFan-official"><img src="https://avatars.githubusercontent.com/u/137064417?v=4?s=100" width="100px;" alt="ScoFan-official"/><br /><sub><b>ScoFan-official</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=ScoFan-official" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://www.littlelyon.com/"><img src="https://avatars.githubusercontent.com/u/6328186?v=4?s=100" width="100px;" alt="Haoliang Wu"/><br /><sub><b>Haoliang Wu</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=haoliangwu" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://guanbear.com/"><img src="https://avatars.githubusercontent.com/u/11829005?v=4?s=100" width="100px;" alt="GuanBear"/><br /><sub><b>GuanBear</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=guanbear" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/ShoelaceMan"><img src="https://avatars.githubusercontent.com/u/9676844?v=4?s=100" width="100px;" alt="Trent Arcuri"/><br /><sub><b>Trent Arcuri</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=ShoelaceMan" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/expnn"><img src="https://avatars.githubusercontent.com/u/18525479?v=4?s=100" width="100px;" alt="expnn"/><br /><sub><b>expnn</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=expnn" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/wirsbf"><img src="https://avatars.githubusercontent.com/u/144008530?v=4?s=100" width="100px;" alt="wirsbf"/><br /><sub><b>wirsbf</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=wirsbf" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/maqifrnswa"><img src="https://avatars.githubusercontent.com/u/424153?v=4?s=100" width="100px;" alt="Scott Howard"/><br /><sub><b>Scott Howard</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=maqifrnswa" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/ananas-wonders"><img src="https://avatars.githubusercontent.com/u/7282452?v=4?s=100" width="100px;" alt="Ananas"/><br /><sub><b>Ananas</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=ananas-wonders" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/jaynis"><img src="https://avatars.githubusercontent.com/u/1553675?v=4?s=100" width="100px;" alt="jaynis"/><br /><sub><b>jaynis</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=jaynis" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/drakeo338"><img src="https://avatars.githubusercontent.com/u/328244157?v=4?s=100" width="100px;" alt="Y.B."/><br /><sub><b>Y.B.</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=drakeo338" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/EmojiPati"><img src="https://avatars.githubusercontent.com/u/49492351?v=4?s=100" width="100px;" alt="pati"/><br /><sub><b>pati</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=EmojiPati" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/unsnow-iac"><img src="https://avatars.githubusercontent.com/u/256081678?v=4?s=100" width="100px;" alt="unsnow-iac"/><br /><sub><b>unsnow-iac</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=unsnow-iac" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/guidan-nick"><img src="https://avatars.githubusercontent.com/u/224735395?v=4?s=100" width="100px;" alt="guidan-nick"/><br /><sub><b>guidan-nick</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=guidan-nick" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://rclb.dev/"><img src="https://avatars.githubusercontent.com/u/856570?v=4?s=100" width="100px;" alt="Rodrigo Belem"/><br /><sub><b>Rodrigo Belem</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=rbelem" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://mustbethecode.com/"><img src="https://avatars.githubusercontent.com/u/42842700?v=4?s=100" width="100px;" alt="GWA"/><br /><sub><b>GWA</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=mustbethecode" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/lancew"><img src="https://avatars.githubusercontent.com/u/11627?v=4?s=100" width="100px;" alt="Lance Wicks"/><br /><sub><b>Lance Wicks</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=lancew" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://incerry.cnblogs.com/"><img src="https://avatars.githubusercontent.com/u/36690780?v=4?s=100" width="100px;" alt="InCerryGit"/><br /><sub><b>InCerryGit</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=InCerryGit" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/doublepi123"><img src="https://avatars.githubusercontent.com/u/54027436?v=4?s=100" width="100px;" alt="doublepi123"/><br /><sub><b>doublepi123</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=doublepi123" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/timothy-cloudopsguy"><img src="https://avatars.githubusercontent.com/u/96697196?v=4?s=100" width="100px;" alt="Timothy"/><br /><sub><b>Timothy</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=timothy-cloudopsguy" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/mwoodson"><img src="https://avatars.githubusercontent.com/u/236828?v=4?s=100" width="100px;" alt="Matt Woodson"/><br /><sub><b>Matt Woodson</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=mwoodson" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/caiozizh"><img src="https://avatars.githubusercontent.com/u/244536034?v=4?s=100" width="100px;" alt="caiozizh"/><br /><sub><b>caiozizh</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=caiozizh" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/capyBearista"><img src="https://avatars.githubusercontent.com/u/20227532?v=4?s=100" width="100px;" alt="Arjun Pramanik"/><br /><sub><b>Arjun Pramanik</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=capyBearista" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://gianniscks.github.io/"><img src="https://avatars.githubusercontent.com/u/6207534?v=4?s=100" width="100px;" alt="Giannis Papakostas"/><br /><sub><b>Giannis Papakostas</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=giannisCKS" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

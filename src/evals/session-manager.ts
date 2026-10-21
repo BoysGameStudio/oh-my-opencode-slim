@@ -1,4 +1,4 @@
-import { withTimeout } from '../utils/with-timeout';
+import { withTimeout } from '../utils/session';
 import type { EvalSessionClient } from './eval-client';
 import { pollSession } from './polling-session';
 import type { Transcript } from './schema';
@@ -67,6 +67,7 @@ export async function runWithSession(
         query: { directory },
       }),
       30_000,
+      'Session creation timed out',
     );
     const sid = created.data?.id;
     if (!sid) {
@@ -110,6 +111,7 @@ export async function runWithSession(
         query: { directory },
       }),
       timeoutMs,
+      'Session prompt timed out',
     );
 
     return await pollSession(

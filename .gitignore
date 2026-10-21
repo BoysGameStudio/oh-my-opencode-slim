@@ -23,8 +23,6 @@ Thumbs.db
 
 # Logs
 *.log
-# Eval run artifacts
-src/evals/results/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -91,9 +89,6 @@ wheels/
 .installed.cfg
 *.egg
 captures/
-
-# Rust companion build artifacts
-companion/target/
 
 # BEGIN oh-my-opencode-slim clonedeps
 .slim/clonedeps/repos/

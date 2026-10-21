@@ -1,11 +1,9 @@
 /**
- * Regression coverage for checkpoint-compatible board injection and provider
- * prompt-cache prefix safety.
+ * Regression coverage for the change-only board scheme's provider prompt-cache
+ * prefix safety.
  *
- * Empirical verification of the checkpoint-compatible board strategy's
- * cache behavior (fix/checkpoint-cache-epochs investigation). Simulates a
- * multi-turn orchestrator tool loop with realistic SDK-shaped message
- * fixtures (github-copilot / gpt-5.6-luna) and measures, per turn:
+ * Simulates a multi-turn orchestrator tool loop with realistic SDK-shaped
+ * message fixtures (github-copilot / gpt-6-luna) and measures, per turn:
  *
  *  1. transform-level bytes: the exact `messages` array the hook produces
  *  2. provider-level bytes: those messages passed through the same
@@ -16,16 +14,14 @@
  *     provider-visible role and ordered text content.
  *
  * For each consecutive pair of requests it computes the longest common
- * byte prefix and reports where the divergence falls.
- *
- * Scenarios A and C intentionally fail against the current implementation.
- * They become passing guards when board snapshots are kept in the trailing
- * cache-safe zone and retained snapshots are replayed on every qualifying
- * request.
+ * byte prefix and reports where the divergence falls. Every request must
+ * preserve the complete prior provider payload as a byte prefix: boards are
+ * replayed frozen on their original anchors, and unchanged digests place
+ * nothing new.
  */
 import { describe, expect, mock, test } from 'bun:test';
-import { DEFAULT_MAX_RETAINED_SNAPSHOTS } from '../../config/constants';
-import { BackgroundJobBoard, createInternalAgentTextPart } from '../../utils';
+import { createInternalAgentTextPart } from '../../utils';
+import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import { createTaskSessionManagerHook } from './index';
 
 const SESSION = 'ses_08f6be16dffednbwYD8dNDIfOI';
@@ -41,7 +37,7 @@ function userMsg(id: string, text: string, createdAt: number) {
       role: 'user',
       time: { created: createdAt },
       agent: 'orchestrator',
-      model: { providerID: 'github-copilot', modelID: 'gpt-5.6-luna' },
+      model: { providerID: 'github-copilot', modelID: 'gpt-6-luna' },
     },
     parts: [
       {
@@ -83,7 +79,7 @@ function assistantMsg(
       role: 'assistant',
       time: { created: createdAt, completed: createdAt + 4321 },
       parentID: 'msg_u1',
-      modelID: 'gpt-5.6-luna',
+      modelID: 'gpt-6-luna',
       providerID: 'github-copilot',
       mode: 'orchestrator',
       path: { cwd: '/work/repo', root: '/work/repo' },
@@ -207,7 +203,7 @@ function describeTransition(label: string, prev: string, next: string) {
 
 // ── Hook + turn runner ────────────────────────────────────────────────
 
-function createHook(board: BackgroundJobBoard) {
+function createHook(board: BackgroundJobBoard, hostFlavor?: string) {
   return createTaskSessionManagerHook(
     {
       client: { session: { status: mock(async () => ({ data: {} })) } },
@@ -216,8 +212,7 @@ function createHook(board: BackgroundJobBoard) {
     } as never,
     {
       maxSessionsPerAgent: 4,
-      maxRetainedSnapshots: DEFAULT_MAX_RETAINED_SNAPSHOTS,
-      strategy: 'checkpoint-compatible',
+      hostFlavor,
       backgroundJobBoard: board,
       shouldManageSession: () => true,
     },
@@ -248,17 +243,32 @@ async function runTurn(
 
 function summarizeInjected(messages: any[]): string[] {
   return messages.map((m) => {
-    const meta = m.parts?.[0]?.metadata;
-    if (meta?.['oh-my-opencode-slim.backgroundJobBoard'] === true) {
+    const meta = m.parts?.find(
+      (p: any) =>
+        p?.metadata?.['oh-my-opencode-slim.backgroundJobBoard'] === true,
+    )?.metadata;
+    if (meta) {
       return `BOARD(${meta.snapshotID ?? m.info.id})`;
     }
     return `${m.info.role.toUpperCase()}(${m.info.id})`;
   });
 }
 
+function boardPartCount(r: TurnResult): number {
+  return (r.injected as any[]).reduce(
+    (sum, m) =>
+      sum +
+      (m.parts?.filter(
+        (p: any) =>
+          p?.metadata?.['oh-my-opencode-slim.backgroundJobBoard'] === true,
+      ).length ?? 0),
+    0,
+  );
+}
+
 // ── Scenario A: tool loop, board state changes across turns ──────────
 
-describe('checkpoint-compatible board cache safety', () => {
+describe('change-only board cache safety', () => {
   test('keeps provider bytes prefix-safe while a tool loop changes the board', async () => {
     const board = new BackgroundJobBoard();
     const hook = createHook(board);
@@ -291,7 +301,7 @@ describe('checkpoint-compatible board cache safety', () => {
         board.registerLaunch({
           taskID: 'child-3',
           parentSessionID: SESSION,
-          agent: 'librarian',
+          agent: 'explorer',
           description: 'find docs',
         }),
       () =>
@@ -338,14 +348,10 @@ describe('checkpoint-compatible board cache safety', () => {
       console.log(JSON.stringify(t, null, 2));
     }
 
-    const broken = transitions.filter((t) => !t.safe);
-    console.log(
-      `\nSCENARIO A RESULT: ${broken.length}/${transitions.length} transitions break the provider byte prefix`,
-    );
-
-    // Every request must preserve the complete prior provider payload as a
-    // byte prefix. The current placement bug makes the later transitions
-    // fail here when a snapshot is inserted before prior assistant messages.
+    // Assistant-tail placements are skipped by design (A5): a board can
+    // only ever land on a user-side tail, where it is retained and replayed
+    // frozen. Every transition — including the assistant-tail ones — must
+    // preserve the complete prior provider payload as a byte prefix.
     for (const transition of transitions) {
       expect(transition.safe, `${transition.label} rewrote cached bytes`).toBe(
         true,
@@ -381,49 +387,35 @@ describe('checkpoint-compatible board cache safety', () => {
     const turn2 = await runTurn(hook, [u1, a1, u2]);
 
     const boardMessageOf = (t: TurnResult): any =>
-      (t.injected as never[]).find(
-        (m: any) =>
-          m.parts?.[0]?.metadata?.['oh-my-opencode-slim.backgroundJobBoard'] ===
-          true,
+      (t.injected as never[]).find((m: any) =>
+        m.parts?.some(
+          (p: any) =>
+            p?.metadata?.['oh-my-opencode-slim.backgroundJobBoard'] === true,
+        ),
       );
 
     const s1turn1 = JSON.stringify(sortValue(boardMessageOf(turn1)));
     const s1turn2 = JSON.stringify(sortValue(boardMessageOf(turn2)));
-    const lcp = commonPrefixLength(s1turn1, s1turn2);
 
-    console.log('\n=== SCENARIO B: same snapshot S1 across turns ===');
-    console.log('turn1 S1 message:', s1turn1.slice(0, 400));
-    console.log('turn2 S1 message:', s1turn2.slice(0, 400));
-    if (s1turn1 !== s1turn2) {
-      console.log(
-        `transform-level divergence at byte ${lcp}:\n  turn1: ...${s1turn1.slice(Math.max(0, lcp - 40), lcp + 60)}\n  turn2: ...${s1turn2.slice(Math.max(0, lcp - 40), lcp + 60)}`,
-      );
-    }
+    console.log('\n=== SCENARIO B: unchanged digest across turns ===');
+    console.log('turn1 board message:', s1turn1.slice(0, 400));
 
+    // Transform-level: the board the parent already saw is replayed frozen,
+    // byte-identical — a replay can never restamp volatile info onto an
+    // already-sent message, so no new board bytes appear at all.
+    expect(s1turn1).toBe(s1turn2);
+    // The unchanged tail places nothing new: the only board in the payload is
+    // the frozen copy on the earlier anchor.
+    expect(boardPartCount(turn2)).toBe(1);
+    // Provider-level: none of that reaches the request body; transition is
+    // a pure prefix extension.
     const transition = describeTransition(
       'turn1 -> turn2 (provider bytes)',
       turn1.providerBytes,
       turn2.providerBytes,
     );
-    console.log('provider transition:', JSON.stringify(transition, null, 2));
-    console.log(
-      'provider bytes mention time.created value?',
-      turn2.providerBytes.includes(String(BASE_TIME + 120_000)),
-    );
-    console.log(
-      'provider bytes mention snapshotID/metadata/cost?',
-      turn2.providerBytes.includes('snapshotID'),
-      turn2.providerBytes.includes('backgroundJobBoard'),
-      turn2.providerBytes.includes('"cost"'),
-    );
-
-    // Transform-level: replayed historical snapshot bytes DO change
-    // (baseMessage.info spread stamps the new turn's volatile info).
-    expect(s1turn1).not.toBe(s1turn2);
-    // Provider-level: none of that reaches the request body; transition is
-    // a pure prefix extension.
     expect(transition.safe).toBe(true);
-    expect(turn2.providerBytes).not.toContain('snapshotID');
+    expect(turn2.providerBytes).not.toContain('backgroundJobBoard');
     expect(turn2.providerBytes).not.toContain(String(BASE_TIME + 120_000));
   }, 20_000);
 
@@ -508,4 +500,221 @@ describe('checkpoint-compatible board cache safety', () => {
       );
     }
   }, 20_000);
+
+  // ── Compaction keeps snapshots whose anchors survive (#1457) ──────────
+
+  test('keeps retained snapshots whose anchors survive a compaction', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map scheduler hooks',
+    });
+    const hook = createHook(board);
+
+    const history: unknown[] = [
+      userMsg('msg_u1', 'Coordinate the refactor work', BASE_TIME),
+    ];
+    await runTurn(hook, history);
+
+    history.push(
+      assistantMsg('msg_a1', 'step', BASE_TIME + 30_000, 0.01, 5000),
+    );
+    history.push(userMsg('msg_u2', 'Continue', BASE_TIME + 60_000));
+    board.registerLaunch({
+      taskID: 'child-2',
+      parentSessionID: SESSION,
+      agent: 'oracle',
+      description: 'review plan',
+    });
+    await runTurn(hook, history);
+
+    history.push(
+      assistantMsg('msg_a2', 'more', BASE_TIME + 90_000, 0.02, 7000),
+    );
+    history.push(userMsg('msg_u3', 'Keep going', BASE_TIME + 120_000));
+    board.registerLaunch({
+      taskID: 'child-3',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'look up docs',
+    });
+    const before = await runTurn(hook, history);
+    const boardIDs = (r: TurnResult) =>
+      summarizeInjected(r.injected as never).filter((s) =>
+        s.startsWith('BOARD('),
+      );
+    expect(boardIDs(before).length).toBe(3);
+
+    // Compaction: the oldest messages disappear, later anchors remain.
+    const compacted = history.slice(2);
+    const after = await runTurn(hook, compacted);
+
+    // Boards anchored on surviving messages are replayed unchanged (same
+    // bytes on the same anchors): compaction never re-renders them.
+    const surviving = boardIDs(before).slice(1);
+    expect(boardIDs(after)).toEqual(surviving);
+    expect(boardPartCount(after)).toBe(boardPartCount(before) - 1);
+
+    // The provider-visible prompt (text and snapshot placement among real
+    // messages) must also be unchanged for the surviving suffix.
+    const visible = (r: TurnResult) => {
+      const items = r.injected as any[];
+      const start = items.findIndex((m) => m.info.id === 'msg_u2');
+      const end = items.findIndex((m) => m.info.id === 'msg_u3');
+      return serializeMessages(items.slice(start, end));
+    };
+    expect(visible(after)).toBe(visible(before));
+  }, 20_000);
+
+  test("replays a surviving duplicate's frozen board as a byte prefix", async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map scheduler hooks',
+    });
+    const hook = createHook(board);
+    const anon = (t: number) => {
+      const m = userMsg('x', 'Continue', t) as any;
+      delete m.info.id;
+      return m;
+    };
+
+    const history: unknown[] = [anon(BASE_TIME)];
+    await runTurn(hook, history);
+    history.push(anon(BASE_TIME + 30_000));
+    board.registerLaunch({
+      taskID: 'child-2',
+      parentSessionID: SESSION,
+      agent: 'oracle',
+      description: 'review plan',
+    });
+    const before = await runTurn(hook, history);
+    expect(boardPartCount(before)).toBe(2);
+
+    // Drop the first identical message. The survivor is anonymous and
+    // content-identical to the removed one, so its anchor key is reused and
+    // a single frozen board is replayed onto it — never two, never a stale
+    // second copy stacked on the survivor.
+    const after = await runTurn(hook, history.slice(1));
+    expect(boardPartCount(after)).toBe(1);
+  }, 20_000);
+});
+
+describe('structural flavor split (v2 boardless)', () => {
+  test('v2: no board text is injected even with active jobs', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    const hook = createHook(board, 'v2');
+    const turn = await runTurn(hook, [
+      userMsg('msg_u_sw_off', 'Coordinate the refactor work', BASE_TIME),
+    ]);
+    expect(turn.transformBytes).not.toContain('Background Job Board');
+  });
+
+  test('v1 (default): the board keeps being injected', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    const hook = createHook(board);
+    const turn = await runTurn(hook, [
+      userMsg('msg_u_sw_on', 'Coordinate the refactor work', BASE_TIME),
+    ]);
+    expect(turn.transformBytes).toContain('Background Job Board');
+  });
+
+  test('v2: never registers jobs; observed deliveries retire only completed ones', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-done',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-done',
+      state: 'completed',
+      resultSummary: 'done',
+      now: BASE_TIME + 60_000,
+    });
+    board.registerLaunch({
+      taskID: 'child-stopped',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+    });
+    board.updateStatus({
+      taskID: 'child-stopped',
+      state: 'stopped',
+      resultSummary: 'stopped without a terminal result',
+      now: BASE_TIME + 60_000,
+    });
+    const hook = createHook(board, 'v2');
+
+    // First real turn: nothing registers against the prompt shape — both
+    // jobs stay unreconciled (the stopped job for the recovery wake, the
+    // completed job until its native delivery is observed).
+    await runTurn(hook, [
+      userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
+    ]);
+    expect(board.getState('child-done')).toBe('completed');
+    expect(board.getState('child-stopped')).toBe('stopped');
+    expect(board.get('child-stopped')).toMatchObject({
+      terminalUnreconciled: true,
+    });
+
+    // A later turn still retires nothing on its own: retirement is
+    // observation-based, not prompt-shape-based. (The stale-terminal
+    // fallback cannot fire here — the terminal reports are newer than the
+    // fixture assistant turn.)
+    await runTurn(hook, [
+      userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
+      assistantMsg('msg_a_off_1', 'consumed the result', BASE_TIME + 1, 1, 10),
+      userMsg('msg_u_off_2', 'next step', BASE_TIME + 2),
+    ]);
+    expect(board.getState('child-done')).toBe('completed');
+    expect(board.getState('child-stopped')).toBe('stopped');
+    expect(board.get('child-stopped')).toMatchObject({
+      terminalUnreconciled: true,
+    });
+
+    // The host's native delivery for the completed job retires it; the
+    // stopped job stays for the recovery flow.
+    await runTurn(hook, [
+      userMsg('msg_u_off_1', 'Coordinate the refactor work', BASE_TIME),
+      assistantMsg('msg_a_off_1', 'consumed the result', BASE_TIME + 1, 1, 10),
+      {
+        info: { id: 'msg_native_1', sessionID: SESSION, role: 'user' },
+        parts: [
+          {
+            type: 'text',
+            text: '<subagent sessionID="child-done" state="completed" description="map hooks">\ndone\n</subagent>',
+            metadata: {
+              source: 'subagent',
+              childID: 'child-done',
+              state: 'completed',
+            },
+          },
+        ],
+      },
+      userMsg('msg_u_off_2', 'next step', BASE_TIME + 2),
+    ]);
+    expect(board.getState('child-done')).toBe('reconciled');
+    expect(board.getState('child-stopped')).toBe('stopped');
+    expect(board.get('child-stopped')).toMatchObject({
+      terminalUnreconciled: true,
+    });
+  });
 });

@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test';
 import * as fs from 'node:fs/promises';
 import { get } from 'node:http';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { createDashboardServer } from './dashboard';
 import { bindFreePort } from './test-port';
@@ -35,7 +36,7 @@ async function startDashboard() {
 
 // Helper to create a temp directory with interview files
 async function createTempInterviewDir() {
-  const tempDir = await fs.mkdtemp('/tmp/dashboard-test-');
+  const tempDir = await fs.mkdtemp(path.join(tmpdir(), 'dashboard-test-'));
   const interviewDir = path.join(tempDir, 'interview');
   await fs.mkdir(interviewDir, { recursive: true });
   return tempDir;
@@ -114,6 +115,165 @@ async function openSseConnection(
 }
 
 describe('dashboard server', () => {
+  test('uses each manual folder project outputFolder', async () => {
+    const originalEnv = { ...process.env };
+    const tempDir = await fs.mkdtemp(path.join(tmpdir(), 'dashboard-project-'));
+    const userConfigDir = await fs.mkdtemp(
+      path.join(tmpdir(), 'dashboard-user-config-'),
+    );
+    try {
+      delete process.env.OPENCODE_CONFIG_DIR;
+      process.env.XDG_CONFIG_HOME = userConfigDir;
+
+      const configDir = path.join(tempDir, '.opencode');
+      await fs.mkdir(configDir, { recursive: true });
+      await fs.writeFile(
+        path.join(configDir, 'oh-my-opencode-slim.json'),
+        JSON.stringify({ interview: { outputFolder: 'specs' } }),
+      );
+      await fs.mkdir(path.join(tempDir, 'specs'));
+      await fs.writeFile(
+        path.join(tempDir, 'specs', 'foo.md'),
+        '# Foo\n\n## Summary\nA spec',
+      );
+
+      const { port, server } = await bindFreePort();
+      const dashboard = createDashboardServer({
+        port,
+        outputFolder: 'interview',
+        server,
+      });
+      dashboard.addManualFolder(tempDir);
+      try {
+        const baseUrl = await dashboard.start();
+        const response = await fetch(
+          `${baseUrl}/api/files?token=${dashboard.authToken}`,
+        );
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({
+          files: expect.arrayContaining([
+            expect.objectContaining({ fileName: 'foo.md' }),
+          ]),
+        });
+      } finally {
+        dashboard.close();
+      }
+    } finally {
+      process.env = originalEnv;
+      await fs.rm(tempDir, { recursive: true, force: true });
+      await fs.rm(userConfigDir, { recursive: true, force: true });
+    }
+  });
+
+  test('falls back to the default folder for projects without interview config', async () => {
+    const originalEnv = { ...process.env };
+    const tempDir = await fs.mkdtemp(
+      path.join(tmpdir(), 'dashboard-projects-'),
+    );
+    const userConfigDir = await fs.mkdtemp(
+      path.join(tmpdir(), 'dashboard-user-config-'),
+    );
+    try {
+      delete process.env.OPENCODE_CONFIG_DIR;
+      process.env.XDG_CONFIG_HOME = userConfigDir;
+      const ownerDir = path.join(tempDir, 'owner');
+      const secondDir = path.join(tempDir, 'second');
+      await fs.mkdir(path.join(ownerDir, '.opencode'), { recursive: true });
+      await fs.writeFile(
+        path.join(ownerDir, '.opencode', 'oh-my-opencode-slim.json'),
+        JSON.stringify({ interview: { outputFolder: 'specs' } }),
+      );
+      await fs.mkdir(path.join(ownerDir, 'specs'), { recursive: true });
+      await fs.mkdir(path.join(secondDir, 'interview'), { recursive: true });
+      await fs.writeFile(
+        path.join(secondDir, 'interview', 'x.md'),
+        '# X\n\n## Summary\nA spec',
+      );
+
+      const { port, server } = await bindFreePort();
+      const dashboard = createDashboardServer({
+        port,
+        outputFolder: 'specs',
+        server,
+      });
+      dashboard.addManualFolder(ownerDir);
+      dashboard.addManualFolder(secondDir);
+      try {
+        const baseUrl = await dashboard.start();
+        const response = await fetch(
+          `${baseUrl}/api/files?token=${dashboard.authToken}`,
+        );
+        expect(await response.json()).toMatchObject({
+          files: expect.arrayContaining([
+            expect.objectContaining({ fileName: 'x.md', directory: secondDir }),
+          ]),
+        });
+      } finally {
+        dashboard.close();
+      }
+    } finally {
+      process.env = originalEnv;
+      await fs.rm(tempDir, { recursive: true, force: true });
+      await fs.rm(userConfigDir, { recursive: true, force: true });
+    }
+  });
+
+  test('uses v2 ancestor project config for manual folders', async () => {
+    const originalEnv = { ...process.env };
+    const tempDir = await fs.mkdtemp(path.join(tmpdir(), 'dashboard-v2-'));
+    const userConfigDir = await fs.mkdtemp(
+      path.join(tmpdir(), 'dashboard-user-config-'),
+    );
+    try {
+      delete process.env.OPENCODE_CONFIG_DIR;
+      process.env.XDG_CONFIG_HOME = userConfigDir;
+      const ancestorDir = path.join(tempDir, 'workspace');
+      const repoDir = path.join(ancestorDir, 'repo');
+      await fs.mkdir(path.join(ancestorDir, '.opencode'), { recursive: true });
+      await fs.writeFile(
+        path.join(ancestorDir, '.opencode', 'oh-my-opencode-slim.json'),
+        JSON.stringify({ interview: { outputFolder: 'specs' } }),
+      );
+      await fs.mkdir(path.join(repoDir, '.git'), { recursive: true });
+      await fs.mkdir(path.join(repoDir, '.opencode'), { recursive: true });
+      await fs.writeFile(
+        path.join(repoDir, '.opencode', 'oh-my-opencode-slim.json'),
+        JSON.stringify({ interview: { dashboard: true } }),
+      );
+      await fs.mkdir(path.join(repoDir, 'specs'));
+      await fs.writeFile(
+        path.join(repoDir, 'specs', 'x.md'),
+        '# X\n\n## Summary\nA spec',
+      );
+
+      const { port, server } = await bindFreePort();
+      const dashboard = createDashboardServer({
+        port,
+        outputFolder: 'interview',
+        hostFlavor: 'v2',
+        server,
+      });
+      dashboard.addManualFolder(repoDir);
+      try {
+        const baseUrl = await dashboard.start();
+        const response = await fetch(
+          `${baseUrl}/api/files?token=${dashboard.authToken}`,
+        );
+        expect(await response.json()).toMatchObject({
+          files: expect.arrayContaining([
+            expect.objectContaining({ fileName: 'x.md', directory: repoDir }),
+          ]),
+        });
+      } finally {
+        dashboard.close();
+      }
+    } finally {
+      process.env = originalEnv;
+      await fs.rm(tempDir, { recursive: true, force: true });
+      await fs.rm(userConfigDir, { recursive: true, force: true });
+    }
+  });
+
   describe('server lifecycle', () => {
     test('close is safe before start and repeated', () => {
       const dashboard = createDashboardServer({
@@ -324,6 +484,98 @@ describe('dashboard server', () => {
         // State doesn't exist yet, but session was registered
       } finally {
         cleanup();
+      }
+    });
+
+    test('uses a registered session output folder for its directory', async () => {
+      const originalEnv = { ...process.env };
+      const tempDir = await fs.mkdtemp(
+        path.join(tmpdir(), 'dashboard-register-'),
+      );
+      const userConfigDir = await fs.mkdtemp(
+        path.join(tmpdir(), 'dashboard-user-config-'),
+      );
+      delete process.env.OPENCODE_CONFIG_DIR;
+      process.env.XDG_CONFIG_HOME = userConfigDir;
+      await fs.mkdir(path.join(tempDir, 'specs'));
+      await fs.writeFile(
+        path.join(tempDir, 'specs', 'x.md'),
+        '# X\n\n## Summary\nA spec',
+      );
+      const { baseUrl, authToken, dashboard, cleanup } = await startDashboard();
+      dashboard.addManualFolder(tempDir);
+      try {
+        const response = await fetch(
+          `${baseUrl}/api/register?token=${authToken}`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              sessionID: 'session-registered-folder',
+              directory: tempDir,
+              outputFolder: 'specs',
+            }),
+            headers: { 'content-type': 'application/json' },
+          },
+        );
+        expect(response.status).toBe(200);
+        expect(
+          await (await fetch(`${baseUrl}/api/files?token=${authToken}`)).json(),
+        ).toMatchObject({
+          files: expect.arrayContaining([
+            expect.objectContaining({ fileName: 'x.md', directory: tempDir }),
+          ]),
+        });
+      } finally {
+        cleanup();
+        process.env = originalEnv;
+        await fs.rm(tempDir, { recursive: true, force: true });
+        await fs.rm(userConfigDir, { recursive: true, force: true });
+      }
+    });
+
+    test('ignores invalid registered output folders', async () => {
+      const originalEnv = { ...process.env };
+      const tempDir = await fs.mkdtemp(
+        path.join(tmpdir(), 'dashboard-invalid-'),
+      );
+      const userConfigDir = await fs.mkdtemp(
+        path.join(tmpdir(), 'dashboard-user-config-'),
+      );
+      delete process.env.OPENCODE_CONFIG_DIR;
+      process.env.XDG_CONFIG_HOME = userConfigDir;
+      await fs.mkdir(path.join(tempDir, 'interview'));
+      await fs.writeFile(
+        path.join(tempDir, 'interview', 'x.md'),
+        '# X\n\n## Summary\nA spec',
+      );
+      const { baseUrl, authToken, dashboard, cleanup } = await startDashboard();
+      dashboard.addManualFolder(tempDir);
+      try {
+        const response = await fetch(
+          `${baseUrl}/api/register?token=${authToken}`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              sessionID: 'session-invalid-folder',
+              directory: tempDir,
+              outputFolder: '../evil',
+            }),
+            headers: { 'content-type': 'application/json' },
+          },
+        );
+        expect(response.status).toBe(200);
+        expect(
+          await (await fetch(`${baseUrl}/api/files?token=${authToken}`)).json(),
+        ).toMatchObject({
+          files: expect.arrayContaining([
+            expect.objectContaining({ fileName: 'x.md', directory: tempDir }),
+          ]),
+        });
+      } finally {
+        cleanup();
+        process.env = originalEnv;
+        await fs.rm(tempDir, { recursive: true, force: true });
+        await fs.rm(userConfigDir, { recursive: true, force: true });
       }
     });
 
@@ -689,10 +941,9 @@ describe('dashboard server', () => {
         const data = (await response.json()) as { document: string };
         expect(data.document).toContain('# Test Document');
         expect(data.document).toContain('Content here.');
-
-        await fs.rm(tempDir, { recursive: true, force: true });
       } finally {
         cleanup();
+        await fs.rm(tempDir, { recursive: true, force: true });
       }
     });
 
@@ -1717,12 +1968,11 @@ describe('dashboard server', () => {
         // os.homedir() is always scanned, so other files may appear.
         // Assert our file is present rather than asserting exact count.
         const ourFile = data.files.find((f) => f.fileName === 'test-file.md');
-        expect(ourFile).toBeDefined();
+        expect(ourFile?.fileName).toBe('test-file.md');
         expect(ourFile?.title).toBe('Test File');
-
-        await fs.rm(tempDir, { recursive: true, force: true });
       } finally {
         cleanup();
+        await fs.rm(tempDir, { recursive: true, force: true });
       }
     });
 

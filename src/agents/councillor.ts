@@ -1,11 +1,15 @@
 import { NO_SHELL_READONLY_FILE_OPERATIONS_RULES } from '../config';
 import { type AgentDefinition, resolvePrompt } from './orchestrator';
-import { createReadOnlyAgentPermission } from './permissions';
+import {
+  createReadOnlyAgentPermission,
+  TASK_OBSERVER_DISPATCH_ONLY,
+} from './permissions';
 
 /**
  * Councillor agent - a read-only advisor in the multi-LLM council.
  *
- * Councillors are dispatched by the orchestrator via task() as agent sessions
+ * Councillors are dispatched by the orchestrator (via `task()` on v1,
+ * `subagent()` on v2) as agent sessions
  * (visible in tmux/UI). They have read-only access to the codebase via tools
  * but CANNOT modify files, run shell commands, or spawn subagents.
  *
@@ -56,6 +60,7 @@ export function createCouncillorAgent(
   customPrompt?: string,
   customAppendPrompt?: string,
   variant?: string,
+  observerDispatchEnabled = false,
 ): AgentDefinition {
   const prompt = resolvePrompt(
     'councillor',
@@ -68,13 +73,22 @@ export function createCouncillorAgent(
   return {
     name: 'councillor',
     description:
-      'Read-only council advisor. Examines codebase and provides independent analysis. Spawned internally by the council system.',
+      'Read-only council advisor providing independent codebase analysis.',
     config: {
       model,
       variant,
       prompt,
-      // Strict read-only allowlist: deny all, then allow inspection tools only.
-      permission: createReadOnlyAgentPermission(),
+      // Strict read-only allowlist: deny all, then allow inspection tools
+      // only. `task` stays at the blanket deny unless nested dispatch is
+      // live (v2 + observer enabled), where it narrows to observer-only so
+      // a councillor can have images read for it without gaining any other
+      // spawning capability.
+      permission: {
+        ...createReadOnlyAgentPermission(),
+        task: observerDispatchEnabled
+          ? { ...TASK_OBSERVER_DISPATCH_ONLY }
+          : 'deny',
+      },
     },
   };
 }

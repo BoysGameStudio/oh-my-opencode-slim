@@ -3,6 +3,8 @@
  * in-flight ownership. Shared across independently created hook instances in
  * the same JS process via globalThis + Symbol.for.
  */
+
+import { getGlobalStore } from '../../utils/global-store';
 import type { ContinuationModelSelection } from '../task-session-manager/continuation-model-selection';
 
 export type WakeProgressState = {
@@ -20,24 +22,40 @@ type WakeGateStore = {
   progress: Map<string, WakeProgressState>;
   inFlight: Map<string, InFlightState>;
   releaseWaiters: Map<string, Set<() => void>>;
+  /** #1411: per session, delta-less wake bodies already delivered with
+   * occurrence counts. */
+  deliveredDeltalessWakeTexts: Map<string, Map<string, number>>;
+  /** #1411: per session, count of duplicate delta-less wakes suppressed. */
+  suppressedDuplicateWakes: Map<string, number>;
   /** Insertion-ordered session keys for bounded eviction. */
   order: string[];
 };
 
-const STORE_KEY = Symbol.for('oh-my-opencode-slim.orchestrator-wake-gate');
+const STORE_KEY = 'oh-my-opencode-slim.orchestrator-wake-gate';
+const HOLDERS_KEY = 'oh-my-opencode-slim.orchestrator-wake-gate-holders';
 const MAX_TRACKED_SESSIONS = 256;
+const MAX_HOLDER_SESSIONS = 512;
+
+/** Hook instances (by token) that serve each tracked session. Separate key so
+ * a store created by an older module generation never lacks it. */
+function getHolders(): Map<string, Set<symbol>> {
+  return getGlobalStore<Map<string, Set<symbol>>>(HOLDERS_KEY, () => new Map());
+}
 
 function getStore(): WakeGateStore {
-  const globalWithStore = globalThis as typeof globalThis & {
-    [STORE_KEY]?: WakeGateStore;
-  };
-  globalWithStore[STORE_KEY] ??= {
+  const store = getGlobalStore<WakeGateStore>(STORE_KEY, () => ({
     progress: new Map(),
     inFlight: new Map(),
     releaseWaiters: new Map(),
+    deliveredDeltalessWakeTexts: new Map(),
+    suppressedDuplicateWakes: new Map(),
     order: [],
-  };
-  return globalWithStore[STORE_KEY];
+  }));
+  // In-process reload can leave a pre-#1411 store object on the global key;
+  // backfill so the delta-less wake path cannot crash on missing maps.
+  store.deliveredDeltalessWakeTexts ??= new Map();
+  store.suppressedDuplicateWakes ??= new Map();
+  return store;
 }
 
 function touchOrder(sessionID: string): void {
@@ -156,6 +174,95 @@ export function commitWakeReservation(
   return true;
 }
 
+/**
+ * #1411: record a delta-less wake body about to be delivered. First
+ * occurrence stores count 1 and returns `repeat: false`; every identical
+ * body afterwards increments the count, bumps the per-session suppressed
+ * counter, and returns `repeat: true` with the new occurrence number.
+ * `reservation` is the map the count was written into: a rollback only
+ * applies while that exact map is still the session's, so an eviction that
+ * replaced it makes a stale rollback a no-op.
+ */
+export function reserveWakeBodyOccurrence(
+  sessionID: string,
+  wakeText: string,
+): {
+  repeat: boolean;
+  occurrence: number;
+  reservation: Map<string, number>;
+} {
+  const store = getStore();
+  let counts = store.deliveredDeltalessWakeTexts.get(sessionID);
+  if (!counts) {
+    counts = new Map();
+    store.deliveredDeltalessWakeTexts.set(sessionID, counts);
+  }
+  touchOrder(sessionID);
+  const previous = counts.get(wakeText) ?? 0;
+  const occurrence = previous + 1;
+  counts.set(wakeText, occurrence);
+  if (previous > 0) {
+    store.suppressedDuplicateWakes.set(
+      sessionID,
+      (store.suppressedDuplicateWakes.get(sessionID) ?? 0) + 1,
+    );
+  }
+  return { repeat: previous > 0, occurrence, reservation: counts };
+}
+
+/** #1411 observability: suppressed duplicate wake count for a session. */
+export function getSuppressedDuplicateWakes(sessionID: string): number {
+  return getStore().suppressedDuplicateWakes.get(sessionID) ?? 0;
+}
+
+/**
+ * #1411: undo the occurrence a failed send reserved, so the retry delivers
+ * the full text instead of a phantom repeat. Removes the sole occurrence
+ * outright; an occurrence that was a counted repeat also undoes its
+ * suppression count (floored at 0). `reservation` and `occurrence` must be
+ * what the caller's `reserveWakeBodyOccurrence` returned: if the session's
+ * occurrence map has since been replaced (LRU eviction, hook disposal,
+ * session deletion) or the count moved on to a newer reservation, this is a
+ * no-op so a stale send cannot undo someone else's reservation.
+ */
+export function rollbackWakeBodyOccurrence(
+  sessionID: string,
+  wakeText: string,
+  occurrence: number,
+  reservation: Map<string, number>,
+): void {
+  const store = getStore();
+  const counts = store.deliveredDeltalessWakeTexts.get(sessionID);
+  if (counts !== reservation || reservation.get(wakeText) !== occurrence) {
+    return;
+  }
+  if (occurrence === 1) {
+    reservation.delete(wakeText);
+    return;
+  }
+  reservation.set(wakeText, occurrence - 1);
+  store.suppressedDuplicateWakes.set(
+    sessionID,
+    Math.max(0, (store.suppressedDuplicateWakes.get(sessionID) ?? 0) - 1),
+  );
+}
+
+/** A failed send did not make progress. Only its current in-flight owner may
+ * undo the cap accounting; keep wakeCommitted so release cannot start a
+ * waiter storm (the session timer controls the next attempt). */
+export function rollbackWakeReservation(
+  sessionID: string,
+  owner: symbol,
+): void {
+  const store = getStore();
+  const flight = store.inFlight.get(sessionID);
+  if (flight?.owner !== owner || !flight.wakeCommitted) return;
+  const progress = store.progress.get(sessionID);
+  if (!progress) return;
+  progress.unchangedWakeCount = Math.max(0, progress.unchangedWakeCount - 1);
+  progress.stopped = false;
+}
+
 /** Host fingerprint changed: reset the two-wake no-progress cap. */
 export function noteHostProgress(sessionID: string, fingerprint: string): void {
   const progress = getWakeProgress(sessionID);
@@ -202,12 +309,55 @@ export function getObservedWakeModel(
   return getStore().progress.get(sessionID)?.observedModel;
 }
 
+/** Record that the hook identified by `holder` serves this session. */
+export function claimWakeSession(sessionID: string, holder: symbol): void {
+  const holders = getHolders();
+  const set = holders.get(sessionID) ?? new Set<symbol>();
+  set.add(holder);
+  // LRU touch, bounded on its own so claims never evict progress entries. An
+  // evicted claim only means disposal leaves that session to the gate's own
+  // eviction or the last-instance clear.
+  holders.delete(sessionID);
+  holders.set(sessionID, set);
+  while (holders.size > MAX_HOLDER_SESSIONS) {
+    const oldest = holders.keys().next().value;
+    if (oldest === undefined) break;
+    holders.delete(oldest);
+  }
+}
+
+/**
+ * One hook instance's disposal while others stay live: drop the wake state of
+ * the sessions only that hook served, so a reloaded generation for its
+ * location starts with fresh no-progress caps, while sessions another live
+ * hook still serves keep theirs. The disposing hook releases its own
+ * in-flight reservations first, so a reservation still present belongs to a
+ * live hook and is left in place together with its release waiters.
+ */
+export function releaseWakeSessionHolder(holder: symbol): void {
+  const store = getStore();
+  for (const [sessionID, set] of [...getHolders()]) {
+    if (!set.delete(holder) || set.size > 0) continue;
+    if (store.inFlight.has(sessionID)) {
+      store.progress.delete(sessionID);
+      store.deliveredDeltalessWakeTexts.delete(sessionID);
+      store.suppressedDuplicateWakes.delete(sessionID);
+      getHolders().delete(sessionID);
+    } else {
+      clearWakeSession(sessionID);
+    }
+  }
+}
+
 /** Full session cleanup (deletion or disposal). */
 export function clearWakeSession(sessionID: string): void {
   const store = getStore();
+  getHolders().delete(sessionID);
   store.progress.delete(sessionID);
   store.inFlight.delete(sessionID);
   store.releaseWaiters.delete(sessionID);
+  store.deliveredDeltalessWakeTexts.delete(sessionID);
+  store.suppressedDuplicateWakes.delete(sessionID);
   const idx = store.order.indexOf(sessionID);
   if (idx >= 0) store.order.splice(idx, 1);
 }
@@ -218,7 +368,10 @@ export function clearAllWakeSessions(): void {
   store.progress.clear();
   store.inFlight.clear();
   store.releaseWaiters.clear();
+  store.deliveredDeltalessWakeTexts.clear();
+  store.suppressedDuplicateWakes.clear();
   store.order.length = 0;
+  getHolders().clear();
 }
 
 /** Test seam. */

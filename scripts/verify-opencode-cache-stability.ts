@@ -411,11 +411,20 @@ function assertStability(requests: Capture[]) {
   }
   const reminderCount = (value: string) =>
     value.split(PHASE_REMINDER_TEXT).length - 1;
-  const eligible = [...firstTurn, ...secondTurn];
-  if (eligible.some((projection) => reminderCount(projection) !== 1)) {
-    fail(
-      `Expected exactly one reminder per eligible user message:\n${redact(eligible)}`,
-    );
+  // First-anchor invariant (supersedes PR #790's per-message form): exactly
+  // one reminder per session view, carried by the first eligible user
+  // projection; every later eligible projection carries none.
+  for (const [label, projections] of [
+    ['first turn', firstTurn],
+    ['second turn', secondTurn],
+  ] as const) {
+    const counts = projections.map(reminderCount);
+    const total = counts.reduce((sum, count) => sum + count, 0);
+    if (total !== 1 || counts[0] !== 1) {
+      fail(
+        `Expected exactly one anchored reminder on the first eligible user projection of the ${label}, with none on later eligible projections:\n${redact(projections)}`,
+      );
+    }
   }
   const toolNames = payloads
     .flatMap((body) => (Array.isArray(body.tools) ? body.tools : []))

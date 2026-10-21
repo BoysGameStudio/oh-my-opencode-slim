@@ -12,12 +12,18 @@
  * see https://github.com/alvinunreal/oh-my-opencode-slim/issues/894.
  */
 
-/** Minimum expected registrations for a healthy plugin load. */
+/**
+ * Minimum expected registrations for a healthy plugin load.
+ *
+ * On v2 hosts `wait_for_user` is unregistered (the native
+ * `question` tool covers the blocking boundary), so the v2 floor drops
+ * by one.
+ */
 export const HEALTH_CHECK = {
   minAgents: 5,
   // Default tool set when council and ACP agents are not configured:
-  // task_cancel, task_message, task_revive, task_status, task_result,
-  // wait_for_user, webfetch, ast_grep_search, ast_grep_replace.
+  // task_cancel, task_message, task_revive, task_status,
+  // task_reply, wait_for_user, webfetch, ast_grep_search, ast_grep_replace.
   minTools: 9,
   minMcps: 1,
 } as const;
@@ -27,7 +33,7 @@ const BASELINE_TOOL_NAMES = new Set([
   'task_message',
   'task_revive',
   'task_status',
-  'task_result',
+  'task_reply',
   'wait_for_user',
   'webfetch',
   'ast_grep_search',
@@ -42,11 +48,15 @@ const BASELINE_TOOL_NAMES = new Set([
  *   values (which should never occur post-validation, but are not trusted at
  *   runtime) are treated as "nothing disabled".
  * @param webfetchEnabled - Whether the enhanced webfetch tool is registered.
+ * @param waitForUserEnabled - Whether the wait_for_user tool is registered
+ *   (false on v2 hosts; the native `question` tool covers the
+ *   blocking boundary there).
  * @returns The adjusted minimum expected tool count
  */
 export function minimumExpectedToolCount(
   disabledTools: readonly string[] = [],
   webfetchEnabled = true,
+  waitForUserEnabled = true,
 ): number {
   // Config values come from user-edited JSON/JSONC (and can be re-derived
   // via runtime preset switches); never trust the declared type at
@@ -57,11 +67,16 @@ export function minimumExpectedToolCount(
     safeDisabledTools.filter(
       (toolName) =>
         BASELINE_TOOL_NAMES.has(toolName) &&
-        (toolName !== 'webfetch' || webfetchEnabled),
+        (toolName !== 'webfetch' || webfetchEnabled) &&
+        (toolName !== 'wait_for_user' || waitForUserEnabled),
     ),
   );
   const webfetchAdjustment = webfetchEnabled ? 0 : 1;
+  const waitForUserAdjustment = waitForUserEnabled ? 0 : 1;
   return (
-    HEALTH_CHECK.minTools - webfetchAdjustment - disabledBaselineTools.size
+    HEALTH_CHECK.minTools -
+    webfetchAdjustment -
+    waitForUserAdjustment -
+    disabledBaselineTools.size
   );
 }

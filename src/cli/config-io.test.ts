@@ -1,26 +1,45 @@
 /// <reference types="bun-types" />
 
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test';
+import * as fs from 'node:fs';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as marketplaceLease from '../marketplace/lease';
 import {
   addPluginToOpenCodeConfig,
   addPluginToOpenCodeTuiConfig,
   detectCurrentConfig,
-  disableDefaultAgents,
   enableLspByDefault,
+  mutateJsonFile,
   parseConfig,
   parseConfigFile,
+  prepareJsonConfigWrite,
+  publishPreparedJsonConfig,
+  removeTopLevelJsonProperty,
+  restorePreparedJsonConfig,
   stripJsonComments,
   writeConfig,
+  writeJsonAtomic,
   writeLiteConfig,
 } from './config-io';
 import * as paths from './paths';
@@ -38,7 +57,10 @@ describe('config-io', () => {
   });
 
   afterEach(() => {
-    process.env = { ...originalEnv };
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
     process.argv = [...originalArgv];
     if (tmpDir && existsSync(tmpDir)) {
       rmSync(tmpDir, { recursive: true, force: true });
@@ -128,6 +150,452 @@ describe('config-io', () => {
     });
   });
 
+  test('mutateJsonFile backup replaces a symlink instead of overwriting its target', () => {
+    const path = join(tmpDir, 'symlink-safe.jsonc');
+    const victim = join(tmpDir, 'victim.txt');
+    const backup = `${path}.bak`;
+    writeFileSync(path, '{"preset":"old"}');
+    writeFileSync(victim, 'do-not-touch');
+    symlinkSync(victim, backup);
+
+    mutateJsonFile(path, (current) => ({ ...current, preset: 'new' }));
+
+    expect(readFileSync(victim, 'utf8')).toBe('do-not-touch');
+    expect(lstatSync(backup).isSymbolicLink()).toBe(false);
+    expect(JSON.parse(readFileSync(backup, 'utf8'))).toEqual({
+      preset: 'old',
+    });
+  });
+
+  test('removeTopLevelJsonProperty preserves trailing comments on the previous property', () => {
+    const path = join(tmpDir, 'remove-last-property.jsonc');
+    writeFileSync(
+      path,
+      `{
+  "companion": { "enabled": true }, // keep this explanation
+  "preset": "local",
+}
+`,
+    );
+
+    removeTopLevelJsonProperty(path, 'preset');
+
+    const savedText = readFileSync(path, 'utf-8');
+    expect(savedText).toContain('// keep this explanation');
+    expect(JSON.parse(stripJsonComments(savedText))).toEqual({
+      companion: { enabled: true },
+    });
+    expect(readFileSync(`${path}.bak`, 'utf-8')).toContain('"preset": "local"');
+  });
+
+  test('removeTopLevelJsonProperty removes duplicate keys without losing unrelated JSONC comments', () => {
+    const path = join(tmpDir, 'remove-duplicate-properties.jsonc');
+    writeFileSync(
+      path,
+      `{
+  "preset": "first",
+  // keep companion comment
+  "companion": { "enabled": true },
+  "preset": "second",
+  // keep unrelated comment
+  "unrelated": 42,
+  "preset": "third",
+}
+`,
+    );
+
+    removeTopLevelJsonProperty(path, 'preset');
+
+    const savedText = readFileSync(path, 'utf-8');
+    expect(savedText.match(/"preset"\s*:/g) ?? []).toHaveLength(0);
+    expect(savedText).toContain('// keep companion comment');
+    expect(savedText).toContain('// keep unrelated comment');
+    expect(JSON.parse(stripJsonComments(savedText))).toEqual({
+      companion: { enabled: true },
+      unrelated: 42,
+    });
+    expect(readFileSync(`${path}.bak`, 'utf-8')).toContain('"preset": "third"');
+  });
+
+  test('removeTopLevelJsonProperty handles adjacent duplicate-only keys with trailing comma', () => {
+    const path = join(tmpDir, 'remove-adjacent-duplicate-properties.jsonc');
+    writeFileSync(
+      path,
+      `{
+  "preset": "first",
+  "preset": "second",
+}
+`,
+    );
+
+    removeTopLevelJsonProperty(path, 'preset');
+
+    const savedText = readFileSync(path, 'utf-8');
+    expect(savedText.match(/"preset"\s*:/g) ?? []).toHaveLength(0);
+    expect(JSON.parse(stripJsonComments(savedText))).toEqual({});
+  });
+
+  test('mutateJsonFile preserves JSONC comments and unrelated keys', () => {
+    const path = join(tmpDir, 'settings.jsonc');
+    writeFileSync(
+      path,
+      '{\n  // Keep this explanation\n  "unrelated": { "enabled": true },\n  "preset": "old",\n}\n',
+    );
+
+    mutateJsonFile(path, (current) => ({ ...current, preset: 'new' }));
+
+    const savedText = readFileSync(path, 'utf-8');
+    expect(savedText).toContain('// Keep this explanation');
+    expect(JSON.parse(stripJsonComments(savedText))).toEqual({
+      unrelated: { enabled: true },
+      preset: 'new',
+    });
+    expect(readFileSync(`${path}.bak`, 'utf-8')).toContain('"preset": "old"');
+  });
+
+  test('mutateJsonFile keeps nested field comments beside edited fields', () => {
+    const path = join(tmpDir, 'localized.jsonc');
+    writeFileSync(
+      path,
+      '{\n  "nested": {\n    // Keep by first\n    "first": 1, // first trailing\n    /* Keep by second */ "second": 2\n  },\n  "url": "https://example.com/a//b",\n}\n',
+    );
+
+    mutateJsonFile(path, (current) => {
+      (current.nested as Record<string, unknown>).first = 3;
+      return current;
+    });
+
+    const savedText = readFileSync(path, 'utf-8');
+    expect(savedText).toContain(
+      '// Keep by first\n    "first": 3, // first trailing',
+    );
+    expect(savedText).toContain('/* Keep by second */ "second": 2');
+    expect(savedText).toContain('"url": "https://example.com/a//b"');
+  });
+
+  test('mutateJsonFile adds and removes properties without relocating neighbor comments', () => {
+    const path = join(tmpDir, 'properties.jsonc');
+    writeFileSync(
+      path,
+      '{\n  // Preserve this comment\n  "neighbor": 1,\n  "removeMe": 2\n}\n',
+    );
+
+    mutateJsonFile(path, (current) => {
+      delete current.removeMe;
+      current.added = true;
+      return current;
+    });
+
+    const savedText = readFileSync(path, 'utf-8');
+    expect(savedText).toContain('// Preserve this comment\n  "neighbor": 1');
+    expect(JSON.parse(stripJsonComments(savedText))).toEqual({
+      neighbor: 1,
+      added: true,
+    });
+  });
+
+  test('mutateJsonFile preserves BOM, CRLF, and untouched JSONC bytes', () => {
+    const path = join(tmpDir, 'crlf.jsonc');
+    const original =
+      '\uFEFF{\r\n  // Keep this CRLF comment\r\n  "untouched": [1, 2],\r\n  "value": 1\r\n}\r\n';
+    writeFileSync(path, original);
+
+    mutateJsonFile(path, (current) => ({ ...current, value: 2 }));
+
+    const savedText = readFileSync(path, 'utf-8');
+    expect(savedText.startsWith('\uFEFF')).toBe(true);
+    expect(savedText).toContain('\r\n  // Keep this CRLF comment\r\n');
+    expect(savedText).toContain('"untouched": [1, 2]');
+    expect(savedText.replaceAll('\r\n', '')).not.toContain('\n');
+    expect(
+      JSON.parse(stripJsonComments(savedText.replace(/^\uFEFF/, ''))),
+    ).toEqual({
+      untouched: [1, 2],
+      value: 2,
+    });
+  });
+
+  test('mutateJsonFile is byte-identical and creates no backup for a no-op', () => {
+    const path = join(tmpDir, 'noop.jsonc');
+    const original = '{\n  // Keep exactly\n  "value": 1,\n}\n';
+    writeFileSync(path, original);
+
+    mutateJsonFile(path, (current) => current);
+
+    expect(readFileSync(path, 'utf-8')).toBe(original);
+    expect(existsSync(`${path}.bak`)).toBe(false);
+  });
+
+  test('mutateJsonFile accepts BOM-prefixed JSON and keeps the BOM and keys', () => {
+    const path = join(tmpDir, 'bom.json');
+    writeFileSync(path, '\uFEFF{\n  "unrelated": true,\n  "value": 1\n}\n');
+
+    mutateJsonFile(path, (current) => ({ ...current, value: 2 }));
+
+    const savedText = readFileSync(path, 'utf-8');
+    expect(savedText.startsWith('\uFEFF')).toBe(true);
+    expect(JSON.parse(savedText.replace(/^\uFEFF/, ''))).toEqual({
+      unrelated: true,
+      value: 2,
+    });
+    expect(readFileSync(`${path}.bak`, 'utf-8')).toContain('\uFEFF');
+  });
+
+  test('mutateJsonFile accepts BOM-prefixed JSONC and preserves comments and keys', () => {
+    const path = join(tmpDir, 'bom.jsonc');
+    writeFileSync(
+      path,
+      '\uFEFF{\n  // Keep this explanation\n  "unrelated": true,\n  "value": 1,\n}\n',
+    );
+
+    mutateJsonFile(path, (current) => ({ ...current, value: 2 }));
+
+    const savedText = readFileSync(path, 'utf-8');
+    expect(savedText.startsWith('\uFEFF')).toBe(true);
+    expect(savedText).toContain('// Keep this explanation');
+    expect(
+      JSON.parse(stripJsonComments(savedText.replace(/^\uFEFF/, ''))),
+    ).toEqual({
+      unrelated: true,
+      value: 2,
+    });
+    expect(readFileSync(`${path}.bak`, 'utf-8')).toContain('"value": 1');
+  });
+
+  test('retries failed lease cleanup after a committed config publication', () => {
+    const path = join(tmpDir, 'lease-retry.json');
+    const originalUnlink = fs.unlinkSync;
+    const unlink = spyOn(fs, 'unlinkSync');
+    let failLeaseUnlink = true;
+    unlink.mockImplementation(((target: fs.PathLike) => {
+      if (String(target).endsWith('.lease') && failLeaseUnlink) {
+        failLeaseUnlink = false;
+        throw new Error('lease unlink failure');
+      }
+      return originalUnlink.call(fs, target);
+    }) as typeof fs.unlinkSync);
+
+    expect(() => writeJsonAtomic(path, { value: 1 })).toThrow(
+      'lease unlink failure',
+    );
+    expect(JSON.parse(readFileSync(path, 'utf-8'))).toEqual({ value: 1 });
+
+    writeJsonAtomic(path, { value: 2 });
+    expect(JSON.parse(readFileSync(path, 'utf-8'))).toEqual({ value: 2 });
+  });
+
+  test('preserves publication error when lease cleanup also fails and retries', () => {
+    const path = join(tmpDir, 'failed-lease-retry.json');
+    const publish = spyOn(marketplaceLease, 'writeAtomic').mockImplementation(
+      () => {
+        throw new Error('original publication failure');
+      },
+    );
+    const originalUnlink = fs.unlinkSync;
+    const unlink = spyOn(fs, 'unlinkSync');
+    let failLeaseUnlink = true;
+    unlink.mockImplementation(((target: fs.PathLike) => {
+      if (String(target).endsWith('.lease') && failLeaseUnlink) {
+        failLeaseUnlink = false;
+        throw new Error('secondary lease unlink failure');
+      }
+      return originalUnlink.call(fs, target);
+    }) as typeof fs.unlinkSync);
+
+    expect(() => writeJsonAtomic(path, { value: 1 })).toThrow(
+      'original publication failure',
+    );
+    expect(existsSync(path)).toBe(false);
+
+    publish.mockRestore();
+    writeJsonAtomic(path, { value: 2 });
+    expect(JSON.parse(readFileSync(path, 'utf-8'))).toEqual({ value: 2 });
+  });
+
+  test('serialized JSON mutations do not lose cross-process updates', async () => {
+    const path = join(tmpDir, 'shared.json');
+    writeFileSync(path, '{"writers": 0}');
+    const script =
+      `import { mutateJsonFile } from './src/cli/config-io.ts';\n` +
+      `mutateJsonFile(process.env.CONFIG_PATH!, (current) => ({ ...current, writers: Number(current.writers) + 1 }));`;
+
+    await Promise.all(
+      Array.from({ length: 8 }, async () => {
+        const child = Bun.spawn(['bun', '-e', script], {
+          cwd: process.cwd(),
+          env: { ...process.env, CONFIG_PATH: path },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        const exitCode = await child.exited;
+        if (exitCode !== 0) {
+          throw new Error(await new Response(child.stderr).text());
+        }
+      }),
+    );
+
+    expect(JSON.parse(readFileSync(path, 'utf-8'))).toEqual({ writers: 8 });
+  });
+
+  test('failed atomic publication leaves the original config intact', () => {
+    const path = join(tmpDir, 'publication.jsonc');
+    const original = '{\n  // Existing setting\n  "value": 1,\n}\n';
+    writeFileSync(path, original);
+    const publish = spyOn(marketplaceLease, 'writeAtomic').mockImplementation(
+      () => {
+        throw new Error('publish failure');
+      },
+    );
+
+    expect(() => writeJsonAtomic(path, { value: 2 })).toThrow(
+      'publish failure',
+    );
+    expect(readFileSync(path, 'utf-8')).toBe(original);
+    expect(readFileSync(`${path}.bak`, 'utf-8')).toBe(original);
+    publish.mockRestore();
+  });
+
+  test('prepares all JSONC edits before publishing either file', () => {
+    const firstPath = join(tmpDir, 'first.jsonc');
+    const secondPath = join(tmpDir, 'second.jsonc');
+    const firstOriginal = '{\n  // First comment\n  "value": 1,\n}\n';
+    const secondOriginal = '{\n  // Second comment\n  "value": 2,\n}\n';
+    writeFileSync(firstPath, firstOriginal);
+    writeFileSync(secondPath, secondOriginal);
+
+    const prepared = [
+      prepareJsonConfigWrite(firstPath, readFileSync(firstPath, 'utf-8'), {
+        value: 10,
+      } as any),
+      prepareJsonConfigWrite(secondPath, readFileSync(secondPath, 'utf-8'), {
+        value: 20,
+      } as any),
+    ];
+
+    expect(prepared.every((write) => write.changed)).toBe(true);
+    expect(readFileSync(firstPath, 'utf-8')).toBe(firstOriginal);
+    expect(readFileSync(secondPath, 'utf-8')).toBe(secondOriginal);
+
+    for (const write of prepared) publishPreparedJsonConfig(write);
+    expect(
+      JSON.parse(stripJsonComments(readFileSync(firstPath, 'utf-8'))),
+    ).toEqual({ value: 10 });
+    expect(
+      JSON.parse(stripJsonComments(readFileSync(secondPath, 'utf-8'))),
+    ).toEqual({ value: 20 });
+  });
+
+  test('prepared no-op keeps original bytes and does not create a backup', () => {
+    const path = join(tmpDir, 'prepared-noop.jsonc');
+    const original = '\uFEFF{\r\n  // Keep exactly\r\n  "value": 1,\r\n}\r\n';
+    writeFileSync(path, original);
+
+    const prepared = prepareJsonConfigWrite(path, readFileSync(path, 'utf-8'), {
+      value: 1,
+    } as any);
+    publishPreparedJsonConfig(prepared);
+
+    expect(prepared.changed).toBe(false);
+    expect(readFileSync(path, 'utf-8')).toBe(original);
+    expect(existsSync(`${path}.bak`)).toBe(false);
+  });
+
+  test('prepared compact JSON no-op preserves file and existing backup', () => {
+    const path = join(tmpDir, 'prepared-compact-noop.json');
+    const original = '{"value":1}';
+    const backup = 'keep this backup byte-for-byte';
+    writeFileSync(path, original);
+    writeFileSync(`${path}.bak`, backup);
+    const oldTime = new Date('2020-01-01T00:00:00.000Z');
+    utimesSync(path, oldTime, oldTime);
+    utimesSync(`${path}.bak`, oldTime, oldTime);
+
+    const fileMtime = statSync(path).mtimeMs;
+    const backupMtime = statSync(`${path}.bak`).mtimeMs;
+    const prepared = prepareJsonConfigWrite(path, original, {
+      value: 1,
+    } as any);
+    publishPreparedJsonConfig(prepared);
+
+    expect(prepared.changed).toBe(false);
+    expect(prepared.content).toBe(original);
+    expect(readFileSync(path, 'utf-8')).toBe(original);
+    expect(readFileSync(`${path}.bak`, 'utf-8')).toBe(backup);
+    expect(statSync(path).mtimeMs).toBe(fileMtime);
+    expect(statSync(`${path}.bak`).mtimeMs).toBe(backupMtime);
+  });
+
+  test('prepared BOM JSON no-op preserves file and existing backup', () => {
+    const path = join(tmpDir, 'prepared-bom-noop.json');
+    const original = '\uFEFF{"value":1}';
+    const backup = 'keep this BOM backup';
+    writeFileSync(path, original);
+    writeFileSync(`${path}.bak`, backup);
+    const oldTime = new Date('2020-01-01T00:00:00.000Z');
+    utimesSync(path, oldTime, oldTime);
+    utimesSync(`${path}.bak`, oldTime, oldTime);
+
+    const fileMtime = statSync(path).mtimeMs;
+    const backupMtime = statSync(`${path}.bak`).mtimeMs;
+    const prepared = prepareJsonConfigWrite(path, original, {
+      value: 1,
+    } as any);
+    publishPreparedJsonConfig(prepared);
+
+    expect(prepared.changed).toBe(false);
+    expect(prepared.content).toBe(original);
+    expect(readFileSync(path, 'utf-8')).toBe(original);
+    expect(readFileSync(`${path}.bak`, 'utf-8')).toBe(backup);
+    expect(statSync(path).mtimeMs).toBe(fileMtime);
+    expect(statSync(`${path}.bak`).mtimeMs).toBe(backupMtime);
+  });
+
+  test('prepared unchanged malformed config still fails parsing', () => {
+    const path = join(tmpDir, 'prepared-malformed.json');
+    expect(() =>
+      prepareJsonConfigWrite(path, '{"value":', { value: 1 } as any),
+    ).toThrow('Invalid JSONC config');
+  });
+
+  test('restores exact prepared bytes and leaves the recovery backup intact', () => {
+    const firstPath = join(tmpDir, 'rollback-first.jsonc');
+    const secondPath = join(tmpDir, 'rollback-second.json');
+    const firstOriginal =
+      '\uFEFF{\r\n  // Preserve exactly\r\n  "value": 1,\r\n}\r\n';
+    const secondOriginal = '{ "value": 2 }';
+    writeFileSync(firstPath, firstOriginal);
+    writeFileSync(secondPath, secondOriginal);
+    const prepared = [
+      prepareJsonConfigWrite(firstPath, firstOriginal, { value: 10 } as any),
+      prepareJsonConfigWrite(secondPath, secondOriginal, { value: 20 } as any),
+    ];
+
+    publishPreparedJsonConfig(prepared[0]);
+    const recoveryBackup = readFileSync(`${firstPath}.bak`, 'utf-8');
+    const publish = spyOn(marketplaceLease, 'writeAtomic').mockImplementation(
+      () => {
+        throw new Error('second publication failed');
+      },
+    );
+    expect(() => publishPreparedJsonConfig(prepared[1])).toThrow(
+      'second publication failed',
+    );
+    publish.mockRestore();
+
+    restorePreparedJsonConfig(prepared[0]);
+    restorePreparedJsonConfig(prepared[1]);
+    expect(readFileSync(firstPath, 'utf-8')).toBe(firstOriginal);
+    expect(readFileSync(secondPath, 'utf-8')).toBe(secondOriginal);
+    expect(readFileSync(`${firstPath}.bak`, 'utf-8')).toBe(recoveryBackup);
+    expect(readFileSync(`${firstPath}.bak`, 'utf-8')).toBe(firstOriginal);
+  });
+
+  test('mutateJsonFile starts from an empty object for a missing config', () => {
+    const path = join(tmpDir, 'created.json');
+    mutateJsonFile(path, (current) => ({ ...current, enabled: true }));
+    expect(JSON.parse(readFileSync(path, 'utf-8'))).toEqual({ enabled: true });
+  });
+
   test('addPluginToOpenCodeConfig adds plugin and removes duplicates', async () => {
     const configPath = join(tmpDir, 'opencode', 'opencode.json');
     paths.ensureConfigDir();
@@ -144,6 +612,25 @@ describe('config-io', () => {
     expect(saved.plugin).toContain('oh-my-opencode-slim');
     expect(saved.plugin).not.toContain('oh-my-opencode-slim@1.0.0');
     expect(saved.plugin.length).toBe(2);
+  });
+
+  test('addPluginToOpenCodeConfig reads and preserves a plural-key config', async () => {
+    const configPath = join(tmpDir, 'opencode', 'opencode.json');
+    paths.ensureConfigDir();
+    writeFileSync(
+      configPath,
+      JSON.stringify({ plugins: ['other', 'oh-my-opencode-slim@1.0.0'] }),
+    );
+    process.argv[1] = '';
+
+    const result = await addPluginToOpenCodeConfig();
+    expect(result.success).toBe(true);
+
+    const saved = JSON.parse(readFileSync(configPath, 'utf-8'));
+    // The file's own key is preserved; the legacy singular key stays untouched.
+    expect(saved.plugins).toContain('oh-my-opencode-slim');
+    expect(saved.plugins).not.toContain('oh-my-opencode-slim@1.0.0');
+    expect(saved.plugin).toBeUndefined();
   });
 
   test('addPluginToOpenCodeConfig respects OPENCODE_CONFIG_DIR', async () => {
@@ -480,7 +967,6 @@ describe('config-io', () => {
     paths.ensureConfigDir();
 
     const result = writeLiteConfig({
-      installCustomSkills: false,
       reset: false,
     });
     expect(result.success).toBe(true);
@@ -499,7 +985,6 @@ describe('config-io', () => {
     paths.ensureConfigDir();
 
     const result = writeLiteConfig({
-      installCustomSkills: false,
       preset: 'opencode-go',
       reset: false,
     });
@@ -517,44 +1002,6 @@ describe('config-io', () => {
       'opencode-go/mimo-v2.5',
     );
     expect(saved.presets['opencode-go'].observer.variant).toBeUndefined();
-  });
-
-  test('disableDefaultAgents disables conflicting OpenCode built-in agents', () => {
-    const configPath = join(tmpDir, 'opencode', 'opencode.json');
-    paths.ensureConfigDir();
-    writeFileSync(configPath, JSON.stringify({}));
-
-    const result = disableDefaultAgents();
-    expect(result.success).toBe(true);
-
-    const saved = JSON.parse(readFileSync(configPath, 'utf-8'));
-    expect(saved.agent.explore.disable).toBe(true);
-    expect(saved.agent.general.disable).toBe(true);
-    expect(saved.agent.build).toBeUndefined();
-    expect(saved.agent.plan).toBeUndefined();
-  });
-
-  test('disableDefaultAgents preserves existing build and plan agent config', () => {
-    const configPath = join(tmpDir, 'opencode', 'opencode.json');
-    paths.ensureConfigDir();
-    writeFileSync(
-      configPath,
-      JSON.stringify({
-        agent: {
-          build: { description: 'custom build agent' },
-          plan: { permission: { edit: 'deny' } },
-        },
-      }),
-    );
-
-    const result = disableDefaultAgents();
-    expect(result.success).toBe(true);
-
-    const saved = JSON.parse(readFileSync(configPath, 'utf-8'));
-    expect(saved.agent.build).toEqual({ description: 'custom build agent' });
-    expect(saved.agent.plan).toEqual({ permission: { edit: 'deny' } });
-    expect(saved.agent.explore.disable).toBe(true);
-    expect(saved.agent.general.disable).toBe(true);
   });
 
   test('enableLspByDefault sets lsp true when missing', () => {
@@ -618,7 +1065,7 @@ describe('config-io', () => {
             orchestrator: { model: 'openai/gpt-4' },
             oracle: { model: 'anthropic/claude-opus-4-6' },
             explorer: { model: 'github-copilot/grok-code-fast-1' },
-            librarian: { model: 'zai-coding-plan/glm-4.7' },
+            designer: { model: 'zai-coding-plan/glm-4.7' },
           },
         },
       }),
@@ -669,10 +1116,7 @@ describe('config-io', () => {
         presets: {
           dev: {
             orchestrator: {
-              model: [
-                'openai/gpt-5.6-luna',
-                { id: 'anthropic/claude-opus-4-6' },
-              ],
+              model: ['openai/gpt-6-luna', { id: 'anthropic/claude-opus-4-6' }],
             },
           },
         },

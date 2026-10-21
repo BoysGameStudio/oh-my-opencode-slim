@@ -4,6 +4,7 @@ import {
   ALL_AGENT_NAMES,
 } from '../config';
 import type { RuntimeConfig } from '../config/runtime';
+import { lookupWithAliases } from '../config/utils';
 
 /**
  * Normalizes an agent name by trimming whitespace and removing the optional @ prefix.
@@ -33,14 +34,7 @@ function getPluginOverride(
   runtime: RuntimeConfig,
   name: string,
 ): AgentOverrideConfig | undefined {
-  const agents = runtime.agents();
-  return (
-    agents[name] ??
-    agents[
-      Object.keys(AGENT_ALIASES).find((key) => AGENT_ALIASES[key] === name) ??
-        ''
-    ]
-  );
+  return lookupWithAliases(runtime.agents(), name);
 }
 
 /**
@@ -75,7 +69,7 @@ export function resolveRuntimeAgentName(
     }
   }
 
-  return normalized;
+  return AGENT_ALIASES[normalized] ?? normalized;
 }
 
 export function escapeRegExp(value: string): string {

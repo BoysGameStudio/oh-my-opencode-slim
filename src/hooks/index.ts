@@ -1,39 +1,45 @@
+export { createAbsolutePathRescueHook } from './absolute-path-rescue';
 export { createApplyPatchHook } from './apply-patch';
-export type { AutoUpdateCheckerOptions } from './auto-update-checker';
 export { createAutoUpdateCheckerHook } from './auto-update-checker';
-export {
-  type CacheMonitorOptions,
-  createCacheMonitorHook,
-} from './cache-monitor';
-export {
-  appendTaggedSyntheticPart,
-  appendTrailingVolatileMessage,
-  createTaggedSyntheticPart,
-  hasTaggedPart,
-  isTaggedPart,
-  isVolatileTaggedMessage,
-  stripTaggedContent,
-  type TaggedSyntheticPartSpec,
-} from './cache-safe-injection';
+export { createCacheMonitorHook } from './cache-monitor';
 export { createChatHeadersHook } from './chat-headers';
+export {
+  COUNCIL_INJECT_METADATA_KEY,
+  createCouncilInjectHook,
+} from './council-inject';
 export { createDeepworkCommandHook } from './deepwork';
-export { createFilterAvailableSkillsHook } from './filter-available-skills';
+export {
+  createDeepworkGoalHook,
+  createDeepworkHeadGate,
+  GOAL_POINTER_METADATA_KEY,
+} from './deepwork-goal';
+export { createDeepworkGuardHook } from './deepwork-guard';
 export {
   ForegroundFallbackManager,
-  isFailoverError,
-  isRetryableError,
+  type ForegroundFallbackModel,
 } from './foreground-fallback';
-export { processImageAttachments } from './image-hook';
 export { createJsonErrorRecoveryHook } from './json-error-recovery/hook';
 export { createLoopCommandHook } from './loop-command';
 export {
+  CHILD_INPUT_QUEUE_CAP,
+  CHILD_INPUT_WAKE_CHUNK,
   createOrchestratorWakeScheduler,
+  formatChildInputWaitDelta,
+  formatStoppedJobDelta,
+  HOST_ATTRIBUTED_STOP_OUTCOME,
+  ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT,
+  ORCHESTRATOR_CHILDREN_WAKE_TEXT,
+  ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT,
+  ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD,
   ORCHESTRATOR_WAKE_TEXT,
   ORCHESTRATOR_WAKE_UNCHANGED_CAP,
+  STOPPED_RECOVERY_OVERFLOW_TEXT,
+  STOPPED_RECOVERY_OVERFLOW_TEXT_NO_BOARD,
+  stoppedJobRecoveryReason,
 } from './orchestrator-wake';
 export { createPhaseReminderHook } from './phase-reminder';
-export { createPostFileToolNudgeHook } from './post-file-tool-nudge';
 export { createReflectCommandHook } from './reflect';
+export { createSearchPathGuardHook } from './search-path-guard';
 export { SessionLifecycle } from './session-lifecycle';
 export { createTaskSessionManagerHook } from './task-session-manager';
 export { createToolLoopGuardHook } from './tool-loop-guard/hook';

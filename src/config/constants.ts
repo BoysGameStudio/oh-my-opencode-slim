@@ -1,12 +1,19 @@
 // Agent names
 export const AGENT_ALIASES: Record<string, string> = {
   explore: 'explorer',
+  // librarian merged into explorer; legacy config keys/prompts keep working.
+  librarian: 'explorer',
   'frontend-ui-ux-engineer': 'designer',
 };
 
+/** OpenCode built-in subagents slim replaces; disabled at runtime (#1582). */
+export const BUILTIN_OPENCODE_SUBAGENTS_TO_DISABLE = [
+  'general',
+  'explore',
+] as const;
+
 export const SUBAGENT_NAMES = [
   'explorer',
-  'librarian',
   'oracle',
   'designer',
   'fixer',
@@ -30,8 +37,6 @@ export const AGENT_THEME_COLORS = [
   'info',
 ] as const;
 
-export type AgentThemeColor = (typeof AGENT_THEME_COLORS)[number];
-
 /** Agents that cannot be disabled even if listed in disabled_agents config. */
 export const PROTECTED_AGENTS = new Set(['orchestrator', 'councillor']);
 
@@ -43,7 +48,6 @@ export const PROTECTED_AGENTS = new Set(['orchestrator', 'councillor']);
 export const DEFAULT_MODELS: Record<AgentName, string | undefined> = {
   orchestrator: undefined,
   oracle: undefined,
-  librarian: undefined,
   explorer: undefined,
   designer: undefined,
   fixer: undefined,
@@ -52,15 +56,8 @@ export const DEFAULT_MODELS: Record<AgentName, string | undefined> = {
   councillor: undefined,
 };
 
-// Polling configuration
-export const POLL_INTERVAL_MS = 500;
-export const POLL_INTERVAL_BACKGROUND_MS = 2000;
-
-// Timeouts
-export const MAX_POLL_TIME_MS = 5 * 60 * 1000; // 5 minutes
-
 // Workflow reminders
-export const PHASE_REMINDER_TEXT = `!IMPORTANT! Scheduler workflow: First choose the lightest workflow that fits the work. If direct execution is justified, complete it and verify proportionately. Otherwise: plan lanes/dependencies → dispatch background specialists → track task IDs → wait for hook-driven completion → reconcile terminal results → verify. !END!`;
+export const PHASE_REMINDER_TEXT = `!IMPORTANT! Scheduler workflow: pick the lightest workflow that fits. Direct work: execute and verify proportionately. Otherwise: plan lanes → dispatch background specialists → track task IDs → await hook-driven completion → reconcile terminal results → verify. !END!`;
 
 export function formatSystemReminder(text: string): string {
   return `<system-reminder>\n${text}\n</system-reminder>`;
@@ -86,9 +83,6 @@ export const NO_SHELL_READONLY_FILE_OPERATIONS_RULES = `**File Operations Rules*
 - Use glob/grep/ast_grep_search for discovery and read for file contents.
 - Do not use bash or shell commands.`;
 
-// Polling stability
-export const STABLE_POLLS_THRESHOLD = 3;
-
 // Toast duration (ms) used by all OMOS toasts
 export const TOAST_DURATION_MS = 10_000;
 
@@ -98,10 +92,14 @@ export const DEFAULT_DISABLED_AGENTS: string[] = ['observer'];
 
 // Background job defaults
 export const DEFAULT_MAX_SESSIONS_PER_AGENT = 2;
-export const DEFAULT_MAX_CONTEXT_LINES = 50_000;
-export const DEFAULT_READ_CONTEXT_MIN_LINES = 10;
-export const DEFAULT_READ_CONTEXT_MAX_FILES = 8;
-export const DEFAULT_MAX_RETAINED_SNAPSHOTS = 20;
+/** Internal display cap for the per-session read-context path list. */
+export const DEFAULT_CONTEXT_FILE_CAP = 8;
+
+/** Shipped child-input wake kinds (#1504): permission off, question on. */
+export const DEFAULT_CHILD_INPUT_WAKE_KINDS = {
+  permission: false,
+  question: true,
+} as const;
 
 /**
  * Maximum session metadata entries retained per plugin instance.
@@ -111,6 +109,18 @@ export const DEFAULT_MAX_RETAINED_SNAPSHOTS = 20;
 export const DEFAULT_MAX_SESSION_METADATA_ENTRIES = 1000;
 
 export type ImageRouting = 'auto' | 'direct';
+
+/** Permission keys that accept only a scalar action — never a pattern map.
+ * Mirrors opencode's v1 permission config typing; enforced by the config
+ * schema's refinement. */
+export const STRING_ONLY_PERMISSION_KEYS = [
+  'todowrite',
+  'question',
+  'webfetch',
+  'websearch',
+  'codesearch',
+  'doom_loop',
+] as const;
 
 export function resolveImageRouting(
   imageRouting: ImageRouting | undefined,

@@ -1,7 +1,7 @@
 # ADR-002: Consolidate Eval CLI into a Single Entry Point
 
 **Date:** 2026-08-29
-**Status:** Accepted
+**Status:** Accepted; implementation details amended 2026-10-21
 **Deciders:** User + Agent
 
 ## Context
@@ -78,6 +78,14 @@ Consolidate to **one file, flag-based dispatch** (Option 1).
 - Mitigation: trivial — extract when the interactive collection logic exceeds ~100 lines.
 
 ## Implementation Notes
+
+The current implementation keeps one flag-based CLI entry point, but extracts
+`eval-server.ts` for independently testable URL/ownership behavior. Explicit
+`OPENCODE_URL` targets are connect-only; no unowned listener is terminated.
+`suite-runner.ts` owns validation, collection/scoring, and worktree restoration;
+`results.ts` owns result lookup. The historical file counts and private
+`startServe`/`stopServe` descriptions below describe the original consolidation,
+not the current module map. See `src/evals/README.md` and `docs/evals.md`.
 
 - `startServe`/`stopServe` are private functions in `eval.ts`, not exported.
 - `--diff` reads result files with `loadLatestResultPath` + `loadAllResults` from the runner.

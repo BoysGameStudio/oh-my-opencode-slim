@@ -3,8 +3,23 @@ import {
   type ToolDefinition,
   tool,
 } from '@opencode-ai/plugin';
+import type {
+  RetainedRecoveryRequest,
+  RetainedRecoveryResult,
+} from '../hooks/task-session-manager/session-recovery';
+import { pluginDisposedMessage } from '../hooks/task-session-manager/session-recovery';
 import type { BackgroundJobLease } from '../utils/background-job-board';
-import type { BackgroundJobStore } from '../utils/background-job-store';
+import {
+  type BackgroundJobStore,
+  getBackgroundJobLifecycleLedger,
+} from '../utils/background-job-store';
+import {
+  type BackgroundJobTerminalGate,
+  createBackgroundJobTerminalGate,
+  type ObservationToken,
+} from '../utils/background-job-terminal-gate';
+import { responseError, stringifyError } from '../utils/child-transcript';
+import { isRecord } from '../utils/guards';
 import { getClient } from '../utils/opencode-client';
 import { delay } from '../utils/polling';
 import {
@@ -16,17 +31,31 @@ import {
   getRuntimeSessionStatusSnapshot,
   runtimeSessionStatus,
 } from '../utils/session-runtime-status';
+import {
+  type CanonicalTaskResolver,
+  idParamFor,
+  readTaskRef,
+  taskRefArgs,
+} from './task-ref';
 
 const z = tool.schema;
 
 export interface TaskControlToolOptions {
   input: PluginInput;
   backgroundJobBoard: BackgroundJobStore;
+  terminalGate?: BackgroundJobTerminalGate;
   shouldManageSession: (sessionID: string) => boolean;
   abortTimeoutMs?: number;
   verifyAbortMs?: number;
   abortRetryIntervalMs?: number;
   stableStoppedMs?: number;
+  /** Read-only host recovery for a reference the board does not know. */
+  recoverRetainedSession?: (
+    request: RetainedRecoveryRequest,
+  ) => Promise<RetainedRecoveryResult>;
+  /** Shared read-only alias gate. Exact session ids do not read parent history. */
+  resolveCanonicalTaskRef?: CanonicalTaskResolver;
+  isDisposed?: () => boolean;
 }
 
 interface CapturedExecution {
@@ -51,31 +80,79 @@ class LeaseOperationTimeoutError extends Error {
 export function createCancelTaskTool(
   options: TaskControlToolOptions,
 ): Record<'task_cancel', ToolDefinition> {
+  const idParam = idParamFor(options.input);
   const task_cancel = tool({
     description: `Cancel a tracked background specialist task without deleting its session.
 
 Use only for obsolete, wrong, conflicting, or user-requested cancellation. The retained session can be revived after the lifecycle lane acknowledges its terminal state.`,
     args: {
-      task_id: z
-        .string()
-        .describe('Tracked background task ID or Background Job Board alias'),
+      ...taskRefArgs(idParam),
       reason: z.string().optional().describe('Short cancellation reason'),
     },
     async execute(args, toolContext) {
-      const parentSessionID = assertOrchestrator(
+      const parentSessionID = assertManagedSession(
         options,
         toolContext,
         'task_cancel',
       );
-      const requested = args.task_id.trim();
-      if (!requested) throw new Error('task_cancel requires task_id');
-
-      const job = options.backgroundJobBoard.resolve(
-        parentSessionID,
-        requested,
-      );
-      if (!job) {
+      const requested = readTaskRef(args, idParam);
+      if (!requested) throw new Error(`task_cancel requires ${idParam}`);
+      const canonical = options.resolveCanonicalTaskRef
+        ? await options.resolveCanonicalTaskRef(parentSessionID, requested)
+        : undefined;
+      if (options.isDisposed?.()) {
+        return unknownTaskOutput(idParam, requested, pluginDisposedMessage());
+      }
+      if (canonical?.kind === 'refused') {
+        return unknownTaskOutput(idParam, requested, canonical.reason);
+      }
+      const identity = canonical?.taskID ?? requested;
+      const job = canonical
+        ? options.backgroundJobBoard.get(identity)
+        : options.backgroundJobBoard.resolve(parentSessionID, requested);
+      if (job && job.parentSessionID !== parentSessionID) {
         return unknownTaskOutput(
+          idParam,
+          identity,
+          `Task ${identity} belongs to a different parent session. No action was sent.`,
+        );
+      }
+      if (!job) {
+        if (options.recoverRetainedSession) {
+          const recovery = await options.recoverRetainedSession({
+            parentSessionID,
+            requested: identity,
+          });
+          const restored = canonical
+            ? options.backgroundJobBoard.get(identity)
+            : options.backgroundJobBoard.resolve(parentSessionID, requested);
+          if (restored) {
+            if (restored.state === 'running' || restored.statusUncertain) {
+              return unknownTaskOutput(
+                idParam,
+                restored.taskID,
+                'The host session is still executing. task_cancel did not take over an untracked busy session, and no abort was sent.',
+              );
+            }
+            const state =
+              restored.state === 'reconciled'
+                ? (restored.terminalState ?? restored.state)
+                : restored.state;
+            return [
+              `${idParam}: ${restored.taskID}`,
+              `state: ${state}`,
+              '',
+              '<task_error>',
+              `Task is ${state}, not running. No abort was sent.`,
+              '</task_error>',
+            ].join('\n');
+          }
+          if (recovery.kind === 'refused') {
+            return unknownTaskOutput(idParam, requested, recovery.reason);
+          }
+        }
+        return unknownTaskOutput(
+          idParam,
           requested,
           await untrackedTaskReason(options, parentSessionID, requested),
         );
@@ -87,6 +164,7 @@ Use only for obsolete, wrong, conflicting, or user-requested cancellation. The r
       };
       if (job.state !== 'running') {
         return staleCancellationOutput(
+          idParam,
           options,
           execution,
           `task is ${job.state}, not running`,
@@ -99,7 +177,7 @@ Use only for obsolete, wrong, conflicting, or user-requested cancellation. The r
         const current = options.backgroundJobBoard.get(execution.taskID);
         const message = error instanceof Error ? error.message : String(error);
         return [
-          `task_id: ${execution.taskID}`,
+          `${idParam}: ${execution.taskID}`,
           `state: ${current?.state ?? 'unknown'}`,
           '',
           '<task_error>',
@@ -110,7 +188,7 @@ Use only for obsolete, wrong, conflicting, or user-requested cancellation. The r
 
       const state = options.backgroundJobBoard.getState(execution.taskID);
       return [
-        `task_id: ${execution.taskID}`,
+        `${idParam}: ${execution.taskID}`,
         `state: ${state ?? 'cancelled'}`,
         '',
         '<task_error>',
@@ -134,6 +212,9 @@ export async function cancelTrackedExecution(
   execution: CapturedExecution,
   reason?: string,
 ): Promise<void> {
+  if (options.isDisposed?.()) {
+    throw new Error(pluginDisposedMessage());
+  }
   const lease = options.backgroundJobBoard.acquireCancellationLease(
     execution.taskID,
     execution.generation,
@@ -146,18 +227,34 @@ export async function cancelTrackedExecution(
 
   let keepLeaseUntilSettled = false;
   try {
-    await abortAndVerifySession(options, execution, lease);
-    assertCapturedExecution(options.backgroundJobBoard, execution);
-    const marked = options.backgroundJobBoard.markCancelled(
-      execution.taskID,
-      reason,
-      Date.now(),
-      {
-        force: true,
-        expectedGeneration: execution.generation,
-        cancellationLease: lease,
-      },
+    const gate =
+      options.terminalGate ??
+      createBackgroundJobTerminalGate({
+        backgroundJobBoard: options.backgroundJobBoard,
+        input: options.input,
+      });
+    const token = await abortAndVerifySession(
+      { ...options, terminalGate: gate },
+      execution,
+      lease,
     );
+    assertCapturedExecution(options.backgroundJobBoard, execution);
+    const observed = gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'cancel-verifier',
+      readStartedAt: token.readStartedAt,
+      stable: true,
+    });
+    if (observed.kind === 'stale')
+      throw new SessionStillRunningError(
+        'Activity changed during cancellation verification',
+      );
+    const result = await gate.reconcile(execution, {
+      kind: 'cancel',
+      lease,
+      reason,
+    });
+    const marked = result.kind === 'committed' ? result.record : undefined;
     if (!isCapturedExecution(marked, execution)) {
       throw new Error(
         `stale/uncertain cancellation: ${execution.taskID} generation changed`,
@@ -184,15 +281,30 @@ async function abortAndVerifySession(
   options: TaskControlToolOptions,
   execution: CapturedExecution,
   lease: BackgroundJobLease,
-): Promise<void> {
+): Promise<ObservationToken> {
   assertLease(options.backgroundJobBoard, lease, execution);
   const taskID = execution.taskID;
+  const abortStartedAt = Date.now();
   let response: unknown;
   try {
     response = await awaitLeaseOperation(
       options.backgroundJobBoard,
       lease,
-      () => getClient(options.input).session.abort({ path: { id: taskID } }),
+      () => {
+        // awaitLeaseOperation defers this callback to a microtask. Ownership
+        // may have changed since the check above; never send a stale abort.
+        assertLease(options.backgroundJobBoard, lease, execution);
+        assertCapturedExecution(options.backgroundJobBoard, execution);
+        if (options.isDisposed?.()) {
+          throw new LeaseOwnershipLostError(pluginDisposedMessage());
+        }
+        if (options.backgroundJobBoard.getState(taskID) !== 'running') {
+          throw new LeaseOwnershipLostError(
+            `stale/uncertain cancellation: ${taskID} is no longer running`,
+          );
+        }
+        return getClient(options.input).session.abort({ path: { id: taskID } });
+      },
       options.abortTimeoutMs ?? 10_000,
       `Session abort timed out after ${options.abortTimeoutMs ?? 10_000}ms`,
     );
@@ -201,28 +313,38 @@ async function abortAndVerifySession(
     throw error;
   }
   assertLease(options.backgroundJobBoard, lease, execution);
-  const responseError = operationError(response);
-  if (responseError !== undefined) throw new Error(errorText(responseError));
+  const error = responseError(response);
+  if (error !== undefined) throw new Error(stringifyError(error));
   if (operationBoolean(response) === false) {
     throw new Error(`Session abort was not confirmed: ${taskID}`);
   }
 
-  await verifyQuiescentSession(options, execution, lease);
+  return verifyQuiescentSession(options, execution, lease, abortStartedAt);
 }
 
 async function verifyQuiescentSession(
   options: TaskControlToolOptions,
   execution: CapturedExecution,
   lease: BackgroundJobLease,
-): Promise<void> {
+  abortStartedAt: number,
+): Promise<ObservationToken> {
   const deadline = Date.now() + (options.verifyAbortMs ?? 1_500);
+  const gate = options.terminalGate;
+  if (!gate) throw new Error('Cancellation terminal gate is required');
   const stableStoppedMs = options.stableStoppedMs ?? 300;
   const retryIntervalMs = options.abortRetryIntervalMs ?? 150;
   let stableStoppedSince: number | undefined;
+  let stableActivityRevision: number | undefined;
   let lastStatus: string | undefined;
+  let statusUnavailable = false;
 
   while (Date.now() <= deadline) {
     assertLease(options.backgroundJobBoard, lease, execution);
+    const token = gate.capture(execution);
+    if (!token)
+      throw new LeaseOwnershipLostError('Cancellation execution changed');
+    if (stableActivityRevision !== token.activityRevision)
+      stableStoppedSince = undefined;
     const status = await getSessionStatus(
       options.input,
       execution.taskID,
@@ -231,21 +353,237 @@ async function verifyQuiescentSession(
       options.backgroundJobBoard,
     );
     assertLease(options.backgroundJobBoard, lease, execution);
+    if (status.source === 'status-unavailable') {
+      // v2 hosts expose no session.status map; polling it can never answer
+      // 'idle'. Fall back to host session info (terminal outcome or a
+      // fresh idle timestamp) instead of failing a confirmed abort.
+      statusUnavailable = true;
+      break;
+    }
     lastStatus = status.status;
-    const quiescent = status.status === 'idle';
+    // Activity-map contract (verified on the host core): entries are
+    // REMOVED when a session goes idle, so a valid status map without an
+    // entry for this session is quiescence evidence — not a failed
+    // lookup. Explicit busy/retry entries and real failures (lookup
+    // error, malformed entry) still refuse to confirm.
+    const quiescent =
+      status.status === 'idle' ||
+      (status.status === undefined && status.source === 'missing-from-map');
+    const observation = gate.observe(token, {
+      kind: quiescent
+        ? 'quiescent'
+        : status.status === 'busy' || status.status === 'retry'
+          ? status.status
+          : 'unknown',
+      origin: 'cancel-verifier',
+      readStartedAt: token.readStartedAt,
+    });
+    if (observation.kind === 'stale') {
+      stableStoppedSince = undefined;
+      await delay(retryIntervalMs);
+      continue;
+    }
     if (!quiescent) {
       stableStoppedSince = undefined;
       await delay(retryIntervalMs);
       continue;
     }
+    stableActivityRevision = token.activityRevision;
     stableStoppedSince ??= Date.now();
-    if (Date.now() - stableStoppedSince >= stableStoppedMs) return;
+    if (Date.now() - stableStoppedSince >= stableStoppedMs) return token;
     await delay(retryIntervalMs);
+  }
+
+  if (statusUnavailable) {
+    return verifyQuiescentViaHostInfo(
+      options,
+      execution,
+      lease,
+      abortStartedAt,
+      deadline,
+    );
   }
 
   throw new SessionStillRunningError(
     `Session abort returned but task did not stay stopped: ${execution.taskID} (${lastStatus ?? 'unknown'})`,
   );
+}
+
+/**
+ * v2 has no session-status map. Interrupt acceptance is not settlement.
+ * Prefer the host idle wait. Otherwise only a new idle timestamp counts.
+ * A stored outcome does not.
+ */
+async function verifyQuiescentViaHostInfo(
+  options: TaskControlToolOptions,
+  execution: CapturedExecution,
+  lease: BackgroundJobLease,
+  abortStartedAt: number,
+  deadline: number,
+): Promise<ObservationToken> {
+  rememberStopEpoch(options, lease, execution.taskID);
+  const wait = sessionIdleWait(options.input);
+  if (wait) {
+    return confirmCancelAfterIdleWait(
+      options,
+      execution,
+      lease,
+      deadline,
+      wait,
+    );
+  }
+  const retryIntervalMs = options.abortRetryIntervalMs ?? 150;
+  let lastDetail = 'no fresh idle evidence';
+  while (Date.now() <= deadline) {
+    assertStopFences(options, execution, lease);
+    const client = getClient(options.input);
+    if (typeof client.session.get !== 'function') {
+      throw new SessionStillRunningError(
+        `Session abort returned but quiescence cannot be verified on this host: ${execution.taskID}`,
+      );
+    }
+    try {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      const response = (await withTimeout(
+        client.session.get({
+          path: { id: execution.taskID },
+          query: { directory: options.input.directory },
+        }),
+        remainingMs,
+        `Session info lookup timed out after ${remainingMs}ms`,
+      )) as {
+        data?: { time?: { idle?: unknown } };
+        time?: { idle?: unknown };
+      };
+      if (Date.now() >= deadline) {
+        throw new OperationTimeoutError('Session info lookup timed out');
+      }
+      assertStopFences(options, execution, lease);
+      const info = response?.data ?? response;
+      const idleAt = info?.time?.idle;
+      if (typeof idleAt === 'number' && idleAt >= abortStartedAt) {
+        return freshCancellationToken(options, execution);
+      }
+      lastDetail =
+        typeof idleAt === 'number'
+          ? `idle=${idleAt}`
+          : 'no fresh idle timestamp';
+    } catch (error) {
+      if (
+        error instanceof LeaseOwnershipLostError ||
+        (error instanceof Error &&
+          error.message.startsWith('stale/uncertain cancellation:'))
+      ) {
+        throw error;
+      }
+      lastDetail = error instanceof Error ? error.message : String(error);
+      if (error instanceof OperationTimeoutError) break;
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    await delay(Math.min(retryIntervalMs, remainingMs));
+  }
+  throw new SessionStillRunningError(
+    `Session abort returned but task did not stay stopped: ${execution.taskID} (host-info: ${lastDetail})`,
+  );
+}
+
+async function confirmCancelAfterIdleWait(
+  options: TaskControlToolOptions,
+  execution: CapturedExecution,
+  lease: BackgroundJobLease,
+  deadline: number,
+  wait: (sessionID: string) => Promise<unknown>,
+): Promise<ObservationToken> {
+  assertStopFences(options, execution, lease);
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    throw new SessionStillRunningError(
+      `Session abort returned but idle wait was not settled before the deadline: ${execution.taskID}`,
+    );
+  }
+  const waiting = wait(execution.taskID);
+  if (!waiting || typeof waiting.then !== 'function') {
+    throw new SessionStillRunningError(
+      `Session abort returned but waitForSessionIdle did not settle: ${execution.taskID}`,
+    );
+  }
+  try {
+    await withTimeout(
+      waiting,
+      remainingMs,
+      `Session idle wait timed out after ${remainingMs}ms`,
+    );
+  } catch (error) {
+    throw new SessionStillRunningError(
+      `Session abort returned but idle wait was not settled: ${execution.taskID} (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+  if (Date.now() >= deadline) {
+    throw new SessionStillRunningError(
+      `Session abort returned but idle wait was not settled before the deadline: ${execution.taskID}`,
+    );
+  }
+  assertStopFences(options, execution, lease);
+  return freshCancellationToken(options, execution);
+}
+
+function sessionIdleWait(
+  input: PluginInput,
+): ((sessionID: string) => Promise<unknown>) | undefined {
+  const channel = (
+    input as {
+      experimental_v2?: { waitForSessionIdle?: unknown };
+    }
+  ).experimental_v2?.waitForSessionIdle;
+  return typeof channel === 'function'
+    ? (channel as (sessionID: string) => Promise<unknown>)
+    : undefined;
+}
+
+function freshCancellationToken(
+  options: TaskControlToolOptions,
+  execution: CapturedExecution,
+): ObservationToken {
+  const token = options.terminalGate?.capture(execution);
+  if (!token)
+    throw new LeaseOwnershipLostError('Cancellation execution changed');
+  return token;
+}
+
+function assertStopFences(
+  options: TaskControlToolOptions,
+  execution: CapturedExecution,
+  lease: BackgroundJobLease,
+): void {
+  assertLease(options.backgroundJobBoard, lease, execution);
+  assertCapturedExecution(options.backgroundJobBoard, execution);
+  const current = deletionEpoch(options, execution.taskID);
+  if (stopEpochs.get(lease) !== current) {
+    throw new Error(
+      `stale/uncertain cancellation: ${execution.taskID} was deleted`,
+    );
+  }
+}
+
+const stopEpochs = new WeakMap<BackgroundJobLease, number | undefined>();
+
+function rememberStopEpoch(
+  options: TaskControlToolOptions,
+  lease: BackgroundJobLease,
+  taskID: string,
+): void {
+  stopEpochs.set(lease, deletionEpoch(options, taskID));
+}
+
+function deletionEpoch(
+  options: TaskControlToolOptions,
+  taskID: string,
+): number | undefined {
+  return getBackgroundJobLifecycleLedger(
+    options.backgroundJobBoard,
+  ).deletionEpochs.get(taskID);
 }
 
 async function getSessionStatus(
@@ -260,6 +598,16 @@ async function getSessionStatus(
     generation: lease.generation,
   });
   try {
+    // Capability pre-check: v2 hosts expose no session.status map. Detect
+    // that deterministically (instead of relying on the thrown lookup
+    // error) so the verification loop can switch to the host-info path.
+    const client =
+      typeof input.client?.session?.status === 'function'
+        ? input.client
+        : getClient(input);
+    if (typeof client.session?.status !== 'function') {
+      return { status: undefined, source: 'status-unavailable' };
+    }
     const snapshot = await awaitLeaseOperation(
       backgroundJobBoard,
       lease,
@@ -337,18 +685,18 @@ function assertLease(
   }
 }
 
-function assertOrchestrator(
+/** Task hooks also manage Build and other host agents when they delegate.
+ * Validate that admission here; each caller then resolves the requested child
+ * against this parent. Tool permissions remain the host's responsibility. */
+export function assertManagedSession(
   options: TaskControlToolOptions,
   toolContext: { sessionID?: string; agent?: string } | undefined,
   toolName: string,
 ): string {
   const parentSessionID = toolContext?.sessionID;
   if (!parentSessionID) throw new Error(`${toolName} requires sessionID`);
-  if (toolContext.agent && toolContext.agent !== 'orchestrator') {
-    throw new Error(`${toolName} can only be used by orchestrator`);
-  }
   if (!options.shouldManageSession(parentSessionID)) {
-    throw new Error(`${toolName} can only be used in orchestrator sessions`);
+    throw new Error(`${toolName} can only be used in managed sessions`);
   }
   return parentSessionID;
 }
@@ -388,36 +736,19 @@ async function getSessionParentID(
   }
 }
 
-function operationError(response: unknown): unknown {
-  if (!isRecord(response)) return undefined;
-  return response.error === undefined || response.error === null
-    ? undefined
-    : response.error;
-}
-
 function operationBoolean(response: unknown): boolean | undefined {
   if (response === true || response === false) return response;
   if (!isRecord(response)) return undefined;
   return typeof response.data === 'boolean' ? response.data : undefined;
 }
 
-function errorText(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  if (typeof error === 'string') return error;
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return String(error);
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
-function unknownTaskOutput(taskID: string, message: string): string {
+function unknownTaskOutput(
+  idParam: string,
+  taskID: string,
+  message: string,
+): string {
   return [
-    `task_id: ${taskID}`,
+    `${idParam}: ${taskID}`,
     'state: unknown',
     '',
     '<task_error>',
@@ -450,13 +781,14 @@ function assertCapturedExecution(
 }
 
 function staleCancellationOutput(
+  idParam: string,
   options: TaskControlToolOptions,
   execution: CapturedExecution,
   detail: string,
 ): string {
   const current = options.backgroundJobBoard.get(execution.taskID);
   return [
-    `task_id: ${execution.taskID}`,
+    `${idParam}: ${execution.taskID}`,
     `state: ${current?.state ?? 'unknown'}`,
     '',
     '<task_error>',

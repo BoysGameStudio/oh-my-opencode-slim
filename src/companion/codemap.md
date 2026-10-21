@@ -2,7 +2,7 @@
 
 ## Responsibility
 
-Provides the optional animated companion UI feature that visualizes agent activity (busy/idle states) as animated GIFs. This is a user-facing visual overlay that runs separately from OpenCode's core orchestration.
+Provides the plugin-side state management and distribution integration for the optional animated Companion UI. The native crate, media, builds, and releases live separately in [oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion), with its crate at the repository root.
 
 ## Design
 
@@ -11,8 +11,16 @@ The companion system consists of two main components following a **Producer-Cons
 - **Producer (manager.ts)**: `CompanionManager` class
   - Listens to OpenCode session lifecycle events (`session.status`, `session.deleted`)
   - Tracks agent activity per session (orchestrator, fixers, etc.)
+  - Publishes live session model metadata for active agent tiles; variants are retained only from observed live chat selections, never inferred from static defaults
   - Maintains state in a JSON file at `~/.local/share/opencode/storage/oh-my-opencode-slim/companion-state.json`
+  - Uses a stable per-project manager identity within each OpenCode process so multiple project scopes coexist instead of overwriting one `proc_<pid>` row
+  - Publishes owner state before allowing the native binary to spawn; a busy state lock is retried asynchronously
+  - Prunes state rows whose owning OpenCode process is no longer alive
   - Spawns the companion binary process when enabled
+  - Publishes the current/available preset catalog for the active project
+  - Maintains a bounded (64) history of previously opened project directories and their last observed preset catalog; never scans disk for repositories
+  - Consumes typed preset requests from the native Companion and applies them through the shared preset-switch domain
+  - For remembered/offline targets, routes writes only through a live TypeScript manager, checks registered absolute paths, directory accessibility, and invalid JSONC before any preset mutation; returns explicit rejection feedback without changing the relay's config
   - Implements a locking mechanism for concurrent state writes
 
 - **Consumer (updater.ts)**: Binary installation and update logic
@@ -36,7 +44,7 @@ interface CompanionSession {
 
 ### State Management
 
-- Uses a lock file pattern (`companion-state.json.lock`) for concurrent access
+- Uses the shared PID/token lock implementation for `companion-state.json.lock`, including stale-owner recovery instead of an unowned mkdir-only lock
 - State file contains array of active sessions with their current agent activity
 - Binary path determined by:
   - User config (`binaryPath` in companion config)
@@ -59,8 +67,9 @@ OpenCode Session → CompanionManager.onSessionStatus() → Updates state → Sp
 
 1. **Plugin loads** (`CompanionManager.onLoad()`)
    - Reads user configuration (`enabled`, `position`, `size`, `gifPack`, `loopStyle`, `speed`, `debug`)
-   - If enabled, spawns companion binary process with session ID and debug flags
-   - Cleans up stale sessions on load
+   - Publishes a distinct project-scoped session row first, then spawns/joins the singleton companion only after publication succeeds
+   - Retries transient state-lock contention without blocking the plugin thread
+   - Cleans up stale sessions from dead OpenCode processes on state writes
 
 2. **Agent activity events** (`CompanionManager.onSessionStatus()`)
    - Receives `session.status` events from OpenCode
@@ -147,9 +156,13 @@ interface CompanionConfig {
 
 ### GitHub Release Artifacts
 
-- Repository: `alvinunreal/oh-my-opencode-slim`
+- Repository: `alvinunreal/oh-my-opencode-companion`
 - Release tag pattern: `companion-v{version}`
 - Artifact names: `oh-my-opencode-slim-companion-v{version}-{target}.{tar.gz|zip}`
+- The plugin's scheduled/manual manifest-sync workflow hashes all five public
+  release archives and opens a plugin-local PR; native releases remain autonomous.
+- Offline manifest validation and pinned remote release/hash verification are
+  independent release guards; neither needs a local native checkout or native tags.
 
 
 ## Error Handling & Edge Cases

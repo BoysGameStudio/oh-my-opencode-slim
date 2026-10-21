@@ -1,19 +1,40 @@
 import type {
+  BackgroundJobAdoptionInput,
   BackgroundJobBoard,
   BackgroundJobLaunchInput,
   BackgroundJobLease,
   BackgroundJobPromptMetadata,
   BackgroundJobRecord,
   BackgroundJobStatusInput,
+  BackgroundJobTerminalInput,
   ContextFile,
+  RestoreRetainedSessionInput,
   WallClockTimeoutClaimInput,
-  WallClockTimeoutFinalizeInput,
 } from './background-job-board';
 import type { BackgroundJobStore } from './background-job-store';
+import type {
+  BackgroundJobTerminalGate,
+  TerminalCommitToken,
+} from './background-job-terminal-gate';
 import { log } from './logger';
 
 type TerminalStateListener = (taskID: string) => void;
 type TerminalOutcomeListener = (record: BackgroundJobRecord) => void;
+
+/**
+ * Identity projection event for accepted/removed launches. Consumed by the
+ * host plugin to mirror alias↔session links into TUI state; consumers must
+ * be best-effort (failures are logged, never propagated to the launch).
+ */
+export interface BackgroundJobIdentityEvent {
+  kind: 'registered' | 'removed';
+  taskID: string;
+  parentSessionID: string;
+  agent: string;
+  alias: string;
+}
+
+type LaunchIdentityListener = (event: BackgroundJobIdentityEvent) => void;
 
 /**
  * BackgroundJobCoordinator owns the lifecycle policy for background jobs.
@@ -29,6 +50,7 @@ type TerminalOutcomeListener = (record: BackgroundJobRecord) => void;
 export class BackgroundJobCoordinator implements BackgroundJobStore {
   private terminalStateListeners: TerminalStateListener[] = [];
   private terminalOutcomeListeners: TerminalOutcomeListener[] = [];
+  private launchIdentityListeners: LaunchIdentityListener[] = [];
   // Stores session IDs (which equal task IDs) awaiting close after background job completes
   private readonly deferredIdleCloses = new Set<string>();
 
@@ -37,6 +59,26 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     this.board.addTerminalStateListener((taskID) => {
       this.handleTerminalState(taskID);
     });
+  }
+
+  // ── Launch identity projection (best-effort, sidebar details) ─────
+
+  addLaunchIdentityListener(listener: LaunchIdentityListener): void {
+    this.launchIdentityListeners.push(listener);
+  }
+
+  private notifyLaunchIdentity(event: BackgroundJobIdentityEvent): void {
+    for (const listener of this.launchIdentityListeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        log('Coordinator launch identity listener threw', {
+          taskID: event.taskID,
+          kind: event.kind,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 
   // ── Terminal state notification (guaranteed delivery) ─────────────
@@ -61,7 +103,8 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     if (state === undefined) return; // Job was already cleaned up
 
     // Check if this session should now close
-    if (this.retryDeferredClose(taskID)) {
+    const closeNow = this.retryDeferredClose(taskID);
+    if (closeNow) {
       // Notify listeners that session should close
       for (const listener of this.terminalStateListeners) {
         try {
@@ -77,6 +120,15 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
 
     const record = this.board.get?.(taskID);
     if (record) {
+      // Observation only: every canonical terminal publication that
+      // reaches listener dispatch is logged with its record identity.
+      log('[job-coordinator] terminal state dispatch', {
+        taskID,
+        generation: record.generation,
+        state,
+        parentSessionID: record.parentSessionID,
+        deferredClose: closeNow,
+      });
       for (const listener of this.terminalOutcomeListeners) {
         try {
           listener(record);
@@ -135,7 +187,53 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
   // ── Mutation methods (sole writer to board) ──────────────────────
 
   registerLaunch(input: BackgroundJobLaunchInput): BackgroundJobRecord {
-    return this.board.registerLaunch(input);
+    const record = this.board.registerLaunch(input);
+    this.notifyLaunchIdentity({
+      kind: 'registered',
+      taskID: record.taskID,
+      parentSessionID: record.parentSessionID,
+      agent: record.agent,
+      alias: record.alias,
+    });
+    return record;
+  }
+
+  abandonLaunch(
+    launched: BackgroundJobRecord,
+    replaced: BackgroundJobRecord,
+  ): boolean {
+    return this.board.abandonLaunch(launched, replaced);
+  }
+
+  restoreRetainedSession(
+    input: RestoreRetainedSessionInput,
+  ): BackgroundJobRecord | undefined {
+    const record = this.board.restoreRetainedSession(input);
+    if (!record) return undefined;
+    this.notifyLaunchIdentity({
+      kind: 'registered',
+      taskID: record.taskID,
+      parentSessionID: record.parentSessionID,
+      agent: record.agent,
+      alias: record.alias,
+    });
+    return record;
+  }
+
+  adoptTerminal(
+    input: BackgroundJobAdoptionInput,
+  ): BackgroundJobRecord | undefined {
+    const record = this.board.adoptTerminal(input);
+    if (!record) return;
+    const { taskID, parentSessionID, agent, alias } = record;
+    this.notifyLaunchIdentity({
+      kind: 'registered',
+      taskID,
+      parentSessionID,
+      agent,
+      alias,
+    });
+    return record;
   }
 
   acquireCancellationLease(
@@ -162,8 +260,13 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
   acquireTerminalNotificationLease(
     taskID: string,
     generation: number,
+    terminalRevision?: number,
   ): BackgroundJobLease | undefined {
-    return this.board.acquireTerminalNotificationLease(taskID, generation);
+    return this.board.acquireTerminalNotificationLease(
+      taskID,
+      generation,
+      terminalRevision,
+    );
   }
 
   validateLease(lease: BackgroundJobLease): boolean {
@@ -175,13 +278,20 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
   }
 
   updateStatus(
-    input: BackgroundJobStatusInput,
+    input: BackgroundJobStatusInput & { state: 'running' },
   ): BackgroundJobRecord | undefined {
     return this.board.updateStatus(input);
   }
 
-  updateFromStatusOutput(output: string): BackgroundJobRecord | undefined {
-    return this.board.updateFromStatusOutput(output);
+  commitTerminal(
+    input: BackgroundJobTerminalInput,
+    token: TerminalCommitToken,
+  ): BackgroundJobRecord | undefined {
+    return this.board.commitTerminal(input, token);
+  }
+
+  bindTerminalGate(gate: BackgroundJobTerminalGate): void {
+    this.board.bindTerminalGate(gate);
   }
 
   claimWallClockDeadline(
@@ -190,37 +300,17 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     return this.board.claimWallClockDeadline(input);
   }
 
-  finalizeWallClockTimeout(
-    input: WallClockTimeoutFinalizeInput,
-  ): BackgroundJobRecord | undefined {
-    return this.board.finalizeWallClockTimeout(input);
-  }
-
   markRunningFromLiveSession(
     taskID: string,
     now = Date.now(),
     expectedGeneration?: number,
+    observedTerminalRevision?: number,
   ): BackgroundJobRecord | undefined {
     return this.board.markRunningFromLiveSession(
       taskID,
       now,
       expectedGeneration,
-    );
-  }
-
-  markStopped(
-    taskID: string,
-    resultSummary: string,
-    observedAt = Date.now(),
-    expectedGeneration?: number,
-    now = Date.now(),
-  ): BackgroundJobRecord | undefined {
-    return this.board.markStopped(
-      taskID,
-      resultSummary,
-      observedAt,
-      expectedGeneration,
-      now,
+      observedTerminalRevision,
     );
   }
 
@@ -253,21 +343,15 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
   markReconciled(
     taskID: string,
     now = Date.now(),
+    expectedGeneration?: number,
+    expectedRevision?: number,
   ): BackgroundJobRecord | undefined {
-    return this.board.markReconciled(taskID, now);
-  }
-
-  markCancelled(
-    taskID: string,
-    reason?: string,
-    now = Date.now(),
-    options: {
-      force?: boolean;
-      expectedGeneration?: number;
-      cancellationLease?: BackgroundJobLease;
-    } = {},
-  ): BackgroundJobRecord | undefined {
-    return this.board.markCancelled(taskID, reason, now, options);
+    return this.board.markReconciled(
+      taskID,
+      now,
+      expectedGeneration,
+      expectedRevision,
+    );
   }
 
   // ── Query methods ────────────────────────────────────────────────
@@ -346,12 +430,33 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     return this.board.list(parentSessionID);
   }
 
+  hasRunningJobs(): boolean {
+    return this.board.hasRunningJobs();
+  }
+
   hasRunning(parentSessionID: string): boolean {
     return this.board.hasRunning(parentSessionID);
   }
 
   hasTerminalUnreconciled(parentSessionID: string): boolean {
     return this.board.hasTerminalUnreconciled(parentSessionID);
+  }
+
+  promoteProvisional(
+    taskID: string,
+    expectedParentSessionID?: string,
+    metadata?: {
+      agent?: string;
+      description?: string;
+      objective?: string;
+      background?: boolean;
+    },
+  ): BackgroundJobRecord | undefined {
+    return this.board.promoteProvisional(
+      taskID,
+      expectedParentSessionID,
+      metadata,
+    );
   }
 
   hasConvergenceSignals(taskID: string, threshold = 3): boolean {
@@ -373,10 +478,32 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
   }
 
   clearParent(parentSessionID: string): void {
+    // Capture identities before the board removes them so the projection
+    // can retract aliases for every affected record.
+    const removed = this.board.list(parentSessionID);
     this.board.clearParent(parentSessionID);
+    for (const record of removed) {
+      this.notifyLaunchIdentity({
+        kind: 'removed',
+        taskID: record.taskID,
+        parentSessionID: record.parentSessionID,
+        agent: record.agent,
+        alias: record.alias,
+      });
+    }
   }
 
   drop(taskID: string): void {
+    const record = this.board.get(taskID);
     this.board.drop(taskID);
+    if (record) {
+      this.notifyLaunchIdentity({
+        kind: 'removed',
+        taskID: record.taskID,
+        parentSessionID: record.parentSessionID,
+        agent: record.agent,
+        alias: record.alias,
+      });
+    }
   }
 }

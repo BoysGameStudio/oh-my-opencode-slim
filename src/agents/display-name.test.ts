@@ -80,7 +80,7 @@ describe('displayName', () => {
     const config: PluginConfig = {
       agents: {
         explorer: { displayName: 'helper' },
-        librarian: { displayName: 'helper' },
+        designer: { displayName: 'helper' },
       },
     };
 
@@ -93,7 +93,7 @@ describe('displayName', () => {
     const config: PluginConfig = {
       agents: {
         explorer: { displayName: 'advisor' },
-        librarian: { displayName: ' @advisor ' },
+        designer: { displayName: ' @advisor ' },
       },
     };
 
@@ -208,6 +208,9 @@ describe('displayName', () => {
   test('keeps internal-only council agents hidden even with displayName configured', () => {
     const config: PluginConfig = {
       disabled_agents: [],
+      council: CouncilConfigSchema.parse({
+        presets: { default: { alpha: { model: 'test/councillor' } } },
+      }),
       agents: {
         councillor: { displayName: 'reviewer' },
       },

@@ -1,119 +1,178 @@
-import { describe, expect, mock, test } from 'bun:test';
-import { BackgroundJobBoard } from '../../utils';
+import { expect, mock, test } from 'bun:test';
 import { createIdleReconciler } from './idle-reconciliation';
 
-async function flushChildIdleReconcile(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 5));
+function fakeGate() {
+  const reconciles: Array<{ run: unknown; signal: unknown }> = [];
+  const gate = {
+    capture: () => ({ taskID: 'child', generation: 1, readStartedAt: 1 }),
+    observe: () => ({ kind: 'deferred', record: {} }),
+    reconcile: mock(async (run: unknown, signal: unknown) => {
+      reconciles.push({ run, signal });
+      return { kind: 'stale' };
+    }),
+    dispose() {},
+  };
+  return { gate, reconciles };
 }
 
-function createHarness(options?: { stopConfirmationGraceMs?: number }) {
-  const board = new BackgroundJobBoard();
-  const terminalListener = mock(() => {});
-  board.addTerminalStateListener(terminalListener);
-  const contextFilesForPrompt = mock(() => []);
-  const prune = mock(() => {});
+test('child idle preserves event provenance and requests runtime inspection', () => {
+  const calls: string[] = [];
+  const token = { taskID: 'child', generation: 1, readStartedAt: 1 };
   const reconciler = createIdleReconciler({
-    backgroundJobBoard: board,
-    reconcileInjectedTerminalJobs: mock(() => {}),
-    idleReconcileDelayMs: 0,
-    stopConfirmationGraceMs: options?.stopConfirmationGraceMs ?? 0,
+    terminalGate: {
+      capture: () => token,
+      observe: (_token: unknown, runtime: unknown) => {
+        calls.push('observe');
+        expect(runtime).toEqual({
+          kind: 'quiescent',
+          origin: 'session.idle',
+          readStartedAt: 1,
+          observedAt: 1,
+        });
+        return { kind: 'deferred', record: {} };
+      },
+      reconcile: async () => {
+        calls.push('inspect');
+        return { kind: 'stale' };
+      },
+      dispose() {},
+    } as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 1,
     hasInputWait: () => false,
-    getIdleSessionToken: () => Symbol('idle'),
+    getIdleSessionToken: () => Symbol(),
     isCurrentIdleSessionToken: () => true,
-    taskContextTracker: {
-      pendingManagedTaskIds: new Set(['child-1']),
-      contextFilesForPrompt,
-      prune,
+  });
+  reconciler.scheduleChildIdleReconciliation('child', 1, 1);
+  expect(calls).toEqual(['observe', 'inspect']);
+  expect(reconciler.clearAllTimers()).toEqual([]);
+});
+test('parent reconciliation retains its independent delay and invalidation', async () => {
+  const acknowledge = mock(() => {});
+  const reconciler = createIdleReconciler({
+    terminalGate: {} as never,
+    reconcileInjectedTerminalJobs: acknowledge,
+    idleReconcileDelayMs: 1,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
+  });
+  reconciler.scheduleIdleReconciliation('cancelled');
+  reconciler.onInvalidateIdle('cancelled');
+  reconciler.scheduleIdleReconciliation('parent');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(acknowledge).toHaveBeenCalledTimes(1);
+  expect(acknowledge).toHaveBeenCalledWith('parent');
+  reconciler.clearAllTimers();
+});
+
+test('deferred-error backstop renews while the fallback is in flight, then consumes and terminalizes', async () => {
+  const { gate, reconciles } = fakeGate();
+  let fallbackInFlight = true;
+  let deferred = 'rate limit exceeded';
+  const consumed: string[] = [];
+  const reconciler = createIdleReconciler({
+    terminalGate: gate as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 5,
+    isFallbackInProgress: () => fallbackInFlight,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
+    consumeDeferredError: (sessionID) => {
+      expect(sessionID).toBe('child');
+      const message = deferred;
+      deferred = '';
+      consumed.push(message);
+      return message || undefined;
     },
   });
-  board.registerLaunch({
-    taskID: 'child-1',
-    parentSessionID: 'parent-1',
-    agent: 'fixer',
-    description: 'fix idle race',
-    now: 0,
+
+  reconciler.scheduleDeferredErrorBackstop('child', 1, 1);
+  // While the fallback is in flight the backstop only renews: nothing is
+  // consumed, nothing is reconciled.
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  expect(consumed).toEqual([]);
+  expect(reconciles).toHaveLength(0);
+
+  // The fallback leaves the window: the next fire consumes the deferred
+  // error and terminalizes it through the gate.
+  fallbackInFlight = false;
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  expect(consumed).toEqual(['rate limit exceeded']);
+  expect(reconciles).toHaveLength(1);
+  expect(reconciles[0]?.signal).toEqual({
+    kind: 'session-error',
+    message: 'rate limit exceeded',
   });
-  return { board, reconciler, terminalListener, contextFilesForPrompt, prune };
-}
+  reconciler.clearAllTimers();
+});
 
-async function observeIdle(
-  reconciler: ReturnType<typeof createIdleReconciler>,
-  idleObservedAt: number,
-  generation: number,
-): Promise<void> {
-  reconciler.scheduleChildIdleReconciliation(
-    'child-1',
-    idleObservedAt,
-    generation,
-  );
-  await flushChildIdleReconcile();
-}
-
-describe('idle reconciliation stop confirmation', () => {
-  test('idle then busy inside grace remains running with no terminal listener', async () => {
-    const { board, reconciler, terminalListener } = createHarness({
-      stopConfirmationGraceMs: 60_000,
-    });
-    const generation = board.get('child-1')?.generation ?? 1;
-
-    await observeIdle(reconciler, 10, generation);
-    expect(board.get('child-1')).toMatchObject({ state: 'running' });
-    expect(terminalListener).not.toHaveBeenCalled();
-
-    board.markRunningFromLiveSession('child-1', 15);
-    await observeIdle(reconciler, 16, generation);
-
-    expect(board.get('child-1')).toMatchObject({
-      state: 'running',
-      stopConfirmationStartedAt: 17,
-    });
-    expect(terminalListener).not.toHaveBeenCalled();
+test('deferred-error backstop renewal is bounded when the fallback never leaves the window', async () => {
+  const { gate, reconciles } = fakeGate();
+  const deferred = 'rate limit exceeded';
+  const reconciler = createIdleReconciler({
+    terminalGate: gate as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 2,
+    // Stuck fallback: always claims to be in flight.
+    isFallbackInProgress: () => true,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
+    consumeDeferredError: () => deferred,
   });
 
-  test('repeated idle beyond confirmation grace becomes stopped exactly once', async () => {
-    const {
-      board,
-      reconciler,
-      terminalListener,
-      contextFilesForPrompt,
-      prune,
-    } = createHarness();
-    const generation = board.get('child-1')?.generation ?? 1;
+  reconciler.scheduleDeferredErrorBackstop('child', 1, 1);
+  // Past the renewal cap (5 renewals × 2ms) the deferred error must
+  // terminalize even though the fallback still claims to be in flight.
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  expect(reconciles).toHaveLength(1);
+  expect(reconciles[0]?.signal).toEqual({
+    kind: 'session-error',
+    message: 'rate limit exceeded',
+  });
+  reconciler.clearAllTimers();
+});
 
-    await observeIdle(reconciler, 10, generation);
-    expect(board.get('child-1')).toMatchObject({ state: 'running' });
-    expect(terminalListener).not.toHaveBeenCalled();
-
-    await observeIdle(reconciler, 20, generation);
-    expect(board.get('child-1')).toMatchObject({
-      state: 'stopped',
-      terminalUnreconciled: true,
-    });
-    expect(terminalListener).toHaveBeenCalledTimes(1);
-    expect(contextFilesForPrompt).toHaveBeenCalledTimes(1);
-    expect(prune).toHaveBeenCalledTimes(1);
-
-    await observeIdle(reconciler, 30, generation);
-    expect(board.get('child-1')).toMatchObject({ state: 'stopped' });
-    expect(terminalListener).toHaveBeenCalledTimes(1);
+test('deferred-error backstop skips the publish when nothing is deferred at fire time', async () => {
+  const { gate, reconciles } = fakeGate();
+  const reconciler = createIdleReconciler({
+    terminalGate: gate as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 2,
+    isFallbackInProgress: () => false,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
+    // Busy already cleared the deferral (the timer was cancelled too
+    // late); nothing to publish.
+    consumeDeferredError: () => undefined,
   });
 
-  test('a busy observation resets pending stop confirmation', async () => {
-    const { board, reconciler, terminalListener } = createHarness();
-    const generation = board.get('child-1')?.generation ?? 1;
+  reconciler.scheduleDeferredErrorBackstop('child', 1, 1);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(reconciles).toHaveLength(0);
+  reconciler.clearAllTimers();
+});
 
-    await observeIdle(reconciler, 10, generation);
-    expect(board.get('child-1')?.stopConfirmationStartedAt).toBe(11);
-
-    board.markRunningFromLiveSession('child-1', 15);
-    expect(board.get('child-1')).toMatchObject({
-      state: 'running',
-      stopConfirmationStartedAt: undefined,
-    });
-
-    await observeIdle(reconciler, 20, generation);
-    expect(board.get('child-1')).toMatchObject({ state: 'running' });
-    expect(board.get('child-1')?.stopConfirmationStartedAt).toBe(21);
-    expect(terminalListener).not.toHaveBeenCalled();
+test('busy cancels a pending deferred-error backstop', async () => {
+  const { gate, reconciles } = fakeGate();
+  const reconciler = createIdleReconciler({
+    terminalGate: gate as never,
+    reconcileInjectedTerminalJobs: () => {},
+    idleReconcileDelayMs: 10,
+    isFallbackInProgress: () => false,
+    hasInputWait: () => false,
+    getIdleSessionToken: () => Symbol(),
+    isCurrentIdleSessionToken: () => true,
+    consumeDeferredError: () => 'rate limit exceeded',
   });
+
+  reconciler.scheduleDeferredErrorBackstop('child', 1, 1);
+  // The re-prompt landed before the backstop fired.
+  reconciler.clearIdleTimers('child');
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  expect(reconciles).toHaveLength(0);
+  reconciler.clearAllTimers();
 });

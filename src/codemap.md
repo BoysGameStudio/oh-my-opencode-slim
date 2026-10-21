@@ -6,8 +6,10 @@ Core plugin implementation for **oh-my-opencode-slim**, providing:
 - Main plugin initialization and OpenCode integration (`index.ts`)
 - Dual v1/v2 host export: `default.server` (v1) + `default.setup` (v2 adapter via `src/v2/`)
 - Terminal User Interface (TUI) sidebar plugin for agent status display (`tui.ts`)
+- Client-side multiplexer pane lifecycle, wired only from the TUI entry (`src/multiplexer/client/`)
 - TUI state persistence and synchronization across sessions (`tui-state.ts`)
 - Three-level TUI `/preset` manager (`tui-preset.ts`)
+- Emergency kill-all for running subagents (`tui-kill.ts`)
 - Installer-managed plugin-entry marker (`plugin-entry.ts`)
 - Plugin init health-check thresholds and helpers (`health-check.ts`)
 
@@ -18,10 +20,14 @@ This directory serves as the primary entry point for the plugin's runtime behavi
 ### Architectural Patterns
 
 - **Plugin Pattern**: The plugin follows OpenCode's plugin architecture with a single exported plugin function that returns agent, tool, and MCP registrations
-- **Facade Pattern**: `index.ts` acts as a facade that composes multiple subsystems (agents, tools, MCPs, hooks, multiplexer)
+- **Facade Pattern**: `index.ts` acts as a facade that composes multiple subsystems (agents, tools, MCPs, hooks)
 - **Observer Pattern**: Event-driven architecture using OpenCode's event system for session lifecycle, message updates, and tool execution
 - **Strategy Pattern**: Runtime model selection and fallback via `ForegroundFallbackManager`
-- **Singleton Pattern**: `MultiplexerSessionManager` maintains single instance for task session management
+- **Client-local pane lifecycle**: `src/multiplexer/client/` runs only in the TUI entry's dependency graph (per-client pane map, in-process uniqueness, stable-idle close); the server entry never reaches it (invariant I1, enforced by `dependency-contract.test.ts`)
+- **Admission runtime lease**: `admission-runtime.ts` scopes the background
+  scheduler and pending-call tracker per directory, retaining them across
+  immediate plugin-generation replacement and disposing them after the last
+  owner is gone.
 
 ### Data Flow
 
@@ -34,6 +40,7 @@ OpenCode Core → Plugin Initialization (index.ts)
   → Event Subscription (session lifecycle, message updates, tool execution)
   → Runtime State Tracking (tui-state.ts)
   → TUI Rendering (tui.ts → sidebar_content slot)
+  → TUI Client Pane Lifecycle (multiplexer/client/tui-wiring.ts)
   → TUI /preset Management (tui-preset.ts → preset-switch.ts)
 ```
 
@@ -41,8 +48,9 @@ OpenCode Core → Plugin Initialization (index.ts)
 
 | File | Role | Dependencies |
 |------|------|--------------|
-| `index.ts` | Main plugin entry, orchestrates all subsystems; exports dual `server`/`setup` default | Config system, agent factories, tool creators, multiplexer, hooks, v2 adapter |
-| `tui.ts` | TUI sidebar plugin for agent model display | tui-state.ts, config constants, tmux-pane-registry |
+| `index.ts` | Main plugin entry, orchestrates all server-side subsystems; exports dual `server`/`setup` default | Config system, agent factories, tool creators, hooks, v2 adapter |
+| `admission-runtime.ts` | Per-directory scheduler/pending-call runtime lease | Background task concurrency, task-session pending calls |
+| `tui.ts` | TUI sidebar plugin for agent model display; wires the client-side multiplexer pane lifecycle | tui-state.ts, config constants, multiplexer/client |
 | `tui-state.ts` | Persistent state management for TUI | Node.js fs/promises, os module |
 | `tui-preset.ts` | Three-level `/preset` manager (preset list → agents → agent edit) using `api.ui` dialogs | preset-switch.ts, config loader/constants |
 | `plugin-entry.ts` | Installer-managed plugin entry marker and `PluginEntry` type | none |
@@ -55,14 +63,16 @@ OpenCode Core → Plugin Initialization (index.ts)
 1. **Config Loading**: `loadPluginConfig()` reads and validates plugin configuration; `RuntimeConfig` singleton seeded and host config captured
 2. **Agent Creation**: `createAgents()` instantiates agent definitions (incl. dynamic councillors) with prompts and permissions
 3. **Agent Configuration**: `getAgentConfigs()` merges defaults with user overrides and runtime presets
-4. **Tool Registration**: Tools are created conditionally based on config (task_cancel, task_message, task_revive, task_status, task_result, wait_for_user, webfetch, AST-grep, acp_run)
+4. **Tool Registration**: Tools are created conditionally based on config (task_cancel, task_message, task_revive, task_status, wait_for_user, webfetch, AST-grep, acp_run)
 5. **MCP Registration**: Built-in MCPs are created (context7, gh_grep)
-6. **Multiplexer Setup**: Multiplexer session manager initialized for task tool sessions
-7. **Hook Initialization**: Auto-update checker, phase reminders, skill filters, task-session manager, cache monitor, orchestrator-wake scheduler, etc.
-8. **Runtime Model Resolution**: Resolves model arrays to single models for startup
-9. **TUI State Sync**: `recordTuiAgentModels()` captures resolved models/variants for TUI display
-10. **Health Check**: Validates agent/tool/MCP counts against `HEALTH_CHECK` thresholds, adjusted for disabled baseline tools via `minimumExpectedToolCount`
-11. **Companion Management**: Ensures companion version compatibility
+6. **Hook Initialization**: Auto-update checker, phase reminders, skill filters, task-session manager, cache monitor, orchestrator-wake scheduler, etc.
+7. **Runtime Model Resolution**: Resolves model arrays to startup primaries; independent children leave their primary provider only when the parent's confirmed fallback records it in `downProviders`, choosing the first healthy entry in their own chain. Inherited children follow the live parent for either error scope. v1 `task` and `task_revive` share prompt-claimed intentions, `task_message` pins transcript execution selection excluding compaction summaries, and v2 uses per-call `model#variant` overrides; internal v1 completions still follow the continuation policy
+8. **TUI State Sync**: `recordTuiAgentModels()` captures resolved models/variants for TUI display
+9. **Health Check**: Validates agent/tool/MCP counts against `HEALTH_CHECK` thresholds, adjusted for disabled baseline tools via `minimumExpectedToolCount`
+10. **Companion Management**: Ensures companion version compatibility
+
+The server entry does not initialize any multiplexer/pane subsystem: pane
+lifecycle lives in the TUI entry's dependency graph (`multiplexer/client/`).
 
 ### TUI Rendering Flow (tui.ts)
 
@@ -73,14 +83,17 @@ OpenCode Core → Plugin Initialization (index.ts)
    from `tui-state.ts`
 5. **Live Updates**: Refreshes persisted state every 1000ms and reactively
    advances 100ms animation frames only while agents are active
-6. **Tmux registration**: Refreshes the active session-to-`TMUX_PANE`
-   registration for parent-aware child-pane routing
+6. **Pane Lifecycle Wiring**: `createTuiPaneWiring()` resolves admission from
+   the client's own environment, initializes plugin logging, reflects the
+   server URL, subscribes to session events, and drives per-client pane
+   create/close/rebuild plus the periodic reconcile sweep
 7. **Sidebar Rendering**: Renders sidebar with:
    - Plugin header (OMO-Slim + version)
    - Config status warning (if invalid)
-   - Agent list with model/variant details and Braille activity indicators
-8. **Lifecycle Management**: Cleans up refresh/animation timers and owned tmux
-   registration on dispose
+   - Agent list with resolved model names and Braille activity indicators
+8. **Lifecycle Management**: Cleans up refresh/animation timers, unsubscribes
+   pane events, stops timers, and best-effort closes this client's panes on
+   dispose
 
 ### State Persistence Flow (tui-state.ts)
 
@@ -98,6 +111,15 @@ OpenCode Core → Plugin Initialization (index.ts)
 4. **Error Handling**: All operations are best-effort; failures don't crash plugin
 5. **Instance Cleanup**: On shutdown, each plugin instance removes only sessions
    it marked active, preserving activity owned by other running instances
+6. **Instance Scope**: opencode loads the plugin once per location inside one
+   server process and broadcasts every event to every instance. Both the v1
+   event hook and the v2 setup event pump process only events whose directory
+   resolves to this instance's location (fail-open when the directory is
+   unresolved or no live instance owns it), so per-instance state never
+   absorbs another location's sessions. Every exit path of an instance —
+   normal dispose, v1 init failure, v2 factory failure — releases its
+   live-directory claim, and the process-global wake gate is cleared only
+   when the last instance is gone
 
 ### Event Handling Flow (index.ts)
 
@@ -105,8 +127,8 @@ Key event flows:
 
 1. **Session Lifecycle**:
    - `session.created` → register child session
-   - `session.status` → multiplexer session management, Companion updates, and
-     TUI activity state
+   - `session.status` → Companion updates and TUI activity state (pane
+     lifecycle is handled separately by the TUI client wiring)
    - `session.deleted` → cleanup session agent map, Companion state, and TUI
      activity state
 
@@ -115,10 +137,10 @@ Key event flows:
 
 3. **Tool Execution**:
    - `tool.execute.before` → apply patch and task session hooks
-   - `tool.execute.after` → post-tool hooks (retry guidance, JSON error recovery, file-tool nudges)
+   - `tool.execute.after` → post-tool hooks (retry guidance, JSON error recovery)
 
 4. **Chat Integration**:
-   - `chat.message` → track session → agent mapping and mark TUI activity
+   - `chat.message` → track session → agent/model mapping, preserve live v1 fallback selection across native background completions, and mark TUI activity
    - `experimental.chat.system.transform` → inject orchestrator prompt for serve mode
    - `experimental.chat.messages.transform` → phase reminders, skill filtering, image attachment processing
 
@@ -144,7 +166,7 @@ Key event flows:
 - **Agents** (`src/agents/`): Agent personalities and permission sets
 - **Tools** (`src/tools/`): Tool implementations (task lifecycle controls, webfetch, AST operations, ACP)
 - **Hooks** (`src/hooks/`): Lifecycle hooks for auto-update, phase reminders, cache monitor, orchestrator wake, etc.
-- **Multiplexer** (`src/multiplexer/`): Tmux/Zellij session management for child sessions
+- **Multiplexer** (`src/multiplexer/`): Client-side pane lifecycle (`client/`) plus tmux/Zellij/Herdr/cmux/kitty adapters; wired only from the TUI entry
 - **Council** (`src/agents/council.ts`, `src/agents/council-agents.ts`): Multi-LLM council orchestration
 - **Companion** (`src/companion/`): Companion version management
 - **Utils** (`src/utils/`): Logger, environment checks, background job board/supervisor, session status
@@ -152,7 +174,7 @@ Key event flows:
 
 ### Cross-Directory Flow
 
-1. **Plugin Initialization**: `src/index.ts` imports and composes all subsystems
+1. **Plugin Initialization**: `src/index.ts` imports and composes the server-side subsystems; the TUI entry composes its own sidebar and pane-lifecycle wiring
 2. **State Synchronization**: TUI state in `src/tui-state.ts` is updated during plugin init and message events
 3. **UI Integration**: TUI plugin in `src/tui.ts` reads state and renders sidebar
 4. **Event Propagation**: Events flow from OpenCode → plugin handlers → subsystems → state updates
@@ -161,7 +183,7 @@ Key event flows:
 
 - Plugin config loaded via `loadPluginConfig()` with support for:
   - User overrides from `~/.config/opencode/oh-my-opencode-slim.json`
-  - Preset switching via the TUI `/preset` manager (persisted to the config file, applied on next reload)
+  - Preset switching via the TUI `/preset` manager (persisted to the config file; v2 hosts request the live inference-profile refresh for NEW child sessions and the sidebar — existing sessions stay frozen — and a malformed config keeps the last-known-good state; v1 hosts apply on next reload)
   - Environment-based disablement via `OH_MY_OPENCODE_SLIM_DISABLE`
 - Agent configurations merged with user settings from OpenCode config
 - Model resolution supports both string models and array-based fallback chains

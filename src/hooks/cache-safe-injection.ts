@@ -32,7 +32,7 @@ import {
   type MessageWithParts,
 } from './types';
 
-export interface TaggedSyntheticPartSpec {
+interface TaggedSyntheticPartSpec {
   /** Text content of the injected part. */
   text: string;
   /**
@@ -136,4 +136,16 @@ export function isVolatileTaggedMessage(
     message.parts.length > 0 &&
     message.parts.every((part) => isTaggedPart(part, metadataKey))
   );
+}
+
+/**
+ * Cap guard for text bound for an injected part: a cap may only ever drop
+ * the whole text, never truncate it. A truncated restriction reads as an
+ * authorization ("only read directory X" cut short becomes "read directory
+ * X"), so overflow omits — fail closed, the caller injects nothing.
+ * Counts characters, not bytes: the guarded failure mode is a mid-sentence
+ * cut, not an encoding split.
+ */
+export function omittedOrFull(text: string, cap: number): string | undefined {
+  return text.length <= cap ? text : undefined;
 }

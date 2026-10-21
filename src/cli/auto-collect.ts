@@ -174,7 +174,7 @@ export async function collectSuite(
       console.log(
         `\n[t=${((Date.now() - t0) / 1000).toFixed(0).padStart(3)}s] Pass ${p + 1}/${passes.length} done \u2014 reverting eval edits for pass ${p + 2}...`,
       );
-      cleanEvalArtifacts();
+      cleanEvalArtifacts(directory);
     }
   }
 

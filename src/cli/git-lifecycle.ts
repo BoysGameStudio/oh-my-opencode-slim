@@ -10,35 +10,64 @@ import { execFileSync } from 'node:child_process';
 
 /**
  * Stash all tracked and untracked changes.
- * Returns true if anything was stashed.
+ * Return the exact stash commit, or null for a clean tree.
  */
-export function stashChanges(msg = 'eval-prestash'): boolean {
-  const result = execFileSync(
+export function stashChanges(
+  msg = 'eval-prestash',
+  cwd = process.cwd(),
+): string | null {
+  const status = execFileSync('git', ['status', '--porcelain'], {
+    cwd,
+    encoding: 'utf-8',
+  });
+  if (!status.trim()) return null;
+  execFileSync(
     'git',
     ['stash', 'push', '--include-untracked', '--message', msg],
-    { encoding: 'utf-8' },
+    { cwd, stdio: 'inherit' },
   );
-  return !result.includes('No local changes to save');
+  return execFileSync('git', ['rev-parse', 'refs/stash'], {
+    cwd,
+    encoding: 'utf-8',
+  }).trim();
 }
 
 /**
- * Reset hard, clean untracked files, then pop the stash if it was set.
- * @param stashed - true if stashChanges() returned true; caller tracks this.
+ * Remove eval edits, then restore the captured stash including staged edits.
+ * Only drop that stash after a successful apply; never pop someone else's.
  */
-export function restoreAfterEvals(stashed: boolean): void {
-  execFileSync('git', ['reset', '--hard', 'HEAD'], { stdio: 'inherit' });
-  execFileSync('git', ['clean', '-fd'], { stdio: 'inherit' });
-  if (stashed) {
-    execFileSync('git', ['stash', 'pop'], { stdio: 'inherit' });
+export function restoreAfterEvals(
+  stash: string | null,
+  cwd = process.cwd(),
+): void {
+  cleanEvalArtifacts(cwd);
+  if (stash) {
+    execFileSync('git', ['stash', 'apply', '--index', stash], {
+      cwd,
+      stdio: 'inherit',
+    });
+    const entries = execFileSync('git', ['stash', 'list', '--format=%gd %H'], {
+      cwd,
+      encoding: 'utf-8',
+    });
+    const entry = entries
+      .split('\n')
+      .find((line) => line.endsWith(` ${stash}`));
+    if (entry) {
+      execFileSync('git', ['stash', 'drop', entry.split(' ')[0]], {
+        cwd,
+        stdio: 'inherit',
+      });
+    }
   }
 }
 
 /**
  * Reset/clean without popping — for use between consecutive passes where
  * the stash remains alive (auto-collect.ts between-run cleanup).
- * No state dependency — always safe to call.
+ * Only call after preserving user changes. Ignored results are retained.
  */
-export function cleanEvalArtifacts(): void {
-  execFileSync('git', ['reset', '--hard', 'HEAD'], { stdio: 'inherit' });
-  execFileSync('git', ['clean', '-fd'], { stdio: 'inherit' });
+export function cleanEvalArtifacts(cwd = process.cwd()): void {
+  execFileSync('git', ['reset', '--hard', 'HEAD'], { cwd, stdio: 'inherit' });
+  execFileSync('git', ['clean', '-fd'], { cwd, stdio: 'inherit' });
 }

@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
+import { createBackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { handleEvent } from './event-router';
 
 function createDeps(board: BackgroundJobBoard, now: () => number) {
@@ -28,12 +29,17 @@ function createDeps(board: BackgroundJobBoard, now: () => number) {
     idleReconciler: {
       scheduleIdleReconciliation: mock(() => {}),
       scheduleChildIdleReconciliation: mock(() => {}),
+      scheduleDeferredErrorBackstop: mock(() => {}),
       scheduleErrorTerminalize: mock(() => {}),
       clearIdleTimers: mock(() => {}),
       clearAllTimers: mock(() => []),
     },
-    deferredInlineErrors: new Set<string>(),
+    deferredInlineErrors: new Map<string, string>(),
     backgroundJobBoard: board,
+    terminalGate: createBackgroundJobTerminalGate({
+      backgroundJobBoard: board,
+      now,
+    }),
     pendingCallTracker: {
       peekByParentAndAgent: mock(() => undefined),
       clearSession: mock(() => {}),
@@ -45,7 +51,6 @@ function createDeps(board: BackgroundJobBoard, now: () => number) {
     },
     terminalJobsInjectedByParent: new Map(),
     pendingInjectedTerminalJobsByParent: new Map(),
-    retainedBoardSnapshots: new Map(),
     backgroundJobSupervisor,
   };
 }
@@ -122,6 +127,7 @@ describe('task session event generation fences', () => {
     await route(deps, 'session.status', {
       sessionID: 'child-1',
       status: { type: 'busy' },
+      activityAt: clock,
     });
     expect(board.get('child-1')).toMatchObject({ lastLiveBusyAt: 201 });
   });

@@ -3,14 +3,44 @@ import * as path from 'node:path';
 import { stripJsonComments } from '../cli/config-io';
 import { getConfigSearchDirs } from '../cli/paths';
 import { DEFAULT_DISABLED_AGENTS } from './constants';
+import type { ResolvedPresetMap } from './presets';
+import {
+  deepMerge,
+  mergeAgentOverrides,
+  mergePresetMaps,
+  normalizePreset,
+  PresetResolutionError,
+  resolvePresetDefinition,
+} from './presets';
+import {
+  stripRemovedConfigKeys,
+  stripRemovedDisabledValues,
+} from './removed-keys';
 import {
   BackgroundJobsConfigSchema,
+  DISABLED_COMMANDS_VALUES,
+  DISABLED_HOOKS_VALUES,
   InterviewConfigSchema,
-  LEGACY_FALLBACK_KEYS,
-  type PluginConfig,
+  type MarketplaceActivation,
+  MultiplexerConfigSchema,
   PluginConfigSchema,
+  type RawPluginConfig,
+  type ResolvedPluginConfig,
+  sanitizeBackgroundJobsConfig,
+  sanitizeMultiplexerConfig,
   WebfetchConfigSchema,
 } from './schema';
+import { legacyAliasesFor } from './utils';
+
+export {
+  deepMerge,
+  mergeAgentOverrides,
+  mergePresetMaps,
+  normalizePreset,
+  PresetResolutionError,
+  resolvePreset,
+  resolvePresets,
+} from './presets';
 
 /**
  * Warning kinds produced during config loading.
@@ -20,8 +50,8 @@ export type ConfigLoadWarningKind =
   | 'invalid-schema'
   | 'read-error'
   | 'missing-preset'
-  | 'deprecated-key'
-  | 'normalized';
+  | 'normalized'
+  | 'removed-key';
 
 /**
  * A warning emitted while loading plugin configuration.
@@ -47,17 +77,39 @@ export interface LoadPluginConfigOptions {
    * Suppress console warnings while still invoking onWarning.
    */
   silent?: boolean;
+
+  /**
+   * Host flavor marker ('v2' on OpenCode v2 hosts; absent on v1). Selects
+   * flavor-derived defaults for background-job keys that no config layer
+   * set explicitly: on v2 the native background notifier already delivers
+   * a run's first terminal publication, so board injection and periodic
+   * wake evaluation default off there. Explicit config always wins.
+   * Unmarked hosts also use v1's worktree-bounded discovery.
+   */
+  hostFlavor?: string;
 }
 
 const PROMPTS_DIR_NAME = 'oh-my-opencode-slim';
+
+/** Once-per-process guard for pre-rename prompt-file notices. */
+const warnedLegacyPromptFiles = new Set<string>();
+
+function warnLegacyPromptFile(agentName: string, fileName: string): void {
+  const key = `${agentName}:${fileName}`;
+  if (warnedLegacyPromptFiles.has(key)) return;
+  warnedLegacyPromptFiles.add(key);
+  console.warn(
+    `[oh-my-opencode-slim] Agent '${agentName}': prompt file '${fileName}' uses a pre-rename name and still applies. Rename it to '${agentName}.md' (or '${agentName}_append.md').`,
+  );
+}
 const INTERVIEW_CONFIG_KEYS = [
   'maxQuestions',
   'outputFolder',
   'autoOpenBrowser',
   'port',
   'dashboard',
+  'printState',
 ] as const;
-const LEGACY_BACKGROUND_JOBS_KEYS = ['continueOnIdle'] as const;
 
 // Config keys that must be arrays. A string value (e.g. "explorer") is
 // normalized to a single-element array; any other non-array value is
@@ -68,17 +120,42 @@ const DISABLED_CONFIG_KEYS = [
   'disabled_tools',
   'disabled_mcps',
   'disabled_skills',
+  'disabled_hooks',
+  'disabled_commands',
 ] as const;
+
+// Enum-backed disabled_* keys: unknown entries are stripped from the array
+// (with a warning) instead of rejecting the whole config layer through the
+// schema's editor-completion enum. Single source: the schema value lists.
+const DISABLED_CONFIG_VALUE_SETS: Partial<
+  Record<(typeof DISABLED_CONFIG_KEYS)[number], readonly string[]>
+> = {
+  disabled_hooks: DISABLED_HOOKS_VALUES,
+  disabled_commands: DISABLED_COMMANDS_VALUES,
+};
+
+/** Apply the environment placeholder syntax shared by config consumers. */
+export function interpolateEnvironmentVariables(value: string): string {
+  return value.replace(
+    /\{env:([^}]+)\}/g,
+    (_match, varName: string) => process.env[varName] ?? '',
+  );
+}
 
 /**
  * Normalize disabled_* config keys in place so a non-array value does not
  * reject the whole config object during schema validation. A string value
  * (e.g. "explorer") becomes a single-element array so the user's disable
  * intent survives; any other non-array value (number, boolean, object, ...)
- * is dropped. Array and undefined values are left untouched. Each
- * normalization is reported through `warn` (if provided) with a plain
- * message; callers wrap it in their own warning channel (loader uses
- * onWarning + console.warn, doctor just reports the message).
+ * is dropped. Array values of enum-backed keys (disabled_hooks,
+ * disabled_commands), including strings after shape normalization, are
+ * filtered to their valid values, stripping unknown entries instead of
+ * failing schema validation; a value consisting only of unknown entries is
+ * treated as unset so a lower config layer's list still applies. Undefined
+ * values are left
+ * untouched. Each normalization is reported through `warn` (if provided)
+ * with a plain message; callers wrap it in their own warning channel
+ * (loader uses onWarning + console.warn, doctor just reports the message).
  *
  * @param rawConfig - Parsed config to normalize (mutated in place)
  * @param warn - Optional callback invoked with each warning message
@@ -98,7 +175,7 @@ export function normalizeDisabledArrayKeys(
   const configRecord = rawConfig as Record<string, unknown>;
   for (const key of DISABLED_CONFIG_KEYS) {
     const value = configRecord[key];
-    if (value === undefined || Array.isArray(value)) {
+    if (value === undefined) {
       continue;
     }
     if (typeof value === 'string') {
@@ -107,61 +184,54 @@ export function normalizeDisabledArrayKeys(
         `Config key "${key}" should be an array; ` +
           `normalized to ["${value}"].`,
       );
-    } else {
+    } else if (!Array.isArray(value)) {
       delete configRecord[key];
       warn?.(`Config key "${key}" must be an array; ignoring invalid value.`);
+      continue;
     }
-  }
-}
 
-function migrateLegacyBackgroundJobsConfig(rawConfig: unknown): unknown {
-  if (
-    typeof rawConfig !== 'object' ||
-    rawConfig === null ||
-    Array.isArray(rawConfig)
-  ) {
-    return rawConfig;
-  }
-
-  const configRecord = rawConfig as Record<string, unknown>;
-  const backgroundJobs = configRecord.backgroundJobs;
-  if (
-    typeof backgroundJobs !== 'object' ||
-    backgroundJobs === null ||
-    Array.isArray(backgroundJobs) ||
-    !Object.hasOwn(backgroundJobs, 'continueOnIdle')
-  ) {
-    return rawConfig;
-  }
-
-  const migratedBackgroundJobs = {
-    ...(backgroundJobs as Record<string, unknown>),
-  };
-  const legacyContinueOnIdle = migratedBackgroundJobs.continueOnIdle;
-  delete migratedBackgroundJobs.continueOnIdle;
-
-  const wake = migratedBackgroundJobs.orchestratorWake;
-  if (
-    typeof legacyContinueOnIdle === 'boolean' &&
-    (wake === undefined ||
-      (typeof wake === 'object' && wake !== null && !Array.isArray(wake)))
-  ) {
-    const wakeConfig = (wake ?? {}) as Record<string, unknown>;
-    if (!Object.hasOwn(wakeConfig, 'enabled')) {
-      migratedBackgroundJobs.orchestratorWake = {
-        ...wakeConfig,
-        enabled: legacyContinueOnIdle,
-      };
+    const validValues = DISABLED_CONFIG_VALUE_SETS[key];
+    if (!validValues) {
+      continue;
     }
+    const normalizedValues = configRecord[key] as unknown[];
+    const stripped: unknown[] = [];
+    const kept: unknown[] = [];
+    for (const entry of normalizedValues) {
+      if (validValues.includes(entry as string)) {
+        kept.push(entry);
+      } else {
+        stripped.push(entry);
+      }
+    }
+    if (stripped.length === 0) {
+      continue;
+    }
+    if (kept.length === 0) {
+      // Every entry was unknown: emit no opt-out signal, so a lower config
+      // layer's valid list survives the layer merge.
+      delete configRecord[key];
+      warn?.(
+        `Config key "${key}" contains only unknown values ` +
+          `(${JSON.stringify(stripped)}); ignoring the key entirely so a ` +
+          `lower config layer still applies. ` +
+          `Valid values: ${validValues.join(', ')}.`,
+      );
+      continue;
+    }
+    configRecord[key] = kept;
+    warn?.(
+      `Config key "${key}" contains unknown values ` +
+        `(${JSON.stringify(stripped)}); ignoring them. ` +
+        `Valid values: ${validValues.join(', ')}.`,
+    );
   }
-
-  return { ...configRecord, backgroundJobs: migratedBackgroundJobs };
 }
 
 function retainExplicitInterviewFields(
-  parsedConfig: PluginConfig,
+  parsedConfig: RawPluginConfig,
   rawConfig: unknown,
-): PluginConfig {
+): RawPluginConfig {
   if (!parsedConfig.interview) {
     return parsedConfig;
   }
@@ -192,70 +262,112 @@ function retainExplicitInterviewFields(
 
   return {
     ...parsedConfig,
-    interview: interview as PluginConfig['interview'],
+    interview: interview as RawPluginConfig['interview'],
   };
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function retainExplicitBackgroundJobsFields(
-  parsedConfig: PluginConfig,
+  parsedConfig: RawPluginConfig,
   rawConfig: unknown,
-): PluginConfig {
+): RawPluginConfig {
   if (!parsedConfig.backgroundJobs) {
     return parsedConfig;
   }
 
   const rawBackgroundJobs =
-    typeof rawConfig === 'object' &&
-    rawConfig !== null &&
-    !Array.isArray(rawConfig) &&
-    typeof (rawConfig as Record<string, unknown>).backgroundJobs === 'object' &&
-    (rawConfig as Record<string, unknown>).backgroundJobs !== null &&
-    !Array.isArray((rawConfig as Record<string, unknown>).backgroundJobs)
-      ? ((rawConfig as Record<string, unknown>).backgroundJobs as Record<
-          string,
-          unknown
-        >)
+    isPlainRecord(rawConfig) && isPlainRecord(rawConfig.backgroundJobs)
+      ? rawConfig.backgroundJobs
       : undefined;
-
   if (!rawBackgroundJobs) {
     return parsedConfig;
   }
 
-  const backgroundJobs: Record<string, unknown> = {};
-  const parsedBackgroundJobs = parsedConfig.backgroundJobs as unknown as Record<
-    string,
-    unknown
-  >;
-  for (const key of Object.keys(rawBackgroundJobs)) {
-    if (
-      key !== 'orchestratorWake' &&
-      Object.hasOwn(parsedBackgroundJobs, key)
-    ) {
-      backgroundJobs[key] = parsedBackgroundJobs[key];
-    }
-  }
-
-  const rawWake =
-    typeof rawBackgroundJobs.orchestratorWake === 'object' &&
-    rawBackgroundJobs.orchestratorWake !== null &&
-    !Array.isArray(rawBackgroundJobs.orchestratorWake)
-      ? (rawBackgroundJobs.orchestratorWake as Record<string, unknown>)
-      : undefined;
-  const orchestratorWake: Record<string, unknown> = {};
-  const parsedWake = parsedConfig.backgroundJobs
-    .orchestratorWake as unknown as Record<string, unknown>;
-  for (const key of Object.keys(rawWake ?? {})) {
-    if (Object.hasOwn(parsedWake, key)) {
-      orchestratorWake[key] = parsedWake[key];
-    }
-  }
-  if (Object.keys(orchestratorWake).length > 0) {
-    backgroundJobs.orchestratorWake = orchestratorWake;
-  }
+  // Keys the sanitizer dropped were invalid in this layer (#1291). Retaining
+  // their parsed defaults would resurrect them as explicit values, letting a
+  // broken upper layer override valid lower-layer settings during merge.
+  // The sanitizer's once-per-process diagnostic already fired inside
+  // safeParse, so this second pass stays silent.
+  const sanitizedBackgroundJobs = sanitizeBackgroundJobsConfig(
+    rawBackgroundJobs,
+  ) as Record<string, unknown>;
 
   return {
     ...parsedConfig,
-    backgroundJobs: backgroundJobs as PluginConfig['backgroundJobs'],
+    backgroundJobs: retainSanitizedValues(
+      parsedConfig.backgroundJobs as unknown as Record<string, unknown>,
+      sanitizedBackgroundJobs,
+    ) as RawPluginConfig['backgroundJobs'],
+  };
+}
+
+/**
+ * Zod applies multiplexer defaults while parsing each layer. Keep those
+ * defaults from masquerading as explicitly configured overrides; the merged
+ * multiplexer config is normalized after all layers are merged.
+ */
+function retainExplicitMultiplexerFields(
+  parsedConfig: RawPluginConfig,
+  rawConfig: unknown,
+): RawPluginConfig {
+  if (!parsedConfig.multiplexer || !isPlainRecord(rawConfig)) {
+    return parsedConfig;
+  }
+
+  // The sanitizer's once-per-process diagnostic already fired in safeParse.
+  return {
+    ...parsedConfig,
+    multiplexer: retainSanitizedValues(
+      parsedConfig.multiplexer as unknown as Record<string, unknown>,
+      sanitizeMultiplexerConfig(rawConfig.multiplexer) as Record<
+        string,
+        unknown
+      >,
+    ) as RawPluginConfig['multiplexer'],
+  };
+}
+
+/** Keep parsed leaf values only where the sanitized raw layer kept the key, recursing into plain objects. */
+function retainSanitizedValues(
+  parsed: Record<string, unknown>,
+  sanitized: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(sanitized)) {
+    if (!Object.hasOwn(parsed, key)) {
+      continue;
+    }
+    const parsedValue = parsed[key];
+    const sanitizedValue = sanitized[key];
+    if (isPlainRecord(parsedValue) && isPlainRecord(sanitizedValue)) {
+      const nested = retainSanitizedValues(parsedValue, sanitizedValue);
+      if (Object.keys(nested).length > 0) {
+        out[key] = nested;
+      }
+      continue;
+    }
+    out[key] = parsedValue;
+  }
+  return out;
+}
+
+/** Normalize preset syntax before layered config objects are merged. */
+function normalizePresetDeclarations(config: RawPluginConfig): RawPluginConfig {
+  if (!config.presets) {
+    return config;
+  }
+
+  return {
+    ...config,
+    presets: Object.fromEntries(
+      Object.entries(config.presets).map(([name, preset]) => [
+        name,
+        normalizePreset(preset),
+      ]),
+    ),
   };
 }
 
@@ -269,10 +381,19 @@ function retainExplicitBackgroundJobsFields(
  * @param onWarning - Optional callback for warnings
  * @returns Validated config object, or null if loading failed
  */
-function loadConfigFromPath(
+export function loadPluginConfigFromPath(
   configPath: string,
   options?: LoadPluginConfigOptions,
-): PluginConfig | null {
+): RawPluginConfig | null {
+  const config = loadRawPluginConfigFromPath(configPath, options);
+  return config ? normalizePresetDeclarations(config) : null;
+}
+
+/** Validate a layer without changing its editable preset declaration syntax. */
+export function loadRawPluginConfigFromPath(
+  configPath: string,
+  options?: LoadPluginConfigOptions,
+): RawPluginConfig | null {
   try {
     // Strip a UTF-8 BOM (RFC 8259 permits one); JSON.parse would otherwise
     // fail with "Unrecognized token" and silently drop the whole config.
@@ -281,10 +402,7 @@ function loadConfigFromPath(
     let rawConfig: unknown;
     try {
       const stripped = stripJsonComments(content);
-      const interpolated = stripped.replace(
-        /\{env:([^}]+)\}/g,
-        (_, varName) => process.env[varName] ?? '',
-      );
+      const interpolated = interpolateEnvironmentVariables(stripped);
       rawConfig = JSON.parse(interpolated);
     } catch (error) {
       // Empty file or JSON parse error is treated as invalid-json
@@ -302,104 +420,32 @@ function loadConfigFromPath(
       }
       return null;
     }
-    // Warn about deprecated tmux key
-    if (
-      typeof rawConfig === 'object' &&
-      rawConfig !== null &&
-      'tmux' in (rawConfig as Record<string, unknown>)
-    ) {
-      const tmuxMsg =
-        'Deprecated tmux config key found and ignored. Use multiplexer config instead.';
+    // Drop keys removed in this version before schema validation: a stale
+    // removed key must not invalidate the whole file (and silently discard
+    // every other user setting). Reported per key, not migrated.
+    stripRemovedConfigKeys(rawConfig, (message) => {
       options?.onWarning?.({
         path: configPath,
-        kind: 'deprecated-key',
-        message: tmuxMsg,
+        kind: 'removed-key',
+        message,
       });
       if (!options?.silent) {
-        console.warn(`[oh-my-opencode-slim] ${tmuxMsg}`);
+        console.warn(`[oh-my-opencode-slim] ${message}`);
       }
-    }
+    });
 
-    // Warn about deprecated council.master key
-    if (
-      typeof rawConfig === 'object' &&
-      rawConfig !== null &&
-      typeof (rawConfig as Record<string, unknown>).council === 'object' &&
-      (rawConfig as Record<string, unknown>).council !== null &&
-      'master' in
-        ((rawConfig as Record<string, unknown>).council as Record<
-          string,
-          unknown
-        >)
-    ) {
-      const masterMsg =
-        'Deprecated council.master config key found and ignored. Configure council agents via presets instead.';
+    // Same for enum members removed from disabled_* arrays: strip them
+    // before the value enum rejects the whole file, reported per value.
+    stripRemovedDisabledValues(rawConfig, (message) => {
       options?.onWarning?.({
         path: configPath,
-        kind: 'deprecated-key',
-        message: masterMsg,
+        kind: 'removed-key',
+        message,
       });
       if (!options?.silent) {
-        console.warn(`[oh-my-opencode-slim] ${masterMsg}`);
+        console.warn(`[oh-my-opencode-slim] ${message}`);
       }
-    }
-
-    // Preserve the opt-out behavior of the removed continueOnIdle key for
-    // one compatibility window by migrating it before schema validation.
-    if (
-      typeof rawConfig === 'object' &&
-      rawConfig !== null &&
-      typeof (rawConfig as Record<string, unknown>).backgroundJobs ===
-        'object' &&
-      (rawConfig as Record<string, unknown>).backgroundJobs !== null
-    ) {
-      const backgroundJobs = (rawConfig as Record<string, unknown>)
-        .backgroundJobs as Record<string, unknown>;
-      const present = LEGACY_BACKGROUND_JOBS_KEYS.filter(
-        (key) => key in backgroundJobs,
-      );
-      if (present.length > 0) {
-        const backgroundJobsMsg =
-          'Deprecated backgroundJobs.continueOnIdle config key found. ' +
-          'Boolean values are migrated to backgroundJobs.orchestratorWake.enabled ' +
-          'unless that replacement is explicit in the same config file; other values are ignored. ' +
-          'Use backgroundJobs.orchestratorWake.enabled instead.';
-        options?.onWarning?.({
-          path: configPath,
-          kind: 'deprecated-key',
-          message: backgroundJobsMsg,
-        });
-        if (!options?.silent) {
-          console.warn(`[oh-my-opencode-slim] ${backgroundJobsMsg}`);
-        }
-      }
-    }
-    rawConfig = migrateLegacyBackgroundJobsConfig(rawConfig);
-
-    // Warn about deprecated fallback.* keys. The schema strips these before
-    // validation so the rest of the config still loads; without this warning
-    // users would not know their stale keys are ignored.
-    if (
-      typeof rawConfig === 'object' &&
-      rawConfig !== null &&
-      typeof (rawConfig as Record<string, unknown>).fallback === 'object' &&
-      (rawConfig as Record<string, unknown>).fallback !== null
-    ) {
-      const fallback = (rawConfig as Record<string, unknown>)
-        .fallback as Record<string, unknown>;
-      const present = LEGACY_FALLBACK_KEYS.filter((key) => key in fallback);
-      if (present.length > 0) {
-        const fallbackMsg = `Deprecated fallback config key${present.length === 1 ? '' : 's'} ${present.join(', ')} found and ignored. These fields were removed in 2.3.x; fallback behavior is controlled by fallback.enabled and fallback.maxRetries.`;
-        options?.onWarning?.({
-          path: configPath,
-          kind: 'deprecated-key',
-          message: fallbackMsg,
-        });
-        if (!options?.silent) {
-          console.warn(`[oh-my-opencode-slim] ${fallbackMsg}`);
-        }
-      }
-    }
+    });
 
     // Normalize disabled_* config keys before schema validation so a
     // non-array value does not reject the whole config object (which would
@@ -437,6 +483,7 @@ function loadConfigFromPath(
     // merged interview config is normalized after all layers are merged.
     let layerConfig = retainExplicitInterviewFields(result.data, rawConfig);
     layerConfig = retainExplicitBackgroundJobsFields(layerConfig, rawConfig);
+    layerConfig = retainExplicitMultiplexerFields(layerConfig, rawConfig);
 
     // Zod applies webfetch.enabled's default while parsing each layer. Keep
     // that default from masquerading as an explicitly configured override;
@@ -452,9 +499,9 @@ function loadConfigFromPath(
       !Object.hasOwn(rawConfig.webfetch, 'enabled')
     ) {
       const { enabled: _enabled, ...webfetch } = layerConfig.webfetch;
-      return {
+      layerConfig = {
         ...layerConfig,
-        webfetch: webfetch as PluginConfig['webfetch'],
+        webfetch: webfetch as RawPluginConfig['webfetch'],
       };
     }
 
@@ -529,7 +576,7 @@ function findConfigPathInDirs(
  * @returns `true` if the routing configuration is valid, `false` otherwise
  */
 function validateFinalImageRouting(
-  config: PluginConfig,
+  config: RawPluginConfig,
   configPath: string,
   options?: LoadPluginConfigOptions,
 ): boolean {
@@ -554,32 +601,114 @@ function validateFinalImageRouting(
   return false;
 }
 
+/** Use the host's case-insensitive boolean flag semantics. */
+export function isProjectConfigDisabled(): boolean {
+  return ['true', '1'].includes(
+    process.env.OPENCODE_DISABLE_PROJECT_CONFIG?.toLowerCase() ?? '',
+  );
+}
+
+/** Project .opencode directories in host-specific, farthest-to-nearest order. */
+export function getProjectConfigDirectories(
+  directory: string,
+  hostFlavor?: string,
+): string[] {
+  if (isProjectConfigDisabled()) {
+    return [];
+  }
+  const directories: string[] = [];
+  let current = path.resolve(directory);
+  for (;;) {
+    directories.push(path.join(current, '.opencode'));
+    if (hostFlavor !== 'v2') {
+      try {
+        fs.lstatSync(path.join(current, '.git'));
+        break;
+      } catch {
+        // As in marketplace preflight, a Git directory or worktree file
+        // marks the inclusive v1 project boundary.
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return directories.reverse();
+}
+
+function getProjectConfigBases(
+  directory: string,
+  hostFlavor?: string,
+): string[] {
+  return getProjectConfigDirectories(directory, hostFlavor).map(
+    (configDirectory) => path.join(configDirectory, 'oh-my-opencode-slim'),
+  );
+}
+
 /**
  * Find plugin config paths (user and project) for a given directory.
  * User config uses getConfigSearchDirs() for lookup.
- * Project config uses <directory>/.opencode/oh-my-opencode-slim.
+ * Project configs follow the host's discovery boundary: the Git worktree
+ * on v1 (the default), or the filesystem root on v2. The project's walk is
+ * omitted when OPENCODE_DISABLE_PROJECT_CONFIG is true or 1.
  *
  * @param directory - Project directory to search for .opencode config
- * @returns Object with userConfigPath and projectConfigPath (null if not found)
+ * @returns All project layers in merge order, plus the current directory's
+ * projectConfigPath for callers that edit local configuration. The singular
+ * path must not redirect writes to an inherited ancestor file.
  */
-export function findPluginConfigPaths(directory: string): {
+export function findPluginConfigPaths(
+  directory: string,
+  hostFlavor?: string,
+): {
   userConfigPath: string | null;
   projectConfigPath: string | null;
+  projectConfigPaths: string[];
 } {
   const userConfigPath = findConfigPathInDirs(
     getConfigSearchDirs(),
     'oh-my-opencode-slim',
   );
 
-  const projectConfigBasePath = path.join(
-    directory,
-    '.opencode',
-    'oh-my-opencode-slim',
-  );
+  const projectConfigBases = getProjectConfigBases(directory, hostFlavor);
+  const projectConfigPaths = projectConfigBases
+    .map(findConfigPath)
+    .filter((configPath): configPath is string => configPath !== null);
+  const projectConfigPath = projectConfigBases.length
+    ? findConfigPath(
+        path.resolve(directory, '.opencode', 'oh-my-opencode-slim'),
+      )
+    : null;
 
-  const projectConfigPath = findConfigPath(projectConfigBasePath);
+  return { userConfigPath, projectConfigPath, projectConfigPaths };
+}
 
-  return { userConfigPath, projectConfigPath };
+/**
+ * All plugin config candidate paths for a directory, independent of
+ * existence: `.jsonc` then `.json` for every user config search location and
+ * for each eligible ancestor's `.opencode`, farthest to nearest.
+ * The loader prefers `.jsonc` over `.json`, and
+ * the v2 watcher must observe creation/deletion/rename and that precedence
+ * change, so it consumes this candidate set instead of existing files only.
+ */
+export function getPluginConfigCandidates(
+  directory: string,
+  hostFlavor?: string,
+): {
+  user: string[];
+  project: string[];
+} {
+  const user: string[] = [];
+  for (const configDir of getConfigSearchDirs()) {
+    const basePath = path.join(configDir, 'oh-my-opencode-slim');
+    user.push(`${basePath}.jsonc`, `${basePath}.json`);
+  }
+  return {
+    user,
+    project: getProjectConfigBases(directory, hostFlavor).flatMap(
+      (basePath) => [`${basePath}.jsonc`, `${basePath}.json`],
+    ),
+  };
 }
 
 /**
@@ -587,14 +716,17 @@ export function findPluginConfigPaths(directory: string): {
  * Project/override takes precedence over base.
  */
 export function mergePluginConfigs(
-  base: PluginConfig,
-  override: PluginConfig,
-): PluginConfig {
+  base: RawPluginConfig,
+  override: RawPluginConfig,
+): RawPluginConfig {
   return {
     ...base,
     ...override,
-    agents: deepMerge(base.agents, override.agents),
-    presets: deepMerge(base.presets, override.presets),
+    agents:
+      base.agents || override.agents
+        ? mergeAgentOverrides(base.agents ?? {}, override.agents ?? {})
+        : undefined,
+    presets: mergePresetMaps(base.presets, override.presets),
     multiplexer: deepMerge(base.multiplexer, override.multiplexer),
     interview: deepMerge(base.interview, override.interview),
     backgroundJobs: deepMerge(base.backgroundJobs, override.backgroundJobs),
@@ -603,64 +735,27 @@ export function mergePluginConfigs(
     webfetch: deepMerge(
       base.webfetch as Record<string, unknown> | undefined,
       override.webfetch as Record<string, unknown> | undefined,
-    ) as PluginConfig['webfetch'],
+    ) as RawPluginConfig['webfetch'],
     acpAgents: deepMerge(base.acpAgents, override.acpAgents),
     companion: deepMerge(
       base.companion as Record<string, unknown> | undefined,
       override.companion as Record<string, unknown> | undefined,
-    ) as PluginConfig['companion'],
+    ) as RawPluginConfig['companion'],
   };
-}
-
-/**
- * Recursively merge two objects, with override values taking precedence.
- * For nested objects, merges recursively. For arrays and primitives, override replaces base.
- *
- * @param base - Base object to merge into
- * @param override - Override object whose values take precedence
- * @returns Merged object, or undefined if both inputs are undefined
- */
-export function deepMerge<T extends Record<string, unknown>>(
-  base?: T,
-  override?: T,
-): T | undefined {
-  if (!base) return override;
-  if (!override) return base;
-
-  const result = { ...base } as T;
-  for (const key of Object.keys(override) as (keyof T)[]) {
-    const baseVal = base[key];
-    const overrideVal = override[key];
-
-    if (
-      typeof baseVal === 'object' &&
-      baseVal !== null &&
-      typeof overrideVal === 'object' &&
-      overrideVal !== null &&
-      !Array.isArray(baseVal) &&
-      !Array.isArray(overrideVal)
-    ) {
-      result[key] = deepMerge(
-        baseVal as Record<string, unknown>,
-        overrideVal as Record<string, unknown>,
-      ) as T[keyof T];
-    } else {
-      result[key] = overrideVal;
-    }
-  }
-  return result;
 }
 
 /**
  * Load plugin configuration from user and project config files, merging them appropriately.
  *
- * Configuration is loaded from two locations:
+ * Configuration is loaded in precedence order:
  * 1. User config: $OPENCODE_CONFIG_DIR/oh-my-opencode-slim.jsonc or .json,
  *    or ~/.config/opencode/oh-my-opencode-slim.jsonc or .json (or $XDG_CONFIG_HOME)
- * 2. Project config: <directory>/.opencode/oh-my-opencode-slim.jsonc or .json
+ * 2. Ancestor project configs: .opencode/oh-my-opencode-slim.jsonc or .json,
+ *    from the host's discovery boundary down to directory, inclusive
  *
  * JSONC format is preferred over JSON (allows comments and trailing commas).
- * Project config takes precedence over user config. Nested objects (agents, multiplexer) are
+ * Closer project configs take precedence over ancestors and user config.
+ * Nested objects (agents, multiplexer) are
  * deep-merged, while top-level arrays are replaced entirely by project config.
  *
  * @param directory - Project directory to search for .opencode config
@@ -670,19 +765,75 @@ export function deepMerge<T extends Record<string, unknown>>(
 export function loadPluginConfig(
   directory: string,
   options?: LoadPluginConfigOptions,
-): PluginConfig {
-  const { userConfigPath, projectConfigPath } =
-    findPluginConfigPaths(directory);
+): ResolvedPluginConfig {
+  const { userConfigPath, projectConfigPaths } = findPluginConfigPaths(
+    directory,
+    options?.hostFlavor,
+  );
 
-  let config: PluginConfig = userConfigPath
-    ? (loadConfigFromPath(userConfigPath, options) ?? {})
+  let config: RawPluginConfig = userConfigPath
+    ? (loadPluginConfigFromPath(userConfigPath, options) ?? {})
     : {};
 
-  const projectConfig = projectConfigPath
-    ? loadConfigFromPath(projectConfigPath, options)
-    : null;
-  if (projectConfig) {
-    config = mergePluginConfigs(config, projectConfig);
+  const presetPaths = new Map<string, string>();
+  const presetInheritancePaths = new Map<string, string>();
+  let selectedPresetPath = '';
+  let imageRoutingPath = '';
+  const recordConfigSources = (
+    layer: RawPluginConfig,
+    configPath: string,
+  ): void => {
+    if (layer.preset !== undefined) selectedPresetPath = configPath;
+    if (layer.image_routing !== undefined) imageRoutingPath = configPath;
+    for (const [name, definition] of Object.entries(layer.presets ?? {})) {
+      presetPaths.set(name, configPath);
+      if (normalizePreset(definition).extends !== undefined) {
+        presetInheritancePaths.set(name, configPath);
+      }
+    }
+  };
+  if (userConfigPath) recordConfigSources(config, userConfigPath);
+
+  for (const configPath of projectConfigPaths) {
+    const projectConfig = loadPluginConfigFromPath(configPath, options);
+    if (projectConfig) {
+      config = mergePluginConfigs(config, projectConfig);
+      recordConfigSources(projectConfig, configPath);
+    }
+  }
+
+  // boardInjection is v1-only: force-disabled at the RuntimeConfig layer on
+  // v2 (native notifier + inbox delivery replace the passive board). An
+  // explicit true warns here — pre-parse, on the merged explicit-only
+  // config — because the loader is the layer that sees user intent, and
+  // Object.hasOwn distinguishes an explicit key from an applied default.
+  // periodicWakeEnabled needs no derivation here: v2 disables the periodic
+  // evaluation structurally where the wake scheduler is wired (src/index.ts).
+  // An explicit true warns the same way, so the override is never silent.
+  if (options?.hostFlavor === 'v2' && !options?.silent) {
+    const backgroundJobs = (config.backgroundJobs ?? {}) as Record<
+      string,
+      unknown
+    >;
+    if (
+      Object.hasOwn(backgroundJobs, 'boardInjection') &&
+      backgroundJobs.boardInjection === true
+    ) {
+      console.warn(
+        '[oh-my-opencode-slim] backgroundJobs.boardInjection is ignored on OpenCode v2 hosts: the native background notifier and inbox delivery replace the passive board. Run oh-my-opencode-slim doctor for details.',
+      );
+    }
+    const orchestratorWake = backgroundJobs.orchestratorWake;
+    if (
+      orchestratorWake !== null &&
+      typeof orchestratorWake === 'object' &&
+      Object.hasOwn(orchestratorWake, 'periodicWakeEnabled') &&
+      (orchestratorWake as Record<string, unknown>).periodicWakeEnabled === true
+    ) {
+      console.warn(
+        '[oh-my-opencode-slim] backgroundJobs.orchestratorWake.periodicWakeEnabled is ignored on OpenCode v2 hosts: the native background notifier delivers terminal publications to an idle parent, so the periodic idle evaluation is off. Run oh-my-opencode-slim doctor for details.',
+      );
+    }
   }
 
   if (config.webfetch) {
@@ -696,6 +847,12 @@ export function loadPluginConfig(
       config.backgroundJobs,
     );
   }
+  if (config.multiplexer) {
+    // Per-layer parsing kept only explicitly configured multiplexer keys
+    // (see retainExplicitMultiplexerFields), so defaults apply once here,
+    // after all layers are merged.
+    config.multiplexer = MultiplexerConfigSchema.parse(config.multiplexer);
+  }
 
   // Override preset from environment variable if set
   const envPreset = process.env.OH_MY_OPENCODE_SLIM_PRESET;
@@ -703,22 +860,86 @@ export function loadPluginConfig(
     config.preset = envPreset;
   }
 
+  // Resolve presets independently. An invalid, unused preset must not prevent
+  // valid presets from being selected. A failed chain is omitted completely,
+  // so the selected preset can never receive a partially resolved ancestor.
+  let resolvedPresets: ResolvedPresetMap | undefined;
+  let resolvedMarketplacePresets:
+    | Record<string, MarketplaceActivation>
+    | undefined;
+  const presetInheritanceFailures = new Set<string>();
+  if (config.presets) {
+    resolvedPresets = {};
+    resolvedMarketplacePresets = {};
+    for (const name of Object.keys(config.presets)) {
+      try {
+        const definition = resolvePresetDefinition(name, config.presets);
+        resolvedPresets[name] = definition.agents;
+        if (definition.marketplace) {
+          resolvedMarketplacePresets[name] = definition.marketplace;
+        }
+      } catch (error) {
+        presetInheritanceFailures.add(name);
+        const message =
+          error instanceof PresetResolutionError
+            ? error.message
+            : `Unable to resolve preset inheritance: ${String(error)}`;
+        const brokenParent =
+          error instanceof PresetResolutionError
+            ? error.chain.at(-2)
+            : undefined;
+        options?.onWarning?.({
+          path:
+            (brokenParent
+              ? presetInheritancePaths.get(brokenParent)
+              : undefined) ??
+            presetPaths.get(name) ??
+            '',
+          kind: 'invalid-schema',
+          message,
+        });
+        if (!options?.silent) {
+          console.warn(`[oh-my-opencode-slim] ${message}`);
+        }
+      }
+    }
+  }
+
+  const { presets: _rawPresets, ...configWithoutPresets } = config;
+  const runtimeConfig: ResolvedPluginConfig = resolvedPresets
+    ? {
+        ...configWithoutPresets,
+        presets: resolvedPresets,
+        ...(resolvedMarketplacePresets
+          ? { marketplacePresets: resolvedMarketplacePresets }
+          : {}),
+      }
+    : configWithoutPresets;
+
   // Resolve preset and merge with root agents
-  if (config.preset) {
-    const preset = config.presets?.[config.preset];
+  if (runtimeConfig.preset) {
+    const preset = resolvedPresets?.[runtimeConfig.preset];
     if (preset) {
       // Merge preset agents with root agents (root overrides)
-      config.agents = deepMerge(preset, config.agents);
+      runtimeConfig.agents = mergeAgentOverrides(
+        preset,
+        runtimeConfig.agents ?? {},
+      );
+    } else if (presetInheritanceFailures.has(runtimeConfig.preset)) {
+      // The inheritance warning above already identifies the exact broken
+      // chain. In particular, never apply only the ancestor portion here.
     } else {
       // Preset name specified but doesn't exist - warn user
       const presetSource =
-        envPreset === config.preset ? 'environment variable' : 'config file';
-      const availablePresets = config.presets
-        ? Object.keys(config.presets).join(', ')
+        envPreset === runtimeConfig.preset
+          ? 'environment variable'
+          : 'config file';
+      const availablePresets = runtimeConfig.presets
+        ? Object.keys(runtimeConfig.presets).join(', ')
         : 'none';
-      const message = `Preset "${config.preset}" not found (from ${presetSource}). Available presets: ${availablePresets}`;
+      const message = `Preset "${runtimeConfig.preset}" not found (from ${presetSource}). Available presets: ${availablePresets}`;
       options?.onWarning?.({
-        path: projectConfigPath ?? userConfigPath ?? '',
+        path: envPreset ? '' : selectedPresetPath,
         kind: 'missing-preset',
         message,
       });
@@ -728,32 +949,41 @@ export function loadPluginConfig(
     }
   }
 
+  // Canonicalize root declarations even when no preset is selected. This
+  // keeps alias and canonical keys from competing in the runtime surface and
+  // preserves canonical values field-by-field across user/project layers.
+  if (runtimeConfig.agents) {
+    runtimeConfig.agents = mergeAgentOverrides({}, runtimeConfig.agents);
+  }
+
+  // Note: per-agent skill directives (skills_add/skills_remove) are left
+  // raw in the returned config. They are folded into the effective skills
+  // list by RuntimeConfig.agents(), the single resolution point, so runtime
+  // /preset switching re-resolves them from the raw preset layers instead
+  // of operating on an already-baked skills array.
+
   // Normalize companion config defaults
-  if (config.companion) {
-    config.companion = {
-      enabled: config.companion.enabled ?? false,
-      binaryPath: config.companion.binaryPath,
-      position: config.companion.position ?? 'bottom-right',
-      size: config.companion.size ?? 'medium',
-      gifPack: config.companion.gifPack ?? 'default',
-      loopStyle: config.companion.loopStyle ?? 'classic',
-      speed: config.companion.speed ?? 1,
-      debug: config.companion.debug ?? false,
+  if (runtimeConfig.companion) {
+    runtimeConfig.companion = {
+      enabled: runtimeConfig.companion.enabled ?? false,
+      binaryPath: runtimeConfig.companion.binaryPath,
+      position: runtimeConfig.companion.position ?? 'bottom-right',
+      size: runtimeConfig.companion.size ?? 'medium',
+      gifPack: runtimeConfig.companion.gifPack ?? 'default',
+      loopStyle: runtimeConfig.companion.loopStyle ?? 'classic',
+      speed: runtimeConfig.companion.speed ?? 1,
+      debug: runtimeConfig.companion.debug ?? false,
     };
   }
 
-  validateFinalImageRouting(
-    config,
-    projectConfigPath ?? userConfigPath ?? '',
-    options,
-  );
+  validateFinalImageRouting(runtimeConfig, imageRoutingPath, options);
   // Note: we intentionally do NOT override image_routing to 'direct' here.
   // The observer-disabled guard in processImageAttachments handles the
   // auto+observer-disabled case by returning true, which triggers the
   // debounced toast in index.ts. Overriding to 'direct' here would prevent
   // processImageAttachments from returning true and suppress the toast.
 
-  return config;
+  return runtimeConfig;
 }
 
 /**
@@ -768,19 +998,23 @@ export function loadPluginConfig(
  */
 export function loadAgentPrompt(
   agentName: string,
-  optionsOrPreset?: string | { preset?: string; projectDirectory?: string },
+  optionsOrPreset?:
+    | string
+    | { preset?: string; projectDirectory?: string; hostFlavor?: string },
 ): {
   prompt?: string;
   appendPrompt?: string;
 } {
   let preset: string | undefined;
   let projectDirectory: string | undefined;
+  let hostFlavor: string | undefined;
 
   if (typeof optionsOrPreset === 'string') {
     preset = optionsOrPreset;
   } else if (optionsOrPreset && typeof optionsOrPreset === 'object') {
     preset = optionsOrPreset.preset;
     projectDirectory = optionsOrPreset.projectDirectory;
+    hostFlavor = optionsOrPreset.hostFlavor;
   }
 
   const presetDirName =
@@ -788,24 +1022,27 @@ export function loadAgentPrompt(
 
   const searchDirs: string[] = [];
 
-  // Lookup order preference:
-  // 1. Project preset dir
-  if (projectDirectory && presetDirName) {
-    searchDirs.push(
-      path.join(projectDirectory, '.opencode', PROMPTS_DIR_NAME, presetDirName),
-    );
-  }
-  // 2. Project root dir
+  // Nearest project location wins, with preset-specific files preferred
+  // within each location. Use the same ancestor walk as configuration.
   if (projectDirectory) {
-    searchDirs.push(path.join(projectDirectory, '.opencode', PROMPTS_DIR_NAME));
+    for (const configDirectory of getProjectConfigDirectories(
+      projectDirectory,
+      hostFlavor,
+    ).reverse()) {
+      const promptsDirectory = path.join(configDirectory, PROMPTS_DIR_NAME);
+      if (presetDirName) {
+        searchDirs.push(path.join(promptsDirectory, presetDirName));
+      }
+      searchDirs.push(promptsDirectory);
+    }
   }
-  // 3. User preset dirs
+  // User preset dirs
   if (presetDirName) {
     for (const userDir of getConfigSearchDirs()) {
       searchDirs.push(path.join(userDir, PROMPTS_DIR_NAME, presetDirName));
     }
   }
-  // 4. User root dirs
+  // User root dirs
   for (const userDir of getConfigSearchDirs()) {
     searchDirs.push(path.join(userDir, PROMPTS_DIR_NAME));
   }
@@ -835,17 +1072,34 @@ export function loadAgentPrompt(
 
   const result: { prompt?: string; appendPrompt?: string } = {};
 
+  // Rename continuity: fall back to pre-rename file names (e.g. a
+  // `librarian.md` override keeps applying to the merged `explorer`). Warn
+  // once per process so users learn to rename.
+  const nameCandidates = [agentName, ...legacyAliasesFor(agentName)];
+
   // Check for replacement prompt
-  result.prompt = readFirstPrompt(
-    `${agentName}.md`,
-    'Error reading prompt file',
-  );
+  for (const candidate of nameCandidates) {
+    const fileName = `${candidate}.md`;
+    const found = readFirstPrompt(fileName, 'Error reading prompt file');
+    if (found === undefined) continue;
+    if (candidate !== agentName) {
+      warnLegacyPromptFile(agentName, fileName);
+    }
+    result.prompt = found;
+    break;
+  }
 
   // Check for append prompt
-  result.appendPrompt = readFirstPrompt(
-    `${agentName}_append.md`,
-    'Error reading append prompt file',
-  );
+  for (const candidate of nameCandidates) {
+    const fileName = `${candidate}_append.md`;
+    const found = readFirstPrompt(fileName, 'Error reading append prompt file');
+    if (found === undefined) continue;
+    if (candidate !== agentName) {
+      warnLegacyPromptFile(agentName, fileName);
+    }
+    result.appendPrompt = found;
+    break;
+  }
 
   return result;
 }

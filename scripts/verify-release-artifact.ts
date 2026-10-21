@@ -28,10 +28,12 @@ const packagedRequiredFiles = [
   'LICENSE',
   'dist/index.js',
   'dist/index.d.ts',
-  'dist/server.js',
+  'dist/server/index.js',
   'dist/tui.js',
   'dist/tui.d.ts',
   'dist/cli/index.js',
+  'dist/marketplace-contract/index.js',
+  'dist/marketplace-contract/index.d.ts',
   'oh-my-opencode-slim.schema.json',
   'src/companion/companion-manifest.json',
   'src/skills/simplify/SKILL.md',
@@ -65,18 +67,34 @@ function run(command: string, args: string[], options: { cwd?: string } = {}) {
   return result.stdout.trim();
 }
 
-function parsePackJson(output: string) {
-  const start = output.indexOf('[');
-  const end = output.lastIndexOf(']');
+type PackEntry = {
+  filename?: string;
+  files?: Array<{ path: string }>;
+};
 
-  if (start === -1 || end === -1 || end < start) {
-    fail(`Could not locate npm pack JSON output:\n${output}`);
+function parsePackJson(output: string): PackEntry[] {
+  // npm pack --json historically emitted an array of entries; npm >= 12
+  // emits an object keyed by package name. Accept both shapes.
+  const arrayStart = output.indexOf('[');
+  const objectStart = output.indexOf('{');
+
+  if (arrayStart !== -1 && (objectStart === -1 || arrayStart < objectStart)) {
+    const end = output.lastIndexOf(']');
+    if (end === -1 || end < arrayStart) {
+      fail(`Could not locate npm pack JSON output:\n${output}`);
+    }
+    return JSON.parse(output.slice(arrayStart, end + 1)) as PackEntry[];
   }
 
-  return JSON.parse(output.slice(start, end + 1)) as Array<{
-    filename?: string;
-    files?: Array<{ path: string }>;
-  }>;
+  const end = output.lastIndexOf('}');
+  if (objectStart === -1 || end === -1 || end < objectStart) {
+    fail(`Could not locate npm pack JSON output:\n${output}`);
+  }
+  const parsed = JSON.parse(output.slice(objectStart, end + 1)) as Record<
+    string,
+    PackEntry | PackEntry[]
+  >;
+  return Object.values(parsed).flat() as PackEntry[];
 }
 
 function walkFiles(dir: string): string[] {
@@ -184,7 +202,45 @@ function verifyFreshInstall(tarballPath: string) {
       "if (pkg?.id !== 'oh-my-opencode-slim') throw new Error('default export has an unexpected plugin id');",
       "if (typeof pkg.server !== 'function') throw new Error('default export is missing a server plugin factory');",
       "if (typeof pkg.setup !== 'function') throw new Error('default export is missing a v2 setup factory');",
+      'const asyncNoop = async () => ({});',
+      'const client = new Proxy({}, {',
+      '  get(_target, property) {',
+      "    if (property === 'app') return { log: asyncNoop };",
+      "    if (property === 'session') return { abort: asyncNoop };",
+      '    return new Proxy({}, { get: () => asyncNoop });',
+      '  },',
+      '});',
+      'globalThis.fetch = async () => new Response(',
+      "  '<!doctype html><html><head><title>Release smoke</title></head><body><main><h1>Release smoke</h1><p>packaged jsdom extraction works</p></main></body></html>',",
+      "  { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } },",
+      ');',
+      'const plugin = await pkg.server({',
+      '  client,',
+      '  directory: process.cwd(),',
+      '  worktree: process.cwd(),',
+      "  serverUrl: new URL('http://127.0.0.1:4096'),",
+      '});',
+      'const webfetch = plugin?.tool?.webfetch;',
+      "if (typeof webfetch?.execute !== 'function') throw new Error('server plugin did not register webfetch');",
+      'const result = await webfetch.execute({',
+      "  url: 'https://example.com/release-smoke',",
+      "  format: 'markdown',",
+      '  timeout: 10,',
+      '  extract_main: true,',
+      "  prefer_llms_txt: 'never',",
+      '  include_metadata: false,',
+      '  save_binary: false,',
+      '}, {',
+      '  ask: async () => undefined,',
+      '  metadata: () => undefined,',
+      '  abort: new AbortController().signal,',
+      '  directory: process.cwd(),',
+      "  sessionID: 'release-smoke',",
+      '});',
+      "if (!String(result).includes('packaged jsdom extraction works')) throw new Error('packaged webfetch did not extract the expected document');",
+      'await plugin.dispose?.();',
       "console.log('package loads');",
+      "console.log('packaged webfetch constructs and extracts a document');",
       'process.exit(0);',
     ].join('\n');
     console.log('Importing installed package entrypoint...');
@@ -202,6 +258,130 @@ function verifyFreshInstall(tarballPath: string) {
     ].join('\n');
     console.log('Importing installed TUI entrypoint...');
     run('bun', ['--eval', tuiSmokeScript], { cwd: installDir });
+
+    // v2 hosts install this package with `subpaths: ["server", ""]`; the
+    // exports map must resolve ./server to the self-contained bundle.
+    const serverSmokeScript = [
+      "import pkg from 'oh-my-opencode-slim/server';",
+      "if (pkg?.id !== 'oh-my-opencode-slim') throw new Error('server export has an unexpected plugin id');",
+      "if (typeof pkg.server !== 'function') throw new Error('server export is missing a v1 plugin factory');",
+      "if (typeof pkg.setup !== 'function') throw new Error('server export is missing a v2 setup factory');",
+      "console.log('server package loads');",
+      'process.exit(0);',
+    ].join('\n');
+    console.log('Importing installed server subpath entrypoint...');
+    run('node', ['--input-type=module', '--eval', serverSmokeScript], {
+      cwd: installDir,
+    });
+
+    const marketplaceContractSmokeScript = [
+      'import {',
+      '  MarketplacePackageBundleV2Schema,',
+      '  createMarketplaceRegistryEntry,',
+      '  createMarketplaceRegistryIndex,',
+      '  digestMarketplaceBundle,',
+      '  parseMarketplaceRegistryIndex,',
+      '  validateMarketplaceRegistryEntry,',
+      "} from 'oh-my-opencode-slim/marketplace-contract';",
+      'const bundle = {',
+      '  manifest: {',
+      '    schemaVersion: 2,',
+      "    id: 'community/contract-agent',",
+      "    version: '1.0.0',",
+      "    displayName: 'Contract agent',",
+      "    description: 'A contract test agent.',",
+      "    agentName: 'contract-agent',",
+      "    prompt: 'Package prompt.',",
+      '    routing: {',
+      "      description: 'Contract routing description.',",
+      "      when: 'The contract task matches.',",
+      "      keywords: ['contract'],",
+      '    },',
+      '    skills: [],',
+      '    mcps: [],',
+      '    tools: [],',
+      "    author: { name: 'Community' },",
+      "    tags: ['contract'],",
+      "    license: 'MIT',",
+      "    compatibility: { plugin: '>=3.0.0-beta.3 <4.0.0' },",
+      "    model: { source: 'explicit', candidates: ['provider/model'] },",
+      "    extends: { builtin: 'explorer', promptMode: 'append' },",
+      '  },',
+      '};',
+      'const parsedBundle = MarketplacePackageBundleV2Schema.parse(bundle);',
+      'const digest = digestMarketplaceBundle(parsedBundle);',
+      'const entry = createMarketplaceRegistryEntry(parsedBundle);',
+      "if (entry.digest.value !== digest) throw new Error('registry entry digest does not match the bundle');",
+      'validateMarketplaceRegistryEntry(entry, parsedBundle);',
+      'const index = createMarketplaceRegistryIndex([entry]);',
+      'const parsedIndex = parseMarketplaceRegistryIndex(index);',
+      "if (parsedIndex.entries[0]?.id !== entry.id) throw new Error('registry index did not retain the package entry');",
+      "console.log('marketplace contract package parses, digests, and validates registry data');",
+      'process.exit(0);',
+    ].join('\n');
+    console.log('Importing installed marketplace contract subpath...');
+    run(
+      'node',
+      ['--input-type=module', '--eval', marketplaceContractSmokeScript],
+      { cwd: installDir },
+    );
+
+    const marketplaceContractTypesPath = path.join(
+      installDir,
+      'marketplace-contract-types-smoke.mts',
+    );
+    writeFileSync(
+      marketplaceContractTypesPath,
+      [
+        "import { MarketplacePackageBundleV2Schema } from 'oh-my-opencode-slim/marketplace-contract';",
+        "import type { MarketplacePackageBundle } from 'oh-my-opencode-slim/marketplace-contract';",
+        'const bundle: MarketplacePackageBundle = {',
+        '  manifest: {',
+        '    schemaVersion: 2,',
+        "    id: 'community/contract-agent',",
+        "    version: '1.0.0',",
+        "    displayName: 'Contract agent',",
+        "    description: 'A contract test agent.',",
+        "    agentName: 'contract-agent',",
+        "    prompt: 'Package prompt.',",
+        '    routing: {',
+        "      description: 'Contract routing description.',",
+        "      when: 'The contract task matches.',",
+        "      keywords: ['contract'],",
+        '    },',
+        '    skills: [],',
+        '    mcps: [],',
+        '    tools: [],',
+        "    author: { name: 'Community' },",
+        "    tags: ['contract'],",
+        "    license: 'MIT',",
+        "    compatibility: { plugin: '>=3.0.0-beta.3 <4.0.0' },",
+        "    model: { source: 'explicit', candidates: ['provider/model'] },",
+        "    extends: { builtin: 'explorer', promptMode: 'append' },",
+        '  },',
+        '};',
+        'MarketplacePackageBundleV2Schema.parse(bundle);',
+        '// @ts-expect-error Incomplete manifests are not package bundles.',
+        'const invalidBundle: MarketplacePackageBundle = { manifest: {} };',
+        'void invalidBundle;',
+      ].join('\n'),
+    );
+    console.log('Checking installed marketplace contract declarations...');
+    run(
+      process.execPath,
+      [
+        path.join(repoRoot, 'node_modules/typescript/bin/tsc'),
+        '--noEmit',
+        '--module',
+        'NodeNext',
+        '--moduleResolution',
+        'NodeNext',
+        '--target',
+        'ES2022',
+        marketplaceContractTypesPath,
+      ],
+      { cwd: installDir },
+    );
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }

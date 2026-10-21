@@ -9,9 +9,9 @@
  * SDK client — the caller wraps the SDK's session.messages() call.
  */
 
-import { assistantText, isTerminalSession } from '../utils/session';
-import { withTimeout } from '../utils/with-timeout';
+import { withTimeout } from '../utils/session';
 import type { Transcript } from './schema';
+import { assistantText, isTerminalSession } from './session-messages';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -30,6 +30,8 @@ export interface PollSessionConfig {
   graceMs: number;
   ts?: () => string;
   onProgress?: (msg: string) => void;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<unknown>;
 }
 
 export interface SessionResult {
@@ -59,15 +61,17 @@ export async function pollSession(
     graceMs,
     ts: tsFn,
     onProgress,
+    now = Date.now,
+    sleep = (ms) => Bun.sleep(ms),
   } = config;
-  const t0 = Date.now();
+  const t0 = now();
   const ts = tsFn ?? (() => '');
   const label = `${config.label} attempt ${config.attempt}`;
   const attemptLabel = `[${label}]`;
-  const pollStart = Date.now();
+  const pollStart = now();
 
   const heartbeat = setInterval(() => {
-    const secs = Math.round((Date.now() - t0) / 1000);
+    const secs = Math.round((now() - t0) / 1000);
     console.log(`${ts()} ${attemptLabel} still running (${secs}s)`);
     onProgress?.(`still running (${secs}s)`);
   }, 30_000);
@@ -91,24 +95,25 @@ export async function pollSession(
   let graceStart: number | null = null;
 
   try {
-    while (Date.now() - pollStart < timeoutMs) {
-      await Bun.sleep(1000);
+    while (now() - pollStart < timeoutMs) {
+      await sleep(1000);
       const raw = await withTimeout(
         fetchMessages(sid).catch(() => null),
         30_000,
+        'Session messages timed out',
       );
       msgs = (raw as unknown as Parameters<typeof isTerminalSession>[0]) ?? [];
 
       // Track activity — reset stall timer when messages or parts change.
       const partCount = msgs.reduce((n, m) => n + (m.parts?.length ?? 0), 0);
       if (msgs.length !== prevMsgCount || partCount !== prevPartCount) {
-        lastActivity = Date.now();
+        lastActivity = now();
         prevMsgCount = msgs.length;
         prevPartCount = partCount;
       }
 
       // Verbose poll logging every 15s
-      const elapsed = Math.round((Date.now() - pollStart) / 1000);
+      const elapsed = Math.round((now() - pollStart) / 1000);
       if (elapsed % 15 === 0 && elapsed > 0) {
         console.log(
           `${ts()} ${attemptLabel} poll @ ${elapsed}s: ${msgs.length} msgs, ${partCount} parts, terminal=${isTerminalSession(msgs)}`,
@@ -116,8 +121,8 @@ export async function pollSession(
       }
 
       // Stall detector — if no activity for stallMs and not terminal, abort.
-      if (!isTerminalSession(msgs) && Date.now() - lastActivity > stallMs) {
-        const stallSecs = Math.round((Date.now() - lastActivity) / 1000);
+      if (!isTerminalSession(msgs) && now() - lastActivity > stallMs) {
+        const stallSecs = Math.round((now() - lastActivity) / 1000);
         if (msgs.length > 0) {
           transcript = buildTranscript(msgs.map((m) => parseSdkMessage(m)));
         }
@@ -126,7 +131,7 @@ export async function pollSession(
           response: '',
           transcript,
           error: `session stalled: no progress for ${stallSecs}s (last poll: ${msgs.length} msgs, ${partCount} parts, terminal=false)`,
-          durationSecs: (Date.now() - t0) / 1000,
+          durationSecs: (now() - t0) / 1000,
         };
       }
 
@@ -158,14 +163,14 @@ export async function pollSession(
 
           // Pending task exists — start or extend the grace window.
           if (graceStart === null) {
-            graceStart = Date.now();
+            graceStart = now();
             console.log(
               `${ts()} ${attemptLabel} terminal with pending task call — grace period ${graceMs / 1000}s`,
             );
           }
 
           // If the grace window expired, finalize.
-          if (Date.now() - graceStart >= graceMs) {
+          if (now() - graceStart >= graceMs) {
             response = text.trim();
             transcript = buildTranscript(msgs.map((m) => parseSdkMessage(m)));
             break;
@@ -186,7 +191,7 @@ export async function pollSession(
         response: '',
         transcript,
         error: `session produced no output (last poll: ${msgs.length} msgs, ${partCount} parts, terminal=${isTerminalSession(msgs)})`,
-        durationSecs: (Date.now() - t0) / 1000,
+        durationSecs: (now() - t0) / 1000,
       };
     }
 
@@ -194,7 +199,7 @@ export async function pollSession(
       success: true,
       response,
       transcript,
-      durationSecs: (Date.now() - t0) / 1000,
+      durationSecs: (now() - t0) / 1000,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

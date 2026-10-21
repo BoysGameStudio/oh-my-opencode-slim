@@ -2,6 +2,13 @@
 
 ## Responsibility
 
+- `patch.ts` applies unified diffs to the current spec body; `history.ts`
+  collapses the older kickoff copy for active interviews.
+- `service.ts` handles quiet state turns, consumed-state dedupe, one patch repair
+  prompt, turn status notices, and `/implement` with newest-complete fallback.
+- `../tools/interview-submit-state.ts` is the static quiet submission tool;
+  primary agents may use it and subagents are denied by permission projection.
+
 - Implement the `/interview` command flow:
   - command registration and pre-exec interception,
   - interactive stateful interview prompts,
@@ -25,7 +32,8 @@
   implementation without expanding the global client shim.
 
 - `manager.ts` (composition root)
-  - Chooses mode via `interview.dashboard === true || interview.port > 0`:
+  - Chooses mode via the shared pure `computeInterviewMode` (also used by the
+    v2 interview bridge): `interview.dashboard === true || interview.port > 0`:
     - per-session mode → `createPerSessionInterviewServer` (`session-server.ts`)
     - dashboard mode → `createDashboardManager` (`dashboard-manager.ts`)
   - Returns event hooks:
@@ -68,6 +76,9 @@
 
 - `createInterviewServer` (`server.ts`)
   - Owns the per-session HTTP endpoints; HTML rendering lives in `ui.ts`.
+  - `createInterviewServerDeps(service, outputFolder, port)` builds the
+    service-delegating deps object shared by the per-session server, the
+    dashboard fallback server, and the v2 interview bridge.
   - Supports:
     - `GET /`, `GET /api/interviews`, `GET /interview/{id}`
     - `GET /api/interviews/{id}/state`
@@ -150,6 +161,9 @@
   - manual file/discovery settings.
 - Existing tests cover service, parser, manager, server, dashboard, and helpers
   under `src/interview/*.test.ts`.
+- `test-port.ts` provides test-only port binding infrastructure for dashboard
+  mode testing, holding ports and failing fast on health probes to prevent
+  TOCTOU windows between port discovery and real server binding.
 
 ## Repaired lifecycle details
 

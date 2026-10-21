@@ -56,6 +56,19 @@ bun test -t "test-name-pattern"
 - Let errors propagate appropriately rather than catching silently
 - Use Zod for runtime validation (already a dependency)
 
+### Test Time
+- Tests never bind to real time (`ts-no-test-timers`): no `Bun.sleep()`,
+  guessed `setTimeout` waits, or duration-based settling.
+- Drive timer code deterministically with `src/utils/test-timers.ts`
+  (`createTimerHarness`, `tick`). Scheduling components accept injected
+  `setTimeout`/`clearTimeout` seams (see `BackgroundJobSupervisor`,
+  `createBackgroundJobTerminalGate`); wire the harness there, not via
+  global spies.
+- Keep observation-time (`now`) seams separate from scheduling when event
+  timestamps are the subject of the test.
+- Integration tests that exercise real platform timing may keep a real
+  delay: keep rare and comment why deterministic control will not work.
+
 ### Git Integration
 - Biome integrates with git (VCS enabled)
 - Commits should pass `bun run check:ci` before pushing
@@ -98,7 +111,7 @@ oh-my-opencode-slim/
 3. Run `bun run check:ci` to verify linting and formatting
 4. Run `bun run typecheck` to verify types
 5. Run `bun test` to verify tests pass
-6. Commit changes — if you ran `bun run eval` (or any eval command), include those resulting changes in the commit
+6. Commit changes. Eval outputs are ignored run artifacts; do not commit edits made by eval sessions.
 
 ## Release Workflow
 
@@ -173,7 +186,9 @@ Log files are named with timestamps (e.g., 2025-01-09T123456.log) and the most r
 You can set the log level with the --log-level command-line option to get more detailed debug information. For example, opencode --log-level DEBUG.
 
 ### Plugin
-~/.local/share/opencode/log/oh-my-opencode-slim.<timestamp>.log
+~/.local/share/opencode/log/oh-my-opencode-slim.<timestamp>-<pid>.log
+One file per process (the pid suffix disambiguates processes that start in the
+same second); TUI client processes use the `tui-` prefix.
 
 ## Cloned Dependency Source
 
@@ -181,7 +196,7 @@ Read-only dependency source repositories are available under
 `.slim/clonedeps/repos/` for inspection. Do not edit these clones.
 
 - `.slim/clonedeps/repos/anomalyco__opencode-v1.18.13/` - `https://github.com/anomalyco/opencode.git` at `v1.18.13@a105350812f05f914c768e468559dbd6bd508d8e`; inspect `packages/plugin` and `packages/sdk/js` for OpenCode plugin and SDK internals.
-- `.slim/clonedeps/repos/opencode/` - `https://github.com/anomalyco/opencode.git` at `dev@f0afb6750e63ee0a60b052914531bde0afb9bc2b`; inspect `packages/opencode` for latest TypeScript runtime internals and experimental background subagent support.
+- `.slim/clonedeps/repos/opencode/` - `https://github.com/anomalyco/opencode.git` at `v2@dbd9b18f3d7b4ef3e346eafd91613896c9e3c864`; inspect `packages/core` and `packages/server` for the v2 TypeScript runtime (split from the former `packages/opencode`), `packages/plugin` for the v2 plugin/hook API, `packages/sdk` (embedded host) and `packages/client` (HTTP client) for v2 SDK internals, and `packages/core/src/tool/plugin/subagent.ts` for background subagent support.
 - `.slim/clonedeps/repos/modelcontextprotocol__typescript-sdk/` - `https://github.com/modelcontextprotocol/typescript-sdk.git` at `1.30.0@2d889f2b329e46680ec9bdd565de4616c497825a`; inspect it for MCP protocol and server integration internals.
 - `.slim/clonedeps/repos/agentclientprotocol__agent-client-protocol/` - `https://github.com/agentclientprotocol/agent-client-protocol.git` at `main@541daf8fa488c6b93aad4a874ac050b3daf9b282`; inspect it for ACP protocol specification and schema details.
 
@@ -200,4 +215,4 @@ submissions use the `community-preset` label (see `docs/maintainers.md`).
 
 ### Domain docs
 
-Single-context repo: `CONTEXT.md` and `docs/adr/` at the root, plus `codemap.md`. See `docs/agents/domain.md`.
+Single glossary at the root: `GLOSSARY.md`, plus `docs/adr/` and `codemap.md`. See `docs/agents/domain.md`.

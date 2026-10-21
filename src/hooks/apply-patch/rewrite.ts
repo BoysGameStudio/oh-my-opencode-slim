@@ -1,60 +1,47 @@
 import path from 'node:path';
 
 import { formatPatch, normalizePatchText } from './codec';
-import {
-  createApplyPatchVerificationError,
-  ensureApplyPatchError,
-} from './errors';
-import {
-  createPatchExecutionContext,
-  resolvePreparedUpdate,
-  stageAddedText,
-} from './execution-context';
-import { deriveNewContentFromText } from './resolution';
-import type {
-  ApplyPatchRuntimeOptions,
-  PatchHunk,
-  UpdatePatchHunk,
-} from './types';
+import { ApplyPatchError, ensureApplyPatchError } from './errors';
+import { simulatePatch, stageAddedText } from './execution-context';
+import { commonEdges } from './matching';
+import { nativeDeriveUpdate } from './native-update';
+import { splitFileLines } from './resolution';
+import type { PatchHunk, UpdatePatchHunk } from './types';
 
 export type RewritePatchResult = {
   patchText: string;
   changed: boolean;
 };
 
-type RewriteUpdateGroup = {
-  index: number;
-  sourcePath: string;
-  outputPath: string;
-  sourceFilePath: string;
-  outputFilePath: string;
-  baseText: string;
-  finalText: string;
-  chunks?: UpdatePatchHunk['chunks'];
-};
-
-type RewriteAddGroup = {
-  index: number;
-  outputPath: string;
-  outputFilePath: string;
-  finalText: string;
-};
-
 type RewriteDependencyGroup =
-  | { kind: 'add'; group: RewriteAddGroup }
-  | { kind: 'update'; group: RewriteUpdateGroup };
+  | { kind: 'add'; index: number }
+  | {
+      kind: 'update';
+      index: number;
+      sourcePath: string;
+      sourceFilePath: string;
+      outputFilePath: string;
+      baseText: string;
+      chunks?: UpdatePatchHunk['chunks'];
+    };
 
-function normalizeTextLineEndings(text: string): string {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-}
+const lf = (text: string) =>
+  text.replace(/\r\n/g, '\n').replace(/([^\n])$/, '$1\n');
 
-function splitPatchTextLines(text: string): string[] {
-  const normalized = normalizeTextLineEndings(text);
-  const lines = normalized.split('\n');
-  if (normalized.endsWith('\n')) {
-    lines.pop();
+function reproduces(
+  filePath: string,
+  baseText: string,
+  chunks: UpdatePatchHunk['chunks'],
+  finalText: string,
+): 0 | 1 | 2 {
+  // 2: exact modulo CRLF/final newline; 1: native's writer dropped one final blank line.
+  try {
+    const actual = lf(nativeDeriveUpdate(filePath, baseText, chunks));
+    const expected = lf(finalText);
+    return actual === expected ? 2 : `${actual}\n` === expected ? 1 : 0;
+  } catch {
+    return 0;
   }
-  return lines;
 }
 
 function createCollapsedUpdateHunk(
@@ -62,12 +49,11 @@ function createCollapsedUpdateHunk(
   filePath: string,
   baseText: string,
   finalText: string,
-  cfg: ApplyPatchRuntimeOptions,
   movePath?: string,
 ): UpdatePatchHunk {
   const collapsedChunk = {
-    old_lines: splitPatchTextLines(baseText),
-    new_lines: splitPatchTextLines(finalText),
+    old_lines: splitFileLines(baseText).lines,
+    new_lines: splitFileLines(finalText).lines,
     change_context: undefined,
     is_end_of_file: true,
   } satisfies UpdatePatchHunk['chunks'][number];
@@ -75,26 +61,17 @@ function createCollapsedUpdateHunk(
   const minimizedChunk = minimizeMergedChunk(collapsedChunk);
   const chunk =
     minimizedChunk.old_lines.length === collapsedChunk.old_lines.length &&
-    minimizedChunk.new_lines.length === collapsedChunk.new_lines.length &&
-    minimizedChunk.change_context === collapsedChunk.change_context &&
-    minimizedChunk.is_end_of_file === collapsedChunk.is_end_of_file
+    minimizedChunk.new_lines.length === collapsedChunk.new_lines.length
       ? collapsedChunk
-      : (() => {
-          try {
-            return deriveNewContentFromText(
-              filePath,
-              baseText,
-              [minimizedChunk],
-              cfg,
-            ) === finalText
-              ? minimizedChunk
-              : collapsedChunk;
-          } catch {
-            // Keep the whole-file chunk when trimming shared context would make
-            // the fallback ambiguous or no longer reproduce the same result.
-            return collapsedChunk;
-          }
-        })();
+      : reproduces(filePath, baseText, [minimizedChunk], finalText)
+        ? minimizedChunk
+        : collapsedChunk;
+  if (!reproduces(filePath, baseText, [chunk], finalText)) {
+    throw new ApplyPatchError(
+      'verification',
+      `Native update cannot reproduce the resolved file: ${filePath}`,
+    );
+  }
 
   return {
     type: 'update',
@@ -104,45 +81,11 @@ function createCollapsedUpdateHunk(
   };
 }
 
-function clonePatchChunks(
-  chunks: UpdatePatchHunk['chunks'],
-): UpdatePatchHunk['chunks'] {
-  return chunks.map((chunk) => ({
-    old_lines: [...chunk.old_lines],
-    new_lines: [...chunk.new_lines],
-    change_context: chunk.change_context,
-    is_end_of_file: chunk.is_end_of_file,
-  }));
-}
-
 function minimizeMergedChunk(chunk: UpdatePatchHunk['chunks'][number]) {
-  if (chunk.old_lines.length === 0 && chunk.new_lines.length === 0) {
-    return {
-      old_lines: [],
-      new_lines: [],
-      change_context: chunk.change_context,
-      is_end_of_file: chunk.is_end_of_file,
-    };
-  }
-
-  let prefixLength = 0;
-  while (
-    prefixLength < chunk.old_lines.length &&
-    prefixLength < chunk.new_lines.length &&
-    chunk.old_lines[prefixLength] === chunk.new_lines[prefixLength]
-  ) {
-    prefixLength += 1;
-  }
-
-  let suffixLength = 0;
-  while (
-    chunk.old_lines.length - suffixLength - 1 >= prefixLength &&
-    chunk.new_lines.length - suffixLength - 1 >= prefixLength &&
-    chunk.old_lines[chunk.old_lines.length - suffixLength - 1] ===
-      chunk.new_lines[chunk.new_lines.length - suffixLength - 1]
-  ) {
-    suffixLength += 1;
-  }
+  const { prefixLength, suffixLength } = commonEdges(
+    chunk.old_lines,
+    chunk.new_lines,
+  );
 
   if (prefixLength === 0 && suffixLength === 0) {
     return {
@@ -150,6 +93,17 @@ function minimizeMergedChunk(chunk: UpdatePatchHunk['chunks'][number]) {
       new_lines: [...chunk.new_lines],
       change_context: chunk.change_context,
       is_end_of_file: chunk.is_end_of_file,
+    };
+  }
+
+  if (
+    chunk.old_lines.length === prefixLength + suffixLength &&
+    (suffixLength > 0 || !chunk.is_end_of_file)
+  ) {
+    return {
+      ...chunk,
+      old_lines: [...chunk.old_lines],
+      new_lines: [...chunk.new_lines],
     };
   }
 
@@ -166,292 +120,246 @@ function minimizeMergedChunk(chunk: UpdatePatchHunk['chunks'][number]) {
       prefixLength > 0
         ? chunk.old_lines[prefixLength - 1]
         : chunk.change_context,
-    is_end_of_file:
-      chunk.is_end_of_file && suffixLength === 0 ? true : undefined,
-  };
-}
-
-function createUpdateHunk(
-  pathValue: string,
-  chunks: UpdatePatchHunk['chunks'],
-  movePath?: string,
-): UpdatePatchHunk {
-  return {
-    type: 'update',
-    path: pathValue,
-    move_path: movePath,
-    chunks: clonePatchChunks(chunks),
-  };
-}
-
-function mergeSameFileUpdateGroupChunks(
-  filePath: string,
-  group: RewriteUpdateGroup,
-  nextChunks: UpdatePatchHunk['chunks'],
-  finalText: string,
-  cfg: ApplyPatchRuntimeOptions,
-): UpdatePatchHunk['chunks'] | undefined {
-  if (!group.chunks) {
-    return undefined;
-  }
-
-  const mergedChunks = [
-    ...clonePatchChunks(group.chunks).map(minimizeMergedChunk),
-    ...clonePatchChunks(nextChunks).map(minimizeMergedChunk),
-  ];
-
-  try {
-    const mergedText = deriveNewContentFromText(
-      filePath,
-      group.baseText,
-      mergedChunks,
-      cfg,
-    );
-
-    return mergedText === finalText ? mergedChunks : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function addContentsFromFinalText(text: string): string {
-  return text.endsWith('\n') ? text.slice(0, -1) : text;
-}
-
-function renderRewriteDependencyGroup(
-  group: RewriteDependencyGroup,
-  cfg: ApplyPatchRuntimeOptions,
-): PatchHunk {
-  if (group.kind === 'add') {
-    return {
-      type: 'add',
-      path: group.group.outputPath,
-      contents: addContentsFromFinalText(group.group.finalText),
-    };
-  }
-
-  return group.group.chunks
-    ? createUpdateHunk(
-        group.group.sourcePath,
-        group.group.chunks,
-        group.group.outputPath !== group.group.sourcePath
-          ? group.group.outputPath
-          : undefined,
-      )
-    : createCollapsedUpdateHunk(
-        group.group.sourcePath,
-        group.group.sourceFilePath,
-        group.group.baseText,
-        group.group.finalText,
-        cfg,
-        group.group.outputPath !== group.group.sourcePath
-          ? group.group.outputPath
-          : undefined,
-      );
-}
-
-function combineDependentUpdateGroup(
-  filePath: string,
-  group: RewriteDependencyGroup,
-  nextChunks: UpdatePatchHunk['chunks'],
-  finalText: string,
-  nextOutputPath: string,
-  nextOutputFilePath: string,
-  cfg: ApplyPatchRuntimeOptions,
-): RewriteDependencyGroup {
-  if (group.kind === 'add') {
-    return {
-      kind: 'add',
-      group: {
-        ...group.group,
-        outputPath: nextOutputPath,
-        outputFilePath: nextOutputFilePath,
-        finalText,
-      },
-    };
-  }
-
-  const mergedChunks =
-    group.group.outputFilePath === filePath &&
-    group.group.sourceFilePath === filePath &&
-    nextOutputFilePath === filePath
-      ? mergeSameFileUpdateGroupChunks(
-          filePath,
-          group.group,
-          nextChunks,
-          finalText,
-          cfg,
-        )
-      : undefined;
-
-  return {
-    kind: 'update',
-    group: {
-      ...group.group,
-      outputPath: nextOutputPath,
-      outputFilePath: nextOutputFilePath,
-      finalText,
-      chunks: mergedChunks,
-    },
+    is_end_of_file: suffixLength === 0 ? chunk.is_end_of_file : undefined,
   };
 }
 
 export async function rewritePatch(
   root: string,
   patchText: string,
-  cfg: ApplyPatchRuntimeOptions,
   worktree?: string,
 ): Promise<RewritePatchResult> {
   try {
-    const {
-      hunks,
-      pathsNormalized,
-      staged,
-      getPreparedFileState,
-      assertPreparedPathMissing,
-    } = await createPatchExecutionContext(root, patchText, worktree);
-    const normalizedPatchText = normalizePatchText(patchText);
+    const { hunks, pathsNormalized, steps } = await simulatePatch(
+      root,
+      patchText,
+      worktree,
+    );
     const rewritten: PatchHunk[] = [];
     let changed = false;
 
     const dependencyGroups = new Map<string, RewriteDependencyGroup>();
 
-    function clearDependencyGroup(filePath: string) {
-      dependencyGroups.delete(filePath);
+    function hunkTouchedPaths(hunk: PatchHunk): Set<string> {
+      const touched = new Set<string>([path.resolve(root, hunk.path)]);
+      if (hunk.type === 'update' && hunk.move_path) {
+        touched.add(path.resolve(root, hunk.move_path));
+      }
+      return touched;
     }
 
-    for (const hunk of hunks) {
-      if (hunk.type === 'add') {
-        const filePath = path.resolve(root, hunk.path);
-        await assertPreparedPathMissing(filePath, 'add');
-        rewritten.push(hunk);
-        clearDependencyGroup(filePath);
-        const finalText = stageAddedText(hunk.contents);
-        staged.set(filePath, {
-          exists: true,
-          text: finalText,
-          derived: true,
-        });
+    // Fold a dependency group in place only when no hunk emitted after it
+    // touches its paths: reordering around interleaved hunks (delete of the
+    // move destination, add recreating the move source) is exactly where
+    // folded patches stop being order-equivalent. On any interference the
+    // fold is abandoned and the update stays in order. Native still verifies
+    // each separate update against the pre-patch file, not the staged state.
+    function reemitFoldedGroup(
+      groupIndex: number,
+      rendered: PatchHunk,
+    ): number | undefined {
+      const touched = hunkTouchedPaths(rendered);
+      for (let index = groupIndex + 1; index < rewritten.length; index += 1) {
+        for (const target of hunkTouchedPaths(rewritten[index])) {
+          if (touched.has(target)) {
+            return undefined;
+          }
+        }
+      }
+
+      rewritten[groupIndex] = rendered;
+      return groupIndex;
+    }
+
+    for (const step of steps) {
+      const { filePath } = step;
+      if (step.type === 'add') {
+        rewritten.push(step.hunk);
         dependencyGroups.set(filePath, {
           kind: 'add',
-          group: {
-            index: rewritten.length - 1,
-            outputPath: hunk.path,
-            outputFilePath: filePath,
-            finalText,
-          },
+          index: rewritten.length - 1,
         });
         continue;
       }
 
-      if (hunk.type === 'delete') {
-        const filePath = path.resolve(root, hunk.path);
-        await getPreparedFileState(filePath, 'delete');
-        clearDependencyGroup(filePath);
-        rewritten.push(hunk);
-        staged.set(filePath, { exists: false, derived: true });
+      if (step.type === 'delete') {
+        dependencyGroups.delete(filePath);
+        rewritten.push(step.hunk);
         continue;
       }
 
-      const filePath = path.resolve(root, hunk.path);
+      const hunk = step.hunk;
+      const { current, movePath, resolved, nextText } = step;
       const currentDependency = dependencyGroups.get(filePath);
-      const current = await getPreparedFileState(filePath, 'update');
-      if (!current.exists) {
-        throw createApplyPatchVerificationError(
-          `Failed to read file to update: ${filePath}`,
-        );
-      }
 
-      const movePath = hunk.move_path
-        ? path.resolve(root, hunk.move_path)
-        : undefined;
-      if (movePath && movePath !== filePath) {
-        await assertPreparedPathMissing(movePath, 'move');
-      }
-
-      const { resolved, nextText } = resolvePreparedUpdate(
-        filePath,
-        current.text,
-        hunk,
-        cfg,
-      );
-
-      const next = resolved.map((chunk, index) => ({
-        old_lines: [...chunk.canonical_old_lines],
-        new_lines: [...chunk.canonical_new_lines],
-        change_context:
-          chunk.canonical_change_context ?? hunk.chunks[index].change_context,
-        is_end_of_file:
-          hunk.chunks[index].is_end_of_file && chunk.resolved_is_end_of_file
+      let next: UpdatePatchHunk['chunks'] = [];
+      let lastCanonicalEnd = -1;
+      let sawCanonicalOverlap = false;
+      for (const [index, chunk] of resolved.entries()) {
+        const changeContext = chunk.canonical_change_context;
+        const isEndOfFile =
+          index === resolved.length - 1 &&
+          hunk.chunks[index].is_end_of_file &&
+          chunk.resolved_is_end_of_file
             ? true
-            : undefined,
-      }));
+            : undefined;
 
-      for (const chunk of resolved) {
-        if (!chunk.rewritten) {
+        const previous = next[next.length - 1];
+        const overlap = previous ? lastCanonicalEnd - chunk.canonical_start : 0;
+
+        if (
+          previous &&
+          overlap > 0 &&
+          overlap <= previous.old_lines.length &&
+          chunk.canonical_old_lines.length >= overlap
+        ) {
+          // A rescue extended this chunk's canonical range over lines the
+          // previous chunk already claimed. Serialize as one chunk, then
+          // verify it with native matching before forwarding the rewrite.
+          previous.old_lines = previous.old_lines
+            .slice(0, previous.old_lines.length - overlap)
+            .concat(chunk.canonical_old_lines);
+          previous.new_lines = previous.new_lines
+            .slice(0, previous.new_lines.length - overlap)
+            .concat(chunk.canonical_new_lines);
+          previous.is_end_of_file = isEndOfFile;
+          lastCanonicalEnd = Math.max(lastCanonicalEnd, chunk.canonical_end);
+          sawCanonicalOverlap = true;
           continue;
         }
-        changed = true;
+
+        if (overlap > 0) {
+          sawCanonicalOverlap = true;
+        }
+
+        next.push({
+          old_lines: [...chunk.canonical_old_lines],
+          new_lines: [...chunk.canonical_new_lines],
+          change_context: changeContext,
+          is_end_of_file: isEndOfFile,
+        });
+        lastCanonicalEnd = chunk.canonical_end;
       }
+
+      if (sawCanonicalOverlap) {
+        // Native matching checks this merged shape; use a whole-file chunk
+        // only if it too reproduces the staged text under native semantics.
+        if (!reproduces(filePath, current.text, next, nextText)) {
+          next = createCollapsedUpdateHunk(
+            hunk.path,
+            filePath,
+            current.text,
+            nextText,
+          ).chunks;
+        }
+      }
+
+      const rewrittenHunk = resolved.some((chunk) => chunk.rewritten);
+      const text = current.text;
+      let keepOriginal = false;
+      if (!current.derived) {
+        const rewrite = rewrittenHunk
+          ? reproduces(filePath, text, next, nextText)
+          : 0;
+        const original =
+          rewrite === 2 ? 0 : reproduces(filePath, text, hunk.chunks, nextText);
+        if (!rewrite && !original) {
+          throw new ApplyPatchError(
+            'verification',
+            `Native apply_patch would not reproduce the verified update: ${filePath}`,
+          );
+        }
+        keepOriginal = original > rewrite;
+        if (keepOriginal) next = hunk.chunks;
+      }
+      changed ||= !keepOriginal && rewrittenHunk;
 
       const nextOutputPath = hunk.move_path ?? hunk.path;
       const nextOutputFilePath = movePath ?? filePath;
 
+      let folded = false;
       if (current.derived && currentDependency) {
-        const nextGroup = combineDependentUpdateGroup(
-          filePath,
-          currentDependency,
-          next,
-          nextText,
-          nextOutputPath,
-          nextOutputFilePath,
-          cfg,
-        );
-        rewritten[currentDependency.group.index] = renderRewriteDependencyGroup(
-          nextGroup,
-          cfg,
-        );
-        changed = true;
-        clearDependencyGroup(filePath);
-        if (movePath && movePath !== filePath) {
-          clearDependencyGroup(movePath);
-        }
-        dependencyGroups.set(nextOutputFilePath, nextGroup);
-      } else {
-        rewritten.push(createUpdateHunk(hunk.path, next, hunk.move_path));
-        clearDependencyGroup(filePath);
-        if (movePath && movePath !== filePath) {
-          clearDependencyGroup(movePath);
-        }
-        dependencyGroups.set(nextOutputFilePath, {
-          kind: 'update',
-          group: {
-            index: rewritten.length - 1,
-            sourcePath: hunk.path,
-            outputPath: nextOutputPath,
-            sourceFilePath: filePath,
+        let nextGroup: RewriteDependencyGroup;
+        let rendered: PatchHunk;
+        if (currentDependency.kind === 'add') {
+          nextGroup = currentDependency;
+          // Add contents must remain newline-terminated after a fold.
+          rendered = {
+            type: 'add',
+            path: nextOutputPath,
+            contents: stageAddedText(nextText),
+          };
+        } else {
+          const group = currentDependency;
+          let chunks: UpdatePatchHunk['chunks'] | undefined;
+          if (
+            group.chunks &&
+            group.outputFilePath === filePath &&
+            group.sourceFilePath === filePath &&
+            nextOutputFilePath === filePath
+          ) {
+            const merged = [
+              ...group.chunks.map(minimizeMergedChunk),
+              ...next.map(minimizeMergedChunk),
+            ];
+            if (reproduces(filePath, group.baseText, merged, nextText)) {
+              chunks = merged;
+            }
+          }
+          nextGroup = {
+            ...group,
             outputFilePath: nextOutputFilePath,
-            baseText: current.text,
-            finalText: nextText,
-            chunks: clonePatchChunks(next),
-          },
-        });
+            chunks,
+          };
+          const move =
+            nextOutputPath !== group.sourcePath ? nextOutputPath : undefined;
+          rendered = chunks
+            ? {
+                type: 'update',
+                path: group.sourcePath,
+                move_path: move,
+                chunks,
+              }
+            : createCollapsedUpdateHunk(
+                group.sourcePath,
+                group.sourceFilePath,
+                group.baseText,
+                nextText,
+                move,
+              );
+        }
+        const foldedIndex = reemitFoldedGroup(
+          currentDependency.index,
+          rendered,
+        );
+        if (foldedIndex !== undefined) {
+          changed = true;
+          dependencyGroups.delete(filePath);
+          nextGroup.index = foldedIndex;
+          dependencyGroups.set(nextOutputFilePath, nextGroup);
+          folded = true;
+        }
       }
 
-      if (movePath && movePath !== filePath) {
-        staged.set(filePath, { exists: false, derived: true });
-        staged.set(movePath, {
-          exists: true,
-          text: nextText,
-          mode: current.mode,
-          derived: true,
+      if (!folded) {
+        // First touch of this path, or an interfering hunk made the fold
+        // order-unsafe: emit this update standalone, which preserves the
+        // original patch ordering.
+        rewritten.push({
+          type: 'update',
+          path: hunk.path,
+          move_path: hunk.move_path,
+          chunks: next,
         });
-      } else {
-        staged.set(filePath, {
-          exists: true,
-          text: nextText,
-          mode: current.mode,
-          derived: true,
+        dependencyGroups.delete(filePath);
+        dependencyGroups.set(nextOutputFilePath, {
+          kind: 'update',
+          index: rewritten.length - 1,
+          sourcePath: hunk.path,
+          sourceFilePath: filePath,
+          outputFilePath: nextOutputFilePath,
+          baseText: current.text,
+          chunks: next,
         });
       }
     }
@@ -464,6 +372,7 @@ export async function rewritePatch(
         };
       }
 
+      const normalizedPatchText = normalizePatchText(patchText);
       if (normalizedPatchText !== patchText) {
         return {
           patchText: normalizedPatchText,
@@ -484,13 +393,4 @@ export async function rewritePatch(
   } catch (error) {
     throw ensureApplyPatchError(error, 'Unexpected rewrite failure');
   }
-}
-
-export async function rewritePatchText(
-  root: string,
-  patchText: string,
-  cfg: ApplyPatchRuntimeOptions,
-  worktree?: string,
-): Promise<string> {
-  return (await rewritePatch(root, patchText, cfg, worktree)).patchText;
 }

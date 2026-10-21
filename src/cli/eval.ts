@@ -3,7 +3,6 @@
  * Run eval suites — one with --suite, or all. Optionally judge and synthesize.
  */
 
-import { spawn } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -13,78 +12,10 @@ import { runJudge } from '../evals/judge';
 import { loadAllResults, loadLatestResultPath } from '../evals/results';
 import type { EvalSuiteResult } from '../evals/schema';
 import { EvalSuiteSchema } from '../evals/schema';
+import { runWithSession } from '../evals/session-manager';
 import { runSuite } from '../evals/suite-runner';
 import { loadEvalSuite, loadEvalSuites } from '../evals/suites';
-import { runPromptCli } from '../utils/session';
-
-/** Ensure an opencode serve on port 4096 — reuse if healthy, spawn if missing. */
-async function startServe(): Promise<{
-  url: string;
-  proc: ReturnType<typeof spawn> | null;
-}> {
-  const serveUrl = 'http://localhost:4096';
-
-  // Check if a healthy server is already running (developer-owned)
-  try {
-    const res = await fetch(`${serveUrl}/session`, {
-      signal: AbortSignal.timeout(2000),
-    });
-    if (res.ok) {
-      console.log(`Using existing OpenCode server at ${serveUrl}`);
-      return { url: serveUrl, proc: null };
-    }
-  } catch {
-    // no server — will spawn one
-  }
-
-  // Kill any stale opencode on port 4096 (crash orphan) before spawning
-  const lsofProc = Bun.spawnSync(['lsof', '-ti', 'tcp:4096']);
-  if (lsofProc.exitCode === 0) {
-    const pids = lsofProc.stdout.toString().trim().split('\n').filter(Boolean);
-    for (const pid of pids) {
-      const psProc = Bun.spawnSync(['ps', '-p', pid, '-o', 'comm=']);
-      if (psProc.stdout.toString().trim() === 'opencode') {
-        try {
-          process.kill(parseInt(pid, 10));
-        } catch {
-          /* gone */
-        }
-      }
-    }
-  }
-  await Bun.sleep(500);
-
-  const serveProc = spawn('opencode', ['serve'], {
-    cwd: process.cwd(),
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  for (let i = 0; i < 40; i++) {
-    await Bun.sleep(250);
-    try {
-      const res = await fetch(`${serveUrl}/session`, {
-        signal: AbortSignal.timeout(1000),
-      });
-      if (res.ok) {
-        console.log(`Connected to OpenCode server at ${serveUrl}`);
-        return { url: serveUrl, proc: serveProc };
-      }
-    } catch {
-      /* not up yet */
-    }
-  }
-  throw new Error(
-    'opencode serve did not become healthy — check the server log',
-  );
-}
-
-/** Kill a serve process spawned by startServe. */
-function stopServe(serveProc: ReturnType<typeof spawn> | null): void {
-  if (!serveProc) return;
-  serveProc.kill('SIGTERM');
-  setTimeout(() => {
-    if (serveProc.exitCode === null) serveProc.kill('SIGKILL');
-  }, 500).unref();
-}
+import { startEvalServer, stopEvalServer } from './eval-server';
 
 const { values } = parseArgs({
   args: process.argv.slice(2),
@@ -298,14 +229,18 @@ try {
   // no stale data
 }
 
-const { proc: serveProc } = await startServe();
-
-const SERVE_URL = process.env.OPENCODE_URL ?? 'http://localhost:4096';
-const client = createEvalClient(SERVE_URL, process.cwd());
+// Scoring saved outputs is offline unless an advisory judge is requested.
+const server =
+  !values['outputs-file'] || values.judge
+    ? await startEvalServer(process.env.OPENCODE_URL)
+    : null;
 
 const judgeResults = new Map<string, string>();
 
 try {
+  const client = server
+    ? createEvalClient(server.url, process.cwd())
+    : undefined;
   for (const suite of suites) {
     const code = await runSuite({
       suiteName: suite,
@@ -316,7 +251,7 @@ try {
     });
     if (code !== 0) failed.push(suite);
 
-    if (values.judge) {
+    if (values.judge && client) {
       const resultsFile = loadLatestResultPath(suite, beforeFiles);
       if (resultsFile) {
         const result = await runJudge({
@@ -339,36 +274,38 @@ try {
       }
     }
   }
-} finally {
-  stopServe(serveProc);
-}
+  if (values.judge && client) {
+    if (judgeResults.size === 0) {
+      console.log('\nNo judge results — skipping oracle synthesis.');
+    } else {
+      const synthesized: string[] = [];
+      for (const suite of suites) {
+        const text = judgeResults.get(suite);
+        if (text) {
+          synthesized.push(`## ${suite}\n\n${text}`);
+        }
+      }
 
-if (values.judge) {
-  if (judgeResults.size === 0) {
-    console.log('\nNo judge results — skipping oracle synthesis.');
-  } else {
-    const synthesized: string[] = [];
-    for (const suite of suites) {
-      const text = judgeResults.get(suite);
-      if (text) {
-        synthesized.push(`## ${suite}\n\n${text}`);
+      if (synthesized.length > 0) {
+        const prompt = `@oracle Review the per-suite council judge feedback below and synthesize a big-picture assessment of the agent orchestration system. Identify cross-suite patterns, the highest-priority fixes, and systemic weaknesses. Be direct and concise.\n\n${synthesized.join('\n\n')}`;
+
+        console.log('\nSynthesizing big-picture assessment via oracle...');
+        const response = await runWithSession(
+          client,
+          'orchestrator',
+          prompt,
+          'oracle synthesis',
+          1,
+          process.cwd(),
+          600_000,
+        );
+        console.log('\n=== Oracle Big-Picture Assessment ===');
+        console.log(response.response || response.error || '(empty response)');
       }
     }
-
-    if (synthesized.length > 0) {
-      const prompt = `@oracle Review the per-suite council judge feedback below and synthesize a big-picture assessment of the agent orchestration system. Identify cross-suite patterns, the highest-priority fixes, and systemic weaknesses. Be direct and concise.\n\n${synthesized.join('\n\n')}`;
-
-      console.log('\nSynthesizing big-picture assessment via oracle...');
-      const response = await runPromptCli(
-        prompt,
-        'orchestrator',
-        process.cwd(),
-        600_000,
-      );
-      console.log('\n=== Oracle Big-Picture Assessment ===');
-      console.log(response || '(empty response)');
-    }
   }
+} finally {
+  await stopEvalServer(server?.proc ?? null);
 }
 
 interface SuiteScore {
@@ -420,8 +357,7 @@ for (const suite of suites) {
     });
   }
 }
-const passed =
-  suites.length - failed.length - scoreboard.filter((s) => s.skipped).length;
+const passed = scoreboard.filter((s) => !s.failed && !s.skipped).length;
 
 console.log(
   `\u2550\u2550\u2550 eval complete: ${passed}/${suites.length} suites passed \u2550\u2550\u2550`,

@@ -1,7 +1,7 @@
 import path from 'node:path';
 import type { PluginInput } from '@opencode-ai/plugin';
 import type { InterviewConfig } from '../config';
-import { createInterviewServer } from './server';
+import { createInterviewServer, createInterviewServerDeps } from './server';
 import { createInterviewService } from './service';
 
 export function createPerSessionInterviewServer(
@@ -9,7 +9,11 @@ export function createPerSessionInterviewServer(
   interviewConfig: InterviewConfig | undefined,
   outputFolder: string,
 ): {
-  registerCommand: (config: Record<string, unknown>) => void;
+  service: ReturnType<typeof createInterviewService>;
+  registerCommand: (
+    config: Record<string, unknown>,
+    enabled?: { interview?: boolean; implement?: boolean },
+  ) => void;
   handleCommandExecuteBefore: (
     input: { command: string; sessionID: string; arguments: string },
     output: { parts: Array<{ type: string; text?: string }> },
@@ -21,26 +25,15 @@ export function createPerSessionInterviewServer(
 } {
   const service = createInterviewService(ctx, interviewConfig);
   const resolvedOutputPath = path.join(ctx.directory, outputFolder);
-  const server = createInterviewServer({
-    getState: async (interviewId) => service.getInterviewState(interviewId),
-    listInterviewFiles: async () => service.listInterviewFiles(),
-    listInterviews: () => service.listInterviews(),
-    submitAnswers: async (interviewId, answers) =>
-      service.submitAnswers(interviewId, answers),
-    submitBlockComment: async (interviewId, section, comment) =>
-      service.submitBlockComment(interviewId, section, comment),
-    submitChat: async (interviewId, message) =>
-      service.submitChat(interviewId, message),
-    handleNudgeAction: async (interviewId, action) =>
-      service.handleNudgeAction(interviewId, action),
-    outputFolder: resolvedOutputPath,
-    port: 0,
-  });
+  const server = createInterviewServer(
+    createInterviewServerDeps(service, resolvedOutputPath, 0),
+  );
   service.setBaseUrlResolver(() => server.ensureStarted());
   let disposed = false;
 
   return {
-    registerCommand: (c) => service.registerCommand(c),
+    service,
+    registerCommand: (c, enabled) => service.registerCommand(c, enabled),
     handleCommandExecuteBefore: async (input, output) =>
       service.handleCommandExecuteBefore(input, output),
     handleEvent: async (input) => service.handleEvent(input),

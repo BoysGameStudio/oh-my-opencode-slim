@@ -1,13 +1,14 @@
 import { Readability } from '@mozilla/readability';
-import { JSDOM, VirtualConsole } from 'jsdom';
+import type { VirtualConsole } from 'jsdom';
 import TurndownService from 'turndown';
 import { escapeHtml } from '../../utils/escape-html';
 import { parseFrontmatter } from '../../utils/frontmatter';
+import { type JsdomModule, loadJSDOM } from '../../utils/jsdom';
 import type { CachedFetch, ExtractedContent } from './types';
 
-export { escapeHtml, parseFrontmatter };
-
 const CSS_TREE_WARN_PREFIX = '[csstree-match]';
+const BLOCK_TAGS =
+  /^(?:ARTICLE|ASIDE|BLOCKQUOTE|DIV|DL|DT|DD|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TH|THEAD|TR|UL)$/;
 
 /**
  * Suppresses css-tree lexer warnings ([csstree-match] prefix) emitted
@@ -37,8 +38,9 @@ export function withCssTreeWarningsSuppressed<T>(fn: () => T): T {
  */
 export function withJsdomCssParsingErrorsSuppressed<T>(
   fn: (vc: VirtualConsole) => T,
+  VirtualConsoleClass: JsdomModule['VirtualConsole'],
 ): T {
-  const vc = new VirtualConsole();
+  const vc = new VirtualConsoleClass();
   vc.on('jsdomError', (error) => {
     const type = (error as Error & { type?: string }).type;
     if (type !== 'css-parsing') console.error(error);
@@ -101,41 +103,6 @@ function extractStructuredText(root: Element | null) {
   if (!root) return '';
   const chunks: string[] = [];
   const ignoredTags = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
-  const blockTags = new Set([
-    'ARTICLE',
-    'ASIDE',
-    'BLOCKQUOTE',
-    'DIV',
-    'DL',
-    'DT',
-    'DD',
-    'FIGCAPTION',
-    'FIGURE',
-    'FOOTER',
-    'FORM',
-    'H1',
-    'H2',
-    'H3',
-    'H4',
-    'H5',
-    'H6',
-    'HEADER',
-    'HR',
-    'LI',
-    'MAIN',
-    'NAV',
-    'OL',
-    'P',
-    'PRE',
-    'SECTION',
-    'TABLE',
-    'TBODY',
-    'TD',
-    'TH',
-    'THEAD',
-    'TR',
-    'UL',
-  ]);
   const isText = (node: Node) => node.nodeType === node.TEXT_NODE;
   const isElement = (node: Node) => node.nodeType === node.ELEMENT_NODE;
   const pushText = (value: string) => {
@@ -180,7 +147,7 @@ function extractStructuredText(root: Element | null) {
       pushBreak(2);
       return;
     }
-    const isBlock = blockTags.has(tag);
+    const isBlock = BLOCK_TAGS.test(tag);
     if (isBlock) pushBreak(tag === 'LI' ? 1 : 2);
     if (tag === 'LI') chunks.push('- ');
     for (const child of element.childNodes) visit(child);
@@ -190,8 +157,10 @@ function extractStructuredText(root: Element | null) {
   return cleanExtractedText(chunks.join(''));
 }
 
-export function cleanHeadingText(input: string): string {
-  const normalized = trimBlankRuns(input).replace(/¶+$/g, '').trim();
+function cleanHeadingText(input: string): string {
+  const normalized = trimBlankRuns(input)
+    .replace(/(?<!¶)¶+$/, '')
+    .trim();
   if (/^(?:C|F)#$/.test(normalized)) return normalized;
   if (/\s#+$/.test(normalized)) {
     return normalized.replace(/\s#+$/g, '').trim();
@@ -200,15 +169,36 @@ export function cleanHeadingText(input: string): string {
 }
 
 export function cleanFetchedMarkdown(input: string): string {
+  const PL = '"Permanent link")';
   const output = mapOutsideCodeBlocks(input, (value) =>
     value
-      .replace(/^\s*!\[[^\]]*\]\([^)]+\)\s*$/gm, 'Image omitted')
-      .replace(/(^|\n)Image(?=\n|$)/g, '$1Image omitted')
-      .replace(/^\s*(#{1,6})\s*\\?\['([^'\n]+)'\s*$/gm, '$1 $2')
-      .replace(/^\s*(#{1,6})\s*'([^'\n]+)'\]\s*$/gm, '$1 $2')
-      .replace(/^\s*(#{1,6})\s*'([^'\n]+)'\s*$/gm, '$1 $2')
-      .replace(/(#{1,6}[^\n]*?)\s*\[¶\]\(#.*?"Permanent link"\)\s*$/gm, '$1')
-      .replace(/\s+\(#[A-Za-z0-9_-]+\)\s*$/gm, ''),
+      .split('\n')
+      .map((line) => {
+        let cleaned = line
+          .replace(/^[^\S\n]*!\[[^\]]*\]\([^)]+\)[^\S\n]*$/, 'Image omitted')
+          .replace(/^Image$/, 'Image omitted')
+          .replace(
+            /^[^\S\n]*(#{1,6})[^\S\n]*\\?\['([^'\n]+)'[^\S\n]*$/,
+            '$1 $2',
+          )
+          .replace(/^[^\S\n]*(#{1,6})[^\S\n]*'([^'\n]+)'\][^\S\n]*$/, '$1 $2')
+          .replace(/^[^\S\n]*(#{1,6})[^\S\n]*'([^'\n]+)'[^\S\n]*$/, '$1 $2');
+        const p = cleaned.startsWith('#') ? cleaned.indexOf('[¶](#', 1) : -1;
+        if (p !== -1) {
+          const t = cleaned.lastIndexOf(PL);
+          if (
+            t >= p + 5 &&
+            /^[^\S\n]*$/.test(cleaned.slice(t + PL.length)) &&
+            !/[\r\u2028\u2029]/.test(cleaned.slice(0, t))
+          )
+            cleaned = cleaned.slice(0, p).trimEnd();
+        }
+        return cleaned.replace(
+          /(?<![^\S\n])[^\S\n]+\(#[A-Za-z0-9_-]+\)[^\S\n]*$/,
+          '',
+        );
+      })
+      .join('\n'),
   );
 
   return trimBlankRuns(output);
@@ -216,38 +206,6 @@ export function cleanFetchedMarkdown(input: string): string {
 
 export function cleanFetchedText(input: string): string {
   return trimBlankRuns(input);
-}
-
-export function withTruncationMarker(
-  content: string,
-  format: 'text' | 'markdown' | 'html',
-  truncated: boolean,
-): string {
-  if (!truncated) return content;
-  if (format === 'html') return `${content}\n<!-- [..content truncated..] -->`;
-  return `${content}\n\n[..content truncated..]`;
-}
-
-export function joinRenderedContent(
-  metadata: string,
-  content: string,
-  format: 'text' | 'markdown' | 'html',
-): string {
-  if (!metadata) return content;
-  if (!content) {
-    return format === 'html' ? `<!--\n${metadata.trim()}\n-->` : metadata;
-  }
-  if (format === 'html') {
-    const comment = `<!--\n${metadata.trim()}\n-->\n`;
-    const xmlDecl = content.match(/^\s*(<\?xml[\s\S]*?\?>\s*)/i);
-    if (xmlDecl) {
-      return `${xmlDecl[1]}${comment}${content.slice(xmlDecl[0].length)}`;
-    }
-    return `${comment}${content}`;
-  }
-  const startsWithFrontmatter = /^---(?:\r?\n|$)/.test(content);
-  if (!startsWithFrontmatter) return `${metadata}${content}`;
-  return `${metadata}Source content:\n\n${content}`;
 }
 
 export function renderMessageForFormat(
@@ -270,14 +228,6 @@ export function buildRedirectResultMessage(
     `Status: ${statusCode}`,
     '',
     'Re-run webfetch with the redirect URL to continue.',
-  ].join('\n');
-}
-
-export function buildLlmsRequiredMessage(originalUrl: string, reason?: string) {
-  return [
-    'Required llms.txt content was unavailable.',
-    `Original URL: ${originalUrl}`,
-    ...(reason ? [`Reason: ${reason}`] : []),
   ].join('\n');
 }
 
@@ -315,24 +265,24 @@ export async function extractFromHtml(
   finalUrl: string,
   extractMain: boolean,
 ): Promise<ExtractedContent> {
-  const dom = withCssTreeWarningsSuppressed(() =>
-    withJsdomCssParsingErrorsSuppressed(
-      (vc) => new JSDOM(html, { url: finalUrl, virtualConsole: vc }),
-    ),
-  );
+  const { JSDOM, VirtualConsole } = await loadJSDOM();
+  const createDom = () =>
+    withCssTreeWarningsSuppressed(() =>
+      withJsdomCssParsingErrorsSuppressed(
+        (vc) => new JSDOM(html, { url: finalUrl, virtualConsole: vc }),
+        VirtualConsole,
+      ),
+    );
+  const dom = createDom();
   const document = dom.window.document;
   const title = document.title || undefined;
   const canonical =
     document.querySelector('link[rel="canonical"]')?.getAttribute('href') ||
     undefined;
-  const canonicalUrl = (() => {
-    if (!canonical) return undefined;
-    try {
-      return new URL(canonical, finalUrl).toString();
-    } catch {
-      return undefined;
-    }
-  })();
+  const canonicalUrl =
+    canonical && URL.canParse(canonical, finalUrl)
+      ? new URL(canonical, finalUrl).toString()
+      : undefined;
   const headings = Array.from(
     document.querySelectorAll<HTMLElement>('h1, h2, h3'),
   )
@@ -340,38 +290,42 @@ export async function extractFromHtml(
     .filter(Boolean)
     .slice(0, 12);
 
+  let fallbackDocument = document;
   if (extractMain) {
-    const readerDom = withCssTreeWarningsSuppressed(() =>
-      withJsdomCssParsingErrorsSuppressed(
-        (vc) => new JSDOM(html, { url: finalUrl, virtualConsole: vc }),
-      ),
-    );
-    const article = new Readability(readerDom.window.document).parse();
-    if (article?.content?.trim()) {
-      const articleContainer = readerDom.window.document.createElement('div');
-      articleContainer.innerHTML = article.content;
-      const articleText = extractStructuredText(articleContainer);
-      const articleMarkdown = trimBlankRuns(turndown.turndown(article.content));
-      return {
-        title: article.title || title,
-        rawContent: html,
-        html: article.content,
-        text: articleText,
-        markdown: articleMarkdown,
-        extractedMain: true,
-        canonicalUrl,
-        headings,
-      };
+    // Readability mutates its document. Check the size before invoking it so
+    // very large pages fall back to the original document instead of blocking.
+    if (document.getElementsByTagName('*').length <= 15_000) {
+      const article = new Readability<Element>(document, {
+        serializer: (node) => node as Element,
+      }).parse();
+      const articleContent = article?.content;
+      const articleHtml = articleContent?.innerHTML;
+      if (articleContent && articleHtml?.trim()) {
+        const reparsed = document.createElement('div');
+        reparsed.innerHTML = articleHtml;
+        return {
+          title: article?.title || title,
+          rawContent: html,
+          html: articleHtml,
+          text: extractStructuredText(reparsed),
+          markdown: trimBlankRuns(turndown.turndown(articleHtml)),
+          extractedMain: true,
+          canonicalUrl,
+          headings,
+        };
+      }
+      // A failed Readability attempt may have changed the DOM; restore it.
+      fallbackDocument = createDom().window.document;
     }
   }
 
-  const bodyHtml = document.body?.innerHTML || html;
-  const bodyText = extractStructuredText(document.body);
+  const bodyHtml = fallbackDocument.body?.innerHTML || html;
+  const bodyText = extractStructuredText(fallbackDocument.body);
   const markdown = trimBlankRuns(turndown.turndown(bodyHtml));
   return {
     title,
     rawContent: html,
-    html: bodyHtml,
+    html,
     text: bodyText,
     markdown,
     extractedMain: false,
@@ -383,12 +337,9 @@ export async function extractFromHtml(
 export function inferCanonicalUrlFromText(content: string, finalUrl: string) {
   const frontmatterData = parseFrontmatter(content);
   const raw = frontmatterData?.url;
-  if (!raw) return undefined;
-  try {
-    return new URL(raw, finalUrl).toString();
-  } catch {
-    return undefined;
-  }
+  return raw && URL.canParse(raw, finalUrl)
+    ? new URL(raw, finalUrl).toString()
+    : undefined;
 }
 
 export function extractHeadingsFromMarkdown(content: string) {
@@ -413,7 +364,7 @@ export function detectQualitySignals(
   >,
 ) {
   const signals = new Set<string>();
-  const text = `${fetchResult.text}\n${fetchResult.markdown}`.toLowerCase();
+  const text = `${fetchResult.text}\n${fetchResult.markdown}`;
 
   if (fetchResult.wordCount > 0 && fetchResult.wordCount < 60) {
     signals.add('very_short_content');
@@ -441,38 +392,4 @@ export function detectQualitySignals(
   }
 
   return [...signals];
-}
-
-export function pickContent(
-  fetchResult: CachedFetch,
-  format: 'text' | 'markdown' | 'html',
-) {
-  if (format === 'html') {
-    if (fetchResult.sourceKind === 'html') {
-      const htmlContent = fetchResult.extractedMain
-        ? fetchResult.html
-        : fetchResult.rawContent;
-      return withTruncationMarker(htmlContent, format, fetchResult.truncated);
-    }
-    return withTruncationMarker(
-      renderMessageForFormat(
-        fetchResult.text || fetchResult.rawContent,
-        format,
-      ),
-      format,
-      fetchResult.truncated,
-    );
-  }
-  if (format === 'text') {
-    return withTruncationMarker(
-      cleanFetchedText(fetchResult.text),
-      format,
-      fetchResult.truncated,
-    );
-  }
-  return withTruncationMarker(
-    cleanFetchedMarkdown(fetchResult.markdown),
-    format,
-    fetchResult.truncated,
-  );
 }

@@ -104,8 +104,8 @@ export const EvalCaseSchema = z.object({
   /** Reference solution for validating graders */
   referenceSolution: ReferenceSolutionSchema.optional(),
   /**
-   * When true, the case is part of the fast smoke subset (`eval:all
-   * --smoke`). Smoke cases must be fast (direct execution) and cover the
+   * When true, the case is part of the fast smoke subset (`eval --smoke`).
+   * Smoke cases must be fast (direct execution) and cover the
    * suite's core contract — they are the quick regression tripwire, not the
    * full pass^k measurement.
    */

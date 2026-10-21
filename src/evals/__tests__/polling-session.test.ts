@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { createTimerHarness } from '../../utils/test-timers';
 import {
   buildTranscript,
   type PollSessionConfig,
@@ -137,8 +138,8 @@ describe('buildTranscript', () => {
       },
     ]);
     expect(result.agentInvocations).toHaveLength(2);
-    expect(result.agentInvocations[0].agent).toBe('fixer');
-    expect(result.agentInvocations[1].agent).toBe('explorer');
+    expect(result.agentInvocations?.[0].agent).toBe('fixer');
+    expect(result.agentInvocations?.[1].agent).toBe('explorer');
   });
 
   test('builds agentTokens from assistant messages', () => {
@@ -184,7 +185,7 @@ describe('buildTranscript', () => {
       { role: 'assistant', text: '', toolCalls: [], modelID: 'gpt-3.5' },
     ]);
     expect(result.modelSwitches).toHaveLength(1);
-    expect(result.modelSwitches[0]).toEqual({ from: 'gpt-4', to: 'gpt-3.5' });
+    expect(result.modelSwitches?.[0]).toEqual({ from: 'gpt-4', to: 'gpt-3.5' });
   });
 
   test('handles empty input', () => {
@@ -211,7 +212,10 @@ describe('pollSession', () => {
   function makeConfig(
     overrides?: Partial<PollSessionConfig>,
   ): PollSessionConfig {
+    const timers = createTimerHarness();
     return {
+      now: timers.now,
+      sleep: timers.advance,
       fetchMessages: async () => [],
       agent: 'orchestrator',
       prompt: 'test',
@@ -244,7 +248,6 @@ describe('pollSession', () => {
       stallMs: 100,
       timeoutMs: 5000,
       fetchMessages: async () => {
-        await Bun.sleep(50);
         return [
           { info: { role: 'user' }, parts: [] },
           { info: { role: 'assistant' }, parts: [] },

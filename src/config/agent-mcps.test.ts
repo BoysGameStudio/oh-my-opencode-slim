@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test';
-import { DEFAULT_AGENT_MCPS, parseList } from './agent-mcps';
+import { DEFAULT_AGENT_MCPS, getAgentMcpList, parseList } from './agent-mcps';
+import { RuntimeConfig } from './runtime';
+import type { PluginConfig } from './schema';
+
+const TEST_DIRECTORY = 'runtime-test-agent-mcps';
+function runtimeFor(config: PluginConfig = {}) {
+  RuntimeConfig.reset(TEST_DIRECTORY);
+  return RuntimeConfig.init(TEST_DIRECTORY, config);
+}
 
 describe('parseList', () => {
   test('empty list returns empty array', () => {
@@ -49,5 +57,24 @@ describe('parseList', () => {
 
   test('exclusions without matching allows', () => {
     expect(parseList(['!mcp2'], ['mcp1', 'mcp2', 'mcp3'])).toEqual([]);
+  });
+});
+
+describe('getAgentMcpList rename continuity', () => {
+  test("reads mcps from a legacy 'librarian' record for the explorer", () => {
+    const runtime = runtimeFor({
+      agents: { librarian: { mcps: ['legacy-mcp'] } },
+    });
+    expect(getAgentMcpList('explorer', runtime)).toEqual(['legacy-mcp']);
+  });
+
+  test("canonical 'explorer' mcps win over the legacy record", () => {
+    const runtime = runtimeFor({
+      agents: {
+        explorer: { mcps: ['canonical-mcp'] },
+        librarian: { mcps: ['legacy-mcp'] },
+      },
+    });
+    expect(getAgentMcpList('explorer', runtime)).toEqual(['canonical-mcp']);
   });
 });

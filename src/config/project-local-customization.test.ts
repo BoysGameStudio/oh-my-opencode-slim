@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createAgents } from '../agents';
 import { loadAgentPrompt, mergePluginConfigs } from './loader';
+import { resolvePreset } from './presets';
 import { RuntimeConfig } from './runtime';
 import { type PluginConfig, PluginConfigSchema } from './schema';
 
@@ -27,7 +28,159 @@ describe('Project-local customization - 15 core cases', () => {
 
   afterEach(() => {
     fs.rmSync(tempDir, { recursive: true, force: true });
-    process.env = originalEnv;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
+  });
+
+  test('inherits prompts across repository and nested worktree boundaries', () => {
+    const workspace = path.join(tempDir, 'workspace');
+    const repository = path.join(workspace, 'repository');
+    const worktree = path.join(repository, '.slim', 'worktrees', 'feature');
+    fs.mkdirSync(path.join(repository, '.git'), { recursive: true });
+    fs.mkdirSync(worktree, { recursive: true });
+    fs.writeFileSync(path.join(worktree, '.git'), 'gitdir: ignored-fixture');
+    const prompts = path.join(workspace, '.opencode', 'oh-my-opencode-slim');
+    fs.mkdirSync(path.join(prompts, 'team'), { recursive: true });
+    fs.writeFileSync(path.join(prompts, 'oracle.md'), 'ancestor-root');
+    fs.writeFileSync(
+      path.join(prompts, 'team', 'oracle.md'),
+      'ancestor-preset',
+    );
+    fs.writeFileSync(path.join(prompts, 'oracle_append.md'), 'ancestor-append');
+
+    expect(
+      loadAgentPrompt('oracle', {
+        preset: 'team',
+        projectDirectory: worktree,
+        hostFlavor: 'v2',
+      }),
+    ).toEqual({ prompt: 'ancestor-preset', appendPrompt: 'ancestor-append' });
+
+    const localPrompts = path.join(
+      worktree,
+      '.opencode',
+      'oh-my-opencode-slim',
+    );
+    fs.mkdirSync(localPrompts, { recursive: true });
+    fs.writeFileSync(path.join(localPrompts, 'oracle.md'), 'local-root');
+    expect(
+      loadAgentPrompt('oracle', {
+        preset: 'team',
+        projectDirectory: worktree,
+        hostFlavor: 'v2',
+      }),
+    ).toEqual({ prompt: 'local-root', appendPrompt: 'ancestor-append' });
+
+    fs.writeFileSync(
+      path.join(localPrompts, 'oracle_append.md'),
+      'local-append',
+    );
+    expect(
+      loadAgentPrompt('oracle', {
+        preset: 'team',
+        projectDirectory: worktree,
+        hostFlavor: 'v2',
+      }),
+    ).toEqual({ prompt: 'local-root', appendPrompt: 'local-append' });
+  });
+
+  test('ancestor prompts beat global prompts and do not search siblings', () => {
+    const workspace = path.join(tempDir, 'workspace');
+    const worktree = path.join(workspace, 'worktrees', 'feature');
+    fs.mkdirSync(worktree, { recursive: true });
+    const userPrompts = path.join(tempDir, 'opencode', 'oh-my-opencode-slim');
+    const ancestorPrompts = path.join(
+      workspace,
+      '.opencode',
+      'oh-my-opencode-slim',
+    );
+    const siblingPrompts = path.join(
+      workspace,
+      'other',
+      '.opencode',
+      'oh-my-opencode-slim',
+    );
+    for (const directory of [userPrompts, ancestorPrompts, siblingPrompts]) {
+      fs.mkdirSync(directory, { recursive: true });
+    }
+    fs.writeFileSync(path.join(userPrompts, 'oracle.md'), 'global');
+    fs.writeFileSync(path.join(ancestorPrompts, 'oracle.md'), 'ancestor');
+    fs.writeFileSync(path.join(siblingPrompts, 'explorer.md'), 'sibling');
+
+    expect(
+      loadAgentPrompt('oracle', { projectDirectory: worktree }).prompt,
+    ).toBe('ancestor');
+    expect(
+      loadAgentPrompt('explorer', { projectDirectory: worktree }).prompt,
+    ).toBeUndefined();
+    fs.unlinkSync(path.join(ancestorPrompts, 'oracle.md'));
+    expect(
+      loadAgentPrompt('oracle', { projectDirectory: worktree }).prompt,
+    ).toBe('global');
+  });
+
+  test('agent factories apply inherited prompt files in a nested worktree', () => {
+    const workspace = path.join(tempDir, 'workspace');
+    const worktree = path.join(workspace, 'worktrees', 'feature');
+    fs.mkdirSync(worktree, { recursive: true });
+    const prompts = path.join(workspace, '.opencode', 'oh-my-opencode-slim');
+    fs.mkdirSync(prompts, { recursive: true });
+    fs.writeFileSync(
+      path.join(prompts, 'oracle.md'),
+      'ancestor oracle instructions',
+    );
+    fs.writeFileSync(
+      path.join(prompts, 'oracle_append.md'),
+      'ancestor extra rules',
+    );
+    const runtime = RuntimeConfig.createDetached(worktree, {});
+    const oracle = createAgents(runtime, { projectDirectory: worktree }).find(
+      (agent) => agent.name === 'oracle',
+    );
+    expect(oracle?.config.prompt).toContain('ancestor oracle instructions');
+    expect(oracle?.config.prompt).toContain('ancestor extra rules');
+  });
+
+  test('pre-rename librarian prompt files apply to explorer and warn once', () => {
+    const userDir = path.join(tempDir, 'opencode', 'oh-my-opencode-slim');
+    fs.mkdirSync(userDir, { recursive: true });
+    fs.writeFileSync(path.join(userDir, 'librarian.md'), 'legacy prompt');
+    fs.writeFileSync(
+      path.join(userDir, 'librarian_append.md'),
+      'legacy append',
+    );
+
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(loadAgentPrompt('explorer', {})).toEqual({
+        prompt: 'legacy prompt',
+        appendPrompt: 'legacy append',
+      });
+      // Repeated loads keep applying the files; each stale file warns once.
+      expect(loadAgentPrompt('explorer', {}).prompt).toBe('legacy prompt');
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(String(warn.mock.calls[0]?.[0])).toContain(
+        "'librarian.md' uses a pre-rename name",
+      );
+      expect(String(warn.mock.calls[1]?.[0])).toContain(
+        "'librarian_append.md' uses a pre-rename name",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('explorer prompt files win over the pre-rename librarian files', () => {
+    const userDir = path.join(tempDir, 'opencode', 'oh-my-opencode-slim');
+    fs.mkdirSync(userDir, { recursive: true });
+    fs.writeFileSync(path.join(userDir, 'explorer.md'), 'canonical prompt');
+    fs.writeFileSync(path.join(userDir, 'librarian.md'), 'legacy prompt');
+
+    expect(loadAgentPrompt('explorer', {})).toEqual({
+      prompt: 'canonical prompt',
+    });
   });
 
   // Test Case 1: Project prompt root beats user prompt root
@@ -302,6 +455,51 @@ describe('Project-local customization - 15 core cases', () => {
       tokenLimit: 1000,
       debug: false,
       maxSearch: 5,
+    });
+  });
+
+  test('same-name project inheritance clears user preset models', () => {
+    const merged = mergePluginConfigs(
+      {
+        presets: {
+          session: {
+            explore: {
+              model: 'user/explorer',
+              options: { fromUser: true, shared: { user: true } },
+            },
+          },
+          orchestrator: {
+            oracle: { model: 'user/oracle' },
+          },
+        },
+      },
+      {
+        presets: {
+          session: {
+            explorer: {
+              inheritModelFrom: 'session',
+              options: { fromProject: true, shared: { project: true } },
+            },
+          },
+          orchestrator: {
+            oracle: { inheritModelFrom: 'orchestrator' },
+          },
+        },
+      },
+    );
+
+    expect(resolvePreset('session', merged.presets ?? {})).toEqual({
+      explorer: {
+        inheritModelFrom: 'session',
+        options: {
+          fromUser: true,
+          fromProject: true,
+          shared: { user: true, project: true },
+        },
+      },
+    });
+    expect(resolvePreset('orchestrator', merged.presets ?? {})).toEqual({
+      oracle: { inheritModelFrom: 'orchestrator' },
     });
   });
 

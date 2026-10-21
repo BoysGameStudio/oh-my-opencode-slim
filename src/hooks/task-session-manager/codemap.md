@@ -9,12 +9,31 @@ Manages V2 background job-board state for task execution and injected completion
 The directory follows a **Facade + Strategy** pattern where `index.ts` acts as the facade that composes and orchestrates behavior across specialized strategy modules:
 
 - **index.ts**: Main facade that wires hooks into OpenCode's lifecycle and coordinates between the job board, pending calls, task context tracking, and explicit user waits. Implements the plugin hook interface (`tool.execute.before`, `tool.execute.after`, `experimental.chat.messages.transform`, `event`) and exposes `beginUserWait()` to the `wait_for_user` tool.
-- **stop-confirmation.ts**: Shared 5s grace for idle/absent runtime observations. Transient non-busy evidence stays provisional; confirmed durable stop evidence calls `markStopped` and can wake the parent. Busy/retry/live-busy reset the clock.
+  Historical-task recovery and injected completions admit already-managed parents
+  regardless of agent name; stale Orchestrator mapping repair stays specific to
+  Orchestrator turns and does not promote unmanaged Build/custom parents.
+- **session-recovery.ts**: On-demand recovery of untracked host children: verifies parent/agent, triages v2 rounds by the `session.get` outcome/idleAt projection (terminal rounds import their true state only when their answer text is readable — a textless success stays pending per incident 1115, rounds without a terminal outcome are refused unless an explicit queued continuation adopts identity, partial or unverifiable evidence fails closed, and no round is imported as stopped on a guess), and imports terminal rows into the board.
+- **revived-run-tracker.ts**: Logs terminal notification transport acceptance and failure with the captured transport-attempt number (including late acceptance after a timeout), lease deferral, and once-only ownership release to the fallback publication wake.
+- **../../utils/background-job-terminal-gate.ts**: Shared execution/observation gate for every terminal publication. Runtime quiescence and attributable result evidence authorize one board commit; busy withdraws terminal publications. Grace, bounded retries and single-open reads are shared across adapters.
 - **input-wait-tracker.ts**: Provides the single `hasInputWait()` seam used by idle reconciliation and continuation evaluation. It combines local question/permission waits with the process-global explicit user-wait latch.
-- **continuation-attempt-gate.ts**: Owns process-global continuation epochs, reservations, and explicit user waits across hook recreation. The wait is encoded as an `attempts` sentinel so pre-upgrade #856 hooks sharing the store also fail closed. Distinct external user-message identity rearms both states.
+- **child-input-wait.ts**: Tracks pending child requests and formats their details/guidance for both wakes and `task_status`. V2 forms carry summaries and host-UI/wait/cancel guidance; v1 questions retain answer options.
 - **continuation-model-selection.ts**: Normalizes current-session and chat-hook model shapes before forwarding runtime model and variant choices to idle continuation prompts.
 - **pending-call-tracker.ts**: Tracks in-flight task calls using a capped ordered map (`MAX_PENDING_TASK_CALLS`) to correlate launch output safely. Provides call ID generation, storage, retrieval, and cleanup for pending task invocations.
-- **task-context-tracker.ts**: Manages read context from child sessions with line-count and file caps. Stores context per task ID and provides pruning to prevent unbounded growth.
+- **admission-runtime.ts**: Re-exports the per-directory admission runtime
+  lease used by plugin generations; its scheduler and pending-call tracker are
+  torn down only after the final unclaimed owner release.
+- **fallback-observation-transfer.ts**: Terminal-observation handoff
+  (`createBackgroundFallbackHandoff`) for background children re-prompted by
+  the foreground fallback — `prepare`/`admit`/`reject`/`settleUnresolved`
+  brackets the re-prompt admission so the stop-evidence gate defers terminal
+  publication until a delivery owner exists; unresolved outcomes convert the
+  preparation into the owning run.
+- **same-provider-policy.ts**: Opt-in per-provider rewrite
+  (`backgroundJobs.sameProviderPolicy: { <provider>: "foreground" }`)
+  converting same-provider `background: true` task requests (including v2
+  omitted-`background` calls, defaulted to true before this check) to the foreground
+  path for shared single-runtime backends; fail-open on unknown model/provider.
+- **task-context-tracker.ts**: Manages read context from child sessions with line-count and file caps. Stores context per task ID, provides pruning to prevent unbounded growth, and exposes `filterStaleContextFiles(directory, files)` for a bounded sync disk re-check (drops missing/unreadable/oversized/truncated, logs; per-file size cap + per-commit byte budget so validation cannot stall the session).
 
 All modules depend on `BackgroundJobBoard` from `src/utils/background-job-board.ts` as the single source of truth for active jobs, terminal unreconciled jobs, reusable completed sessions, aliases, read context, and LRU caps.
 
@@ -39,31 +58,34 @@ All modules depend on `BackgroundJobBoard` from `src/utils/background-job-board.
    - If no reusable task exists, allows fresh task creation
    - Refuses a brand-new spawn whose objective exactly matches an
      unreconciled terminal job from the same parent and agent (dispatch
-     loop guard, #1070); a `task_result` retrieval after that job's
+     loop guard, #1070); a result-mode read after that job's
      completion (`lastUsedAt > completedAt`) authorizes the retry
 
 2. **Task Launch (`tool.execute.after`)**
    - Registers task launches in the job board with task ID, parent session ID, agent type, and description
    - Parses task output to extract task ID, status, or launch information
-   - Adds read context to the job board for completed or terminal unreconciled tasks
+   - Adds validated read context to the job board for completed or terminal unreconciled tasks
    - Handles late-cancelled tasks by normalizing output and updating state accordingly
 
 3. **Context Tracking**
    - Extracts read files from `read` tool outputs using `extractReadFiles`
    - Stores context per task ID in the task context tracker
    - Prunes stale context during lifecycle events and status transitions
+   - Both tool-execute-hooks commit sites validate the stored board contextFiles plus fresh tracker context via `filterStaleContextFiles` before `board.addContext`, so stale entries leave the board on the next commit (revived/index paths still unvalidated)
 
 4. **Message Injection (`experimental.chat.messages.transform`)**
-    - Injects a `<system-reminder>` part containing the `### Background Job Board` section into user messages for managed sessions
+    - Injects a `<system-reminder>` part containing the `### Background Job Board` section into user messages for managed sessions, including Build/custom primary parents; placement is change-only (one frozen board per state change, replayed byte-identically, nothing on unchanged turns) and gated by managed-session ownership rather than the parent agent name
     - Lists active, unreconciled, and reusable sessions
     - Remembers injected terminal jobs to reconcile them on the next request after the completion was surfaced to the model (via `reconcileConsumedTerminalJobs`)
     - The idle timer remains a backstop for when the model ends its turn without further requests; after reconciling injected terminal results, the opt-in continuation evaluator can run in the same idle cycle under its existing guards
 
 5. **Lifecycle Events (`event`)**
-    - `session.created`: Adds new task IDs to pending managed set
+    - `session.created`: Adds new task IDs to pending managed set. Early board registration claims a pending call only when it can be identified unambiguously: a unique child-session `title` match (the v2 host stamps `title = description` argument, additionally constrained to the child's agent) or a unique agent-type match among unmarked pendings **with no already-consumed same-agent call** — a no-title child arriving after a same-agent call's after-hook consumed its pending is treated as stale and never claims. Ambiguous, stale, or unattributable children get a placeholder `unattributed <agent> task` registration so task_status always resolves them; the owning `tool.execute.after` corrects the description. An already-registered child never fences a pending, and a pending's flags never cause `tool.execute.after` to drop the task ID parsed from its own output. On hosts that do not supply tool call IDs, `tool.execute.after` resolves identity via `takeByTaskID` — matching the task ID parsed from its own output against the pending the early registration claimed for that child — instead of guessing by insertion order among parallel calls; `take()` without a call ID only proceeds when exactly one pending exists for the parent. When neither identity source resolves but the call's own output carries a task ID, a guarded first-match drain fallback (`takeUnresolvedFirstMatch`) consumes the oldest eligible unmarked pending with a warning, so a parallel no-ID burst cannot strand unmarked pendings and poison the parent's future takes (a pending set consisting solely of marked pendings still refuses the fallback; each marked pending keeps its own owner-resolution path). Residual risk is bounded: unresolved-identity registrations (drain fallback and window-shifted sole takes, both flagged `identityUnresolved`) keep a generic description/objective — labels are never guessed; `resultSummary`/`taskID` always come from the call's own output. Admission tickets still bind to the registered task (fungible per agent/model bucket, totals correct; per-ticket attribution is unknowable in that window), and an evicted pending's ticket is released at eviction (pre-existing): capacity may under-count a still-running evicted task on no-ID hosts. Unattributed placeholder registrations whose owning after-hook never arrives may eventually be marked stopped by idle reconciliation and trigger the parent's stopped-job recovery wake, bounded by the two-wake no-progress cap.
     - `session.idle` / `session.status` (idle): Reconciles injected terminal jobs for the parent session (backstop path), then can run the opt-in continuation evaluator in the same idle cycle under its existing guards. Child idle is a stop candidate: the first observation stays provisional, and only a confirmed idle/absent after the 5s grace marks `stopped`
     - `session.status` (busy): Marks sessions as running from live session state and resets pending stop confirmation
     - `session.deleted`: Clears job state, child jobs, and pending call records for the session
+    - `server.instance.disposed`: Clears generation-local state but leaves the
+      shared pending calls and admission queue for the next generation
 
 6. **Human-in-the-loop Waits**
    - `wait_for_user` calls the facade's `beginUserWait()` only after tool validation
@@ -71,11 +93,19 @@ All modules depend on `BackgroundJobBoard` from `src/utils/background-job-board.
    - Foreground-fallback replay provenance and shared fallback teardown state preserve the latch across plugin-manager recreation
    - Idle continuation remains suppressed until a distinct real user message arrives
 
+### Fallback deferral
+
+- A recoverable child `session.error` records a deferral before foreground fallback arms its delay. Both terminal-gate wiring sites include `hasDeferredError()` alongside pending handoffs; the production gate also checks the fallback manager's pending delay and in-flight work, so runtime polling, result retrieval, and board injection cannot publish the failed attempt while fallback remains pending.
+- Child idle always schedules the deferred-error backstop, including for managed children; parent idle reconciliation cannot occupy that timer. It waits `idleReconcileDelayMs`, renews at most five times while fallback is in progress, then consumes the deferral before reconciliation. Pending fallback retries keep their timer without marking status uncertain.
+- Live busy clears the deferral and timer. A final error or genuine deletion clears it before publication. Fallback deletion cleanup preserves or re-arms the backstop; parent invalidation cannot cancel it. Genuine session/parent cleanup and plugin disposal remove deferrals with their timers.
+- The tracker flags admitted and unresolved-promoted fallback runs; external `register()` clears the flag. Plugin wiring uses pending/running fallback activity for v1 revive refusal. Verified cancellation remains allowed. v2 has no replay refusal and publishes unrecovered errors through the same backstop.
+- Normal confirmed admission after a terminal failover error sends one queued internal `state="running"` notice per hop. It shares the terminal parent transport but takes no terminal lease and has no retry ladder. The result waits for its notice attempt to settle. `chat.message` treats the part as internal, and board injection ignores its non-terminal state.
+
 ### Data & Control Flow
 
 ```
 User task call → tool.execute.before → PendingTaskCall created → task ID resolved/reused
-→ tool.execute.after → BackgroundJobBoard.registerLaunch() → context extracted/added
+→ tool.execute.after → BackgroundJobBoard.registerLaunch() → context validated/added
 → Message transform → BackgroundJobBoard.formatForPrompt() injected as a system-reminder message part
 → session.idle → reconcileInjectedTerminalJobs() → BackgroundJobBoard.markReconciled()
 → opt-in continuation evaluator (same idle cycle, existing guards)
@@ -95,9 +125,8 @@ User task call → tool.execute.before → PendingTaskCall created → task ID r
 
 ### Configuration & Caps
 
-- `maxSessionsPerAgent`: Limits reusable sessions per agent type
-- `readContextMinLines`: Minimum lines to include in read context
-- `readContextMaxFiles`: Maximum files to include in read context
+- `maxSessionsPerAgent`: Limits reusable sessions per agent type (LRU eviction)
+- Read-context list: path-only, deduped per path, internal display cap (8) with a `(+N more)` tail; informational only
 - `shouldManageSession`: Predicate to determine which sessions are managed by this hook
 
 ### Events & Hooks
@@ -115,3 +144,4 @@ The original monolithic module was split to improve:
 - **Scalability**: Capped data structures prevent unbounded memory growth.
 
 Each submodule adheres to the **Single Responsibility Principle** while collaborating through the facade to provide a cohesive user experience.
+

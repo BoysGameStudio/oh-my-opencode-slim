@@ -1,6 +1,7 @@
 /**
  * A custom skill bundled in this repository.
- * Unlike npx-installed skills, these are copied from src/skills/ to the OpenCode skills directory
+ * Registered in-process from src/skills/ via the host's `ctx.skill` channel
+ * at plugin load — never copied to the OpenCode skills directory.
  */
 export interface CustomSkill {
   /** Skill name (folder name) */
@@ -14,7 +15,10 @@ export interface CustomSkill {
 }
 
 /**
- * Registry of custom skills bundled in this repository.
+ * Registry of custom skills bundled in this repository — the single gate for
+ * in-process skill registration. Note: `src/skills/loop-engineering` is
+ * deliberately NOT registered; the `/loop` command hook drives that workflow
+ * inline and the directory is reference material only.
  */
 export const CUSTOM_SKILLS: CustomSkill[] = [
   {
@@ -48,6 +52,27 @@ export const CUSTOM_SKILLS: CustomSkill[] = [
       'Plan credible, proportionate evidence before non-trivial implementation',
     allowedAgents: ['orchestrator'],
     sourcePath: 'src/skills/verification-planning',
+  },
+  {
+    name: 'step-back',
+    description:
+      'Pause snowballing patches and reassess direction before continuing',
+    allowedAgents: ['orchestrator'],
+    sourcePath: 'src/skills/step-back',
+  },
+  {
+    name: 'deanchor',
+    description:
+      'Generalize from examples instead of copying them with light edits',
+    allowedAgents: ['orchestrator'],
+    sourcePath: 'src/skills/deanchor',
+  },
+  {
+    name: 'ai-estimates',
+    description:
+      'Estimate task duration for a human working with AI, not alone',
+    allowedAgents: ['orchestrator'],
+    sourcePath: 'src/skills/ai-estimates',
   },
   {
     name: 'reflect',

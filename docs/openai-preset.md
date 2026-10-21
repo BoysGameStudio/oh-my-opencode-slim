@@ -19,10 +19,8 @@ opencode models --refresh
 ## Switch at Runtime
 
 If both presets are already in your config, switch from inside OpenCode:
-
-```text
-/preset openai
-```
+- **v2 hosts:** type `/preset openai` to apply directly (reload still required)
+- **v1 hosts:** open `/preset` from autocomplete and pick Apply
 
 See [Preset Switching](preset-switching.md) for the full runtime switching
 workflow.
@@ -33,12 +31,11 @@ The generated `openai` preset assigns each specialist an OpenAI model:
 
 | Agent | Model |
 |-------|-------|
-| Orchestrator | `openai/gpt-5.6-terra` (`high`) |
-| Oracle | `openai/gpt-5.6-sol` (`high`) |
-| Librarian | `openai/gpt-5.6-luna` (`low`) |
-| Explorer | `openai/gpt-5.6-luna` (`low`) |
-| Designer | `openai/gpt-5.6-luna` (`medium`) |
-| Fixer | `openai/gpt-5.6-luna` (`high`) |
+| Orchestrator | `openai/gpt-6.1-sol` (`medium`) |
+| Oracle | `openai/gpt-6.1-sol` (`high`) |
+| Explorer | `openai/gpt-6-luna` (`low`) |
+| Designer | `openai/gpt-6-luna` (`medium`) |
+| Fixer | `openai/gpt-6.1-sol` (`low`) |
 
 ## Generated Config Shape
 
@@ -51,45 +48,38 @@ setting the top-level `preset` field:
   "presets": {
     "openai": {
       "orchestrator": {
-        "model": "openai/gpt-5.6-terra",
-        "variant": "high",
-        "skills": ["*"],
-        "mcps": ["*", "!context7"]
+        "model": "openai/gpt-6.1-sol",
+        "variant": "medium",
+        "skills": ["*"]
       },
       "oracle": {
-        "model": "openai/gpt-5.6-sol",
+        "model": "openai/gpt-6.1-sol",
         "variant": "high",
-        "skills": ["simplify"],
-        "mcps": []
-      },
-      "librarian": {
-        "model": "openai/gpt-5.6-luna",
-        "variant": "low",
-        "skills": [],
-        "mcps": ["context7", "gh_grep"]
+        "skills": ["simplify"]
       },
       "explorer": {
-        "model": "openai/gpt-5.6-luna",
+        "model": "openai/gpt-6-luna",
         "variant": "low",
-        "skills": [],
-        "mcps": []
+        "skills": []
       },
       "designer": {
-        "model": "openai/gpt-5.6-luna",
+        "model": "openai/gpt-6-luna",
         "variant": "medium",
-        "skills": [],
-        "mcps": []
+        "skills": []
       },
       "fixer": {
-        "model": "openai/gpt-5.6-luna",
-        "variant": "high",
-        "skills": [],
-        "mcps": []
+        "model": "openai/gpt-6.1-sol",
+        "variant": "low",
+        "skills": []
       }
     }
   }
 }
 ```
+
+Per-agent MCP defaults (e.g. `explorer` gets `context7` and `gh_grep`) are
+applied at runtime; generated configs omit them so they never pin stale
+values.
 
 ## Skill Reference
 

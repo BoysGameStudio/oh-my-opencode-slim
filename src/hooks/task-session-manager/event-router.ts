@@ -8,16 +8,26 @@
 import type { BackgroundJobExecution } from '../../utils/background-job-board';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
+import { structuredErrorMessage } from '../../utils/child-transcript';
+import { isRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
 import {
   isFailoverError,
   isInlineFailoverError,
 } from '../foreground-fallback/index';
+import type { InjectedTerminalJobs } from './board-injection';
+import {
+  type ChildInputWaitKind,
+  type ChildInputWaitNotification,
+  clearChildInputWait,
+  clearChildInputWaitsForSession,
+  getChildInputWait,
+  noteChildInputWait,
+} from './child-input-wait';
 import type {
-  InjectedTerminalJobs,
-  RetainedBoardSnapshotState,
-} from './board-injection';
-import type { PendingTaskCall } from './pending-call-tracker';
+  EarlyTaskRegistration,
+  PendingTaskCall,
+} from './pending-call-tracker';
 import type { RevivedRunTracker } from './revived-run-tracker';
 
 type BackgroundJobRecord = NonNullable<ReturnType<BackgroundJobStore['get']>>;
@@ -60,10 +70,6 @@ function eventFenceMap(
   const created = new Map<string, SessionEventGenerationFence>();
   sessionEventFences.set(key, created);
   return created;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
 }
 
 function finiteNumber(value: unknown): value is number {
@@ -202,6 +208,7 @@ export async function handleEvent(
           id?: string;
           parentID?: string;
           agent?: string;
+          title?: string;
           generation?: number;
           activityAt?: number;
           timestamp?: number;
@@ -256,7 +263,10 @@ export async function handleEvent(
         idleObservedAt: number,
         observedGeneration: number,
       ): void;
-      scheduleErrorTerminalize(
+      /** Bounded deferred-error backstop for the fallback-preparation
+       *  window: re-checks the fallback state on each fire and
+       *  terminalizes the deferred error once it is no longer in flight. */
+      scheduleDeferredErrorBackstop(
         sessionID: string,
         idleObservedAt: number,
         observedGeneration: number,
@@ -264,13 +274,19 @@ export async function handleEvent(
       clearIdleTimers(sessionID: string): void;
       clearAllTimers(): string[];
     };
-    /** Sessions with a deferred inline 401/410 awaiting fallback outcome. */
-    deferredInlineErrors: Set<string>;
+    /** Sessions with a deferred failover error awaiting the fallback
+     *  outcome, mapped to the summary the idle backstop publishes when
+     *  no recovery happens (managed inline 401/410, background children
+     *  with an armed fallback chain). */
+    deferredInlineErrors: Map<string, string>;
+    withFallbackReason: (sessionID: string, text: string) => string;
     backgroundJobBoard: BackgroundJobStore;
+    terminalGate: import('../../utils/background-job-terminal-gate').BackgroundJobTerminalGate;
     pendingCallTracker: {
       peekByParentAndAgent(
         parentSessionID: string,
         agentHint?: string,
+        title?: string,
       ): PendingTaskCall | undefined;
       clearSession(sessionID: string): void;
       clearAll?(): void;
@@ -285,13 +301,19 @@ export async function handleEvent(
       string,
       Map<string, BackgroundJobExecution>
     >;
-    retainedBoardSnapshots: Map<string, RetainedBoardSnapshotState>;
     backgroundJobSupervisor?: BackgroundJobSupervisor;
+    bindConcurrencyTicket?: (taskID: string, pending: PendingTaskCall) => void;
+    releaseConcurrencyTask?: (taskID: string) => void;
     observeSyntheticTerminalPart?: (part: unknown) => void;
     revivedRunTracker?: RevivedRunTracker;
+    /** Surface a background child's newly opened input wait to the parent. */
+    onChildInputWait?: (notification: ChildInputWaitNotification) => void;
+    /** Test seam; production uses event-arrival wall-clock time. */
+    now?: () => number;
   },
 ): Promise<void> {
   deps.inputWaits.trackInputWait(input.event);
+  routeChildInputWait(input, deps);
 
   if (input.event.type === 'message.part.updated') {
     deps.observeSyntheticTerminalPart?.(input.event.properties?.part);
@@ -300,7 +322,6 @@ export async function handleEvent(
 
   if (input.event.type === 'session.created') {
     const info = input.event.properties?.info;
-    if (info?.id) deps.retainedBoardSnapshots.delete(info.id);
     if (info?.id) {
       rememberSessionGeneration(deps.backgroundJobBoard, info.id);
     }
@@ -331,12 +352,17 @@ export async function handleEvent(
       const pending = deps.pendingCallTracker.peekByParentAndAgent(
         info.parentID,
         info.agent,
+        typeof info.title === 'string' ? info.title : undefined,
       );
       if (pending && !pending.resumedTaskId && !pending.earlyRegisteredTaskID) {
         if (deps.backgroundJobBoard.get(info.id)) {
-          pending.earlyRegistrationRejected = true;
+          // The child is already registered — its own tool.execute.after
+          // won the race. Fencing the peeked pending here punished an
+          // unrelated call and caused its later output to be dropped
+          // (incident 2026-09-12); the existing board record already
+          // prevents double registration.
           log(
-            '[task-session-manager] refused early registration for an existing task ID',
+            '[task-session-manager] skipped early registration for an already-registered task ID',
             { taskID: info.id, parentSessionID: info.parentID },
           );
         } else {
@@ -353,6 +379,13 @@ export async function handleEvent(
               background: false,
             });
             pending.earlyRegisteredTaskID = record.taskID;
+            pending.earlyRegistration = {
+              taskID: record.taskID,
+              generation: record.generation,
+              backgroundJobBoard: deps.backgroundJobBoard,
+              backgroundJobSupervisor: deps.backgroundJobSupervisor,
+            } satisfies EarlyTaskRegistration;
+            deps.bindConcurrencyTicket?.(record.taskID, pending);
             log(
               '[task-session-manager] tentative early board registration from session.created',
               {
@@ -375,6 +408,46 @@ export async function handleEvent(
           }
         }
       }
+
+      if (!pending && !deps.backgroundJobBoard.get(info.id)) {
+        // No pending call can be attributed to this child (ambiguous
+        // parallel launches, or the owning pending was consumed).
+        // Register a placeholder so task_status always resolves it; the
+        // matching tool.execute.after corrects the description via
+        // description via registerLaunch's existing-record update path
+        // when it fires.
+        const agent =
+          typeof info.agent === 'string' && info.agent ? info.agent : 'unknown';
+        try {
+          const record = deps.backgroundJobBoard.registerLaunch({
+            taskID: info.id,
+            parentSessionID: info.parentID,
+            agent,
+            description: `unattributed ${agent} task`,
+            objective: `unattributed ${agent} task`,
+            background: false,
+            provisional: true,
+          });
+          log(
+            '[task-session-manager] placeholder board registration for unattributed child session',
+            {
+              taskID: record.taskID,
+              alias: record.alias,
+              parentSessionID: info.parentID,
+              agent,
+            },
+          );
+        } catch (error) {
+          log(
+            '[task-session-manager] refused placeholder registration for child session',
+            {
+              taskID: info.id,
+              parentSessionID: info.parentID,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+        }
+      }
     }
     return;
   }
@@ -382,10 +455,9 @@ export async function handleEvent(
   if (input.event.type === 'server.instance.disposed') {
     deps.backgroundJobSupervisor?.dispose();
     deps.revivedRunTracker?.dispose();
-    deps.pendingCallTracker.clearAll?.();
-    deps.retainedBoardSnapshots.clear();
     eventFenceMap(deps.backgroundJobBoard).clear();
     const idleSessionIds = deps.idleReconciler.clearAllTimers();
+    deps.deferredInlineErrors.clear();
     // Local-only: drop idle tokens. Process-global wait_for_user stays armed.
     const waitSessionIDs = new Set([
       ...idleSessionIds,
@@ -422,19 +494,40 @@ export async function handleEvent(
       : undefined;
     if (observation?.stale || observation?.activityFenceOnly) return;
     const job = observation?.job;
-    log('[task-session-manager] idle/status idle observed', {
-      sessionID: sessionId,
-      managesSession: sessionId
-        ? deps.options.shouldManageSession(sessionId)
-        : false,
-      terminalJobsPending: sessionId
-        ? (deps.terminalJobsInjectedByParent.get(sessionId)?.executions.size ??
-            0) +
-          (deps.pendingInjectedTerminalJobsByParent.get(sessionId)?.size ?? 0)
-        : 0,
-      runningJobForSession: job?.state === 'running' || false,
-    });
-    if (sessionId && deps.options.shouldManageSession(sessionId)) {
+    const runningJobForSession = job?.state === 'running' || false;
+    // Warn elevation: a tracked managed child (session.created-observed,
+    // not yet settled by its terminal output) reporting idle while the
+    // board holds no running record for it is the host/board drift
+    // signature — without the warn prefix these hid inside the routine
+    // idle log line. The logger is single-level text, so the severity
+    // rides the `[task-session-manager] WARN:` prefix (same convention
+    // as the `[plugin] WARN:` lines in src/index.ts).
+    const trackedManagedChildWithoutJob =
+      sessionId !== undefined &&
+      !runningJobForSession &&
+      deps.taskContextTracker.pendingManagedTaskIds.has(sessionId);
+    log(
+      trackedManagedChildWithoutJob
+        ? '[task-session-manager] WARN: idle observed for tracked managed child with no running board record'
+        : '[task-session-manager] idle/status idle observed',
+      {
+        sessionID: sessionId,
+        managesSession: sessionId
+          ? deps.options.shouldManageSession(sessionId)
+          : false,
+        terminalJobsPending: sessionId
+          ? (deps.terminalJobsInjectedByParent.get(sessionId)?.executions
+              .size ?? 0) +
+            (deps.pendingInjectedTerminalJobsByParent.get(sessionId)?.size ?? 0)
+          : 0,
+        runningJobForSession,
+      },
+    );
+    if (
+      sessionId &&
+      deps.options.shouldManageSession(sessionId) &&
+      !(runningJobForSession && deps.deferredInlineErrors.has(sessionId))
+    ) {
       deps.idleReconciler.scheduleIdleReconciliation(sessionId);
     }
 
@@ -443,11 +536,11 @@ export async function handleEvent(
     // session being idle is itself the completion signal.
     // Delayed so FG can claim the session before we mark completed.
     if (job && sessionId && job.state === 'running') {
-      if (deps.deferredInlineErrors.has(sessionId)) {
-        // A persistent 401/410 was deferred for fallback recovery but the
-        // session ended without one: terminalize as error instead of the
-        // false completion the child-idle path would record.
-        deps.idleReconciler.scheduleErrorTerminalize(
+      const deferredError = deps.deferredInlineErrors.get(sessionId);
+      if (deferredError !== undefined) {
+        // Idle may precede the fallback manager arming its initial delay.
+        // Only the bounded backstop can decide that recovery never landed.
+        deps.idleReconciler.scheduleDeferredErrorBackstop(
           sessionId,
           observedAt,
           job.generation,
@@ -492,21 +585,23 @@ export async function handleEvent(
     }
     if (sessionId && deps.options.shouldManageSession(sessionId)) {
       const props = input.event.properties as { error?: unknown } | undefined;
+      const job = observation?.job ?? deps.backgroundJobBoard.get(sessionId);
+      const inline = isInlineFailoverError(props?.error);
       // Only clear injected terminal jobs for fatal errors.
       // Rate-limit errors are recovered by ForegroundFallbackManager
       // (abort + reprompt with fallback model); clearing the injected
       // job state here would make the orchestrator lose track of
       // completed background tasks and unable to dispatch follow-ups.
-      // Persistent 401/410 (auth, model gone) may ALSO be recovered by a
-      // fallback reprompt, so defer while recovery is still possible:
-      // record the deferred error in the set so an idle with no recovery
+      // Defer foreground 401/410 and all background failover errors while
+      // recovery by a fallback reprompt is still possible:
+      // record the deferred error in the map so an idle with no recovery
       // terminalizes the job as 'error' instead of a false completion.
       // When no chain exists, fallback is disabled, or the chain is
       // exhausted the error is final — record it now.
       if (
         !props?.error ||
         !isFailoverError(props.error) ||
-        (isInlineFailoverError(props.error) &&
+        ((inline || job?.background === true) &&
           !deps.options.willAttemptFallback?.(sessionId))
       ) {
         deps.deferredInlineErrors.delete(sessionId);
@@ -514,7 +609,6 @@ export async function handleEvent(
         deps.pendingInjectedTerminalJobsByParent.delete(sessionId);
         // Record non-retryable errors on the job board so the
         // orchestrator sees the failure instead of a false completion.
-        const job = observation?.job ?? deps.backgroundJobBoard.get(sessionId);
         if (job && job.state === 'running') {
           // BackgroundJobStore has no expected-generation/CAS form for
           // updateStatus. The check immediately above is the strongest
@@ -526,24 +620,29 @@ export async function handleEvent(
           ) {
             return;
           }
-          const updated = deps.backgroundJobBoard.updateStatus({
-            taskID: sessionId,
-            state: 'error',
-            expectedGeneration: observation?.generation,
-            resultSummary:
-              (props?.error as { message?: string } | undefined)?.message ??
-              'Session error',
+          const message =
+            structuredErrorMessage(props?.error) ?? 'Session error';
+          await deps.terminalGate.reconcile(job, {
+            kind: 'session-error',
+            message:
+              job.background && isFailoverError(props?.error)
+                ? deps.withFallbackReason(sessionId, message)
+                : message,
           });
-          if (updated) deps.revivedRunTracker?.onTerminal(updated);
         }
-      } else if (isInlineFailoverError(props.error)) {
+      } else if (inline || job?.background === true) {
         // Recovery possible: defer. The idle backstop terminalizes this
         // if the fallback fails silently; busy/deleted clears it.
-        deps.deferredInlineErrors.add(sessionId);
+        deps.deferredInlineErrors.set(
+          sessionId,
+          inline
+            ? 'Session error after failed model fallback (auth/model unavailable)'
+            : (structuredErrorMessage(props.error) ?? 'Session error'),
+        );
       }
     } else if (sessionId) {
-      // Child subagent sessions are not orchestrators, so the block
-      // above never runs for them. Without this, a failed background
+      // Unmanaged child sessions have no orchestrator mapping, so the block
+      // above skips them. Without this, a failed background
       // subagent leaves its job in `running` and the idle-reconciliation
       // path (which has no shouldManageSession guard) marks it
       // `completed` — a false success. A child with no fallback chain has
@@ -551,6 +650,33 @@ export async function handleEvent(
       const props = input.event.properties as { error?: unknown } | undefined;
       if (deps.options.isFallbackInProgress?.(sessionId)) return;
       const job = observation?.job ?? deps.backgroundJobBoard.get(sessionId);
+      // This router sees session.error BEFORE ForegroundFallbackManager
+      // does (event-hook dispatch order in src/index.ts), so the
+      // isFallbackInProgress guard above cannot cover the fallback this
+      // error is about to trigger. Reconciling a failover-worthy error
+      // now would publish it to the parent while the fallback re-prompt
+      // is still coming: the substituted run's result is delivered
+      // through the observation handoff, which only arms while the
+      // record is still 'running' (fallback-observation-transfer prepare
+      // guard) — an early terminal state orphans the retried run's
+      // result. Defer instead, mirroring the managed branch's 401/410
+      // contract: live busy from the re-prompt clears the deferral; an
+      // idle without recovery terminalizes the deferred error, so the
+      // parent still sees the failure.
+      if (
+        job &&
+        job.state === 'running' &&
+        props?.error &&
+        isFailoverError(props.error) &&
+        deps.options.willAttemptFallback?.(sessionId)
+      ) {
+        deps.deferredInlineErrors.set(
+          sessionId,
+          structuredErrorMessage(props.error) ?? 'Session error',
+        );
+        return;
+      }
+      deps.deferredInlineErrors.delete(sessionId);
       if (job && job.state === 'running') {
         // This is a final synchronous generation check, not a claim that
         // updateStatus is a CAS operation; the store API cannot provide that.
@@ -560,15 +686,13 @@ export async function handleEvent(
         ) {
           return;
         }
-        const updated = deps.backgroundJobBoard.updateStatus({
-          taskID: sessionId,
-          state: 'error',
-          expectedGeneration: observation?.generation,
-          resultSummary:
-            (props?.error as { message?: string } | undefined)?.message ??
-            'Session error',
+        const message = structuredErrorMessage(props?.error) ?? 'Session error';
+        await deps.terminalGate.reconcile(job, {
+          kind: 'session-error',
+          message: isFailoverError(props?.error)
+            ? deps.withFallbackReason(sessionId, message)
+            : message,
         });
-        if (updated) deps.revivedRunTracker?.onTerminal(updated);
       }
     }
 
@@ -581,7 +705,7 @@ export async function handleEvent(
     const statusType = (
       input.event.properties as { status?: { type?: string } } | undefined
     )?.status?.type;
-    if (statusType !== 'busy') {
+    if (statusType !== 'busy' && statusType !== 'retry') {
       if (sessionId) deps.idleSessionTokens.invalidate(sessionId);
       return;
     }
@@ -612,19 +736,33 @@ export async function handleEvent(
     // timer; clearIdleTimers handles the child timer.
     if (sessionId) {
       deps.idleReconciler.clearIdleTimers(sessionId);
-      // Live busy after a deferred 401/410 means the fallback re-prompt
-      // (or continued work) recovered the session — the error is not final.
+      // Live busy after a deferred failover error means the fallback
+      // re-prompt (or continued work) recovered the session — the error
+      // is not final.
       deps.deferredInlineErrors.delete(sessionId);
     }
     const before = sessionId
       ? (observation?.job ?? deps.backgroundJobBoard.get(sessionId))
       : undefined;
+    const token = before ? deps.terminalGate.capture(before) : undefined;
+    const eventAt = eventActivityAt(input, Number.NaN);
+    if (before && token) {
+      const result = deps.terminalGate.observe(token, {
+        kind: statusType,
+        origin: 'session.status-event',
+        readStartedAt: token.readStartedAt,
+        observedAt: Number.isFinite(eventAt) ? eventAt : undefined,
+      });
+      // Deferred without recorded activity means the gate needs a contrast.
+      // A stale identity never gets upgraded into a request for the current run.
+      if (
+        result.kind === 'deferred' &&
+        result.record.activityRevision === before.activityRevision
+      )
+        await deps.terminalGate.reconcile(before);
+    }
     const updated = sessionId
-      ? deps.backgroundJobBoard.markRunningFromLiveSession(
-          sessionId,
-          observedAt,
-          observation?.generation,
-        )
+      ? deps.backgroundJobBoard.get(sessionId)
       : undefined;
     if (before?.cancellationRequested) {
       log('[task-session-manager] busy observed after cancel request', {
@@ -703,7 +841,7 @@ export async function handleEvent(
   }
   deps.inputWaits.clearInputWaits(sessionId);
   deps.pendingCallTracker.clearSession(sessionId);
-  deps.retainedBoardSnapshots.delete(sessionId);
+  clearChildInputWaitsForSession(sessionId);
   const fallbackInProgress =
     deps.options.isFallbackInProgress?.(sessionId) === true;
   const job = deps.backgroundJobBoard.get(sessionId);
@@ -711,8 +849,165 @@ export async function handleEvent(
     deps.backgroundJobSupervisor?.onSessionDeleted(sessionId);
   }
 
+  // Deletion may precede idle, so a deferred error may have no backstop yet.
+  // Token invalidation preserves any backstop already awaiting fallback.
+  const deferredError = deps.deferredInlineErrors.get(sessionId);
+  if (deferredError !== undefined) {
+    if (fallbackInProgress) {
+      // Fallback teardown: keep the deferral and ensure a backstop exists,
+      // even if deletion arrived before idle. Live busy clears both;
+      // a replay that never lands leaves the bounded backstop to publish.
+      if (job && job.state === 'running') {
+        deps.idleReconciler.scheduleDeferredErrorBackstop(
+          sessionId,
+          observedAt,
+          job.generation,
+        );
+      }
+    } else {
+      // Genuine deletion inside the deferral window: publish the deferred
+      // error now (pre-fix behavior published it at session.error time)
+      // before the deletion cleanup drops the record, then clear the
+      // entry. Awaited so the publication lands before the coordinator's
+      // session-deleted cleanup runs.
+      deps.deferredInlineErrors.delete(sessionId);
+      if (job && job.state === 'running') {
+        await deps.terminalGate.reconcile(job, {
+          kind: 'session-error',
+          message: deps.withFallbackReason(sessionId, deferredError),
+        });
+      }
+    }
+  }
+
   log('[task-session-manager] session.deleted observed', {
     sessionID: sessionId,
   });
   eventFenceMap(deps.backgroundJobBoard).delete(sessionId);
+}
+
+/**
+ * Surface a background child's pending question/permission to its parent.
+ *
+ * The per-session input-wait tracker arms a wait for the asking session
+ * only; a background child's ask never reaches the parent whose turn
+ * already ended. When the asking session is a RUNNING board-tracked
+ * BACKGROUND child, record the ask in the child-input-wait sidecar
+ * (idempotent per request id) and notify so the parent can be woken with
+ * the ask content. Replies/rejections clear the entry. Foreground children
+ * (background !== true), unknown sessions, and id-less asks are ignored.
+ */
+function routeChildInputWait(
+  input: {
+    event: {
+      type: string;
+      properties?: {
+        id?: string;
+        requestID?: string;
+        sessionID?: string;
+        questions?: unknown;
+        permission?: unknown;
+        patterns?: unknown;
+      };
+    };
+  },
+  deps: {
+    backgroundJobBoard: BackgroundJobStore;
+    onChildInputWait?: (notification: ChildInputWaitNotification) => void;
+    now?: () => number;
+  },
+): void {
+  const type = input.event.type;
+  const properties = input.event.properties;
+  const sessionID = properties?.sessionID;
+  if (!sessionID) return;
+
+  if (
+    type === 'question.asked' ||
+    type === 'question.v2.asked' ||
+    type === 'permission.asked'
+  ) {
+    const kind: ChildInputWaitKind =
+      type === 'permission.asked' ? 'permission' : 'question';
+    const requestID =
+      typeof properties?.id === 'string' ? properties.id : undefined;
+    if (!requestID || requestID.trim() === '') return;
+    const job = deps.backgroundJobBoard.get(sessionID);
+    if (
+      job?.state !== 'running' ||
+      job.background !== true ||
+      job.provisional === true
+    ) {
+      return;
+    }
+    const existingWait = getChildInputWait(sessionID, requestID);
+    const existingSnapshot = existingWait
+      ? {
+          questionsLength: existingWait.questions?.length ?? 0,
+          permission: existingWait.permission ?? '',
+          patternsLength: existingWait.patterns?.length ?? 0,
+        }
+      : undefined;
+    const isDuplicate = existingWait !== undefined;
+    const record = noteChildInputWait({
+      taskID: sessionID,
+      parentSessionID: job.parentSessionID,
+      kind,
+      requestID,
+      questions: properties?.questions,
+      permission: properties?.permission,
+      patterns: properties?.patterns,
+      now: deps.now?.(),
+    });
+    if (record) {
+      // Notify the direct dep once per request id (true duplicates are
+      // suppressed). A raw v2 permission.asked can arrive before its
+      // normalized v1-shaped copy; when the duplicate enriches the stored
+      // wait with action/resources, re-notify so the queued parent wake can
+      // replace its stale "unknown" delta before delivery.
+      const enrichedDuplicate =
+        existingSnapshot !== undefined &&
+        (existingSnapshot.questionsLength < (record.questions?.length ?? 0) ||
+          (!existingSnapshot.permission && !!record.permission) ||
+          existingSnapshot.patternsLength < (record.patterns?.length ?? 0));
+      if (!isDuplicate || enrichedDuplicate) {
+        deps.onChildInputWait?.({
+          parentSessionID: record.parentSessionID,
+          taskID: record.taskID,
+          kind: record.kind,
+          requestID: record.requestID,
+        });
+      }
+      log('[task-session-manager] background child input wait opened', {
+        taskID: record.taskID,
+        parentSessionID: record.parentSessionID,
+        kind: record.kind,
+        requestID: record.requestID,
+      });
+    }
+    return;
+  }
+
+  if (
+    type === 'question.replied' ||
+    type === 'question.v2.replied' ||
+    type === 'question.rejected' ||
+    type === 'question.v2.rejected' ||
+    type === 'permission.replied'
+  ) {
+    const requestID =
+      typeof properties?.requestID === 'string'
+        ? properties.requestID
+        : undefined;
+    if (!requestID || requestID.trim() === '') return;
+    if (
+      clearChildInputWait(sessionID, requestID) &&
+      deps.backgroundJobBoard.get(sessionID)
+    ) {
+      log('[task-session-manager] background child input wait resolved', {
+        taskID: sessionID,
+        requestID,
+      });
+    }
+  }
 }

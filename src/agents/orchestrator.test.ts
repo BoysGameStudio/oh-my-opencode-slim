@@ -1,44 +1,154 @@
 import { describe, expect, test } from 'bun:test';
-import { buildOrchestratorPrompt } from './orchestrator';
+import {
+  buildOrchestratorPrompt,
+  createOrchestratorAgent,
+} from './orchestrator';
+import { ROLE_ROUTING_SLIM_LINES } from './role-routing';
 
-describe('orchestrator prompt', () => {
-  test('requires the question tool for blocking user input', () => {
-    const prompt = buildOrchestratorPrompt();
+const v1 = (options = {}) => buildOrchestratorPrompt(options);
+const v2 = (options = {}) =>
+  buildOrchestratorPrompt({ ...options, hostFlavor: 'v2' });
 
-    expect(prompt).toContain('use the `question` tool');
-    expect(prompt).toContain('Enable custom input');
-    expect(prompt).toContain('concise pasted response or command output');
-    expect(prompt).toContain('small bounded set of options');
-    expect(prompt).toContain('ordinary dialogue that does not block work');
+describe('orchestrator prompt: host vocabulary', () => {
+  test('v2 uses subagent and soft-steered task_message', () => {
+    const prompt = v2();
+
+    expect(prompt).toContain('`subagent` calls in one message');
+    expect(prompt).toContain('look up IDs with the models tool');
+    expect(prompt).not.toContain('task_id');
   });
 
-  test('requires wait_for_user for external manual work', () => {
-    const prompt = buildOrchestratorPrompt();
+  test('v1 uses task, task_revive, and queue-only task_message', () => {
+    const prompt = v1();
 
-    expect(prompt).toContain('call `wait_for_user` as your final tool action');
-    expect(prompt).toContain('give the user concrete manual steps');
-    expect(prompt).toContain('end the turn');
-    expect(prompt).toContain('never use `wait_for_user` to await them');
-    expect(prompt).toContain('Do not rely on ordinary text alone');
+    expect(prompt).toContain('`task` calls in one message');
+    expect(prompt).not.toContain('delivery:');
+    expect(prompt).not.toContain('subagent(');
+    expect(prompt).not.toContain('models tool');
   });
 
-  test('falls back to question when wait_for_user is disabled', () => {
-    const prompt = buildOrchestratorPrompt(undefined, undefined, false);
-
-    expect(prompt).not.toContain(
-      'call `wait_for_user` as your final tool action',
-    );
-    expect(prompt).toContain('`wait_for_user` is disabled');
-    expect(prompt).toContain(
-      'use the `question` tool as the blocking boundary',
-    );
+  test('result reads go through task_status, not a task_result tool', () => {
+    for (const prompt of [v1(), v2()]) {
+      expect(prompt).not.toContain('task_result');
+    }
   });
 
-  test('omits end-turn instruction when wake scheduler is disabled', () => {
-    const prompt = buildOrchestratorPrompt(undefined, undefined, true, false);
+  test('unknown flavors render the v1 vocabulary', () => {
+    expect(buildOrchestratorPrompt({ hostFlavor: 'v1' })).toBe(v1());
+    expect(buildOrchestratorPrompt({ hostFlavor: 'v3-ish' })).toBe(v1());
+  });
 
-    expect(prompt).toContain('call `wait_for_user` as your final tool action');
-    expect(prompt).not.toContain('End Turn After Background Tasks');
-    expect(prompt).toContain('Do not immediately wait after spawning');
+  test('shared guidance is identical across hosts', () => {
+    for (const prompt of [v1(), v2()]) {
+      expect(prompt).toContain('You are Orchestrator, a workflow manager');
+      expect(prompt).toContain('Value productivity');
+      expect(prompt).toContain('Build in passes');
+      expect(prompt).toContain('Subagent summaries are claims, not evidence');
+      expect(prompt).toContain('## File operations');
+    }
+  });
+});
+
+describe('orchestrator prompt: blocking on the user', () => {
+  test('v1 with wait_for_user enabled ends manual steps with wait_for_user', () => {
+    const prompt = v1();
+
+    expect(prompt).toContain('then call `wait_for_user`');
+    expect(prompt).toContain('Never use it to wait for');
+  });
+
+  test('v1 with wait_for_user disabled falls back to question', () => {
+    const prompt = v1({ waitForUser: false });
+
+    expect(prompt).not.toContain('wait_for_user');
+    expect(prompt).toContain('then ask with `question`');
+  });
+
+  test('v2 never mentions wait_for_user, whatever the flag', () => {
+    expect(v2()).not.toContain('wait_for_user');
+    expect(v2({ waitForUser: false })).toBe(v2());
+  });
+});
+
+describe('orchestrator prompt: options', () => {
+  test('wake scheduler off drops the scheduler from the resume promise', () => {
+    for (const render of [v1, v2]) {
+      expect(render()).toContain(
+        'completion notifications and the wake scheduler resume you',
+      );
+      const off = render({ wakeScheduler: false });
+      expect(off).toContain('completion notifications resume you');
+      expect(off).not.toContain('wake scheduler');
+    }
+  });
+
+  test('disabledAgents and excludeDescriptions filter routing lines', () => {
+    for (const render of [v1, v2]) {
+      const full = render();
+      for (const line of Object.values(ROLE_ROUTING_SLIM_LINES)) {
+        expect(full).toContain(line);
+      }
+      const filtered = render({
+        disabledAgents: new Set(['explorer']),
+        excludeDescriptions: ['council'],
+      });
+      expect(filtered).not.toContain('@explorer —');
+      expect(filtered).not.toContain('@council —');
+      expect(filtered).toContain(ROLE_ROUTING_SLIM_LINES.fixer);
+    }
+  });
+
+  test('routingBlock=false removes the whole <Agents> element and nothing else', () => {
+    for (const render of [v1, v2]) {
+      const on = render();
+      const off = render({ routingBlock: false });
+      expect(on.match(/<Agents>/g)?.length).toBe(1);
+      expect(off).not.toContain('<Agents>');
+      expect(off).not.toContain('read-only codebase recon');
+      const [head, tail] = on.split('<Agents>');
+      expect(off).toBe(`${head}${tail.split('</Agents>\n\n')[1]}`);
+    }
+  });
+});
+
+describe('orchestrator prompt: cache safety', () => {
+  test('renders byte-identical output for identical options', () => {
+    // No time, randomness, or per-request state may reach the template.
+    for (const render of [v1, v2]) {
+      const first = render();
+      const second = render();
+      expect(first).toContain('You are Orchestrator, a workflow manager');
+      expect(first).toBe(second);
+    }
+
+    const opts = { disabledAgents: new Set(['explorer']), waitForUser: false };
+    const scoped1 = v2(opts);
+    const scoped2 = v2(opts);
+    expect(scoped1).not.toContain('@explorer');
+    expect(scoped1).toContain('@oracle');
+    expect(scoped1).toBe(scoped2);
+  });
+
+  test('v1 render is snapshot-pinned', () => {
+    expect(v1()).toMatchSnapshot();
+  });
+
+  test('v2 render is snapshot-pinned', () => {
+    expect(v2()).toMatchSnapshot();
+  });
+});
+
+describe('createOrchestratorAgent', () => {
+  test('passes prompt options through to the builder', () => {
+    const options = { hostFlavor: 'v2', routingBlock: false };
+    const agent = createOrchestratorAgent(undefined, undefined, undefined, {
+      ...options,
+    });
+    expect(agent.config.prompt).toBe(buildOrchestratorPrompt(options));
+  });
+
+  test('a custom prompt replaces the built one and appends still apply', () => {
+    const agent = createOrchestratorAgent(undefined, 'custom', 'extra');
+    expect(agent.config.prompt).toBe('custom\n\nextra');
   });
 });
