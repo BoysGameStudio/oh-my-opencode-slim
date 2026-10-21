@@ -33,7 +33,10 @@ or shell actions it invokes. v1 SDK permission maps keep their original keys.
 For example, an agent may deny `bash`, allow `execute`, deny `research_*`,
 and allow only `research_lookup`. The child permission compiler preserves
 that explicitly named MCP exception when reapplying the namespace deny,
-while keeping other namespace actions denied. A stricter host deny or ask
+while keeping other namespace actions denied. Replayed exceptions are bounded
+by the final declared policy: an earlier allowance overridden by a later
+resource denial is not restored, and partial allowances retain their narrower
+restrictions. A stricter host deny or ask
 for the action (including narrower resources) still wins. Overlapping
 wildcard-action grants remain conservatively bounded; this is not a general
 permission-widening rule. These mappings are source-checked against OpenCode

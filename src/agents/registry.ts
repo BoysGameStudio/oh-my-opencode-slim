@@ -370,7 +370,14 @@ function denyCeilingTail(
         ) {
           if (peer === rule && !seen.has(laterIndex)) {
             seen.add(laterIndex);
-            exceptions.push(later);
+            // Cross-action replay must respect the FINAL declared policy,
+            // not revive an allow superseded by a later resource denial.
+            // Keep partial grants with their narrower restrictions too.
+            exceptions.push(
+              ...(later.action === rule.action
+                ? [later]
+                : boundGrantByHost(baselineRules, later)),
+            );
           }
           break;
         }

@@ -2082,6 +2082,63 @@ describe('child permission payload stance tail', () => {
     }
   });
 
+  test.each(['public/old', 'public/old/*', '*'])(
+    'namespace replay does not revive a superseded %s allowance',
+    (oldGrant) => {
+      const registry = build(
+        runtimeFor({
+          agents: {
+            explorer: {
+              permission: {
+                'research_*': 'deny',
+                research_lookup: {
+                  [oldGrant]: 'allow',
+                  'public/*': 'deny',
+                  'public/safe/*': 'deny',
+                  'public/safe/doc': 'allow',
+                },
+              },
+            },
+          },
+        }),
+        { mcp: { research: { type: 'local' } } },
+        { hostFlavor: 'v2' },
+      );
+      const baseline = registry.nativePolicies.explorer.rules;
+      const resources = [
+        'public/old',
+        'public/old/doc',
+        'public/other',
+        'public/safe/other',
+        'public/safe/doc',
+        'private/doc',
+      ];
+      for (const hostTail of [[], [USER_GLOBAL_ALLOW]]) {
+        const compiled = registry.compileChildPermissions('explorer', [
+          ...baseline,
+          ...hostTail,
+        ]);
+        for (const resource of resources) {
+          const expected =
+            resource === 'public/safe/doc' ||
+            (oldGrant === '*' && resource === 'private/doc')
+              ? 'allow'
+              : 'deny';
+          expect(decideOf(baseline)('research_lookup', resource)).toBe(
+            expected,
+          );
+          expect(decideOf(compiled)('research_lookup', resource)).toBe(
+            expected,
+          );
+          expect(decideOf(compiled)('research_mutate', resource)).toBe('deny');
+        }
+        expect(registry.compileChildPermissions('explorer', compiled)).toEqual(
+          compiled,
+        );
+      }
+    },
+  );
+
   test('writer and custom planner helper routes remain Explorer-only and v1 maps stay native', () => {
     for (const name of ['fixer', 'planner']) {
       const runtime = runtimeFor({
