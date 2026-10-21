@@ -20,6 +20,7 @@ import {
 } from '../../utils/background-job-store';
 import { STOP_CONFIRMATION_GRACE_MS } from '../../utils/background-job-terminal-gate';
 import {
+  attributeHostRoundToTranscript,
   classifyCurrentDeliveredRound,
   fetchChildTranscript,
   latestInputAtOf,
@@ -346,7 +347,10 @@ async function recoverRetainedSession(
   let queuedAdoption = false;
   if (options.hostFlavor === 'v2') {
     const latestInputAt = latestInputAtOf(childTranscript);
-    const hostState = hostRoundStateOf(hosted.hostInfo);
+    const hostState = attributeHostRoundToTranscript(
+      hostRoundStateOf(hosted.hostInfo),
+      childTranscript,
+    );
     let verdict = hostRoundVerdict(hostState, latestInputAt);
     const text = terminalTextOf(childTranscript);
     // Do not freeze an empty success (incident 1115). Failure/interruption

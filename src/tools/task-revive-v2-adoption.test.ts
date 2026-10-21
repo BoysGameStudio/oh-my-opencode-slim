@@ -27,11 +27,11 @@ const childID = 'ses_v2_adoption';
 const parentID = 'ses_parent';
 type Prompt = Parameters<NonNullable<V2Context['session']['prompt']>>[0];
 
-function assistant(id: string, text: string) {
+function assistant(id: string, text: string, completedAt = Date.now()) {
   return {
     id,
     type: 'assistant',
-    time: { completed: Date.now() },
+    time: { completed: completedAt },
     content: [{ type: 'text', text }],
   };
 }
@@ -49,7 +49,7 @@ function harness(
   );
   let transcript: unknown[] = [
     { id: 'old-user', type: 'user', time: { created: 1 } },
-    ...(options.busy ? [] : [assistant('old-answer', 'old result')]),
+    ...(options.busy ? [] : [assistant('old-answer', 'old result', 2)]),
   ];
   const wait = mock(async () => {});
   const interrupt = mock(async () => {});

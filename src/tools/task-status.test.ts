@@ -873,6 +873,51 @@ describe('task_status result mode', () => {
       expect(context).toHaveBeenCalledTimes(1);
     },
   );
+  test.each([{ created: 14 }, { created: 11, completed: 14 }, {}])(
+    'untracked v2 never serves an answer outside its host terminal (%j)',
+    async (time) => {
+      const board = new BackgroundJobBoard();
+      const input = buildPluginInput({
+        session: {
+          get: async () => ({
+            parentID: 'parent-1',
+            outcome: 'succeeded',
+            time: { idle: 13 },
+          }),
+          context: async () => [
+            { id: 'u1', type: 'user', text: 'ask', time: { created: 10 } },
+            {
+              id: 'a1',
+              type: 'assistant',
+              text: 'PARTIAL',
+              time,
+            },
+          ],
+        },
+      } as never) as never;
+      const tool = createTaskStatusTool({ input, backgroundJobBoard: board });
+      const context = { sessionID: 'parent-1' } as never;
+      const status = await tool.task_status.execute(
+        { task_id: 'ses_child1' },
+        context,
+      );
+      expect(String(status)).not.toContain('state: completed');
+      expect(String(status)).not.toContain('PARTIAL');
+      const result = tool.task_status.execute(
+        { task_id: 'ses_child1', result: true },
+        context,
+      );
+      if (Object.keys(time).length === 0) {
+        await expect(result).rejects.toThrow('no terminal evidence');
+      } else {
+        const output = await result;
+        expect(String(output)).toContain('running (unconfirmed)');
+        expect(String(output)).not.toContain('PARTIAL');
+      }
+      expect(board.list('parent-1')).toHaveLength(0);
+    },
+  );
+
   test('unknown alias and empty task id are rejected', async () => {
     const h = makeResultTool();
     await expect(h.execute('exp-99')).rejects.toThrow('Unknown task ID');
