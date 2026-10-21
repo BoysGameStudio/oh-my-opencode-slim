@@ -43,7 +43,6 @@ import {
   injectBackgroundJobBoard,
   observeSyntheticTerminalPart,
   pruneReopenCorrectionState,
-  reconcileObservedTerminalRun,
   stabilizeRunningTaskParts,
   updateFromInjectedCompletion,
 } from './board-injection';
@@ -950,30 +949,18 @@ export function createTaskSessionManagerHook(
         }
 
         for (const [partIndex, part] of message.parts.entries()) {
-          const observed = await updateFromInjectedCompletion(
+          // The host's native completion commits the terminal state. Its
+          // retirement is NOT observed here: on v1 the native delivery is
+          // untagged (the plugin cannot see it as one of its own deltas), so
+          // the run retires through the tagged-delta observation or the
+          // stale-terminal fallback (issue #1647).
+          await updateFromInjectedCompletion(
             injectionState,
             part,
             message,
             messageIndex,
             partIndex,
           );
-          // Retirement by observed delivery (issue #1647): the host's native
-          // completion part for this run is in the prompt being sent, so the
-          // parent is being told. Generation/revision fenced.
-          if (
-            observed?.terminalUnreconciled &&
-            observed.parentSessionID === message.info.sessionID
-          ) {
-            reconcileObservedTerminalRun(
-              injectionState,
-              observed.parentSessionID,
-              {
-                taskID: observed.taskID,
-                generation: observed.generation,
-                terminalRevision: observed.terminalRevision,
-              },
-            );
-          }
         }
       }
     },
