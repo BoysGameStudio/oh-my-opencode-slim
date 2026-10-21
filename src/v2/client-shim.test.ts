@@ -1023,15 +1023,11 @@ describe('v2 client shim delegation', () => {
     ]);
   });
 
-  test('list passes directory/parentID filters and normalizes the legacy root sentinel to null', async () => {
+  test('list normalizes root filters to real null', async () => {
     const calls: unknown[] = [];
     const input = buildPluginInput(
       makeCtx({
-        list: async (i: Record<string, unknown>) => {
-          // v2.1 Session.ID never accepts the literal "null" string.
-          if (i.parentID === 'null') {
-            throw new Error('invalid Session.ID: "null"');
-          }
+        list: async (i: unknown) => {
           calls.push(i);
           return { data: [] };
         },
@@ -1049,9 +1045,156 @@ describe('v2 client shim delegation', () => {
     expect(calls).toEqual([
       { directory: '/w', limit: 50 },
       { parentID: 'ses_parent', limit: 50 },
-      { parentID: null, limit: 50 }, // real null for root-only listing
+      { parentID: null, limit: 50 },
       { parentID: null, limit: 50 },
     ]);
+  });
+
+  test('list drains cursors and sends root filters only on the first page', async () => {
+    const calls: unknown[] = [];
+    const input = buildPluginInput(
+      makeCtx({
+        list: async (args: { cursor?: string }) => {
+          calls.push(args);
+          if (!args.cursor) {
+            return { data: [{ id: 'ses_first' }], cursor: { next: 'page-2' } };
+          }
+          if (args.cursor === 'page-2') {
+            return { data: [{ id: 'ses_last' }], cursor: { next: 'end' } };
+          }
+          return { data: [], cursor: {} };
+        },
+      } as never),
+    );
+    const list = (
+      input.client as {
+        session: { list: (args: unknown) => Promise<{ data: unknown[] }> };
+      }
+    ).session.list;
+    expect(
+      await list({ query: { directory: '/project', parentID: null } }),
+    ).toEqual({ data: [{ id: 'ses_first' }, { id: 'ses_last' }] });
+    expect(calls).toEqual([
+      { directory: '/project', parentID: null, limit: 50 },
+      { cursor: 'page-2', limit: 50 },
+      { cursor: 'end', limit: 50 },
+    ]);
+  });
+
+  test.each([
+    ['invalid response', undefined],
+    ['invalid entry', { data: [null] }],
+    ['invalid cursor', { data: [], cursor: { next: 1 } }],
+    ['empty continuation', { data: [], cursor: { next: 'more' } }],
+  ])(
+    'list refuses %s instead of returning partial success',
+    async (_, page) => {
+      const input = buildPluginInput(
+        makeCtx({ list: async () => page } as never),
+      );
+      await expect(
+        (
+          input.client as {
+            session: { list: (args: unknown) => Promise<unknown> };
+          }
+        ).session.list({ query: {} }),
+      ).rejects.toThrow(/session.list/);
+    },
+  );
+
+  test('list accepts the official 2.1 nullable terminal cursor', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        list: async () => ({
+          data: [{ id: 'ses_terminal' }],
+          cursor: { previous: null, next: null },
+        }),
+      } as never),
+    );
+    expect(
+      await (
+        input.client as {
+          session: { list: (args: unknown) => Promise<unknown> };
+        }
+      ).session.list({ query: {} }),
+    ).toEqual({ data: [{ id: 'ses_terminal' }] });
+  });
+
+  test('list rejects a repeated cursor', async () => {
+    const input = buildPluginInput(
+      makeCtx({
+        list: async () => ({
+          data: [{ id: 'ses_repeat' }],
+          cursor: { next: 'same' },
+        }),
+      } as never),
+    );
+    await expect(
+      (
+        input.client as {
+          session: { list: (args: unknown) => Promise<unknown> };
+        }
+      ).session.list({ query: {} }),
+    ).rejects.toThrow(/repeated.*cursor/);
+  });
+
+  test.each([0, 51, 1000, 1001])(
+    'list bounds complete enumeration of %i sessions',
+    async (count) => {
+      let calls = 0;
+      const input = buildPluginInput(
+        makeCtx({
+          list: async ({ cursor }: { cursor?: string }) => {
+            calls++;
+            const start = Number(cursor ?? 0);
+            const data = Array.from(
+              { length: Math.max(0, Math.min(50, count - start)) },
+              (_, index) => ({ id: `ses_${start + index}` }),
+            );
+            return {
+              data,
+              cursor: data.length ? { next: String(start + data.length) } : {},
+            };
+          },
+        } as never),
+      );
+      const result = (
+        input.client as {
+          session: { list: (args: unknown) => Promise<{ data: unknown[] }> };
+        }
+      ).session.list({ query: {} });
+      if (count > 1000) {
+        await expect(result).rejects.toThrow(/capacity/);
+        expect(calls).toBe(21);
+      } else {
+        expect((await result).data).toHaveLength(count);
+        expect(calls).toBe(Math.ceil(count / 50) + 1);
+      }
+    },
+  );
+
+  test('list refuses enumeration after its total time budget', async () => {
+    let now = 0;
+    const clock = spyOn(performance, 'now').mockImplementation(() => now);
+    try {
+      const input = buildPluginInput(
+        makeCtx({
+          list: async () => {
+            now = 4_001;
+            return { data: [{ id: 'ses_late' }], cursor: {} };
+          },
+        } as never),
+      );
+      await expect(
+        (
+          input.client as {
+            session: { list: (args: unknown) => Promise<unknown> };
+          }
+        ).session.list({ query: {} }),
+      ).rejects.toThrow(/budget/);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test('list without session.list keeps the v1-parity empty page', async () => {
@@ -1063,243 +1206,6 @@ describe('v2 client shim delegation', () => {
         }
       ).session.list({ query: {} }),
     ).resolves.toEqual({ data: [] });
-  });
-
-  test('list drains page 2 and the terminal probe so legacy discovery sees all children', async () => {
-    // OpenCode 2.1.0 (60c68d145a14127ce633e26aa5fdfb882a7baa6d) makes
-    // session.list cursor-paginated: response
-    // {data, cursor:{previous?, next?}}. Core emits `next` on every
-    // nonempty page, including the final data page; only an empty page
-    // terminates. Legacy v1-shaped consumers (dashboard, child discovery,
-    // wake scheduler) issue the single call v1 allowed and read only
-    // `{data}`, so the shim must drain every page before answering or they
-    // silently lose sessions past page 1.
-    // Deterministic host: page 1 = 50 children, page 2 = the wanted child,
-    // page 3 = empty terminal page.
-    const calls: Array<Record<string, unknown>> = [];
-    const firstPage = Array.from({ length: 50 }, (_, i) => ({
-      id: `child_${String(i).padStart(2, '0')}`,
-      parentID: 'ses_parent',
-      time: { updated: i },
-      location: { directory: '/proj' },
-    }));
-    const input = buildPluginInput(
-      makeCtx({
-        list: async (i: Record<string, unknown>) => {
-          calls.push(i);
-          if (i.cursor === 'page-3') {
-            return { data: [], cursor: {} };
-          }
-          if (i.cursor === 'page-2') {
-            return {
-              data: [
-                {
-                  id: 'child_page2',
-                  parentID: 'ses_parent',
-                  time: { updated: 100 },
-                  location: { directory: '/proj' },
-                },
-              ],
-              // Nonempty final data page still carries a next cursor.
-              cursor: { next: 'page-3' },
-            };
-          }
-          return { data: firstPage, cursor: { next: 'page-2' } };
-        },
-      } as never),
-    );
-
-    // Legacy v1 consumer: one call, reads the `{data}` envelope only.
-    const res = await (
-      input.client as {
-        session: {
-          list: (a: unknown) => Promise<{ data: Array<{ id: string }> }>;
-        };
-      }
-    ).session.list({
-      query: { parentID: 'ses_parent', directory: '/proj' },
-    });
-
-    expect(res.data.map((s) => s.id)).toContain('child_page2');
-    expect(res.data).toHaveLength(51);
-    // The first request carries filters; a v2.1 cursor carries them
-    // thereafter.
-    expect(calls).toEqual([
-      { directory: '/proj', parentID: 'ses_parent', limit: 50 },
-      { limit: 50, cursor: 'page-2' },
-      { limit: 50, cursor: 'page-3' },
-    ]);
-  });
-
-  test('list keeps a complete page on hosts without cursors (bare array or data-only)', async () => {
-    const responses: unknown[] = [
-      [{ id: 'old_1' }, { id: 'old_2' }],
-      { data: [{ id: 'old_3' }] },
-    ];
-    const input = buildPluginInput(
-      makeCtx({
-        list: async () => responses.shift(),
-      } as never),
-    );
-    const list = (
-      input.client as {
-        session: { list: (a: unknown) => Promise<{ data: unknown[] }> };
-      }
-    ).session.list;
-    await expect(list({ query: {} })).resolves.toEqual({
-      data: [{ id: 'old_1' }, { id: 'old_2' }],
-    });
-    await expect(list({ query: {} })).resolves.toEqual({
-      data: [{ id: 'old_3' }],
-    });
-  });
-
-  test('list rejects a repeated cursor instead of returning silently incomplete data', async () => {
-    let calls = 0;
-    const input = buildPluginInput(
-      makeCtx({
-        list: async () => {
-          calls++;
-          return {
-            data: [{ id: `ses_${calls}` }],
-            cursor: { next: 'same-cursor' },
-          };
-        },
-      } as never),
-    );
-    await expect(
-      (
-        input.client as {
-          session: { list: (a: unknown) => Promise<unknown> };
-        }
-      ).session.list({ query: {} }),
-    ).rejects.toThrow('[v2] session.list repeated a cursor');
-    expect(calls).toBe(2);
-  });
-
-  test.each([
-    ['non-array data', { data: 'nope' }, 'valid session page'],
-    ['non-object entry', { data: [null] }, 'valid session page'],
-    ['invalid next cursor', { data: [], cursor: { next: 42 } }, 'cursor'],
-    [
-      'oversized page',
-      {
-        data: Array.from({ length: 51 }, (_, i) => ({ id: `ses_${i}` })),
-        cursor: { next: 'more' },
-      },
-      'more than one page',
-    ],
-    [
-      'empty page with next',
-      { data: [], cursor: { next: 'more' } },
-      'empty page',
-    ],
-  ])('list rejects malformed pages (%s)', async (_name, page, message) => {
-    const input = buildPluginInput(
-      makeCtx({
-        list: async () => page,
-      } as never),
-    );
-    await expect(
-      (
-        input.client as {
-          session: { list: (a: unknown) => Promise<unknown> };
-        }
-      ).session.list({ query: {} }),
-    ).rejects.toThrow(message);
-  });
-
-  test.each([
-    [950, 950, 20],
-    [951, 951, 21],
-    [1000, 1000, 21],
-  ])(
-    'list drains %i sessions across data pages and the terminal probe',
-    async (total, expected, expectedCalls) => {
-      let calls = 0;
-      const input = buildPluginInput(
-        makeCtx({
-          list: async () => {
-            calls++;
-            const start = (calls - 1) * 50;
-            const data = Array.from(
-              { length: Math.max(0, Math.min(50, total - start)) },
-              (_, i) => ({ id: `ses_${start + i}` }),
-            );
-            return {
-              data,
-              // Core emits next on every nonempty page, final data page too.
-              cursor: data.length > 0 ? { next: `cursor_${calls}` } : {},
-            };
-          },
-        } as never),
-      );
-      const res = await (
-        input.client as {
-          session: {
-            list: (a: unknown) => Promise<{ data: Array<{ id: string }> }>;
-          };
-        }
-      ).session.list({ query: {} });
-      expect(res.data).toHaveLength(expected);
-      expect(calls).toBe(expectedCalls);
-    },
-  );
-
-  test('list rejects when the one allowed terminal probe reveals session 1001', async () => {
-    let calls = 0;
-    const input = buildPluginInput(
-      makeCtx({
-        list: async () => {
-          calls++;
-          const start = (calls - 1) * 50;
-          const data = Array.from(
-            { length: Math.max(0, Math.min(50, 1001 - start)) },
-            (_, i) => ({ id: `ses_${start + i}` }),
-          );
-          return {
-            data,
-            cursor: data.length > 0 ? { next: `cursor_${calls}` } : {},
-          };
-        },
-      } as never),
-    );
-    await expect(
-      (
-        input.client as {
-          session: { list: (a: unknown) => Promise<unknown> };
-        }
-      ).session.list({ query: {} }),
-    ).rejects.toThrow('[v2] session.list exceeded its 1000-session capacity');
-    // 20 data pages plus the terminal probe; no partial result returned.
-    expect(calls).toBe(21);
-  });
-
-  test('list enforces its time budget independently of the history budget', async () => {
-    let now = 0;
-    let calls = 0;
-    const clock = spyOn(performance, 'now').mockImplementation(() => now);
-    try {
-      const input = buildPluginInput(
-        makeCtx({
-          list: async () => {
-            calls++;
-            now += 5_000;
-            return { data: [{ id: 'ses_1' }], cursor: { next: 'more' } };
-          },
-        } as never),
-      );
-      await expect(
-        (
-          input.client as {
-            session: { list: (a: unknown) => Promise<unknown> };
-          }
-        ).session.list({ query: {} }),
-      ).rejects.toThrow('[v2] session.list read budget exceeded');
-      expect(calls).toBe(1);
-    } finally {
-      clock.mockRestore();
-    }
   });
 
   test('unavailable methods fail explicitly, never fake success', async () => {

@@ -312,6 +312,10 @@ export function mapV2EventToV1(
   const out: Array<Record<string, unknown>> = [event];
   const type = typeof event.type === 'string' ? event.type : '';
   const props = payloadOf(event);
+  // Shutdown suspends the execution claim for native restart recovery. The
+  // host intentionally writes no terminal idle/outcome for this event.
+  if (type === 'session.execution.interrupted' && props.reason === 'shutdown')
+    return out;
 
   if (
     type === 'session.execution.started' ||

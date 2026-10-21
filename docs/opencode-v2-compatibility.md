@@ -5,8 +5,8 @@ and OpenCode v2 (`opencode2`) from a single published package. This document
 describes how each host loads the plugin, what is supported where, and how to
 register it.
 
-The repository baseline is **oh-my-opencode-slim v2.2.25** (see
-`package.json`), with live host verification on **OpenCode v2.0.7**. The
+The source baseline for this compatibility work is **oh-my-opencode-slim
+v3.0.5**, with historical live host verification on **OpenCode v2.0.7**. The
 plugin requires OpenCode v2.0.7+ on v2 hosts; older v2 hosts are unsupported.
 Bundled-skill delivery requires the host's in-process skill registration
 channel (a `ctx.skill` draft with `add`), available on OpenCode v2 hosts. On
@@ -15,10 +15,15 @@ removed, and v1-era skill drafts expose `{source, list}` rather than `add`.
 The adapter targets the v2 plugin API surface (see
 [The v2 plugin API surface](#the-v2-plugin-api-surface-this-adapter-uses)),
 and the compile-time mirror guard below is pinned to `@opencode/plugin`
-2.0.18 (revalidated: `bun run typecheck` passes against 2.0.18 with no
-official session-hook surface drift from the 2.0.15 pin; the event
-adapter ignores unknown event types, so no new mapping is required.
-Live host verification remains the v2.0.7 baseline above).
+2.1.2. Typecheck covers the consumed listing filters, nullable continuation
+cursors, native execution event envelope, compaction result names and the
+existing hook/permission contracts. This is not live 2.1.2 verification.
+
+The 2.1 replay renames do not require rewriting host-owned data here: the
+compaction bridge leaves `result.native` and `metadata.keepID` untouched.
+OMO does not use the removed credential-configuration write shape in its
+adapter. The list shim implements only the directory/parent filters its
+callers consume, not every filter exposed by the host API.
 
 ## How it works
 
@@ -70,10 +75,9 @@ Three builds are produced:
 | `./tui` | `dist/tui2.js` | `build:tui` | same external set as `build:plugin` (composes the v1 TUI entry; inlines zod) |
 
 The optional `@opentui/*` pins (0.5.11) provide the v2 TUI entry's rendering
-stack. `@opencode/plugin` 2.0.18 raised its (optional) peer floor to
-`>=0.5.12`; the floor is not enforced on the plugin loading path, so the
-pins deliberately stay at 0.5.11 until the live-verified host baseline
-moves past v2.0.7 and the TUI smoke is re-run. `@opentui/solid` pins
+stack. The development-only `@opencode/plugin` 2.1.2 contract declares an
+optional OpenTUI peer floor of `>=0.6.6`. Runtime pins stay unchanged in
+this patch; TUI runtime compatibility with 2.1.2 is unverified. `@opentui/solid` pins
 `solid-js` exactly (0.5.12 still requires 1.9.12), so any future OpenTUI
 bump must re-check that pin.
 
@@ -110,7 +114,7 @@ orchestrator-wake children-driven degraded mode are exercised end-to-end
 on the stable host — live mock-driven re-verification on 2026-09-09
 included a queued wake firing after 60 s of parent idle with a stalled
 background child). v2 conformance is compile-time-pinned by the
-mirror-conformance guard against the `@opencode/plugin` 2.0.18
+mirror-conformance guard against the `@opencode/plugin` 2.1.2
 devDependency and exercised by the mock-driven bridge tests. Every v2
 API the adapter touches is
 capability-probed at runtime (`s.switchModel`, `ctx.generate`, …), so a host
@@ -152,18 +156,16 @@ not an optional-degradation path.
    `noReply: true` maps to `delivery: "queue", resume: false` — or `delivery: "steer", resume: false` when the v1-shaped body carries an explicit `delivery: 'steer'` from `task_message`),
    `session.update`→
    `session.update` (`{sessionID, title}`), `session.delete`→`remove` (same
-   `DELETE /api/session/:id`), and `session.list` (v2 `Session.Info`
-   cursor page → a complete v1 `{data}` envelope: first-page filters
-   normalized and carried by the cursor, `cursor.next` drained within a
-   bounded budget, `directory` derived from `location`, and `outcome`
-   mapped; used by the interview dashboard's session scan and the
-   orchestrator-wake children enumeration). Note that `remove` is **not
-   part of the stock v2 plugin session domain**; `list` was not exposed
-   through v2.0.x either, but v2.1 exposes it natively as a cursor-paginated
-   route. The capability probes
-   still succeed only on hosts that extend the domain, and older hosts take
-   the degraded paths (see
-   [Plugin session domain](#plugin-session-domain-list-and-remove)).
+   `DELETE /api/session/:id`), and `session.list` (v2 `Session.Info` page → the v1
+   `{data}` envelope with `directory` derived from `location` and `outcome`
+   mapped, used by the interview dashboard's session scan and the
+    orchestrator-wake children enumeration). OpenCode 2.1 exposes `list`:
+    the shim drains its cursor pages, sends root-only filters as real `null`,
+    and refuses incomplete enumeration after 1000 sessions or four seconds.
+    The final empty page is included in the read budget. Older cursorless
+    extensions still work; v2.0.x hosts without `list` retain the degraded
+    path. These adapter checks do not establish live 2.1 compatibility (see
+   [Not exposed to plugins: `session.list` / `session.remove`](#not-exposed-to-plugins-sessionlist-sessionremove)).
    The shim marks the input `hostFlavor: 'v2'` and never fakes success
    shapes: methods the host lacks degrade with an honest log (or are
    omitted entirely, as with `session.get`, so capability probes see the
@@ -957,52 +959,47 @@ environment; no extra setup is needed for panes. See
 [Secret handling](multiplexer-integration.md#known-limitations).
 See [Deployment Modes](multiplexer-integration.md#deployment-modes).
 
-### Plugin session domain: list and remove
+### Not exposed to plugins: `session.list` / `session.remove`
 
-The v2 plugin session domain (`packages/plugin/src/promise/session.ts`,
+This limitation applies to v2.0.x. OpenCode 2.1 exposes both methods to
+plugins. Its `list` is paginated: the adapter follows `cursor.next` through
+the empty terminal page, with a 1000-session and four-second total budget.
+Exceeding either budget fails the read instead of returning a partial list.
+This is source-contract and fixture coverage, not a live-host verification.
+
+The v2.0.x plugin session domain (`packages/plugin/src/promise/session.ts`,
 `SessionDomain`, mirrored by the runtime object the promise adapter
 builds) exposes exactly `create`/`get`/`switchAgent`/`switchModel`/
 `prompt`/`generate`/`command`/`synthetic`/`interrupt`/`update`/`move`/
-`wait`/`context` through v2.0.x — **`list` and `remove` are not handed to
-plugins there**. Both endpoints exist on the host's HTTP API, and v2.1
-exposes `session.list` natively to plugins as a cursor-paginated route
-(`{data, cursor:{previous?, next?}}`, default 50). Core emits
-`cursor.next` on every nonempty page — including the final data page —
-and an empty page is the terminal signal. The shim drains pages with its
-own bounded budget: at most 20 data pages of 50 (1000 sessions), one
-terminal empty probe, and four seconds total. A probe that reveals more
-data, repeated cursors, malformed pages, or an exhausted budget reject
-instead of returning a partial list. Root-only listing sends a real
-`null` (the legacy `"null"` string is normalized, because v2.1
-`Session.ID` rejects it), and the cursor carries the first page's
-filters. `session.status`, `session.todo`, and
+`wait`/`context` — **`list` and `remove` are not handed to plugins**.
+Both endpoints exist on the host's HTTP API, but the
+plugin context never receives them. `session.status`, `session.todo`, and
 `session.children` are likewise not exposed to plugins — the wake
 scheduler's fallback enumeration, the delete no-op below, and the disabled
 runtime-status reconciliation (see
 [Upstream behaviors](#upstream-behaviors-to-know)) all follow from these
-gaps. The client shim capability-probes `list` and `remove` at runtime
-(`typeof s.list === 'function'`, `s.remove`), so a future host that
-extends the domain gets real delegation with no plugin change; on v2.0.x
-stable hosts both probes fail and the shims degrade:
+gaps. The client shim capability-probes both at runtime
+(`typeof s.list === 'function'`, `s.remove`), so hosts exposing them use
+real delegation; on all
+v2.0.x stable hosts both probes fail and the shims degrade:
 
-- **Children enumeration (orchestrator-wake).** On hosts without `list`,
-  the shim's `client.session.list` returns the v1-parity empty page
-  `{data: []}`, so `session.list({parentID})`-based enumeration never
-  yields children and the scheduler runs its **event-tracked fallback**
+- **Children enumeration (orchestrator-wake).** The shim's
+  `client.session.list` returns the v1-parity empty page `{data: []}`,
+  so `session.list({parentID})`-based enumeration never yields children
+  and the scheduler always runs its **event-tracked fallback**
   (adapter-synthesized `session.created` parentID links plus tracked
-  busy/idle statuses). On v2.1 the shim drains every cursor page, so the
-  list path is operative; a list failure or budget overrun still falls
-  back to the event-tracked path. The gate still passes because it probes
-  the *shim's* `list` function, which always exists. The interview
-  dashboard's session scan likewise sees every page on v2.1 and no
-  sessions where `list` is absent.
+  busy/idle statuses — the mode the doc's wake section describes as the
+  fallback is effectively the only path on v2). The gate still passes
+  because it probes the *shim's* `list` function, which always exists.
+  The interview dashboard's session scan likewise sees no sessions from
+  `list` on v2.
 - **Session delete.** `client.session.delete` is a **no-op**. No caller is
   affected: smartfetch summarizes through `generate.text` and never creates
   temp sessions on v2.
 
-Where those probes fail, both degradations announce themselves in the
-plugin log with a single deterministic, **one-time-per-process** warning
-instead of degrading silently (`list`) or logging on every call (`remove`):
+Both degradations announce themselves in the plugin log with a single
+deterministic, **one-time-per-process** warning instead of degrading
+silently (`list`) or logging on every call (`remove`):
 
 ```
 [v2][shim] session.list unavailable on this host build; children enumeration falls back to event tracking
@@ -1027,8 +1024,7 @@ How it differs from the v1 path:
   (`session.get` is optional model enrichment). v1 keeps its exact
   historical probe set (`get`/`todo`/`children`/`status`/`promptAsync`).
 - **Children enumeration:** `session.list({ parentID })` through the shim
-  (v2.1 cursor pages drained to one complete v1 envelope; v2
-  `Session.Info` → v1 shape; `outcome` and `time.updated` mapped).
+  (v2 `Session.Info` → v1 envelope; `outcome` and `time.updated` mapped).
   When the listing is unavailable (missing/erroring/empty), an event-tracked
   fallback uses the adapter-synthesized `session.created` parentID links plus
   tracked busy/idle statuses — refreshed on every evaluation with the host's
@@ -1036,12 +1032,11 @@ How it differs from the v1 path:
   child). A finished child is therefore terminal immediately instead of
   reading active for the whole staleness window, and a live child stays
   visible on its host evidence rather than dropping out on stale local
-  evidence. `session.list` is not exposed to plugins on older stable
-  hosts
+  evidence. `session.list` is not exposed to plugins on any stable
+  host
   (see
-  [Plugin session domain](#plugin-session-domain-list-and-remove)),
-  and list errors or budget overruns fall back to the event-tracked path.
-  Results are scoped
+  [Not exposed to plugins](#not-exposed-to-plugins-sessionlist-sessionremove)),
+  so the event-tracked fallback is the operative path. Results are scoped
   to the session's directory when the host reports one.
 - **Wake condition:** children with `outcome === undefined` (v2 records an
   outcome only on terminal transition: succeeded|failed|interrupted) that
