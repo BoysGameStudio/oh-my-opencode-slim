@@ -1419,6 +1419,26 @@ function parseCompletedJobDeltaText(
   return blocks;
 }
 
+/** The plugin's own revived-run terminal notification
+ * (`<task id="..." state="completed">`). It is a delivery the parent
+ * observes in its history, so it retires that run like any other observed
+ * delivery. */
+function parseRevivedTerminalNotification(
+  text: string,
+): Array<{ taskID: string; state: 'completed' | 'error' }> {
+  const blocks: Array<{ taskID: string; state: 'completed' | 'error' }> = [];
+  for (const match of text.matchAll(
+    /<task id="([^"]+)" state="(completed|error)">/g,
+  )) {
+    const taskID = match[1]?.trim();
+    const state = match[2];
+    if (taskID && (state === 'completed' || state === 'error')) {
+      blocks.push({ taskID, state: state as 'completed' | 'error' });
+    }
+  }
+  return blocks;
+}
+
 /**
  * Retirement-by-observed-delta (issue #1647). A later terminal publication
  * the plugin delivered as a `<completed-job>` push retires ONLY when that
@@ -1466,7 +1486,11 @@ function reconcileObservedTerminalDeltas(
         continue;
       }
       if (!isInternalInitiatorPart(part)) continue;
-      for (const block of parseCompletedJobDeltaText(part.text)) {
+      const observedDeliveries = [
+        ...parseCompletedJobDeltaText(part.text),
+        ...parseRevivedTerminalNotification(part.text),
+      ];
+      for (const block of observedDeliveries) {
         const record = state.backgroundJobBoard.get(block.taskID);
         if (!record || record.parentSessionID !== parentSessionID) continue;
         if (!record.terminalUnreconciled) continue;
