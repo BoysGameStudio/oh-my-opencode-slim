@@ -76,12 +76,12 @@ const TASK_POLICY = {
 };
 
 /** deriveExactPermissionRules(TASK_POLICY) — insertion order, with the
- * v1→v2 action mapping (bash → execute+bash, task → subagent). The
+ * v1→v2 action mapping (bash → shell+bash, task → subagent). The
  * whole-tool `edit: 'deny'` derives the host-canonical `'*'`-resource
  * rule; only the wildcard-pattern shapes are skipped. */
 const EXACT_RULES: V2PermissionRule[] = [
   { action: 'edit', resource: '*', effect: 'deny' },
-  { action: 'execute', resource: 'git push', effect: 'ask' },
+  { action: 'shell', resource: 'git push', effect: 'ask' },
   { action: 'bash', resource: 'git push', effect: 'ask' },
   { action: 'subagent', resource: 'explorer', effect: 'allow' },
   {
@@ -165,7 +165,7 @@ describe('deriveExactPermissionRules', () => {
     );
     // v1→v2 action aliasing applies to whole-tool entries too.
     expect(deriveExactPermissionRules({ bash: 'deny' })).toEqual([
-      { action: 'execute', resource: '*', effect: 'deny' },
+      { action: 'shell', resource: '*', effect: 'deny' },
       { action: 'bash', resource: '*', effect: 'deny' },
     ]);
     expect(deriveExactPermissionRules({ task: 'deny' })).toEqual([
@@ -197,7 +197,7 @@ describe('deriveExactPermissionRules', () => {
 /** v1 tool keys the v2 evaluator addresses under a different action name. */
 const V1_KEY_TO_V2_ACTIONS: Record<string, readonly string[]> = {
   task: ['subagent'],
-  bash: ['execute', 'bash'],
+  bash: ['shell', 'bash'],
 };
 
 function v2ActionsForV1Key(key: string): readonly string[] {
@@ -1796,9 +1796,9 @@ describe('createV2Setup permission rules wiring', () => {
         }
         expect(calls[0].sessionID).toBe('ses_probe_child');
         // The fixture's exact-match entry made it through the derivation
-        // (v1 `bash` maps to the v2 `execute` + `bash` actions).
+        // (v1 `bash` maps to the v2 `shell` + `bash` actions).
         expect(calls[0].permissions).toContainEqual({
-          action: 'execute',
+          action: 'shell',
           resource: 'git push',
           effect: 'ask',
         });
@@ -1854,7 +1854,7 @@ describe('createV2Setup permission rules wiring', () => {
         expect(
           calls[0].permissions.some(
             (rule) =>
-              rule.action === 'execute' &&
+              rule.action === 'shell' &&
               rule.resource === 'git push' &&
               rule.effect === 'ask',
           ),

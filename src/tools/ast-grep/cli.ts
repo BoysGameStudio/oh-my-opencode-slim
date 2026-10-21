@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { crossSpawn } from '../../utils/compat';
+import { applyRewrites } from './apply-rewrites';
 import {
   DEFAULT_MAX_MATCHES,
   DEFAULT_MAX_OUTPUT_BYTES,
@@ -66,20 +67,10 @@ export function startBackgroundInit(): void {
 }
 
 export async function runSg(options: RunOptions): Promise<SgResult> {
-  const args = [
-    'run',
-    '-p',
-    options.pattern,
-    '--lang',
-    options.lang,
-    '--json=compact',
-  ];
+  const args = ['-p', options.pattern, '--lang', options.lang];
 
   if (options.rewrite) {
     args.push('-r', options.rewrite);
-    if (options.updateAll) {
-      args.push('--update-all');
-    }
   }
 
   if (options.context && options.context > 0) {
@@ -107,7 +98,7 @@ export async function runSg(options: RunOptions): Promise<SgResult> {
 
   const timeout = DEFAULT_TIMEOUT_MS;
 
-  const proc = crossSpawn([cliPath, ...args], {
+  const proc = crossSpawn([cliPath, 'run', '--json=compact', ...args], {
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -192,6 +183,27 @@ export async function runSg(options: RunOptions): Promise<SgResult> {
     return { matches: [], totalMatches: 0, truncated: false };
   }
 
+  // JSON mode reports rewrites but never writes them, even with --update-all.
+  // Check the raw report before truncating it: a single match can exceed the
+  // entire report budget and leave no parseable matches below.
+  let rewritesApplied = false;
+  if (
+    options.rewrite &&
+    options.updateAll &&
+    stdout.trimStart().startsWith('[{')
+  ) {
+    const applyError = await applyRewrites(cliPath, args, timeout);
+    if (applyError) {
+      return {
+        matches: [],
+        totalMatches: 0,
+        truncated: false,
+        error: applyError,
+      };
+    }
+    rewritesApplied = true;
+  }
+
   const outputTruncated = stdout.length >= DEFAULT_MAX_OUTPUT_BYTES;
   const outputToProcess = outputTruncated
     ? stdout.substring(0, DEFAULT_MAX_OUTPUT_BYTES)
@@ -221,6 +233,7 @@ export async function runSg(options: RunOptions): Promise<SgResult> {
           truncated: true,
           truncatedReason: 'max_output_bytes',
           error: 'Output too large and could not be parsed',
+          rewritesApplied,
         };
       }
     } else {
@@ -237,6 +250,7 @@ export async function runSg(options: RunOptions): Promise<SgResult> {
   return {
     matches: finalMatches,
     totalMatches,
+    rewritesApplied,
     truncated: outputTruncated || matchesTruncated,
     truncatedReason: outputTruncated
       ? 'max_output_bytes'

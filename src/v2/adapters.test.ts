@@ -131,10 +131,29 @@ describe('adaptPermissions', () => {
     ]);
   });
 
-  test('maps v1 bash -> v2 execute and bash', () => {
+  test('shell restrictions do not disable CodeMode research tools', () => {
+    const rules = adaptPermissions({
+      bash: { '*': 'deny', 'git status*': 'allow' },
+      execute: 'allow',
+    }) as V2PermissionRule[];
+    expect(evaluatePermission(rules, 'shell', 'echo blocked')).toBe('deny');
+    expect(evaluatePermission(rules, 'shell', 'git status --short')).toBe(
+      'allow',
+    );
+    expect(evaluatePermission(rules, 'execute')).toBe('allow');
+    const shellOnly = adaptPermissions({ bash: 'deny' }) as V2PermissionRule[];
+    expect(evaluatePermission(shellOnly, 'execute')).toBe('allow');
+    const explicit = adaptPermissions({
+      execute: 'deny',
+      bash: 'allow',
+    }) as V2PermissionRule[];
+    expect(evaluatePermission(explicit, 'execute')).toBe('deny');
+  });
+
+  test('maps v1 bash -> v2 shell and bash', () => {
     const rules = adaptPermissions({ bash: 'deny' });
     expect(rules).toContainEqual({
-      action: 'execute',
+      action: 'shell',
       resource: '*',
       effect: 'deny',
     });
