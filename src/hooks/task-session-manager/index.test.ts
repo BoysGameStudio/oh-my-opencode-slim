@@ -5887,9 +5887,9 @@ describe('task-session-manager hook', () => {
       hook,
       createMessagesAfterAssistantTurn('parent-1', 'reuse') as never,
     );
-    expect(board.resolveReusable('parent-1', 'exp-1', 'explorer')).toMatchObject(
-      { taskID: 'child-1', state: 'reconciled' },
-    );
+    expect(
+      board.resolveReusable('parent-1', 'exp-1', 'explorer'),
+    ).toMatchObject({ taskID: 'child-1', state: 'reconciled' });
     // Nothing about the reconciled run reaches the prompt (issue #1647).
     expect(boardText(messages)).toBeUndefined();
 

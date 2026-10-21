@@ -8,8 +8,7 @@ export const INTERNAL_INITIATOR_METADATA_KEY =
   'oh-my-opencode-slim.internalInitiator';
 
 /** Host-side fence attached to queued completed-job push parts. */
-export const TERMINAL_DELTA_METADATA_KEY =
-  'oh-my-opencode-slim.terminalDelta';
+export const TERMINAL_DELTA_METADATA_KEY = 'oh-my-opencode-slim.terminalDelta';
 
 /**
  * OpenCode v1's native background-task notifier submits an untagged

@@ -25,10 +25,10 @@ import type {
 import {
   isInternalInitiatorPart,
   parseTaskIdFromTaskOutput,
-  TERMINAL_DELTA_METADATA_KEY,
   parseTaskStateFromOutput,
   parseTaskStatusOutput,
   renderRunningTaskPlaceholder,
+  TERMINAL_DELTA_METADATA_KEY,
 } from '../../utils';
 import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { isRecord } from '../../utils/guards';
@@ -1462,9 +1462,7 @@ function reconcileObservedTerminalDeltas(
       if (part.type !== 'text' || typeof part.text !== 'string') continue;
       const metadata = isRecord(part.metadata) ? part.metadata : undefined;
       const fences = metadata
-        ? parseObservedCompletedJobFences(
-            metadata[TERMINAL_DELTA_METADATA_KEY],
-          )
+        ? parseObservedCompletedJobFences(metadata[TERMINAL_DELTA_METADATA_KEY])
         : [];
       if (fences.length > 0) {
         for (const fence of fences) {

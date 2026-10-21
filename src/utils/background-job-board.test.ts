@@ -719,9 +719,9 @@ describe('BackgroundJobBoard', () => {
       );
     }
 
-    expect(
-      board.listReusable('parent-1').map((job) => job.taskID),
-    ).toEqual(expect.arrayContaining(['ses_cancelled', 'ses_error']));
+    expect(board.listReusable('parent-1').map((job) => job.taskID)).toEqual(
+      expect.arrayContaining(['ses_cancelled', 'ses_error']),
+    );
   });
 
   test('does not reuse an acknowledged terminal job with uncertain status', () => {
@@ -2472,7 +2472,6 @@ describe('BackgroundJobBoard', () => {
       expect(board.get('ses_1')?.lastUsedAt).toBe(before);
     });
   });
-
 });
 
 describe('terminal-session GC eviction listener', () => {

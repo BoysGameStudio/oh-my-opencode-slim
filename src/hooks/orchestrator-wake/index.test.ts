@@ -397,7 +397,7 @@ describe('overflow input requests across host versions', () => {
       const { scheduler } = createScheduler({
         hostFlavor,
         periodicWakeEnabled: false,
-          sessionClient:
+        sessionClient:
           hostFlavor === 'v2'
             ? makeV2Client({ promptAsync })
             : makeClient({ promptAsync, todos: [] }),

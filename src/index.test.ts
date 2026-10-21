@@ -2192,7 +2192,8 @@ describe('plugin reload generation cleanup', () => {
       });
     expect(completedPush).toHaveBeenCalledTimes(1);
     expect(publicationWake).not.toHaveBeenCalled();
-    const [sessionID, delta, dedupeKey, fence] = completedPush.mock.calls[0] as [
+    const [sessionID, delta, dedupeKey, fence] = completedPush.mock
+      .calls[0] as [
       string,
       string,
       string,

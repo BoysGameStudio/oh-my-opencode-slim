@@ -2863,14 +2863,7 @@ export function createOrchestratorWakeScheduler(
     dedupeKey: string,
     fence: CompletedJobFence,
   ): void {
-    triggerDeltaWake(
-      completedJobQueue,
-      sessionID,
-      delta,
-      dedupeKey,
-      0,
-      fence,
-    );
+    triggerDeltaWake(completedJobQueue, sessionID, delta, dedupeKey, 0, fence);
   }
 
   /**

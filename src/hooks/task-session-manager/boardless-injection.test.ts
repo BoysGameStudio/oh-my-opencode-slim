@@ -14,6 +14,7 @@
  *     part is observed in the parent history, and only for that exact run.
  */
 import { describe, expect, test } from 'bun:test';
+import { TERMINAL_DELTA_METADATA_KEY } from '../../utils';
 import { BackgroundJobBoard } from '../../utils/background-job-fixture';
 import { isVolatileTaggedMessage } from '../cache-safe-injection';
 import {
@@ -22,7 +23,6 @@ import {
   injectBackgroundJobBoard,
   reconcileObservedTerminalRun,
 } from './board-injection';
-import { TERMINAL_DELTA_METADATA_KEY } from '../../utils';
 
 const SESSION = 'ses_parent_1';
 const BASE_TIME = 1752968000000;
@@ -215,8 +215,18 @@ describe('retirement by observed delta', () => {
 
   test('a push part for another generation or revision retires nothing', async () => {
     for (const fence of [
-      { taskID: 'child-1', generation: 2, terminalRevision: 1, state: 'completed' },
-      { taskID: 'child-1', generation: 1, terminalRevision: 9, state: 'completed' },
+      {
+        taskID: 'child-1',
+        generation: 2,
+        terminalRevision: 1,
+        state: 'completed',
+      },
+      {
+        taskID: 'child-1',
+        generation: 1,
+        terminalRevision: 9,
+        state: 'completed',
+      },
       { taskID: 'child-1', generation: 1, terminalRevision: 1, state: 'error' },
     ]) {
       const board = terminalBoard();
