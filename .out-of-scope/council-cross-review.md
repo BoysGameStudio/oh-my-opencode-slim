@@ -33,15 +33,16 @@ output.
 "Cross-review" as a Council Mode feature means something different: seat
 beta receives seat alpha's answer as input and critiques it, with the
 critique fed back into the loop. That is a structurally different
-intervention, and the adjacent evidence points against it:
+intervention. Two adjacent findings caution against it, without directly
+testing cross-member council review:
 
-- Repeated review rounds in the same session raised false positives by
-  62% without improving recall.
-- A multi-stage pipeline whose later stages could see earlier stages'
-  conclusions produced only sycophantic confirmation. The benefit
-  observed in that work came from *information restriction*, not from
-  structural complexity — a later stage conditioned on an earlier
-  stage's answer is the pattern that failed.
+- In [the repeated-review study](https://arxiv.org/abs/2603.16244),
+  repeated rounds in the same session increased recall, but those gains
+  were outweighed by precision and F1 degradation as false positives grew.
+- In [the multi-stage pipeline pilot](https://arxiv.org/abs/2603.21454v2),
+  allowing later stages to see earlier stages' conclusions produced
+  sycophantic confirmation. The authors attribute the observed benefit
+  to *information restriction*, not structural complexity.
 
 Making seats see each other would trade away the independence the
 council depends on, in exchange for a review stage with no measured

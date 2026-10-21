@@ -91,8 +91,9 @@ across different models it drops to 37–46%. A three-seat council is
 already the mix of differently-biased reviewers that does the work.
 Adding a stage where seat B critiques seat A would trade that
 independence away for a review round with no measured accuracy gain
-behind it — and repeated review rounds have been observed to raise false
-positives without improving recall.
+behind it — and [a repeated-review study](https://arxiv.org/abs/2603.16244)
+found recall gains outweighed by precision and F1 degradation as false
+positives grew.
 
 The practical corollary when you build a lineup: **seat quality outranks
 seat count.** In testing, the spread between the strongest and weakest

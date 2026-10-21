@@ -21,8 +21,9 @@ rather than a regression.
 This ADR records the decision and the evidence behind it, so the next
 reader does not have to re-derive it.
 
-The evidence is a single external study (below). It is directional
-support, not proof, and its limits are recorded in [Evidence limits](#evidence-limits).
+The primary evidence is a cross-model review study (below); decision 3
+also draws on a repeated-review study and a pipeline pilot. This is
+directional support, not proof, with limits recorded in [Evidence limits](#evidence-limits).
 
 ## Decisions
 
@@ -67,15 +68,16 @@ different intervention from the one the study measured. The study's
 reviewers looked at an artifact in a fresh session and never saw the
 conversation that produced it. Nobody reviewed anybody's output.
 
-The two findings that do bear on it both point away from it:
+Two adjacent findings caution against it, without directly testing
+cross-member council review:
 
-- Repeated review rounds in the same session raised false positives by
-  62% without improving recall.
-- A multi-stage pipeline whose later stages could see earlier stages'
-  conclusions produced only sycophantic confirmation. The study
-  attributes the benefit it observed to *information restriction*, not
-  to structural complexity — a later stage conditioned on an earlier
-  stage's answer is the pattern that failed, not one that succeeded.
+- In [the repeated-review study](https://arxiv.org/abs/2603.16244),
+  repeated rounds in the same session increased recall, but those gains
+  were outweighed by precision and F1 degradation as false positives grew.
+- In [the multi-stage pipeline pilot](https://arxiv.org/abs/2603.21454v2),
+  allowing later stages to see earlier stages' conclusions produced
+  sycophantic confirmation. The authors attribute the observed benefit
+  to *information restriction*, not structural complexity.
 
 Making seats see each other would trade the independence this ADR
 depends on for a review stage with no measured accuracy gain behind it.
@@ -158,7 +160,7 @@ reviewers being smarter.
 
 ### Evidence limits
 
-Read the numbers as direction, not precision:
+Read the cross-model study's numbers as direction, not precision:
 
 - Single-author preprint, not peer reviewed.
 - All artifacts and ground truth in Korean; the finding matcher is
