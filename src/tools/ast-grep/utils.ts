@@ -46,11 +46,11 @@ export function formatReplaceResult(
   result: SgResult,
   isDryRun: boolean,
 ): string {
-  if (result.error) {
+  if (result.error && !(result.rewritesApplied && result.truncated)) {
     return `Error: ${result.error}`;
   }
 
-  if (result.matches.length === 0) {
+  if (result.matches.length === 0 && !result.truncated) {
     return 'No matches found for replacement.';
   }
 
@@ -85,9 +85,20 @@ export function formatReplaceResult(
   }
 
   const fileCount = byFile.size;
-  lines.push(
-    `\n${mode} ${result.totalMatches} replacements in ${fileCount} files`,
-  );
+  if (result.truncated) {
+    const status = result.rewritesApplied
+      ? '[APPLIED] Replacements written.'
+      : isDryRun
+        ? '[DRY RUN] No files changed.'
+        : 'No replacements applied.';
+    lines.push(
+      `\n${status} Report truncated (${result.truncatedReason}); replacement and file totals unavailable.`,
+    );
+  } else {
+    lines.push(
+      `\n${mode} ${result.totalMatches} replacements in ${fileCount} files`,
+    );
+  }
 
   if (isDryRun) {
     lines.push('\nTo apply changes, run with dryRun=false');

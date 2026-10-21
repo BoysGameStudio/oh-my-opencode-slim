@@ -25,6 +25,28 @@ OMO does not use the removed credential-configuration write shape in its
 adapter. The list shim implements only the directory/parent filters its
 callers consume, not every filter exposed by the host API.
 
+## Shell and MCP permission compatibility
+
+The v2 permission adapter maps legacy `bash` declarations to `shell`
+(and retains the `bash` spelling), including command-pattern rules. It does
+not map them to `execute`: on OpenCode v2, `execute` is the CodeMode
+JavaScript dispatcher, not the shell tool. Configure `execute` separately
+when a role needs CodeMode tools. A wildcard deny still requires an explicit
+`execute` grant; allowing the dispatcher does not grant the individual MCP
+or shell actions it invokes. v1 SDK permission maps keep their original keys.
+
+For example, an agent may deny `bash`, allow `execute`, deny `research_*`,
+and allow only `research_lookup`. The child permission compiler preserves
+that explicitly named MCP exception when reapplying the namespace deny,
+while keeping other namespace actions denied. Replayed exceptions are bounded
+by the final declared policy: an earlier allowance overridden by a later
+resource denial is not restored, and partial allowances retain their narrower
+restrictions. A stricter host deny or ask
+for the action (including narrower resources) still wins. Overlapping
+wildcard-action grants remain conservatively bounded; this is not a general
+permission-widening rule. These mappings are source-checked against OpenCode
+v2.0.18 and v2.0.32; they do not represent a new live-host certification.
+
 ## How it works
 
 The package's default export is an object:
@@ -176,7 +198,7 @@ not an optional-degradation path.
    models and the slash commands.
 4. Bridges the returned v1 `Hooks` into v2 registrations:
    - `agent` → `ctx.agent.transform` (model/prompt/permission adaptation +
-     `subagent`/`execute` permission mapping + `draft.default("orchestrator")`).
+     `subagent`/`shell` permission mapping + `draft.default("orchestrator")`).
      On v2 hosts the generated orchestrator/council prompts use
      native wording (`subagent` tool, `agent` param). No delegation-vocabulary
      rewriting is applied: every user-supplied prompt must be written in the

@@ -48,4 +48,6 @@ export interface SgResult {
   truncated: boolean;
   truncatedReason?: 'timeout' | 'max_output_bytes' | 'max_matches';
   error?: string;
+  /** The non-JSON write pass succeeded, independent of report parsing. */
+  rewritesApplied?: boolean;
 }
