@@ -45,6 +45,13 @@ Fast, structural code search and refactoring - more powerful than plain text gre
 
 `ast_grep` understands code structure, so it can find patterns like "all arrow functions that return a JSX element" rather than relying on exact text matching.
 
+`ast_grep_replace` previews changes by default. Set `dryRun: false` to write
+the replacements. Report-size limits do not limit which matching rewrites
+are applied. Write failures and timeouts return errors instead of a successful
+`[APPLIED]` report.
+If the report is truncated, the output distinguishes successful writes from
+dry-run previews and does not claim complete replacement or file totals.
+
 Before the built-in `grep`/`glob` tools run, the plugin pre-checks that the
 requested `path` is valid, using the same resolution rules as the host:
 v1 `grep` joins relative paths, while v1 `glob` resolves them; v2 resolves
