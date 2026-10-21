@@ -149,6 +149,7 @@ function createPublicationScheduler(options: {
   intervalMs?: number;
   wakeOnTerminalPublication?: boolean;
   publicationWakeMinIntervalMs?: number;
+  periodicWakeEnabled?: boolean;
   sessionClient: SessionClient;
   shouldManageSession?: (id: string) => boolean;
   hasInputWait?: (id: string) => boolean;
@@ -163,6 +164,7 @@ function createPublicationScheduler(options: {
   const scheduler = createOrchestratorWakeScheduler(ctx, {
     config: {
       enabled: true,
+      periodicWakeEnabled: options.periodicWakeEnabled,
       intervalMs: options.intervalMs ?? 60_000,
       ...(options.wakeOnTerminalPublication === undefined
         ? {}
@@ -236,6 +238,47 @@ afterEach(() => {
 });
 
 describe('terminal-publication wake', () => {
+  test.each([false, true])(
+    'a failed publication retries after busy with periodic=%s',
+    async (periodicWakeEnabled) => {
+      let fail = true;
+      const promptAsync = mock(async () => {
+        if (fail) throw new Error('transport unavailable');
+        return {};
+      });
+      const { scheduler } = createPublicationScheduler({
+        hostFlavor: 'v2',
+        periodicWakeEnabled,
+        sessionClient: makeV2Client({
+          promptAsync,
+          listChildren: [terminalChild('child-1')],
+        }),
+      });
+      await scheduler.triggerTerminalPublicationWake('p1', 'child-1', 2);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      await scheduler.event({
+        event: {
+          type: 'session.status',
+          properties: { sessionID: 'p1', status: { type: 'busy' } },
+        },
+      });
+      fail = false;
+      await scheduler.event({
+        event: {
+          type: 'session.status',
+          properties: { sessionID: 'p1', status: { type: 'idle' } },
+        },
+      });
+      await scheduler.event({
+        event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+      });
+      await clock.advance(60_000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      await clock.advance(60_000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+    },
+  );
+
   test.each(['input-wait', 'fallback-in-progress'] as const)(
     'G3a publication blocked by %s reports its task identity',
     async (reason) => {
@@ -519,7 +562,7 @@ describe('terminal-publication wake', () => {
     },
   );
 
-  test('parent busy cancels the failed-publication retry instead of waking an empty v2 parent', async () => {
+  test('a deleted parent cancels a failed-publication retry retained across busy', async () => {
     const promptAsync = mock(async () => {
       throw new Error('transport down');
     });
@@ -536,6 +579,9 @@ describe('terminal-publication wake', () => {
         type: 'session.status',
         properties: { sessionID: 'p1', status: { type: 'busy' } },
       },
+    });
+    await scheduler.event({
+      event: { type: 'session.deleted', properties: { sessionID: 'p1' } },
     });
     await scheduler.event({
       event: {

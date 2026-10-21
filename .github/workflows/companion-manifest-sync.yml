@@ -1,0 +1,65 @@
+name: Companion Manifest Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
+
+# Public native-repository reads need no cross-repository write credentials.
+# This token may only create the synchronization branch/PR in the plugin repo.
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: companion-manifest-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - name: Install locked dependencies without building the plugin
+        run: bun ci --ignore-scripts
+      - name: Check packaged manifest consistency offline
+        run: bun run verify:companion-manifest
+      - name: Read native release and hash all five published archives
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun run sync:companion-manifest
+      - name: Validate synchronized manifests and focused release checks
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bun run verify:companion-manifest
+          bun run verify:companion-release
+          bun test ./scripts/check-companion-release.test.ts ./scripts/companion-release-scripts.test.ts ./src/companion/updater.test.ts ./src/cli/companion.test.ts
+          bunx biome check scripts/check-companion-release.mjs scripts/prepare-companion-release.mjs scripts/sync-companion-manifest.mjs scripts/verify-companion-release.mjs scripts/verify-companion-manifest.ts scripts/check-companion-release.test.ts scripts/companion-release-scripts.test.ts scripts/companion-release-fixtures.ts src/companion/updater.ts src/companion/updater.test.ts src/companion/companion-manifest.json
+      - name: Propose plugin manifest update
+        if: steps.sync.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ github.token }}
+          branch: chore/companion-manifest-sync
+          base: ${{ github.event.repository.default_branch }}
+          add-paths: |
+            src/companion/companion-manifest.json
+            src/companion/updater.ts
+          commit-message: 'chore(companion): sync native v${{ steps.sync.outputs.version }}'
+          title: 'chore(companion): sync native v${{ steps.sync.outputs.version }}'
+          body: |
+            Synchronizes the plugin with the published release in
+            https://github.com/alvinunreal/oh-my-opencode-companion.
+
+            All five archive checksums were calculated from downloaded bytes.
+            Only plugin metadata changes; native releases remain autonomous.
+
+            Refs #1646.

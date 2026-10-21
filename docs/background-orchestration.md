@@ -108,6 +108,10 @@ untracked child owned by the calling parent, then
 continues it with the new prompt.
 Recovery verifies the original agent and latest delivered round before importing
 a retained terminal row. This cache-only import does not launch or notify.
+On V2, `session.execution.interrupted` with reason `shutdown` is suspension,
+not a terminal idle transition. OMO preserves the raw event without synthesizing
+idle/status events; the host retains execution and first-notification ownership.
+This does not restore process-local board entries or prove restart recovery.
 `task_cancel` still cannot abort a run launched before the restart — the board
 has no live handle to it (tracked in #1387).
 The production board numbers a parent's children only when the host's creation
@@ -572,7 +576,10 @@ channels would duplicate that delivery, so on v2 they are **structurally off**
 Event-driven wakes keep working on both flavors: stopped-job recovery, later
 terminal publications of the same run (for example a child that
 self-continued), and child-input asks still wake an idle parent, and their
-SDK-error retries still use the idle timer. On v2, terminal retirement is
+SDK-error retries still use the idle timer. A failed publication retry survives
+parent busy/idle transitions, including when periodic wakes are disabled.
+Deletion clears the retry. This does not add restart persistence or retry
+publications skipped by the throttle. On v2, terminal retirement is
 observation-based: the plugin watches the host's native `<subagent>`
 deliveries in the parent's transcript and retires the matching record, with a
 timestamp fallback for a missed observation. On v1, `boardInjection: false`

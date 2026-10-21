@@ -2774,7 +2774,14 @@ export function createOrchestratorWakeScheduler(
       if (canObserveSelection(sessionID)) {
         // Wake-initiated busy preserves the no-progress cap; external busy rearms.
         const wakeBusy = isExpectingWakeBusy(sessionID);
+        // An SDK-failed publication is still owed after unrelated parent
+        // work. Invalidate the old timer, not the retry's classification:
+        // otherwise the next idle takes the disabled periodic path on V2.
+        const retry = localSessions.get(sessionID)?.retryReason;
         endIdleSpell(sessionID, !wakeBusy);
+        if (retry === 'publication') {
+          touchLocal(sessionID).retryReason = retry;
+        }
       }
       return;
     }
