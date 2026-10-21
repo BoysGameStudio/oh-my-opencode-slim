@@ -605,17 +605,21 @@ async function readTaskResult(
       if (latestState === 'completed' && result?.kind !== 'committed')
         return runningResultRefusal(idParam, taskID, true);
     }
-    board.markUsed(parentSessionID, taskID);
-    if (state === 'error')
+    if (state === 'error') {
+      board.markUsed(parentSessionID, taskID);
       throw new Error(
         `Task ${requested} ended in error: ${current.lastStatusError ?? current.resultSummary ?? 'no error details available'}`,
       );
-    if (state === 'cancelled')
+    }
+    if (state === 'cancelled') {
+      board.markUsed(parentSessionID, taskID);
       throw new Error(
         `Task ${requested} was cancelled: ${current.resultSummary?.replace(/^cancelled:\s*/i, '') ?? 'cancelled'}`,
       );
+    }
     if (state !== 'completed' || !current.resultSummary?.trim())
       throw new Error(`Task ${requested} has no confirmed completed result`);
+    board.markUsed(parentSessionID, taskID);
     return current.resultSummary;
   }
 

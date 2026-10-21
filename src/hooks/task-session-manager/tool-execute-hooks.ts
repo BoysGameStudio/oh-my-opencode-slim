@@ -20,11 +20,16 @@ import {
   parseTaskStatusOutput,
 } from '../../utils';
 import type { BackgroundJobRecord } from '../../utils/background-job-board';
+import { getBackgroundJobLifecycleLedger } from '../../utils/background-job-store';
 import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
 import { controlParamName } from '../../v2/adapters';
-import { type DelegationWording, delegationWording } from '../../v2/delegation';
+import {
+  type DelegationWording,
+  delegationWording,
+  v2ResumeCall,
+} from '../../v2/delegation';
 import { isMissingRememberedSessionError } from './board-injection';
 import type { PendingTaskCall } from './pending-call-tracker';
 import { convertSameProviderBackgroundTask } from './same-provider-policy';
@@ -163,13 +168,11 @@ function refuseExplicitTaskId(
   throw new Error(message);
 }
 
-function isNativeContinuableCompleted(
+function isNativeResumable(
   job: BackgroundJobRecord,
   agentType: string,
 ): boolean {
-  if (job.agent !== agentType) return false;
-  if (job.state === 'completed') return true;
-  return job.state === 'reconciled' && job.terminalState === 'completed';
+  return job.agent === agentType;
 }
 
 function refuseKnownTaskResume(
@@ -179,6 +182,11 @@ function refuseKnownTaskResume(
   delegation: DelegationWording,
 ): never {
   const label = `${job.alias} / ${job.taskID}`;
+  // v2 retired task_revive: continuation is the native delegation resume.
+  const continueHint =
+    delegation.tool === 'subagent'
+      ? `Continue it with ${v2ResumeCall(job.taskID)}.`
+      : 'Use task_revive with a new prompt.';
   if (job.agent !== agentType) {
     refuseExplicitTaskId(
       requested,
@@ -190,7 +198,7 @@ function refuseKnownTaskResume(
     const ack = job.terminalUnreconciled ? 'unreconciled' : 'acknowledged';
     refuseExplicitTaskId(
       requested,
-      `${label}: stopped, ${ack}; ${delegation.tool}() cannot resume this session. Use task_revive with a new prompt. No new session was created.`,
+      `${label}: stopped, ${ack}; ${delegation.tool}() cannot resume this session. ${continueHint} No new session was created.`,
       { state: job.state, acknowledged: !job.terminalUnreconciled },
     );
   }
@@ -199,13 +207,13 @@ function refuseKnownTaskResume(
       requested,
       delegation.tool === 'task'
         ? `${label}: ${job.state}, unreconciled; task() cannot resume until acknowledgement. Call task_revive(task_id: "${job.taskID}", prompt: "...") directly; it continues that same session. No result read is required first. This prompt was not sent.`
-        : `${label}: ${job.state}, unreconciled; ${delegation.tool}() cannot resume this session. Use task_revive with a new prompt. It was not dropped; no new session was created. This prompt was not sent.`,
+        : `${label}: ${job.state}, unreconciled; ${delegation.tool}() cannot resume this session. ${continueHint} It was not dropped; no new session was created. This prompt was not sent.`,
       { state: job.state, terminalUnreconciled: true },
     );
   }
   refuseExplicitTaskId(
     requested,
-    `${label}: ${job.state}; ${delegation.tool}() cannot resume this session. Use task_revive with a new prompt. No new session was created.`,
+    `${label}: ${job.state}; ${delegation.tool}() cannot resume this session. ${continueHint} No new session was created.`,
     { state: job.state },
   );
 }
@@ -251,6 +259,9 @@ export async function handleToolExecuteBefore(
       parentSessionID: string;
       requested: string;
       agent?: string;
+      purpose?: 'revive';
+      allowExactAdoption?: boolean;
+      allowQueuedContinuation?: boolean;
     }) => Promise<RetainedRecoveryResult>;
     resolveCanonicalTaskRef?: (
       parentSessionID: string,
@@ -428,15 +439,27 @@ export async function handleToolExecuteBefore(
         requested,
       );
       if (knownManagedTask?.state === 'running') {
-        throw new Error(
-          `Task ${requested} is still running and cannot be resumed or amended with ${delegation.tool}(). Do not spawn or cancel a duplicate for an additive request. Wait for its terminal result, then resume the session after that terminal notification is acknowledged if follow-up work is still needed.`,
-        );
-      }
-
-      if (
+        if (deps.hostFlavor === 'v2' && knownManagedTask.agent === agentType) {
+          // Native steer: the host continues a running child safely. The
+          // board row keeps its generation; no lease, no markUsed, and the
+          // output is not registered as a new launch.
+          remembered = knownManagedTask;
+        } else if (deps.hostFlavor === 'v2') {
+          refuseKnownTaskResume(
+            requested,
+            knownManagedTask,
+            agentType,
+            delegation,
+          );
+        } else {
+          throw new Error(
+            `Task ${requested} is still running and cannot be resumed or amended with ${delegation.tool}(). Do not spawn or cancel a duplicate for an additive request. Wait for its terminal result, then resume the session after that terminal notification is acknowledged if follow-up work is still needed.`,
+          );
+        }
+      } else if (
         knownManagedTask &&
         deps.hostFlavor === 'v2' &&
-        isNativeContinuableCompleted(knownManagedTask, agentType)
+        isNativeResumable(knownManagedTask, agentType)
       ) {
         remembered = knownManagedTask;
       } else if (knownManagedTask) {
@@ -475,17 +498,67 @@ export async function handleToolExecuteBefore(
             parentSessionID: input.sessionID,
             requested,
             agent: agentType,
+            purpose: 'revive',
+            allowQueuedContinuation: true,
           });
           if (deps.isDisposed?.()) {
             throw new Error(
               `${pluginDisposedMessage()} No session was created.`,
             );
           }
-          const restored = deps.backgroundJobBoard.resolve(
+          let restored = deps.backgroundJobBoard.resolve(
             input.sessionID,
             requested,
           );
-          if (restored && isNativeContinuableCompleted(restored, agentType)) {
+          if (!restored && recovery.kind === 'adoptable') {
+            // Restart untracked-incomplete adoption: the host may still be
+            // running the round the board lost. Adopt the verified identity
+            // the way task_revive did, so the native resume below owns a
+            // tracked record instead of leaving the seat a permanent
+            // unresolved placeholder.
+            const raced = deps.backgroundJobBoard.get(recovery.taskID);
+            if (raced && raced.parentSessionID !== input.sessionID) {
+              refuseExplicitTaskId(
+                requested,
+                `Task ${requested}: tracking does not survive a host restart and the recovered session belongs to a different parent; verify whether the host restored it before re-dispatching.`,
+                { unresolved: true },
+              );
+            }
+            if (
+              getBackgroundJobLifecycleLedger(
+                deps.backgroundJobBoard,
+              ).deletionEpochs.get(recovery.taskID) !== recovery.deletionEpoch
+            ) {
+              refuseExplicitTaskId(
+                requested,
+                `Task ${requested} was deleted during recovery; no prompt was sent.`,
+                { unresolved: true, deleted: true },
+              );
+            }
+            if (raced) {
+              restored = raced;
+            } else {
+              const adopted = deps.backgroundJobBoard.registerLaunch({
+                taskID: recovery.taskID,
+                parentSessionID: input.sessionID,
+                agent: recovery.agent,
+                description: recovery.description,
+                background: true,
+                adopted: true,
+                now: Date.now(),
+              });
+              // Until a continuation is accepted this row still represents
+              // recovered host work, including across a refused attempt.
+              adopted.recoveredWithoutPrompt = true;
+              log('[task-session-manager] adopted untracked session', {
+                taskID: recovery.taskID,
+                parentSessionID: input.sessionID,
+                agent: recovery.agent,
+              });
+              restored = adopted;
+            }
+          }
+          if (restored && isNativeResumable(restored, agentType)) {
             remembered = restored;
           } else if (restored) {
             refuseKnownTaskResume(requested, restored, agentType, delegation);
@@ -518,24 +591,97 @@ export async function handleToolExecuteBefore(
       if (deps.isDisposed?.()) {
         throw new Error(`${pluginDisposedMessage()} No session was created.`);
       }
-      const relaunchLease = deps.backgroundJobBoard.acquireRelaunchLease(
-        remembered.taskID,
-        remembered.generation,
-      );
-      if (!relaunchLease) {
-        throw new Error(
-          `Task ${requested} cannot be resumed safely: its current generation is already owned by another lifecycle operation. Do not launch a duplicate with the same ${delegation.resumeParam}.`,
+      // A running v2 child is continued by native steer: the host owns the
+      // timeline, so this call takes no relaunch lease, acknowledges no old
+      // round, and publishes nothing. The resumedTaskId marker alone fences
+      // the after-hook (no lease -> its resumed-output guard drops the ack).
+      // v1 keeps the lease protocol (a running recoverable record there is a
+      // timed-out relaunch, not a live steer).
+      const steered =
+        deps.hostFlavor === 'v2' && remembered.state === 'running';
+      if (steered) {
+        // Same generation fence as a relaunch: a cancellation or another
+        // lifecycle operation that owns this generation must win.
+        const fence = deps.backgroundJobBoard.acquireRelaunchLease(
+          remembered.taskID,
+          remembered.generation,
         );
+        if (!fence) {
+          throw new Error(
+            `Task ${requested} cannot be resumed safely: its current generation is already owned by another lifecycle operation. Do not launch a duplicate with the same ${delegation.resumeParam}.`,
+          );
+        }
+        deps.backgroundJobBoard.releaseLease(fence);
       }
-      if (deps.isDisposed?.()) {
-        deps.backgroundJobBoard.releaseLease(relaunchLease);
-        throw new Error(`${pluginDisposedMessage()} No session was created.`);
+      if (!steered) {
+        const relaunchLease = deps.backgroundJobBoard.acquireRelaunchLease(
+          remembered.taskID,
+          remembered.generation,
+        );
+        if (!relaunchLease) {
+          throw new Error(
+            `Task ${requested} cannot be resumed safely: its current generation is already owned by another lifecycle operation. Do not launch a duplicate with the same ${delegation.resumeParam}.`,
+          );
+        }
+        if (deps.isDisposed?.()) {
+          deps.backgroundJobBoard.releaseLease(relaunchLease);
+          throw new Error(`${pluginDisposedMessage()} No session was created.`);
+        }
+        // v2 reconciliation internalization: task_revive used to acknowledge
+        // the previous round. The native resume path now owns it: with the
+        // relaunch lease held and before the host sends the continuation,
+        // acknowledge an unreconciled terminal or a retained stop. A failed
+        // generation/revision validation aborts the resume.
+        if (
+          deps.hostFlavor === 'v2' &&
+          (remembered.terminalUnreconciled || remembered.state === 'stopped')
+        ) {
+          const resumedGeneration = remembered.generation;
+          const resumedRevision = remembered.terminalRevision;
+          // An already-acknowledged retained stop has no old round left to
+          // close: markReconciled is a no-op for it, so its fresh read below
+          // is the only proof that the record did not change under the lease.
+          const alreadyAcknowledgedStop =
+            remembered.state === 'stopped' && !remembered.terminalUnreconciled;
+          const acknowledged = deps.backgroundJobBoard.markReconciled(
+            remembered.taskID,
+            Date.now(),
+            resumedGeneration,
+            resumedRevision,
+          );
+          let settled = false;
+          if (
+            acknowledged &&
+            acknowledged.generation === resumedGeneration &&
+            acknowledged.terminalRevision === resumedRevision &&
+            !acknowledged.terminalUnreconciled &&
+            (acknowledged.state === 'reconciled' ||
+              acknowledged.state === 'stopped')
+          ) {
+            settled = true;
+            remembered = acknowledged;
+          } else if (alreadyAcknowledgedStop) {
+            const current = deps.backgroundJobBoard.get(remembered.taskID);
+            settled =
+              current !== undefined &&
+              current.generation === resumedGeneration &&
+              current.terminalRevision === resumedRevision &&
+              current.state === 'stopped' &&
+              !current.terminalUnreconciled;
+          }
+          if (!settled) {
+            deps.backgroundJobBoard.releaseLease(relaunchLease);
+            throw new Error(
+              `Task ${requested} changed while its previous round was being acknowledged; the resume prompt was NOT sent and no duplicate was launched. Use task_status to inspect it.`,
+            );
+          }
+        }
+        deps.backgroundJobBoard.markUsed(input.sessionID, remembered.taskID);
+        pendingCall.relaunchLease = relaunchLease;
       }
       args.task_id = remembered.taskID;
       deps.taskContextTracker.pendingManagedTaskIds.add(remembered.taskID);
-      deps.backgroundJobBoard.markUsed(input.sessionID, remembered.taskID);
       pendingCall.resumedTaskId = remembered.taskID;
-      pendingCall.relaunchLease = relaunchLease;
     }
   }
 

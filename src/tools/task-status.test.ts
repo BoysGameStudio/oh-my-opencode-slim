@@ -743,23 +743,31 @@ describe('task_status result mode', () => {
     expect(await h.execute()).toContain('state: running (unconfirmed)');
     expect(h.messages).not.toHaveBeenCalled();
   });
-  test.each(['error', 'cancelled', 'stopped'] as const)(
-    'quiescent %s is rejected only after checking activity',
+  test.each(['error', 'cancelled'] as const)(
+    'quiescent %s is rejected only after checking activity and marks the result consumed',
     async (state) => {
       const h = makeResultTool();
       await h.settle(state);
       h.status.mockClear();
       await expect(h.execute()).rejects.toThrow(
-        state === 'error'
-          ? 'ended in error'
-          : state === 'cancelled'
-            ? 'was cancelled'
-            : 'no confirmed completed result',
+        state === 'error' ? 'ended in error' : 'was cancelled',
       );
       expect(h.status).toHaveBeenCalledTimes(1);
+      // error/cancelled throw text IS the delivered result → mark used.
       expect(h.board.get(h.run.taskID)?.lastUsedAt).toBeGreaterThan(0);
     },
   );
+  test('quiescent stopped is refused without marking the result consumed', async () => {
+    const h = makeResultTool();
+    await h.settle('stopped');
+    h.status.mockClear();
+    const before = h.board.get(h.run.taskID)?.lastUsedAt;
+    await expect(h.execute()).rejects.toThrow('no confirmed completed result');
+    expect(h.status).toHaveBeenCalledTimes(1);
+    // stopped has no delivered result: markUsed would silently open the
+    // duplicate-dispatch escape hatch, so it must not run.
+    expect(h.board.get(h.run.taskID)?.lastUsedAt).toBe(before);
+  });
   test('acknowledged completed result stays retrievable on matching evidence', async () => {
     const h = makeResultTool();
     await h.settle('completed', true);

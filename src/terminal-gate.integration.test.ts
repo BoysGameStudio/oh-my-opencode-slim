@@ -688,18 +688,16 @@ test('production fallback wiring fences polling and announces the admitted repla
   expect(parentParts()).toHaveLength(2);
 });
 
-test('v2 production wiring has no replay notice or fallback revive refusal', async () => {
+test('v2 production wiring retires task_revive and keeps no replay notice', async () => {
   const h = await fallbackAssembly('v2');
   await h.fail();
   expect(h.taskHook.hasDeferredError('child')).toBe(true);
-  const revival = h.hooks.tool?.task_revive.execute(
-    { sessionID: 'child', prompt: 'continue' },
-    h.context,
-  );
+  // v2 continues retained sessions through the native delegation tool; no
+  // plugin revive exists to emit a replay notice or fallback refusal.
+  expect(h.hooks.tool?.task_revive).toBeUndefined();
   await flush();
   await h.advance(300);
-  expect(await revival).toBeString();
-  expect(h.promptAsync).toHaveBeenCalledTimes(1);
+  expect(h.promptAsync).not.toHaveBeenCalled();
   expect(JSON.stringify(h.promptAsync.mock.calls)).not.toContain(
     '<task_fallback>',
   );

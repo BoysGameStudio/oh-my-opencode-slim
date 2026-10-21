@@ -240,6 +240,11 @@ export const CHILD_INPUT_OVERFLOW_TEXT =
 export const ORCHESTRATOR_CHILDREN_WAKE_TEXT =
   '<system-reminder>\nCheck on unfinished background child sessions and unreconciled jobs. Await running agents; if one appears stuck, assess it and cancel/respawn only when justified. Do not respond to this reminder.\n</system-reminder>';
 
+/** Bare v2 terminal-publication pointer: the latest job deltas carry the
+ * facts, so later revisions need only resume the idle orchestrator. */
+export const ORCHESTRATOR_PUBLICATION_WAKE_TEXT =
+  '<system-reminder>\nResume this session. Do not respond to this reminder.\n</system-reminder>';
+
 /** #1411: short core per delta-less wake template, used to build the
  * non-identical repeat marker when the same body was already delivered in
  * the session. Unmapped delta-less texts keep the full template. The
@@ -2072,9 +2077,14 @@ export function createOrchestratorWakeScheduler(
             ? boardInjectionEnabled
               ? ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT
               : ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD
-            : wakeMode === 'children'
-              ? ORCHESTRATOR_CHILDREN_WAKE_TEXT
-              : ORCHESTRATOR_WAKE_TEXT;
+            : reason === 'publication' && capabilities.flavor === 'v2'
+              ? // rev>1 terminal publication: the native delivery and result
+                // transport carry the facts, so the wake is a bare resume
+                // pointer instead of a second children checklist.
+                ORCHESTRATOR_PUBLICATION_WAKE_TEXT
+              : wakeMode === 'children'
+                ? ORCHESTRATOR_CHILDREN_WAKE_TEXT
+                : ORCHESTRATOR_WAKE_TEXT;
       // Snapshot keys/values at send time. Do not detach the map: a stop
       // arriving during promptAsync lands in the same entry and must survive
       // confirmation. After delivery, retire only the keys that were sent.

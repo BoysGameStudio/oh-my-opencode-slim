@@ -18,14 +18,41 @@ describe('plugin health thresholds', () => {
     ).toBe(6);
   });
 
-  test('drops the floor by one when wait_for_user is unregistered (v2 default)', () => {
+  test('drops the floor by two on v2 (no wait_for_user, no task_revive)', () => {
     // minTools 9 already excludes task_result (folded into task_status);
-    // v2 additionally drops wait_for_user → 8.
-    expect(minimumExpectedToolCount([], true, false)).toBe(8);
+    // v2 drops wait_for_user and task_revive → 7.
+    expect(minimumExpectedToolCount([], true, 'v2')).toBe(7);
     // disabled_tools still wins when listed: no double-counting.
-    expect(minimumExpectedToolCount(['wait_for_user'], true, false)).toBe(8);
-    expect(minimumExpectedToolCount(['task_reply'], true, false)).toBe(7);
-    expect(minimumExpectedToolCount([], false, false)).toBe(7);
+    expect(minimumExpectedToolCount(['wait_for_user'], true, 'v2')).toBe(7);
+    expect(minimumExpectedToolCount(['task_reply'], true, 'v2')).toBe(6);
+    expect(minimumExpectedToolCount([], false, 'v2')).toBe(6);
+  });
+
+  test('v2 never lowers the floor for the tools it does not register', () => {
+    // task_revive and wait_for_user are unregistered on v2, so listing them
+    // under disabled_tools must not mask a genuinely missing tool.
+    expect(minimumExpectedToolCount(['task_revive'], true, 'v2')).toBe(7);
+    expect(
+      minimumExpectedToolCount(['task_revive', 'wait_for_user'], true, 'v2'),
+    ).toBe(7);
+    // v1 keeps both in the baseline.
+    expect(minimumExpectedToolCount(['task_revive'], true, 'v1')).toBe(8);
+  });
+
+  test('keeps at least one tool of margin for the v2 registrations', () => {
+    // v2 registers: task_cancel, task_message, task_reply, task_status,
+    // interview_submit_state, acp_run, webfetch, ast_grep_search,
+    // ast_grep_replace (9) + marketplace_inspect + marketplace_manage (2).
+    const registered = 11;
+    const defaultFloor = minimumExpectedToolCount([], true, 'v2');
+    expect(registered - defaultFloor).toBeGreaterThanOrEqual(1);
+    // disabled_commands:["interview"] removes interview_submit_state.
+    const withoutInterview = registered - 1;
+    expect(withoutInterview - defaultFloor).toBeGreaterThanOrEqual(1);
+    // disabled_tools:["task_revive"] changes nothing on v2 (never registered).
+    expect(
+      registered - minimumExpectedToolCount(['task_revive'], true, 'v2'),
+    ).toBeGreaterThanOrEqual(1);
   });
 
   test('never throws when disabledTools is not an array', () => {

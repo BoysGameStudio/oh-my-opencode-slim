@@ -729,7 +729,7 @@ describe('task_reply', () => {
     expect(error.message).toContain('do not launch a duplicate');
   });
 
-  test('a board-missed settled child on v2 routes with the sessionID param', async () => {
+  test('a board-missed settled child on v2 routes with the native resume call', async () => {
     resetChildInputWaitForTests();
     const board = new BackgroundJobBoard();
     const { task_reply } = createTaskReplyTool({
@@ -741,7 +741,10 @@ describe('task_reply', () => {
         sessionID: 'parent-1',
       } as never)
       .catch((e: Error) => e)) as Error;
-    expect(error.message).toContain('task_revive and sessionID: "ses_child1"');
+    expect(error.message).toContain(
+      'subagent(sessionID: "ses_child1", prompt: "...")',
+    );
+    expect(error.message).not.toContain('task_revive');
   });
 
   test('a board-missed alias keeps the bare unknown error', async () => {

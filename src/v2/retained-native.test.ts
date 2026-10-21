@@ -311,7 +311,7 @@ describe('v2 historical context', () => {
 });
 
 describe('v2 native resume through the setup bridge', () => {
-  test('an unacknowledged completed session continues without a result read or an early ack', async () => {
+  test('an unacknowledged completed session reconciles its old round and continues without a result read', async () => {
     const board = new FixtureBoard();
     board.registerLaunch({
       taskID: CHILD,
@@ -343,16 +343,20 @@ describe('v2 native resume through the setup bridge', () => {
     );
     await bridges.beforeBridge(input);
     expect(input.input.sessionID).toBe(CHILD);
+    // The old round is acknowledged by the resume path itself (the retired
+    // task_revive used to do it), so the terminal result is consumed exactly
+    // once and the same generation keeps its identity.
     expect(board.get(CHILD)).toMatchObject({
-      state: 'completed',
+      state: 'reconciled',
+      terminalState: 'completed',
       resultSummary: 'OLD',
-      terminalUnreconciled: true,
+      terminalUnreconciled: false,
       generation: before?.generation,
       terminalRevision: before?.terminalRevision,
     });
   });
 
-  test('an unknown completed child is imported and then resumed, and failures do not create a child', async () => {
+  test('an unknown completed child is imported, reconciled, and then resumed, and failures do not create a child', async () => {
     const board = new BackgroundJobBoard();
     const input = host();
     const event = {
@@ -373,7 +377,8 @@ describe('v2 native resume through the setup bridge', () => {
     );
     await bridges.beforeBridge(event);
     expect(board.get(CHILD)).toMatchObject({
-      state: 'completed',
+      state: 'reconciled',
+      terminalState: 'completed',
       agent: 'fixer',
       resultSummary: 'LAB-MARKER',
       parentSessionID: PARENT,
@@ -433,8 +438,52 @@ describe('v2 native resume through the setup bridge', () => {
           description: 'next',
         },
       }),
-    ).rejects.toThrow(/different parent/);
+    ).rejects.toThrow(/cannot resolve this sessionID/);
     expect(board.get(CHILD)).toBeUndefined();
+  });
+
+  test('an untracked incomplete session is adopted instead of refused', async () => {
+    // A seat that was running when the plugin restarted has no board row.
+    // Without adoption the seat is a permanent [no response] placeholder, so
+    // the delegation path adopts the verified host session and resumes it.
+    const board = new BackgroundJobBoard();
+    const input = host({
+      get: () => ({
+        id: CHILD,
+        parentID: PARENT,
+        agent: 'fixer',
+        time: { created: 9 },
+      }),
+    });
+    const event = {
+      tool: 'subagent',
+      sessionID: PARENT,
+      id: 'call_adopt',
+      input: {
+        agent: 'fixer',
+        sessionID: CHILD,
+        prompt: 'again',
+        description: 'again',
+      },
+    };
+    await createToolExecuteBridges(
+      (hookInput, output) =>
+        handleToolExecuteBefore(hookInput, output, deps(board, input)),
+      undefined,
+    ).beforeBridge(event);
+
+    // The adopted row represents recovered host work until a continuation is
+    // accepted, and it is tracked under the calling parent.
+    const adopted = board.get(CHILD);
+    expect(adopted).toMatchObject({
+      parentSessionID: PARENT,
+      agent: 'fixer',
+      externalOrigin: true,
+      recoveredWithoutPrompt: true,
+    });
+    expect(event.input.sessionID).toBe(CHILD);
+    // One row only: adoption never spawns a second child.
+    expect(board.list(PARENT)).toHaveLength(1);
   });
 });
 
@@ -462,13 +511,13 @@ test('host state that cannot be verified fails closed', async () => {
   expect(board.get(CHILD)).toBeUndefined();
 });
 
-test('an unfinished (shutdown-interrupted) session is refused as pending and task_revive queues one continuation', async () => {
+test('an unfinished (shutdown-interrupted) session is refused as pending and the delegation path adopts it', async () => {
   // Shutdown preserves the execution claim on purpose and the host may resume
-  // the round after a restart, so neither plain recovery nor the subagent
-  // continuation may import it or prompt it. Only the explicit queued revive
-  // adopts identity and lets the host admit the input at an idle boundary.
+  // the round after a restart, so plain recovery must not import it as
+  // terminal. The delegation path (purpose revive + queued continuation)
+  // adopts the verified identity instead, so a seat that was running at
+  // restart is not a permanent unresolved placeholder.
   const board = new BackgroundJobBoard();
-  let promptCalls = 0;
   const input = host({
     get: () => ({
       id: CHILD,
@@ -476,10 +525,6 @@ test('an unfinished (shutdown-interrupted) session is refused as pending and tas
       agent: 'fixer',
       time: { created: 9 },
     }),
-    prompt: async () => {
-      promptCalls += 1;
-      return { id: 'msg_host_1' };
-    },
   });
   const refused = await createSessionRecovery({
     input: input as never,
@@ -490,7 +535,8 @@ test('an unfinished (shutdown-interrupted) session is refused as pending and tas
   expect(refused.kind).toBe('refused');
   if (refused.kind === 'refused') {
     expect(refused.reason).toContain('no terminal outcome');
-    expect(refused.reason).toContain('task_revive');
+    expect(refused.reason).toContain('subagent(sessionID: "ses_child"');
+    expect(refused.reason).not.toContain('task_revive');
   }
   expect(board.get(CHILD)).toBeUndefined();
 
@@ -505,53 +551,19 @@ test('an unfinished (shutdown-interrupted) session is refused as pending and tas
       description: 'again',
     },
   };
-  await expect(
-    createToolExecuteBridges(
-      (hookInput, output) =>
-        handleToolExecuteBefore(hookInput, output, deps(board, input)),
-      undefined,
-    ).beforeBridge(event),
-  ).rejects.toThrow(/no terminal outcome/);
-  expect(board.get(CHILD)).toBeUndefined();
-
-  const { createRevivedRunTracker } = await import(
-    '../hooks/task-session-manager/revived-run-tracker'
-  );
-  const { createTaskReviveTool } = await import('../tools/task-revive');
-  const { createBackgroundJobTerminalGate } = await import(
-    '../utils/background-job-terminal-gate'
-  );
-  const gate = createBackgroundJobTerminalGate({
-    backgroundJobBoard: board,
-    input: input as never,
+  await createToolExecuteBridges(
+    (hookInput, output) =>
+      handleToolExecuteBefore(hookInput, output, deps(board, input)),
+    undefined,
+  ).beforeBridge(event);
+  // Adopted, not refused: one tracked row, no silent re-dispatch.
+  expect(board.list(PARENT)).toHaveLength(1);
+  expect(board.get(CHILD)).toMatchObject({
+    parentSessionID: PARENT,
+    agent: 'fixer',
+    recoveredWithoutPrompt: true,
   });
-  const tracker = createRevivedRunTracker({
-    input: input as never,
-    backgroundJobBoard: board,
-    terminalGate: gate,
-  });
-  const revive = createTaskReviveTool({
-    input: input as never,
-    backgroundJobBoard: board,
-    shouldManageSession: () => true,
-    terminalGate: gate,
-    revivedRunTracker: tracker,
-    recoverRetainedSession: createSessionRecovery({
-      input: input as never,
-      backgroundJobBoard: board,
-      hostFlavor: 'v2',
-      stableStoppedMs: 0,
-    }),
-    baselineTimeoutMs: 1_000,
-  }).task_revive;
-  const output = await revive.execute(
-    { sessionID: CHILD, prompt: 'continue' },
-    { sessionID: PARENT, agent: 'orchestrator' } as never,
-  );
-  expect(String(output)).toContain('status: started');
-  expect(promptCalls).toBe(1);
-  gate.dispose();
-  tracker.dispose();
+  expect(event.input.sessionID).toBe(CHILD);
 });
 
 test('real parent context pairs an alias through the shim', async () => {
