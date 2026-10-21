@@ -155,10 +155,12 @@ not an optional-degradation path.
    `DELETE /api/session/:id`), and `session.list` (v2 `Session.Info` page → the v1
    `{data}` envelope with `directory` derived from `location` and `outcome`
    mapped, used by the interview dashboard's session scan and the
-   orchestrator-wake children enumeration). Note that `remove` and `list`
-   are **not part of the stock v2 plugin session domain** — the
-   capability probes only succeed on hosts that extend it, and all v2.0.x
-   stable hosts take the degraded paths (see
+    orchestrator-wake children enumeration). OpenCode 2.1 exposes `list`:
+    the shim drains its cursor pages, sends root-only filters as real `null`,
+    and refuses incomplete enumeration after 1000 sessions or four seconds.
+    The final empty page is included in the read budget. Older cursorless
+    extensions still work; v2.0.x hosts without `list` retain the degraded
+    path. These adapter checks do not establish live 2.1 compatibility (see
    [Not exposed to plugins: `session.list` / `session.remove`](#not-exposed-to-plugins-sessionlist-sessionremove)).
    The shim marks the input `hostFlavor: 'v2'` and never fakes success
    shapes: methods the host lacks degrade with an honest log (or are
@@ -911,7 +913,13 @@ See [Deployment Modes](multiplexer-integration.md#deployment-modes).
 
 ### Not exposed to plugins: `session.list` / `session.remove`
 
-The v2 plugin session domain (`packages/plugin/src/promise/session.ts`,
+This limitation applies to v2.0.x. OpenCode 2.1 exposes both methods to
+plugins. Its `list` is paginated: the adapter follows `cursor.next` through
+the empty terminal page, with a 1000-session and four-second total budget.
+Exceeding either budget fails the read instead of returning a partial list.
+This is source-contract and fixture coverage, not a live-host verification.
+
+The v2.0.x plugin session domain (`packages/plugin/src/promise/session.ts`,
 `SessionDomain`, mirrored by the runtime object the promise adapter
 builds) exposes exactly `create`/`get`/`switchAgent`/`switchModel`/
 `prompt`/`generate`/`command`/`synthetic`/`interrupt`/`update`/`move`/
@@ -923,8 +931,8 @@ scheduler's fallback enumeration, the delete no-op below, and the disabled
 runtime-status reconciliation (see
 [Upstream behaviors](#upstream-behaviors-to-know)) all follow from these
 gaps. The client shim capability-probes both at runtime
-(`typeof s.list === 'function'`, `s.remove`), so a future host that
-extends the domain gets real delegation with no plugin change; on all
+(`typeof s.list === 'function'`, `s.remove`), so hosts exposing them use
+real delegation; on all
 v2.0.x stable hosts both probes fail and the shims degrade:
 
 - **Children enumeration (orchestrator-wake).** The shim's

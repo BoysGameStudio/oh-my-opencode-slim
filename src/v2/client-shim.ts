@@ -315,14 +315,11 @@ function toV1SessionInfo(
 
 /**
  * v1 `client.session.list` over v2 `session.list`. Accepts the v1
- * `{query}` call shape (or a flat query object); passes through the
- * filters shim callers use — `directory` and the `parentID` filter
- * (session id or root-only: the literal `"null"` string, with a real
- * `null` normalized to it) — and wraps the mapped page in the v1
- * `{data}` envelope. Hosts without `session.list` keep the v1-parity
- * empty page (honest absence, not a fake success) after a one-time
- * per-generation warning — stock v2 hosts match this path because the
- * plugin session domain does not expose `list` (see the notice above).
+ * `{query}` call shape (or a flat query object). V2.1 cursors retain the
+ * filters and every nonempty page has a next cursor, so drain through the
+ * empty terminal page before returning the legacy complete `{data}` list.
+ * Refuse incomplete reads after 1000 sessions or 4 seconds. Cursorless
+ * older hosts still complete in one read; missing list keeps the fallback.
  */
 export function createSessionListShim(
   s: V2Context['session'],
@@ -344,21 +341,59 @@ export function createSessionListShim(
     if (typeof query.directory === 'string' && query.directory) {
       input.directory = query.directory;
     }
-    if (query.parentID === null) {
-      input.parentID = 'null'; // root-only sentinel on the wire
+    if (query.parentID === null || query.parentID === 'null') {
+      input.parentID = null;
     } else if (typeof query.parentID === 'string' && query.parentID !== '') {
       input.parentID = query.parentID;
     }
-    const output = (await s.list(input)) as
-      | { data?: unknown }
-      | Array<Record<string, unknown>>
-      | undefined;
-    const infos = Array.isArray(output)
-      ? output
-      : isRecord(output) && Array.isArray(output.data)
-        ? (output.data as Array<Record<string, unknown>>)
-        : [];
-    return { data: infos.filter(isRecord).map(toV1SessionInfo) };
+    const sessions: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
+    const deadline = performance.now() + 4_000;
+    let cursor: string | undefined;
+    // Twenty data pages plus one empty terminal probe.
+    for (let pageNumber = 0; pageNumber <= 20; pageNumber++) {
+      const remaining = deadline - performance.now();
+      const timeout = '[v2] session.list read budget exceeded';
+      if (remaining <= 0) throw new Error(timeout);
+      const page = await withTimeout(
+        s.list(cursor ? { cursor, limit: 50 } : { ...input, limit: 50 }),
+        remaining,
+        timeout,
+      );
+      if (performance.now() >= deadline) throw new Error(timeout);
+      const entries = Array.isArray(page)
+        ? page
+        : isRecord(page)
+          ? page.data
+          : undefined;
+      if (!Array.isArray(entries) || !entries.every(isRecord)) {
+        throw new Error('[v2] session.list returned an invalid page');
+      }
+      let next: unknown;
+      if (isRecord(page) && page.cursor !== undefined) {
+        if (!isRecord(page.cursor)) {
+          throw new Error('[v2] session.list returned an invalid cursor');
+        }
+        next = page.cursor.next;
+        if (next !== undefined && (typeof next !== 'string' || !next)) {
+          throw new Error('[v2] session.list returned an invalid cursor');
+        }
+      }
+      if (next && (entries.length === 0 || entries.length > 50)) {
+        throw new Error('[v2] session.list returned an invalid continuation');
+      }
+      if (sessions.length + entries.length > 1000) {
+        throw new Error('[v2] session.list exceeded its 1000-session capacity');
+      }
+      sessions.push(...entries);
+      if (!next) return { data: sessions.map(toV1SessionInfo) };
+      cursor = next as string;
+      if (seen.has(cursor)) {
+        throw new Error('[v2] session.list repeated a cursor');
+      }
+      seen.add(cursor);
+    }
+    throw new Error('[v2] session.list exceeded its page capacity');
   };
 }
 
