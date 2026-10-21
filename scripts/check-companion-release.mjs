@@ -1,141 +1,146 @@
 #!/usr/bin/env node
-import { resolve } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
-import { pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
 
-const TARGETS = [
+export const COMPANION_REPOSITORY = 'alvinunreal/oh-my-opencode-companion';
+export const COMPANION_TARGETS = [
   'aarch64-apple-darwin',
   'aarch64-unknown-linux-gnu',
   'x86_64-apple-darwin',
   'x86_64-pc-windows-msvc',
   'x86_64-unknown-linux-gnu',
 ];
-const MAX_ATTEMPTS = 3;
 
-export function classifyCompanionRelease(release, tag) {
-  if (
-    !release ||
-    typeof release !== 'object' ||
-    typeof release.draft !== 'boolean' ||
-    !Array.isArray(release.assets)
-  ) {
-    throw new Error('Malformed GitHub Companion release response.');
+export function companionArchiveNames(version) {
+  if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) {
+    throw new Error(`Invalid Companion version: ${version}`);
   }
-
-  if (release.draft) return 'incomplete';
-
-  const version = tag.slice('companion-v'.length);
-  const assets = new Map();
-  for (const asset of release.assets) {
-    if (typeof asset?.name !== 'string') {
-      throw new Error('Malformed GitHub Companion release asset.');
-    }
-    if (assets.has(asset.name)) return 'incomplete';
-    assets.set(asset.name, asset);
-  }
-
-  for (const target of TARGETS) {
-    const extension = target.includes('windows') ? 'zip' : 'tar.gz';
-    const name = `oh-my-opencode-slim-companion-v${version}-${target}.${extension}`;
-    const asset = assets.get(name);
-    if (
-      asset?.state !== 'uploaded' ||
-      !Number.isSafeInteger(asset?.size) ||
-      asset.size <= 0
-    ) {
-      return 'incomplete';
-    }
-  }
-
-  return 'complete';
+  return COMPANION_TARGETS.map(
+    (target) =>
+      `oh-my-opencode-slim-companion-v${version}-${target}.${target.includes('windows') ? 'zip' : 'tar.gz'}`,
+  );
 }
 
-export async function checkPublishedCompanionRelease(tag, options = {}) {
+export function validateCompanionManifest(manifest) {
+  const names = companionArchiveNames(manifest?.version);
+  if (
+    manifest.tag !== `companion-v${manifest.version}` ||
+    manifest.repo !== COMPANION_REPOSITORY
+  ) {
+    throw new Error('Unexpected Companion manifest release identity.');
+  }
+  if (
+    JSON.stringify(Object.keys(manifest.checksums ?? {}).sort()) !==
+    JSON.stringify([...names].sort())
+  ) {
+    throw new Error(
+      'Companion manifest assets do not match the supported set.',
+    );
+  }
+  for (const name of names) {
+    if (!/^[a-f0-9]{64}$/.test(manifest.checksums[name])) {
+      throw new Error(`Invalid SHA256 checksum for ${name}.`);
+    }
+  }
+}
+
+export function validateCompanionRelease(release, tag) {
   if (!/^companion-v\d+\.\d+\.\d+$/.test(tag)) {
     throw new Error(`Invalid Companion release tag: ${tag}`);
   }
-
-  const repository = options.repository ?? process.env.GITHUB_REPOSITORY;
-  const token = options.token ?? process.env.GH_TOKEN;
-  if (!repository || !/^[\w.-]+\/[\w.-]+$/.test(repository) || !token) {
-    throw new Error(
-      'Companion lookup requires GITHUB_REPOSITORY and GH_TOKEN.',
-    );
+  if (
+    !Number.isSafeInteger(release?.id) ||
+    release.id <= 0 ||
+    release.tag_name !== tag ||
+    release.html_url !==
+      `https://github.com/${COMPANION_REPOSITORY}/releases/tag/${tag}` ||
+    release.draft !== false ||
+    release.prerelease !== false ||
+    typeof release.published_at !== 'string' ||
+    !Array.isArray(release.assets)
+  ) {
+    throw new Error('Invalid published Companion release identity.');
   }
-
-  const request = options.request ?? fetch;
-  const pause = options.pause ?? sleep;
-  const apiBase = process.env.GITHUB_API_URL ?? 'https://api.github.com';
-  const url = `${apiBase}/repos/${repository}/releases/tags/${tag}`;
-  const headers = {
-    Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
-    'X-GitHub-Api-Version': '2022-11-28',
-  };
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    let response;
-    try {
-      response = await request(url, {
-        headers,
-        signal: AbortSignal.timeout(15_000),
-      });
-    } catch (error) {
-      if (attempt === MAX_ATTEMPTS) {
-        throw new Error(
-          'GitHub Companion release lookup failed after retries.',
-          {
-            cause: error,
-          },
-        );
-      }
-      await pause(attempt * 1_000);
-      continue;
-    }
-
-    if (response.status === 200) {
-      let release;
-      try {
-        release = await response.json();
-      } catch (error) {
-        throw new Error('Invalid GitHub Companion release JSON.', {
-          cause: error,
-        });
-      }
-      return classifyCompanionRelease(release, tag);
-    }
-
-    if (response.status === 404) {
-      if (attempt === MAX_ATTEMPTS) return 'missing';
-      await pause(attempt * 1_000);
-      continue;
-    }
-
-    // GitHub auth/permission failures, rate limits and server errors must
-    // NEVER turn into "missing": that would publish an unnecessary new binary.
+  const names = companionArchiveNames(tag.slice('companion-v'.length));
+  return names.map((name) => {
+    const matches = release.assets.filter((asset) => asset?.name === name);
+    const asset = matches[0];
     if (
-      attempt === MAX_ATTEMPTS ||
-      ![408, 429, 500, 502, 503, 504].includes(response.status)
+      matches.length !== 1 ||
+      asset.state !== 'uploaded' ||
+      !Number.isSafeInteger(asset.size) ||
+      asset.size <= 0 ||
+      asset.browser_download_url !==
+        `https://github.com/${COMPANION_REPOSITORY}/releases/download/${tag}/${name}`
     ) {
-      throw new Error(
-        `GitHub Companion release lookup returned HTTP ${response.status}.`,
-      );
+      throw new Error(`Incomplete Companion release asset: ${name}`);
     }
-    await pause(attempt * 1_000);
-  }
-
-  throw new Error('Unable to determine published Companion release state.');
+    return asset;
+  });
 }
 
-if (
-  process.argv[1] &&
-  pathToFileURL(resolve(process.argv[1])).href === import.meta.url
-) {
-  const tag = process.argv.find((arg) => arg.startsWith('--tag='))?.slice(6);
-  checkPublishedCompanionRelease(tag)
-    .then((state) => console.log(state))
-    .catch((error) => {
-      console.error(error.message);
-      process.exitCode = 1;
-    });
+export async function fetchCompanionRelease(tag, options = {}) {
+  if (tag !== undefined && !/^companion-v\d+\.\d+\.\d+$/.test(tag)) {
+    throw new Error(`Invalid Companion release tag: ${tag}`);
+  }
+  // Public reads need no cross-repository token. Never derive the native
+  // repository from GITHUB_REPOSITORY (which identifies the plugin in CI).
+  const token = options.token ?? process.env.GH_TOKEN;
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+  const response = await (options.request ?? fetch)(
+    `https://api.github.com/repos/${COMPANION_REPOSITORY}/releases/${tag ? `tags/${tag}` : 'latest'}`,
+    { headers, signal: AbortSignal.timeout(30_000) },
+  );
+  if (response.status !== 200) {
+    throw new Error(
+      `GitHub Companion release lookup returned HTTP ${response.status}.`,
+    );
+  }
+  const release = await response.json();
+  validateCompanionRelease(release, tag ?? release?.tag_name);
+  return release;
+}
+
+export async function publishedCompanionManifest(release, options = {}) {
+  const assets = validateCompanionRelease(release, release?.tag_name);
+  const checksums = {};
+  // Hash the downloaded bytes, not GitHub's optional digest metadata. All
+  // five must succeed before callers may write either manifest copy.
+  for (const asset of assets) {
+    const response = await (options.request ?? fetch)(
+      asset.browser_download_url,
+      { signal: AbortSignal.timeout(120_000) },
+    );
+    if (response.status !== 200) {
+      throw new Error(`Companion download returned HTTP ${response.status}.`);
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length !== asset.size) {
+      throw new Error(`Companion archive size mismatch: ${asset.name}`);
+    }
+    const checksum = createHash('sha256').update(bytes).digest('hex');
+    if (asset.digest != null && asset.digest !== `sha256:${checksum}`) {
+      throw new Error(`Companion archive digest mismatch: ${asset.name}`);
+    }
+    checksums[asset.name] = checksum;
+  }
+  return {
+    version: release.tag_name.slice('companion-v'.length),
+    tag: release.tag_name,
+    repo: COMPANION_REPOSITORY,
+    checksums,
+  };
+}
+
+export function companionManifestsEqual(left, right) {
+  return (
+    left.version === right.version &&
+    left.tag === right.tag &&
+    left.repo === right.repo &&
+    JSON.stringify(Object.entries(left.checksums ?? {}).sort()) ===
+      JSON.stringify(Object.entries(right.checksums ?? {}).sort())
+  );
 }

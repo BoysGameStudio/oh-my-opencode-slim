@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
-import { execFileSync, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -10,173 +10,163 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {
+  companionArchiveNames,
+  publishedCompanionManifest,
+} from './check-companion-release.mjs';
+import {
+  archiveBytes,
+  publishedRelease,
+  releaseRequest,
+} from './companion-release-fixtures';
+import {
+  prepareCompanionRelease,
+  writeCompanionManifests,
+} from './prepare-companion-release.mjs';
+import { syncCompanionManifest } from './sync-companion-manifest.mjs';
 
-const sourceCheck = join(import.meta.dir, 'verify-companion-source.mjs');
-const prepareRelease = join(import.meta.dir, 'prepare-companion-release.mjs');
-const windowsArchive =
-  'oh-my-opencode-slim-companion-v0.1.5-x86_64-pc-windows-msvc.zip';
+const manifestPath = 'src/companion/companion-manifest.json';
+const updaterPath = 'src/companion/updater.ts';
 
-function git(cwd: string, ...args: string[]): void {
-  execFileSync('git', ['-C', cwd, ...args], { stdio: 'pipe' });
-}
-
-function fixture(): string {
+async function fixture(version = '0.1.4') {
   const root = mkdtempSync(join(tmpdir(), 'omo-companion-release-'));
-  mkdirSync(join(root, 'companion', 'src'), { recursive: true });
-  mkdirSync(join(root, 'companion', 'animations'), { recursive: true });
-  mkdirSync(join(root, 'src', 'companion'), { recursive: true });
+  mkdirSync(join(root, 'src/companion'), { recursive: true });
+  const release = publishedRelease(version);
+  const manifest = await publishedCompanionManifest(release, {
+    request: releaseRequest(release),
+  });
   writeFileSync(
-    join(root, 'companion', 'Cargo.toml'),
-    '[package]\nname = "oh-my-opencode-slim-companion"\nversion = "0.1.4"\n\n[dependencies]\nserde = "1"\n',
+    join(root, updaterPath),
+    'export const COMPANION_MANIFEST: CompanionManifest = {\n};\n',
   );
-  writeFileSync(
-    join(root, 'companion', 'Cargo.lock'),
-    '[[package]]\nname = "oh-my-opencode-slim-companion"\nversion = "0.1.4"\n',
-  );
-  writeFileSync(join(root, 'companion', 'src', 'main.rs'), 'fn main() {}\n');
-  writeFileSync(join(root, 'companion', 'animations', 'intro.jpg'), 'frame-v1');
-  writeFileSync(
-    join(root, 'src', 'companion', 'companion-manifest.json'),
-    JSON.stringify({
-      version: '0.1.4',
-      tag: 'companion-v0.1.4',
-      repo: 'alvinunreal/oh-my-opencode-slim',
-      checksums: {},
-    }),
-  );
-  writeFileSync(
-    join(root, 'src', 'companion', 'updater.ts'),
-    "export const COMPANION_MANIFEST: CompanionManifest = {\n  version: '0.1.4',\n  tag: 'companion-v0.1.4',\n  repo: 'alvinunreal/oh-my-opencode-slim',\n  checksums: {},\n};\n",
-  );
-  git(root, 'init', '-q');
-  git(root, 'config', 'user.email', 'test@example.com');
-  git(root, 'config', 'user.name', 'Companion Test');
-  git(root, 'add', '.');
-  git(root, 'commit', '-qm', 'Companion v0.1.4 source');
-  git(root, 'tag', 'companion-v0.1.4');
+  writeCompanionManifests(manifest, root);
   return root;
 }
 
-function check(root: string) {
-  return spawnSync('node', [sourceCheck], { cwd: root, encoding: 'utf8' });
-}
-
-test('native source check rejects post-release Rust changes', () => {
-  const root = fixture();
+test('preparation only synchronizes plugin manifests from real bytes, without native files or git', async () => {
+  const root = await fixture();
   try {
-    expect(check(root).status).toBe(0);
-    writeFileSync(
-      join(root, 'companion', 'src', 'main.rs'),
-      'fn main() { println!("new"); }\n',
-    );
-    const result = check(root);
-    expect(result.status).toBe(2);
-    expect(result.stderr).toContain('main.rs');
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('native source check detects changes to embedded Companion sprites', () => {
-  const root = fixture();
-  try {
-    expect(check(root).status).toBe(0);
-    writeFileSync(
-      join(root, 'companion', 'animations', 'intro.jpg'),
-      'frame-v2',
-    );
-    const result = check(root);
-    expect(result.status).toBe(2);
-    expect(result.stderr).toContain('animations/intro.jpg');
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('native source check permits crate version-only synchronization', () => {
-  const root = fixture();
-  try {
-    writeFileSync(
-      join(root, 'companion', 'Cargo.toml'),
-      '[package]\nname = "oh-my-opencode-slim-companion"\nversion = "0.1.5"\n\n[dependencies]\nserde = "1"\n',
-    );
-    writeFileSync(
-      join(root, 'companion', 'Cargo.lock'),
-      '[[package]]\nname = "oh-my-opencode-slim-companion"\nversion = "0.1.5"\n',
-    );
-    for (const name of ['Cargo.toml', 'Cargo.lock']) {
-      const file = join(root, 'companion', name);
-      writeFileSync(file, readFileSync(file, 'utf8').replaceAll('\n', '\r\n'));
+    const assetsDir = join(root, 'assets');
+    mkdirSync(assetsDir);
+    for (const name of companionArchiveNames('0.1.5')) {
+      writeFileSync(join(assetsDir, name), archiveBytes(name));
     }
-    expect(check(root).status).toBe(0);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('native source check rejects dependency changes and missing tags', () => {
-  const root = fixture();
-  try {
-    const cargoPath = join(root, 'companion', 'Cargo.toml');
-    writeFileSync(
-      cargoPath,
-      `${readFileSync(cargoPath, 'utf8')}winit = "0.30"\n`,
+    prepareCompanionRelease('0.1.5', assetsDir, root);
+    const manifest = JSON.parse(readFileSync(join(root, manifestPath), 'utf8'));
+    const release = publishedRelease();
+    expect(manifest).toEqual(
+      await publishedCompanionManifest(release, {
+        request: releaseRequest(release),
+      }),
     );
-    expect(check(root).status).toBe(2);
-    git(root, 'tag', '-d', 'companion-v0.1.4');
-    expect(check(root).status).toBe(1);
+    expect(readFileSync(join(root, updaterPath), 'utf8')).toContain(
+      Object.values(manifest.checksums)[0],
+    );
+    expect(existsSync(join(root, 'companion'))).toBe(false);
+    expect(existsSync(join(root, '.git'))).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('release preparation reads real archive hashes and synchronizes both manifests', () => {
-  const root = fixture();
+test('preparation requires all assets and fallback location before any writes', async () => {
+  const root = await fixture();
   try {
-    mkdirSync(join(root, 'assets'));
-    for (const target of [
-      'aarch64-apple-darwin',
-      'aarch64-unknown-linux-gnu',
-      'x86_64-apple-darwin',
-      'x86_64-pc-windows-msvc',
-      'x86_64-unknown-linux-gnu',
+    const before = readFileSync(join(root, manifestPath), 'utf8');
+    expect(() => prepareCompanionRelease('0.1.5', undefined, root)).toThrow(
+      '--assets-dir',
+    );
+    expect(() => prepareCompanionRelease('0.1.5', root, root)).toThrow();
+    expect(readFileSync(join(root, manifestPath), 'utf8')).toBe(before);
+    writeFileSync(join(root, updaterPath), 'no fallback here');
+    expect(() => writeCompanionManifests(JSON.parse(before), root)).toThrow(
+      'fallback manifest',
+    );
+    expect(readFileSync(join(root, manifestPath), 'utf8')).toBe(before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('sync updates once then leaves aligned manifest bytes untouched', async () => {
+  const root = await fixture();
+  try {
+    const release = publishedRelease();
+    const options = { root, request: releaseRequest(release) };
+    expect(await syncCompanionManifest(options)).toEqual({
+      changed: true,
+      version: '0.1.5',
+    });
+    const before = readFileSync(join(root, manifestPath), 'utf8');
+    const updater = readFileSync(join(root, updaterPath), 'utf8');
+    expect(await syncCompanionManifest(options)).toEqual({
+      changed: false,
+      version: '0.1.5',
+    });
+    expect(readFileSync(join(root, manifestPath), 'utf8')).toBe(before);
+    expect(readFileSync(join(root, updaterPath), 'utf8')).toBe(updater);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('sync refuses API errors, incomplete releases, downgrades and same-tag mutations without writes', async () => {
+  const root = await fixture('0.1.5');
+  try {
+    const before = readFileSync(join(root, manifestPath), 'utf8');
+    const partial = publishedRelease('0.1.6');
+    partial.assets.pop();
+    for (const request of [
+      async () => new Response('', { status: 503 }),
+      releaseRequest(partial),
+      releaseRequest(publishedRelease('0.1.4')),
     ]) {
-      const suffix = target.includes('windows') ? 'zip' : 'tar.gz';
-      writeFileSync(
-        join(
-          root,
-          'assets',
-          `oh-my-opencode-slim-companion-v0.1.5-${target}.${suffix}`,
-        ),
-        `archive bytes for ${target}`,
-      );
+      await expect(syncCompanionManifest({ root, request })).rejects.toThrow();
+      expect(readFileSync(join(root, manifestPath), 'utf8')).toBe(before);
     }
-
-    const result = spawnSync(
-      'node',
-      [prepareRelease, '--version=0.1.5', '--assets-dir=assets'],
-      { cwd: root, encoding: 'utf8' },
-    );
-    expect(result.status).toBe(0);
-    const manifest = JSON.parse(
-      readFileSync(
-        join(root, 'src', 'companion', 'companion-manifest.json'),
-        'utf8',
-      ),
-    );
-    const digest = createHash('sha256')
-      .update(readFileSync(join(root, 'assets', windowsArchive)))
-      .digest('hex');
-    expect(manifest.version).toBe('0.1.5');
-    expect(Object.keys(manifest.checksums)).toHaveLength(5);
-    expect(manifest.checksums[windowsArchive]).toBe(digest);
-    expect(
-      readFileSync(join(root, 'src', 'companion', 'updater.ts'), 'utf8'),
-    ).toContain(digest);
-    expect(
-      readFileSync(join(root, 'companion', 'Cargo.lock'), 'utf8'),
-    ).toContain('version = "0.1.5"');
+    const manifest = JSON.parse(before);
+    manifest.checksums[Object.keys(manifest.checksums)[0]] = '0'.repeat(64);
+    writeCompanionManifests(manifest, root);
+    await expect(
+      syncCompanionManifest({ root, request: releaseRequest() }),
+    ).rejects.toThrow('immutable tag');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('offline verification is independent of native source, local tags and network', () => {
+  const result = spawnSync('bun', ['scripts/verify-companion-manifest.ts'], {
+    cwd: join(import.meta.dir, '..'),
+    encoding: 'utf8',
+    env: { ...process.env, GH_TOKEN: '', GITHUB_REPOSITORY: 'wrong/repo' },
+  });
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain('verified offline');
+});
+
+test('plugin release hooks and sync workflow have no native build or same-repo provenance dependency', () => {
+  const root = join(import.meta.dir, '..');
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  expect(pkg.scripts.preversion).toContain('verify:companion-release');
+  expect(pkg.scripts.prepublishOnly).toContain('verify:companion-manifest');
+  expect(pkg.scripts.prepublishOnly).toContain('verify:companion-release');
+  expect(pkg.scripts['verify:companion-source']).toBeUndefined();
+  for (const name of [
+    'companion-ci',
+    'companion-release',
+    'companion-auto-release',
+  ]) {
+    expect(existsSync(join(root, `.github/workflows/${name}.yml`))).toBe(false);
+  }
+  const workflow = readFileSync(
+    join(root, '.github/workflows/companion-manifest-sync.yml'),
+    'utf8',
+  );
+  expect(workflow).toContain('workflow_dispatch:');
+  expect(workflow).toContain('schedule:');
+  expect(workflow).toContain("if: steps.sync.outputs.changed == 'true'");
+  expect(workflow).not.toContain('cargo ');
+  expect(workflow).not.toContain('companion/Cargo');
+  expect(workflow).not.toContain('git fetch --tags');
 });

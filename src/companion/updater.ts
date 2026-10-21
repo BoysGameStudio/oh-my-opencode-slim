@@ -49,7 +49,7 @@ const FIRST_METADATA_VERSION = '0.1.2';
 export const COMPANION_MANIFEST: CompanionManifest = {
   version: '0.1.9',
   tag: 'companion-v0.1.9',
-  repo: 'alvinunreal/oh-my-opencode-slim',
+  repo: 'alvinunreal/oh-my-opencode-companion',
   checksums: {
     'oh-my-opencode-slim-companion-v0.1.9-aarch64-apple-darwin.tar.gz':
       'd41b1b8789218252e3a88acf55221476a10f3dc83cf3c2f57ad360afcc6b7ed4',
