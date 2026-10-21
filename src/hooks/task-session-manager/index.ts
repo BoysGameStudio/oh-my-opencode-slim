@@ -39,12 +39,11 @@ import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
   BACKGROUND_JOB_BOARD_METADATA_KEY,
-  type InjectedTerminalJobs,
   type InjectionState,
   injectBackgroundJobBoard,
   observeSyntheticTerminalPart,
   pruneReopenCorrectionState,
-  reconcileInjectedTerminalJobs,
+  reconcileObservedTerminalRun,
   stabilizeRunningTaskParts,
   updateFromInjectedCompletion,
 } from './board-injection';
@@ -345,10 +344,6 @@ export function createTaskSessionManagerHook(
     /** Host flavor marker ('v2' on OpenCode v2 hosts); selects the native
      *  delegation vocabulary in model-visible tool guidance. Defaults v1. */
     hostFlavor?: string;
-    /** v1-only honoured switch (runtime.backgroundJobs.boardInjection;
-     *  forced false on v2 at the RuntimeConfig layer). false on v1 =
-     *  boardless. */
-    boardInjection?: boolean;
     /** Per-instance pairing flag for the background-default flip (v2 only);
      *  see BackgroundDefaultFlipState in v2/delegation. */
     isBackgroundDefaultFlipArmed?: () => boolean;
@@ -617,11 +612,6 @@ export function createTaskSessionManagerHook(
     });
   const taskContextTracker = createTaskContextTracker();
 
-  const terminalJobsInjectedByParent = new Map<string, InjectedTerminalJobs>();
-  const pendingInjectedTerminalJobsByParent = new Map<
-    string,
-    Map<string, BackgroundJobExecution>
-  >();
   /** Sessions with a deferred failover error awaiting the fallback
    *  outcome (managed inline 401/410, or a background child's
    *  failover-worthy error with an armed fallback chain), mapped to the
@@ -646,8 +636,6 @@ export function createTaskSessionManagerHook(
 
   const idleReconciler = createIdleReconciler({
     terminalGate,
-    reconcileInjectedTerminalJobs: (parentSessionID: string) =>
-      reconcileInjectedTerminalJobs(injectionState, parentSessionID),
     idleReconcileDelayMs:
       options.idleReconcileDelayMs ?? IDLE_RECONCILE_DELAY_MS,
     isFallbackInProgress: options.isFallbackInProgress,
@@ -733,10 +721,7 @@ export function createTaskSessionManagerHook(
         backgroundJobBoard.clearParent(sessionId);
         if (!hardTimedOut) options.backgroundJobSupervisor?.drop(sessionId);
       }
-      terminalJobsInjectedByParent.delete(sessionId);
-      pendingInjectedTerminalJobsByParent.delete(sessionId);
       historyBoundaries.delete(sessionId);
-      injectionState.retainedTailBoards.delete(sessionId);
       // Orphaned reopen corrections must never surface in a recreated
       // session; the board entries they referenced are being dropped too.
       pruneReopenCorrectionState(injectionState, sessionId);
@@ -751,7 +736,6 @@ export function createTaskSessionManagerHook(
     backgroundJobBoard,
     terminalGate,
     hostFlavor: options.hostFlavor,
-    boardInjection: options.boardInjection !== false,
     lifecycleLedger: rehydrateState,
     processedInjectedCompletions: rehydrateState.processedInjectedCompletions,
     processedInjectedCompletionOrder:
@@ -762,13 +746,9 @@ export function createTaskSessionManagerHook(
       rehydrateState.syntheticTerminalOccurrenceOrder,
     getLifecycleEpoch: () => rehydrateState.nextEpoch,
     getDeletionEpoch: (taskID) => rehydrateState.deletionEpochs.get(taskID),
-    terminalJobsInjectedByParent,
-    pendingInjectedTerminalJobsByParent,
     metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
     shouldManageSession: options.shouldManageSession,
     taskContextTracker,
-    lastInjectedBoardTextByParent: new Map(),
-    retainedTailBoards: new Map(),
   };
 
   // Early session.created registrations belong to the pending native call,
@@ -970,13 +950,30 @@ export function createTaskSessionManagerHook(
         }
 
         for (const [partIndex, part] of message.parts.entries()) {
-          await updateFromInjectedCompletion(
+          const observed = await updateFromInjectedCompletion(
             injectionState,
             part,
             message,
             messageIndex,
             partIndex,
           );
+          // Retirement by observed delivery (issue #1647): the host's native
+          // completion part for this run is in the prompt being sent, so the
+          // parent is being told. Generation/revision fenced.
+          if (
+            observed?.terminalUnreconciled &&
+            observed.parentSessionID === message.info.sessionID
+          ) {
+            reconcileObservedTerminalRun(
+              injectionState,
+              observed.parentSessionID,
+              {
+                taskID: observed.taskID,
+                generation: observed.generation,
+                terminalRevision: observed.terminalRevision,
+              },
+            );
+          }
         }
       }
     },
@@ -1034,8 +1031,6 @@ export function createTaskSessionManagerHook(
         terminalGate,
         pendingCallTracker,
         taskContextTracker,
-        terminalJobsInjectedByParent,
-        pendingInjectedTerminalJobsByParent,
         backgroundJobSupervisor: options.backgroundJobSupervisor,
         bindConcurrencyTicket: (taskID, pending) =>
           pending.concurrencyTicket?.bind(taskID),
