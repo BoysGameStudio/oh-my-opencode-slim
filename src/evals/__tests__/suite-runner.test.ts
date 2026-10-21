@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { collectSuite } from '../../cli/auto-collect';
 import type { EvalSessionClient } from '../eval-client';
 import { type EvalSuiteResult, EvalSuiteSchema } from '../schema';
+import { EvalQuiescenceError } from '../session-quiescence';
 import { runSuite } from '../suite-runner';
 
 function dependencies() {
@@ -97,6 +98,19 @@ describe('suite-runner', () => {
     deps.collectSuite.mockRejectedValue(new Error('collection failed'));
     await expect(runSuite(options, deps)).rejects.toThrow('collection failed');
     expect(deps.restoreAfterEvals).toHaveBeenCalledTimes(1);
+  });
+
+  test('unconfirmed shutdown preserves the stash and checkout without destructive cleanup', async () => {
+    const deps = dependencies();
+    deps.collectSuite.mockRejectedValue(
+      new EvalQuiescenceError(['eval-root', 'child'], 'still busy'),
+    );
+    await expect(runSuite(options, deps)).rejects.toBeInstanceOf(
+      EvalQuiescenceError,
+    );
+    expect(deps.stashChanges).toHaveBeenCalledTimes(1);
+    expect(deps.restoreAfterEvals).not.toHaveBeenCalled();
+    expect(deps.executeSuite).not.toHaveBeenCalled();
   });
 
   test('restores on scoring or result-write failure', async () => {

@@ -30,6 +30,24 @@ work after scoring or collection failure. Ignored files are not preserved by
 the stash and can still be modified by agents. Never run live suites as part of
 ordinary unit validation without explicit authorization.
 
+Before a trial returns (including success, stall, or timeout), the harness
+awaits abort acknowledgements for its created session and recursively verified
+descendants. It rechecks the child tree and runtime status until two consecutive
+scans are idle. Only those owned IDs are aborted; unrelated sessions in the
+server's status map are ignored. All concurrent workers finish shutdown before
+between-pass cleanup or final restoration.
+
+Shutdown is bounded to 10 seconds with bounded individual requests. If abort,
+child enumeration, or status checks fail, or prompt submission was still pending
+when shutdown began, the command fails **without reset, clean, or stash restore**.
+It prints the checkout and preserved stash commit. This deliberately prefers
+recoverable stashed work to restoring it underneath a possible active writer.
+Stop only the reported eval sessions and their descendants using the selected
+server; confirm they have stopped before inspecting/discarding eval edits and
+applying the printed stash with `git stash apply --index <commit>`. Do not stop
+unrelated production sessions or blindly pop another stash. Abrupt process
+termination likewise requires checking the eval sessions before recovery.
+
 ```bash
 bun run eval --suite orchestrator-natural-routing
 bun run eval --smoke --suite orchestrator-direct-execution
@@ -49,8 +67,9 @@ Startup failure cleans up only that child. Saved-output scoring does not contact
 a server unless `--judge` is also requested.
 
 `--judge` adds token-costing council feedback and oracle synthesis over the same
-client and keeps the owned server alive until both are finished. Judge failures
-are advisory. Deterministic suite failures exit 1; observed flaky trials exit 2.
+client and keeps the owned server alive until both are finished. Judge scoring
+failures are advisory, but an unconfirmed judge-session shutdown is fatal for
+safety. Deterministic suite failures exit 1; observed flaky trials exit 2.
 Results are ignored timestamped JSON files in `src/evals/results/`; `--diff`
 compares the latest two suite results or an explicit baseline.
 

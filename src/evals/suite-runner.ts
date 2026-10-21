@@ -15,6 +15,7 @@ import type { EvalSessionClient } from './eval-client';
 import { saveResults } from './results';
 import type { EvalSuiteResult, Transcript } from './schema';
 import { executeSuite } from './scoring';
+import { EvalQuiescenceError } from './session-quiescence';
 import { loadEvalSuite } from './suites';
 
 // ── Options ─────────────────────────────────────────────────────────
@@ -72,9 +73,11 @@ export async function runSuite(
   let outputsFile = outputsFileOpt;
   let stash: string | null = null;
   let collectionStarted = false;
+  let cleanupSafe = true;
   let result: EvalSuiteResult | undefined;
 
-  // Validate before stashing; every path after a successful stash restores.
+  // Validate before stashing. Restore only after collection proves its writers
+  // stopped; an unconfirmed shutdown deliberately leaves user work stashed.
   try {
     if (!outputsFile) {
       const out = `/tmp/${suiteName}.json`;
@@ -190,8 +193,16 @@ export async function runSuite(
       const resultsFile = deps.saveResults(suiteName, result);
       console.log(`\nResults saved to ${resultsFile}`);
     }
+  } catch (error) {
+    if (error instanceof EvalQuiescenceError) {
+      cleanupSafe = false;
+      console.error(
+        `Eval shutdown could not be confirmed. No reset, clean, or stash restore was attempted. Working directory: ${cwd}. Preserved stash: ${stash ?? '(initial tree was clean)'}. Stop the listed eval sessions before recovering user work with git stash apply --index <stash>.`,
+      );
+    }
+    throw error;
   } finally {
-    if (collectionStarted) {
+    if (collectionStarted && cleanupSafe) {
       console.log('Cleaning eval artifacts and restoring working tree...');
       deps.restoreAfterEvals(stash, cwd);
     }

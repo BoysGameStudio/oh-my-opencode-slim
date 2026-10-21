@@ -8,6 +8,7 @@
 
 import type { EvalSessionClient } from './eval-client';
 import { runWithSession } from './session-manager';
+import { EvalQuiescenceError } from './session-quiescence';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -92,6 +93,7 @@ ${rubric}`;
       error: sessionResult.error,
     };
   } catch (err) {
+    if (err instanceof EvalQuiescenceError) throw err;
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`Judge session error (${suite}): ${msg}`);
     return { text: '', success: false, error: msg };

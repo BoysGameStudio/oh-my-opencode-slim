@@ -1,7 +1,8 @@
-import { withTimeout } from '../utils/session';
+import { sessionAbortFailure, withTimeout } from '../utils/session';
 import type { EvalSessionClient } from './eval-client';
 import { pollSession } from './polling-session';
 import type { Transcript } from './schema';
+import { EvalQuiescenceError, stopEvalSessionTree } from './session-quiescence';
 
 const AGENT_NAME_RE = /^@([A-Za-z][A-Za-z0-9-]*)\s*/;
 
@@ -38,6 +39,8 @@ export type RunViaServer = (
   attempt: number,
 ) => Promise<EvalSessionResult>;
 
+const sessionDependencies = { withTimeout, pollSession, stopEvalSessionTree };
+
 /**
  * Run a session end-to-end: create, route @agent, prompt, poll.
  * Direct callable — not a factory. Testable with a mock client.
@@ -51,6 +54,7 @@ export async function runWithSession(
   directory: string,
   timeoutMs: number,
   ts?: () => string,
+  deps = sessionDependencies,
 ): Promise<EvalSessionResult> {
   const attemptLabel = attempt > 1 ? `${label} (attempt ${attempt})` : label;
   const t0 = Date.now();
@@ -59,9 +63,12 @@ export async function runWithSession(
     const secs = Math.round((Date.now() - t0) / 1000);
     console.log(`${tsFn()} ${attemptLabel} still running (${secs}s)`);
   }, 30_000);
+  let sid: string | undefined;
+  let dispatchSettled = true;
+  let result: EvalSessionResult;
 
   try {
-    const created = await withTimeout(
+    const created = await deps.withTimeout(
       client.session.create({
         body: { title: `eval: ${label.trim()}` },
         query: { directory },
@@ -69,14 +76,9 @@ export async function runWithSession(
       30_000,
       'Session creation timed out',
     );
-    const sid = created.data?.id;
+    sid = created.data?.id;
     if (!sid) {
-      return {
-        success: false,
-        response: '',
-        error: 'session.create returned no id',
-        durationSecs: 0,
-      };
+      throw new Error('session.create returned no id');
     }
 
     const mentionMatch = prompt.match(AGENT_NAME_RE);
@@ -104,17 +106,26 @@ export async function runWithSession(
       };
     }
 
-    await withTimeout(
-      client.session.promptAsync({
+    dispatchSettled = false;
+    const dispatch = client.session
+      .promptAsync({
         path: { id: sid },
         body: promptBody,
         query: { directory },
-      }),
+      })
+      .finally(() => {
+        dispatchSettled = true;
+      });
+    const dispatched = await deps.withTimeout(
+      dispatch,
       timeoutMs,
       'Session prompt timed out',
     );
+    const dispatchFailure = sessionAbortFailure(dispatched);
+    if (dispatchFailure)
+      throw new Error(`Prompt dispatch failed: ${dispatchFailure}`);
 
-    return await pollSession(
+    result = await deps.pollSession(
       {
         fetchMessages: (id: string) =>
           client.session
@@ -138,7 +149,7 @@ export async function runWithSession(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.log(`${attemptLabel} — error: ${msg}`);
-    return {
+    result = {
       success: false,
       response: '',
       error: msg,
@@ -147,4 +158,17 @@ export async function runWithSession(
   } finally {
     clearInterval(heartbeat);
   }
+  if (sid) {
+    const dispatchWasPending = !dispatchSettled;
+    await deps.stopEvalSessionTree(client, sid, directory);
+    // A still-pending submission could start work after an abort. Do not
+    // claim quiescence or restore user work in that ambiguous case.
+    if (dispatchWasPending) {
+      throw new EvalQuiescenceError(
+        [sid],
+        'Prompt submission was still pending when shutdown began',
+      );
+    }
+  }
+  return result;
 }

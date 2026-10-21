@@ -32,6 +32,21 @@ export interface EvalSessionClient {
       path: { id: string };
       query: { directory: string };
     }) => Promise<unknown>;
+    abort: (opts: {
+      path: { id: string };
+      query: { directory: string };
+    }) => Promise<{ data?: boolean; error?: unknown }>;
+    children: (opts: {
+      path: { id: string };
+      query: { directory: string };
+    }) => Promise<{
+      data?: Array<{ id: string; parentID?: string }>;
+      error?: unknown;
+    }>;
+    status: (opts: { query: { directory: string } }) => Promise<{
+      data?: Record<string, { type: string }>;
+      error?: unknown;
+    }>;
   };
 }
 

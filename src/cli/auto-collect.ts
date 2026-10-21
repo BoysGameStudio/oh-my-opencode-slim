@@ -11,6 +11,7 @@ import { runCase } from '../evals/run-case';
 import type { EvalSuite, Transcript } from '../evals/schema';
 import { FAILED_TRIAL_MARKER } from '../evals/scoring';
 import { runWithSession } from '../evals/session-manager';
+import { EvalQuiescenceError } from '../evals/session-quiescence';
 import { cleanEvalArtifacts } from './git-lifecycle';
 
 // ── Library entry point ─────────────────────────────────────────────
@@ -44,6 +45,7 @@ export interface CollectSuiteResult {
  */
 export async function collectSuite(
   options: CollectSuiteOptions,
+  deps = { runWithSession, cleanEvalArtifacts, runCase },
 ): Promise<CollectSuiteResult> {
   const { suite, client, runs, concurrency, directory, outPath, timeoutMs } =
     options;
@@ -84,9 +86,10 @@ export async function collectSuite(
   let completedCount = 0;
   const t0 = Date.now();
   const ts = () => `[t=${((Date.now() - t0) / 1000).toFixed(0).padStart(3)}s]`;
+  let workerFailed = false;
 
   async function worker(pass: Task[]) {
-    while (true) {
+    while (!workerFailed) {
       const index = nextIndex++;
       if (index >= pass.length) return;
       const task = pass[index];
@@ -96,7 +99,7 @@ export async function collectSuite(
         label: string,
         attempt: number,
       ) =>
-        runWithSession(
+        deps.runWithSession(
           client,
           agent,
           prompt,
@@ -106,16 +109,21 @@ export async function collectSuite(
           timeoutMs,
           ts,
         );
-      const result = await runCase({
-        evalId: task.evalId,
-        prompt: task.prompt,
-        agent: task.agent,
-        runIndex: task.runIndex,
-        caseIndex: index + 1,
-        runs,
-        runViaServer,
-        ts,
-      });
+      const result = await deps
+        .runCase({
+          evalId: task.evalId,
+          prompt: task.prompt,
+          agent: task.agent,
+          runIndex: task.runIndex,
+          caseIndex: index + 1,
+          runs,
+          runViaServer,
+          ts,
+        })
+        .catch((error: unknown) => {
+          workerFailed = true;
+          throw error;
+        });
 
       if (!allTranscripts[task.evalId]) {
         allTranscripts[task.evalId] = [];
@@ -165,16 +173,27 @@ export async function collectSuite(
   for (let p = 0; p < passes.length; p++) {
     const pass = passes[p];
     nextIndex = 0;
-    await Promise.all(
+    const settled = await Promise.allSettled(
       Array.from({ length: Math.min(concurrency, pass.length) }, () =>
         worker(pass),
       ),
     );
+    const failures = settled.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      // Do not restore while another worker is still shutting down. Preserve
+      // the fail-closed classification even if a different worker failed first.
+      throw (
+        failures.find((error) => error instanceof EvalQuiescenceError) ??
+        failures[0]
+      );
+    }
     if (p < passes.length - 1) {
       console.log(
         `\n[t=${((Date.now() - t0) / 1000).toFixed(0).padStart(3)}s] Pass ${p + 1}/${passes.length} done \u2014 reverting eval edits for pass ${p + 2}...`,
       );
-      cleanEvalArtifacts(directory);
+      deps.cleanEvalArtifacts(directory);
     }
   }
 

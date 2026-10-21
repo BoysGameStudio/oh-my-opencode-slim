@@ -15,6 +15,8 @@ are advisory and never determine the exit code.
 - `suite-runner.ts`: validates the suite before stashing, collects live outputs
   or loads saved outputs, scores, saves results, and restores the worktree.
 - `session-manager.ts`: creates sessions and submits prompts.
+- `session-quiescence.ts`: aborts only the owned session tree and confirms idle
+  state before allowing cleanup; unknown shutdown state preserves the stash.
 - `polling-session.ts`: polls messages with stalls, timeout, and grace handling.
 - `session-messages.ts`: terminal-state and assistant-text helpers.
 - `run-case.ts`: trial retries and lock detection.
@@ -30,6 +32,14 @@ are advisory and never determine the exit code.
 
 Results are ignored under `src/evals/results/`. Do not commit file changes made
 by eval sessions as product code.
+
+Collection drains all workers before propagating errors. Every created root is
+stopped on success as well as failure, including discovered descendants; abort
+acknowledgements and two stable idle scans are required. Shutdown uncertainty
+throws `EvalQuiescenceError`, which prevents reset/clean/stash restoration and
+prints recovery context. A pending prompt dispatch is never treated as stopped
+just because an earlier abort returned successfully. See the recovery policy in
+the command documentation.
 
 ## Adding cases
 
