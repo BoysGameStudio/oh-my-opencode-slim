@@ -22,7 +22,7 @@ Centralized utilities and shared abstractions used across the oh-my-opencode-sli
 - **BackgroundJobCoordinator** (`background-job-coordinator.ts`): Lifecycle policy layer between board and consumers with terminal-state subscriptions, deferred-close policy, and metadata shaping
 - **BackgroundJobSupervisor** (`background-job-supervisor.ts`): One-shot wall-clock deadline supervision with timer/generation/abort mechanics
 - **BackgroundTaskConcurrency** (`background-task-concurrency.ts`): Process-local admission scheduler for native background task launches with model/provider capacity tracking
-- **Runtime Session Status** (`session-runtime-status.ts`): Reads and validates the in-process OpenCode session-status map with absent/unknown distinction
+- **Runtime Session Status** (`session-runtime-status.ts`): Reads and validates the in-process OpenCode session-status map with absent/unknown distinction; also reduces the `session.get` outcome/idleAt projection to terminal/pending/unknown verdicts for v2 recovery triage
 - **Session Metadata** (`session-metadata.ts`): Bounded session → agent/directory map with LRU eviction and active orchestrator protection
 - **Session Selection** (`session-selection.ts`): Session selection resolution with provenance tracking (host-persisted, observed-external, unknown)
 - **Child Transcript** (`child-transcript.ts`): Child session transcript evidence extraction and terminal evidence classification
@@ -164,9 +164,9 @@ Session metadata, the opencode client accessor, and the type-only call-shape con
 | `tui-reusable-projection.ts` | Board → tui-state projection for sidebar reusable dots |
 | `session.ts` | Session timeout, abort, and model-reference utilities |
 | `session-metadata.ts` | Bounded session → agent/directory store |
-| `session-runtime-status.ts` | Bounded live session-status map reads |
+| `session-runtime-status.ts` | Bounded live session-status map reads; host round-state verdicts from the session info projection |
 | `session-selection.ts` | Session selection resolution with provenance |
-| `child-transcript.ts` | Child session transcript evidence extraction |
+| `child-transcript.ts` | Child session transcript evidence extraction; v1 terminal classification, v2 recovery only reads latest-input time and terminal text (host state owns v2 terminality) |
 | `jsdom.ts` | JSDOM runtime detection without prerequisite |
 | `redact.ts` | Shape-based secret redaction for logging |
 | `logger.ts` | Process-wide file logging (pid-suffixed) |

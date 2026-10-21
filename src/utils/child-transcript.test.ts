@@ -4,7 +4,9 @@ import {
   classifyAssistantTurnEvidence,
   classifyTerminalEvidence,
   fetchChildTranscript,
+  latestInputAtOf,
   stringifyError,
+  terminalTextOf,
 } from './child-transcript';
 
 function message(overrides: {
@@ -28,6 +30,71 @@ function message(overrides: {
     parts: overrides.parts ?? [{ type: 'text', text: 'the answer' }],
   };
 }
+
+describe('host transcript round helpers', () => {
+  const transcript = {
+    data: [
+      {
+        info: {
+          role: 'user',
+          sourceType: 'user',
+          time: { created: 10 },
+        },
+        parts: [],
+      },
+      {
+        info: {
+          role: 'assistant',
+          sourceType: 'assistant',
+          time: { completed: 11 },
+        },
+        parts: [{ type: 'text', text: 'older answer' }],
+      },
+      {
+        info: {
+          role: 'synthetic',
+          sourceType: 'synthetic',
+          time: { created: 12 },
+        },
+        parts: [],
+      },
+      {
+        info: {
+          role: 'assistant',
+          sourceType: 'assistant',
+          time: { completed: 13 },
+        },
+        parts: [
+          { type: 'text', text: ' latest ' },
+          { type: 'text', text: 'answer ' },
+        ],
+      },
+    ],
+  };
+
+  test('latestInputAtOf uses the newest user or synthetic boundary', () => {
+    expect(latestInputAtOf(transcript)).toBe(12);
+    expect(latestInputAtOf({ data: [] })).toBeUndefined();
+    expect(latestInputAtOf(undefined)).toBeUndefined();
+  });
+
+  test('terminalTextOf returns the latest assistant text after the boundary', () => {
+    expect(terminalTextOf(transcript)).toBe('latest\nanswer');
+    expect(
+      terminalTextOf({
+        data: [transcript.data[0], transcript.data[1], transcript.data[2]],
+      }),
+    ).toBeUndefined();
+    expect(
+      terminalTextOf({
+        data: [
+          transcript.data[2],
+          { info: { role: 'assistant', sourceType: 'assistant' }, parts: [] },
+        ],
+      }),
+    ).toBe('');
+  });
+});
 
 test('stringifyError never throws on unserializable empty-message errors', () => {
   const error = Object.assign(new Error(''), { name: 'E', self: {} });

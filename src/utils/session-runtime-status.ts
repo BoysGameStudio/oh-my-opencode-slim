@@ -1,4 +1,5 @@
 import type { PluginInput } from '@opencode-ai/plugin';
+import type { CurrentRoundClassification } from './child-transcript';
 import { isRecord } from './guards';
 import { getClient } from './opencode-client';
 
@@ -132,6 +133,95 @@ export function runtimeSessionStatus(
   if (snapshot.error) return undefined;
   if (snapshot.malformedSessionIDs.has(sessionID)) return undefined;
   return snapshot.statuses.get(sessionID);
+}
+
+/** v2 host round evidence derived from the `session.get` info projection.
+ *  `outcome` and `time.idle` are written atomically with the idle message;
+ *  both absent means the latest round has no terminal transition. */
+export type HostRoundState =
+  | {
+      kind: 'terminal';
+      outcome: 'succeeded' | 'failed' | 'interrupted';
+      idleAt: number;
+    }
+  | { kind: 'pending' }
+  | { kind: 'unknown'; reason: string };
+
+/** Parse the host round state from a session info payload. A partially
+ *  projected round (one of outcome/time.idle present) is abnormal data and
+ *  fails closed; both absent is pending. */
+export function hostRoundStateOf(
+  info: Record<string, unknown> | undefined,
+): HostRoundState {
+  const outcome = info?.outcome;
+  const time = isRecord(info?.time) ? info.time : undefined;
+  const idleAt = time?.idle;
+  const outcomePresent = outcome !== undefined && outcome !== null;
+  if (!outcomePresent && idleAt === undefined) return { kind: 'pending' };
+  if (
+    !outcomePresent ||
+    typeof idleAt !== 'number' ||
+    !Number.isFinite(idleAt) ||
+    (outcome !== 'succeeded' &&
+      outcome !== 'failed' &&
+      outcome !== 'interrupted')
+  ) {
+    return { kind: 'unknown', reason: 'host outcome and idle time disagree' };
+  }
+  return { kind: 'terminal', outcome, idleAt };
+}
+
+/** A terminal verdict requires an idle time strictly after the latest input;
+ *  otherwise the round is pending — never a guessed stop. Service-level
+ *  claims survive a graceful shutdown on purpose, so the host may still
+ *  resume the latest round after a restart. */
+export function hostRoundVerdict(
+  state: HostRoundState,
+  latestInputAt: number | undefined,
+): 'terminal' | 'pending' | 'unknown' {
+  if (state.kind === 'unknown') return 'unknown';
+  if (state.kind === 'pending') return 'pending';
+  return latestInputAt !== undefined && state.idleAt > latestInputAt
+    ? 'terminal'
+    : 'pending';
+}
+
+/** Legacy classification shape: pending is incomplete; unknown is unreadable. */
+export function composeHostRound(
+  state: HostRoundState,
+  latestInputAt: number | undefined,
+): CurrentRoundClassification {
+  const verdict = hostRoundVerdict(state, latestInputAt);
+  if (verdict === 'unknown') {
+    return {
+      verdict: 'unreadable',
+      reason: state.kind === 'unknown' ? state.reason : 'host state is unknown',
+    };
+  }
+  if (verdict !== 'terminal' || state.kind !== 'terminal') {
+    return { verdict: 'incomplete', startedAt: latestInputAt };
+  }
+  switch (state.outcome) {
+    case 'succeeded':
+      return {
+        verdict: 'completed',
+        startedAt: latestInputAt,
+        completedAt: state.idleAt,
+      };
+    case 'failed':
+      return {
+        verdict: 'error',
+        text: 'The historical round failed before an assistant result.',
+        startedAt: latestInputAt,
+        completedAt: state.idleAt,
+      };
+    case 'interrupted':
+      return {
+        verdict: 'interrupted',
+        startedAt: latestInputAt,
+        completedAt: state.idleAt,
+      };
+  }
 }
 
 async function withTimeout<T>(

@@ -1,13 +1,18 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 import {
   classifyTerminalEvidence,
-  classifyV2HistoricalRound,
   fetchChildTranscript,
+  latestInputAtOf,
+  terminalTextOf,
 } from '../utils/child-transcript';
 import { isRecord } from '../utils/guards';
 import { getClient } from '../utils/opencode-client';
 import { SESSION_ID_PATTERN, withTimeout } from '../utils/session';
-import { getRuntimeSessionStatusSnapshot } from '../utils/session-runtime-status';
+import {
+  composeHostRound,
+  getRuntimeSessionStatusSnapshot,
+  hostRoundStateOf,
+} from '../utils/session-runtime-status';
 
 /** Each untracked host read (ownership, transcript) refuses after 5 s. */
 const DEFAULT_READ_TIMEOUT_MS = 5_000;
@@ -23,7 +28,7 @@ export interface UntrackedEvidence {
   };
   round?:
     | Awaited<ReturnType<typeof classifyTerminalEvidence>>
-    | Awaited<ReturnType<typeof classifyV2HistoricalRound>>;
+    | ReturnType<typeof composeHostRound>;
   roundError?: unknown;
 }
 
@@ -82,6 +87,7 @@ export async function verifyUntrackedOwnership(
   return {
     kind: 'verified',
     agent,
+    hostInfo: data,
     createdAt:
       typeof created === 'number' && Number.isFinite(created)
         ? created
@@ -98,11 +104,20 @@ export async function readUntrackedEvidence(
     statusTimeoutMs?: number;
   },
   identity: string,
+  hostInfo?: Record<string, unknown>,
 ): Promise<UntrackedEvidence> {
   const readTimeoutMs = options.readTimeoutMs ?? DEFAULT_READ_TIMEOUT_MS;
   const client = getClient(options.input);
   const v2 = (options.input as { hostFlavor?: string }).hostFlavor === 'v2';
-  if (v2) return readTranscript(client, options, identity, readTimeoutMs, true);
+  if (v2)
+    return readTranscript(
+      client,
+      options,
+      identity,
+      readTimeoutMs,
+      true,
+      hostInfo,
+    );
   const snapshot = await getRuntimeSessionStatusSnapshot(options.input, {
     timeoutMs: options.statusTimeoutMs,
   });
@@ -127,6 +142,7 @@ async function readTranscript(
   identity: string,
   readTimeoutMs: number,
   v2: boolean,
+  hostInfo?: Record<string, unknown>,
 ): Promise<UntrackedEvidence> {
   const live: UntrackedEvidence['live'] = { status: v2 ? 'v2' : 'absent' };
   try {
@@ -142,12 +158,18 @@ async function readTranscript(
       readTimeoutMs,
       'child transcript read timed out',
     );
-    return {
-      live,
-      round: v2
-        ? classifyV2HistoricalRound(transcript)
-        : classifyTerminalEvidence(transcript),
-    };
+    if (!v2) {
+      return { live, round: classifyTerminalEvidence(transcript) };
+    }
+    const state = hostRoundStateOf(hostInfo);
+    const latestInputAt = latestInputAtOf(transcript);
+    const round = composeHostRound(state, latestInputAt);
+    if (state.kind === 'terminal') {
+      const text = terminalTextOf(transcript);
+      if (text) round.text = text;
+      else round.reason = 'answer text is not readable yet';
+    }
+    return { live, round };
   } catch (error) {
     return { live, roundError: error };
   }
