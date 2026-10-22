@@ -1658,6 +1658,20 @@ function buildPresetRow(
   });
 }
 
+/**
+ * Ambient "a newer release exists" badge for the v2 `sidebar.footer` slot
+ * (see `./v2/update-notice`). The toast is transient; this line is the trace
+ * that survives being missed, so it stays muted, single-row and unselectable
+ * — it must never wrap, grow the sidebar, or compete with the agent rows.
+ */
+export function renderUpdateBadge(latest: string, color: unknown): JSX.Element {
+  return box({ flexDirection: 'row', flexShrink: 0 }, [
+    text({ fg: color, wrapMode: 'none', selectable: false }, [
+      `OMO ↑${latest}`,
+    ]),
+  ]);
+}
+
 export interface SidebarConfigState {
   configInvalid: boolean;
   compactSidebar: boolean;
