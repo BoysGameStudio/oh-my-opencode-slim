@@ -17,6 +17,28 @@ import {
 import { composeHostRound, hostRoundStateOf } from './session-runtime-status';
 
 describe('diagnostic excerpts', () => {
+  test('budget truncation counts a pre-start boundary input only once', () => {
+    const result = diagnosticExcerptOf(
+      {
+        data: [
+          { info: { role: 'user', time: { created: 99 } }, parts: [] },
+          {
+            info: { role: 'assistant', time: { created: 110 } },
+            parts: [{ type: 'text', text: 'x'.repeat(200) }],
+          },
+        ],
+      },
+      { runStartedAt: 100, maxBytes: 100 },
+    );
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.omittedMessages).toBe(1);
+    expect(result.text).toContain('1 earlier messages omitted');
+    expect(result.truncated).toBe('messages,chars');
+    expect(
+      new TextEncoder().encode(result.text).byteLength,
+    ).toBeLessThanOrEqual(100);
+  });
+
   test('real v2 compacted context reports omitted maintenance messages', async () => {
     const input = buildPluginInput({
       session: {

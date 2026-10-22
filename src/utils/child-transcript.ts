@@ -346,12 +346,11 @@ export function diagnosticExcerptOf(
   );
   const chunks: string[] = [];
   let omittedMessages = window.omittedMessages + Math.max(0, boundary);
-  if (
+  const boundaryCounted =
     runStartedAt !== undefined &&
     typeof entries[boundary]?.info?.time?.created === 'number' &&
-    (entries[boundary].info?.time?.created as number) < runStartedAt
-  )
-    omittedMessages++;
+    (entries[boundary].info?.time?.created as number) < runStartedAt;
+  if (boundaryCounted) omittedMessages++;
   let compactionMessages = 0;
   let bytes = 0;
   for (let index = entries.length - 1; index > boundary; index--) {
@@ -411,7 +410,8 @@ export function diagnosticExcerptOf(
     chunks.unshift(text);
     bytes += new TextEncoder().encode(text).byteLength + 1;
     if (bytes >= budget) {
-      omittedMessages += index - Math.max(0, boundary);
+      omittedMessages +=
+        index - Math.max(0, boundary) - (boundaryCounted ? 1 : 0);
       charsCut = true;
       break;
     }
