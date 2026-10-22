@@ -2174,12 +2174,13 @@ export function createOrchestratorWakeScheduler(
       // neither evidenced work remains, the wake ends here. An overflow
       // marker remains actionable even when all retained details have
       // since gone stale.
-      const childInputDeltas = pendingChildInputWakes.get(sessionID);
+      let childInputDeltas = pendingChildInputWakes.get(sessionID);
       if (
         childInputDeltas &&
         prunedToEmpty(childInputQueue, childInputDeltas)
       ) {
         pendingChildInputWakes.delete(sessionID);
+        childInputDeltas = undefined;
         if (!recoveryBatch && !completedBatch) return false;
       }
       // A stale, revived, or already-reconciled detail must not cause a
@@ -2188,14 +2189,18 @@ export function createOrchestratorWakeScheduler(
       if (recoveryBatch && prunedToEmpty(stoppedRecoveryQueue, recoveryBatch)) {
         pendingStoppedRecoveries.delete(sessionID);
         recoveryBatch = undefined;
-        if (!completedBatch) return false;
+        // A still-queued child question must not be stranded here: its own
+        // settling timer already fired, and the only remaining timer (the
+        // periodic path) stops when the parent has no incomplete TODOs
+        // (Greptile P1 4344705554).
+        if (!completedBatch && !childInputDeltas) return false;
       }
       // A completed result whose record reopened, left the parent, or was
       // already consumed must not wake the parent on its own.
       if (completedBatch && prunedToEmpty(completedJobQueue, completedBatch)) {
         pendingCompletedJobs.delete(sessionID);
         completedBatch = undefined;
-        if (!recoveryBatch) return false;
+        if (!recoveryBatch && !childInputDeltas) return false;
       }
 
       const modelSelection =
@@ -2238,7 +2243,11 @@ export function createOrchestratorWakeScheduler(
       if (recoveryBatch && prunedToEmpty(stoppedRecoveryQueue, recoveryBatch)) {
         pendingStoppedRecoveries.delete(sessionID);
         recoveryBatch = undefined;
-        if (!completedBatch) return false;
+        // Same stranding guard as the pre-selection prune: a still-queued
+        // child question has no timer left after this one.
+        if (!completedBatch && !pendingChildInputWakes.get(sessionID)) {
+          return false;
+        }
       }
       if (completedBatch && prunedToEmpty(completedJobQueue, completedBatch)) {
         pendingCompletedJobs.delete(sessionID);

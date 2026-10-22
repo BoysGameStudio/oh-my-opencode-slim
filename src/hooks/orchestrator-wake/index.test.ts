@@ -166,6 +166,7 @@ function createScheduler(options?: {
   isFallbackInProgress?: (id: string) => boolean;
   isStoppedJobRecoveryCurrent?: (taskID: string, generation: number) => boolean;
   isChildInputWaitCurrent?: (taskID: string, requestID: string) => boolean;
+  isCompletedJobCurrent?: (taskID: string, generation: number) => boolean;
   isWriterLaneTask?: (taskID: string) => boolean;
   hasPendingDelegatedWork?: (id: string) => boolean;
   resolveSelection?: (sessionID: string) => Promise<{
@@ -200,6 +201,7 @@ function createScheduler(options?: {
     isFallbackInProgress: options?.isFallbackInProgress,
     isStoppedJobRecoveryCurrent: options?.isStoppedJobRecoveryCurrent,
     isChildInputWaitCurrent: options?.isChildInputWaitCurrent,
+    isCompletedJobCurrent: options?.isCompletedJobCurrent,
     isWriterLaneTask: options?.isWriterLaneTask,
     hasPendingDelegatedWork: options?.hasPendingDelegatedWork,
     resolveSelection: options?.resolveSelection,
@@ -968,6 +970,64 @@ describe('orchestrator wake scheduler', () => {
     expect(
       call?.body.parts[0]?.metadata?.['oh-my-opencode-slim.terminalDelta'],
     ).toEqual([fence]);
+  });
+
+  test('a reopened completed result does not strand a queued child question', async () => {
+    const promptAsync = mock(async () => ({}));
+    let reopened = false;
+    const { scheduler } = createScheduler({
+      isCompletedJobCurrent: () => !reopened,
+      isChildInputWaitCurrent: () => true,
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+    scheduler.triggerChildInputWaitWake(
+      'p1',
+      formatChildInputWaitDelta({
+        alias: 'fix-1',
+        taskID: 'ses_q',
+        kind: 'permission',
+        requestID: 'r1',
+        detail: 'permission: external_directory\npatterns: /approved/*',
+      }),
+      'ses_q:r1',
+    );
+    scheduler.triggerCompletedJobPublication(
+      'p1',
+      formatCompletedJobDelta({
+        alias: 'exp-1',
+        taskID: 'ses_done',
+        state: 'completed',
+        resultSummary: 'the answer',
+      }),
+      'ses_done:2',
+      {
+        taskID: 'ses_done',
+        generation: 2,
+        terminalRevision: 3,
+        state: 'completed' as const,
+      },
+    );
+    // The completed task reopens before the parent goes idle: its queued
+    // result is stale, but the still-open question must still be delivered —
+    // the settle timer was the last non-periodic timer (Greptile P1
+    // 4344705554).
+    reopened = true;
+    await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const call = (
+      promptAsync.mock.calls as unknown as Array<
+        [{ body: { parts: Array<{ text: string }> } }]
+      >
+    )[0]?.[0];
+    expect(call?.body.parts[0]?.text).toContain(
+      'permission: external_directory',
+    );
+    expect(call?.body.parts[0]?.text).not.toContain('<completed-job>');
   });
 
   test('completed-job overflow keeps a bounded batch and a task_status pointer', async () => {
