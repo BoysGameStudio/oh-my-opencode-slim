@@ -46,15 +46,15 @@ async function executeSg(
   const setTimer = dependencies.setTimeout ?? setTimeout;
   const clearTimer = dependencies.clearTimeout ?? clearTimeout;
   let timer: TimerHandle | undefined;
+  let proc: SearchProcess | undefined;
 
   try {
-    const proc = spawn([cliPath, 'run', '--json=compact', ...args], {
+    proc = spawn([cliPath, 'run', '--json=compact', ...args], {
       stdout: 'pipe',
       stderr: 'pipe',
     });
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimer(() => {
-        proc.kill();
         reject(new Error(`Search timeout after ${DEFAULT_TIMEOUT_MS}ms`));
       }, DEFAULT_TIMEOUT_MS);
     });
@@ -63,47 +63,57 @@ async function executeSg(
       Promise.all([proc.stdout(), proc.stderr(), proc.exited]),
       timeoutPromise,
     ]);
+  } catch (error) {
+    proc?.kill();
+    throw error;
   } finally {
     if (timer !== undefined) clearTimer(timer);
   }
 }
 
-// Use a single init promise to avoid race conditions
+// Share initialization and recovery so callers cannot overwrite one download.
 let initPromise: Promise<string | null> | null = null;
 
+function initializeAstGrep(
+  dependencies: RunDependencies = {},
+  failedPath?: string,
+): Promise<string | null> {
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    const findBinary = dependencies.findBinary ?? findSgCliPathSync;
+    const ensureBinary = dependencies.ensureBinary ?? ensureAstGrepBinary;
+    // A stale path may have an installed replacement; try it offline.
+    // Do not rediscover an existing binary that already failed to execute.
+    const syncPath =
+      !failedPath || !existsSync(failedPath) ? findBinary() : null;
+    const recoveredPath =
+      syncPath && existsSync(syncPath)
+        ? syncPath
+        : await ensureBinary(failedPath);
+    if (recoveredPath) setSgCliPath(recoveredPath);
+    return recoveredPath;
+  })().finally(() => {
+    initPromise = null;
+  });
+
+  return initPromise;
+}
+
 export async function getAstGrepPath(): Promise<string | null> {
+  if (initPromise) return initPromise;
+
   const currentPath = getSgCliPath();
   if (currentPath !== 'sg' && existsSync(currentPath)) {
     return currentPath;
   }
 
-  if (initPromise) {
-    return initPromise;
-  }
-
-  initPromise = (async () => {
-    const syncPath = findSgCliPathSync();
-    if (syncPath && existsSync(syncPath)) {
-      setSgCliPath(syncPath);
-      return syncPath;
-    }
-
-    const downloadedPath = await ensureAstGrepBinary();
-    if (downloadedPath) {
-      setSgCliPath(downloadedPath);
-      return downloadedPath;
-    }
-
-    return null;
-  })();
-
-  return initPromise;
+  return initializeAstGrep();
 }
 
 export function startBackgroundInit(): void {
   if (!initPromise) {
-    initPromise = getAstGrepPath();
-    initPromise.catch((err) => {
+    getAstGrepPath().catch((err) => {
       console.warn(
         '[ast-grep] Background initialization failed:',
         err?.message ?? err,
@@ -139,8 +149,6 @@ export async function runSg(
   let cliPath = getSgCliPath();
 
   const timeout = DEFAULT_TIMEOUT_MS;
-  const ensureBinary = dependencies.ensureBinary ?? ensureAstGrepBinary;
-  const findBinary = dependencies.findBinary ?? findSgCliPathSync;
   let stdout = '';
   let stderr = '';
   let exitCode = 1;
@@ -172,11 +180,11 @@ export async function runSg(
         let recoveryError = '';
         if (attempt === 0) {
           try {
-            // A stale path may have an installed replacement; try it offline.
-            const recoveredPath =
-              (!present ? findBinary() : null) ?? (await ensureBinary(cliPath));
+            const recoveredPath = await initializeAstGrep(
+              dependencies,
+              cliPath,
+            );
             if (recoveredPath) {
-              setSgCliPath(recoveredPath);
               cliPath = recoveredPath;
               continue;
             }
