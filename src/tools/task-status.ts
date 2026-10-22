@@ -15,10 +15,17 @@ import {
   createBackgroundJobTerminalGate,
   type GateResult,
   runtimeObservationFromSnapshot,
+  STOPPED_WITHOUT_TERMINAL_RESULT,
 } from '../utils/background-job-terminal-gate';
+import {
+  DIAGNOSTIC_MAX_BYTES,
+  diagnosticExcerptOf,
+  diagnosticTail,
+  fetchChildTranscript,
+} from '../utils/child-transcript';
 import { isRecord } from '../utils/guards';
 import { getClient } from '../utils/opencode-client';
-import { SESSION_ID_PATTERN } from '../utils/session';
+import { SESSION_ID_PATTERN, withTimeout } from '../utils/session';
 import {
   raceEvidenceDeadline,
   readHostSessionInfo,
@@ -30,7 +37,11 @@ import {
   runtimeSessionStatus,
 } from '../utils/session-runtime-status';
 import type { TaskActivityTracker } from './task-activity';
-import { observationFromSnapshot, summarizeTaskStatus } from './task-policy';
+import {
+  observationFromSnapshot,
+  resolveLastActivity,
+  summarizeTaskStatus,
+} from './task-policy';
 import {
   type CanonicalTaskResolver,
   idParamFor,
@@ -131,12 +142,14 @@ function committedStatusOutput(
   record: BackgroundJobRecord,
   lastActivityAt: number,
   now: number,
+  activitySource: string,
 ): string {
   return [
     `Task ${record.alias} (${record.taskID})`,
     `state: ${terminalStateOf(record)}`,
     `agent: ${record.agent}`,
     `last_activity_at: ${new Date(lastActivityAt).toISOString()}`,
+    `last_activity_source: ${activitySource}`,
     `idle_for_seconds: ${Math.max(
       0,
       Math.floor((now - (lastActivityAt ?? now)) / 1000),
@@ -166,19 +179,29 @@ export function createTaskStatusTool(options: {
   const z = tool.schema;
   const task_status = tool({
     description:
-      "Inspect a tracked child task without resuming, prompting, or changing it. It accepts its task ID or parent-scoped alias. Pass result: true for a completed task's final text; refuses other terminals. For an untracked session (e.g. after a restart), reports a read-only observed state.",
+      "Inspect a tracked child task without resuming, prompting, or changing it. It accepts its task ID or parent-scoped alias. Pass result: true for a completed task's final text; refuses other terminals. For an untracked session (e.g. after a restart), reports a read-only observed state. diagnostic: true returns a bounded, non-final excerpt for a failed/cancelled/stopped child.",
     args: {
       ...taskRefArgs(idParam),
       result: z
         .boolean()
         .optional()
         .describe('Return the completed task’s final text.'),
+      diagnostic: z
+        .boolean()
+        .optional()
+        .describe(
+          'Return a bounded partial-output excerpt for a failed, cancelled, or stopped child. Read-only; does not consume or acknowledge anything.',
+        ),
     },
     async execute(args, toolContext) {
       const parentSessionID = toolContext?.sessionID;
       if (!parentSessionID) throw new Error('task_status requires sessionID');
       const requested = readTaskRef(args, idParam);
       if (!requested) throw new Error(`task_status requires ${idParam}`);
+      if (args.result === true && args.diagnostic === true)
+        throw new Error(
+          'task_status accepts either result or diagnostic, not both',
+        );
       if (args.result === true)
         return readTaskResult(
           {
@@ -191,6 +214,12 @@ export function createTaskStatusTool(options: {
           },
           { parentSessionID, idParam, requested },
         );
+      if (args.diagnostic === true)
+        return readTaskDiagnostic(options, {
+          parentSessionID,
+          idParam,
+          requested,
+        });
       const canonical = options.resolveCanonicalTaskRef
         ? await options.resolveCanonicalTaskRef(parentSessionID, requested)
         : undefined;
@@ -239,10 +268,8 @@ export function createTaskStatusTool(options: {
       const observation = observationFromSnapshot(snapshot, taskID);
       const now = options.now?.() ?? Date.now();
       let renderRecord = current;
-      let lastActivityAt =
-        options.activityTracker?.lastActivityAt(taskID) ??
-        current.lastLiveBusyAt ??
-        current.runStartedAt;
+      let activity = resolveLastActivity(current, options.activityTracker);
+      let lastActivityAt = activity.at;
       let report = summarizeTaskStatus(
         renderRecord,
         observation,
@@ -262,10 +289,8 @@ export function createTaskStatusTool(options: {
           terminalProbe.record.generation === current.generation
         ) {
           renderRecord = terminalProbe.record;
-          lastActivityAt =
-            options.activityTracker?.lastActivityAt(taskID) ??
-            renderRecord.lastLiveBusyAt ??
-            renderRecord.runStartedAt;
+          activity = resolveLastActivity(renderRecord, options.activityTracker);
+          lastActivityAt = activity.at;
           report = summarizeTaskStatus(
             renderRecord,
             observation,
@@ -281,6 +306,7 @@ export function createTaskStatusTool(options: {
             terminalProbe.record,
             lastActivityAt,
             now,
+            activity.source,
           );
         }
       }
@@ -290,6 +316,7 @@ export function createTaskStatusTool(options: {
         `state: ${report.state}${report.uncertain ? ' (unconfirmed)' : ''}`,
         `agent: ${renderRecord.agent}`,
         `last_activity_at: ${new Date(lastActivityAt).toISOString()}`,
+        `last_activity_source: ${activity.source}`,
         `idle_for_seconds: ${report.idleSeconds}`,
         `possibly_stuck: ${report.possiblyStuck}`,
       ];
@@ -666,6 +693,189 @@ interface UntrackedStatusOptions {
   readTimeoutMs?: number;
 }
 
+const DIAGNOSTIC_TERMINALS = new Set(['error', 'cancelled', 'stopped']);
+
+/** Cap every variable header field as well as the excerpt. Newlines in host
+ * reasons cannot impersonate protocol header lines. */
+function diagnosticField(value: string): string {
+  const tail = diagnosticTail(value, 512).replace(/[\r\n]/g, ' ');
+  return tail.length < value.length ? `[... truncated ...] ${tail}` : tail;
+}
+
+function diagnosticRefusal(taskID: string, state: string): string {
+  return [
+    `Task ${diagnosticField(taskID)}`,
+    `state: ${state}`,
+    'message: Diagnostics are only for finished-but-unsuccessful children (error, cancelled, stopped).',
+    state === 'completed'
+      ? 'next: retry task_status with { result: true }'
+      : `next: ${UNCONFIRMED_NEXT}`,
+  ].join('\n');
+}
+
+function renderDiagnostic(
+  info: {
+    taskID: string;
+    alias?: string;
+    state: string;
+    generation: number | 'untracked';
+    reason: string;
+    source?: string;
+  },
+  transcript: unknown,
+  unavailable?: string,
+): string {
+  const header = [
+    `Task ${diagnosticField(info.alias ?? info.taskID)} (${diagnosticField(info.taskID)})`,
+    `state: ${info.state}`,
+    `generation: ${info.generation}`,
+    `terminal_reason: ${diagnosticField(info.reason)}`,
+    'partial_output: true (non-final excerpt; not the task result; read-only)',
+  ].join('\n');
+  // Reserve the entire envelope, including the longest truncation label. The
+  // remaining byte budget belongs to the excerpt, not the whole 6 KiB.
+  const footer = `\nexcerpt_end\ntruncated: messages,chars\nevidence: ${info.source ?? 'transcript'}`;
+  const budget =
+    DIAGNOSTIC_MAX_BYTES -
+    new TextEncoder().encode(`${header}\nexcerpt_begin\n${footer}`).byteLength;
+  const excerpt = unavailable
+    ? { unavailable }
+    : diagnosticExcerptOf(transcript, { maxBytes: budget });
+  if ('unavailable' in excerpt)
+    return `${header}\nexcerpt: none (evidence unavailable)\nevidence: unavailable (${diagnosticField(excerpt.unavailable)})`;
+  return `${header}\nexcerpt_begin\n${excerpt.text}\nexcerpt_end\ntruncated: ${excerpt.truncated}\nevidence: ${info.source ?? 'transcript'}`;
+}
+
+/** Diagnostic reads deliberately bypass snapshots, the gate, and consumption. */
+async function readTaskDiagnostic(
+  options: UntrackedStatusOptions & {
+    resolveCanonicalTaskRef?: CanonicalTaskResolver;
+  },
+  ref: TaskResultReadRef,
+): Promise<string> {
+  const { parentSessionID, requested } = ref;
+  const board = options.backgroundJobBoard;
+  const resolution = await resolveTaskRecord(
+    options,
+    parentSessionID,
+    requested,
+  );
+  if (resolution.kind === 'disposed') throw new Error(pluginDisposedMessage());
+  if (resolution.kind === 'refused')
+    throw new Error(
+      withRecentTaskHandles(
+        resolution.reason,
+        recentTaskHandles(board, parentSessionID),
+      ),
+    );
+  const { identity } = resolution;
+  const job = resolution.job ?? board.get(identity);
+  if (job) {
+    if (job.parentSessionID !== parentSessionID)
+      throw new Error(`Task ${identity} does not belong to this session`);
+    const state = terminalStateOf(job);
+    if (!DIAGNOSTIC_TERMINALS.has(state))
+      return diagnosticRefusal(
+        job.taskID,
+        state === 'completed' ? state : 'running',
+      );
+    const generation = job.generation;
+    const revision = job.terminalRevision;
+    const reason =
+      state === 'error'
+        ? (job.lastStatusError ??
+          job.resultSummary ??
+          'no error details available')
+        : state === 'cancelled'
+          ? (job.resultSummary?.replace(/^cancelled:\s*/i, '') ?? 'cancelled')
+          : (job.resultSummary ?? STOPPED_WITHOUT_TERMINAL_RESULT);
+    let transcript: unknown;
+    let unavailable: string | undefined;
+    const controller = new AbortController();
+    try {
+      transcript = await withTimeout(
+        fetchChildTranscript(
+          getClient(options.input),
+          job.taskID,
+          options.input.directory,
+          100,
+          controller.signal,
+        ),
+        options.readTimeoutMs ?? 5_000,
+        'child transcript read timed out',
+      );
+    } catch (error) {
+      controller.abort();
+      unavailable =
+        error instanceof Error ? error.message : 'child transcript read failed';
+    }
+    const latest = board.get(job.taskID);
+    if (
+      !latest ||
+      latest.generation !== generation ||
+      latest.terminalRevision !== revision ||
+      !DIAGNOSTIC_TERMINALS.has(terminalStateOf(latest))
+    )
+      throw new Error(
+        `Task ${job.taskID} changed generation while its diagnostic was being read`,
+      );
+    return renderDiagnostic(
+      { taskID: job.taskID, alias: job.alias, state, generation, reason },
+      transcript,
+      unavailable,
+    );
+  }
+  const ownership = await verifyUntrackedOwnership(
+    options,
+    identity,
+    parentSessionID,
+  );
+  if (ownership.kind === 'foreign-parent')
+    throw new Error(`Task ${identity} does not belong to this session`);
+  if (ownership.kind !== 'verified' || options.isDisposed?.())
+    throw new Error(
+      withRecentTaskHandles(
+        `Unknown task ID or alias: ${identity}`,
+        recentTaskHandles(board, parentSessionID),
+      ),
+    );
+  const evidence = await readUntrackedEvidence(
+    options,
+    identity,
+    ownership.hostInfo,
+  );
+  if (evidence.live.status === 'busy' || evidence.live.status === 'retry')
+    return diagnosticRefusal(identity, 'running');
+  const round = evidence.round;
+  if (
+    evidence.live.status !== 'unknown' &&
+    (round?.verdict === 'error' || round?.verdict === 'interrupted')
+  )
+    return renderDiagnostic(
+      {
+        taskID: identity,
+        state: round.verdict === 'error' ? 'error' : 'stopped',
+        generation: 'untracked',
+        reason:
+          ('text' in round ? round.text : undefined) ??
+          ('reason' in round ? round.reason : undefined) ??
+          round.verdict,
+        source: evidence.live.status === 'v2' ? 'host state' : 'history',
+      },
+      evidence.transcript,
+    );
+  if (round?.verdict === 'completed')
+    return diagnosticRefusal(identity, 'completed');
+  const reason =
+    evidence.live.reason ??
+    (evidence.roundError instanceof Error
+      ? evidence.roundError.message
+      : undefined) ??
+    (round && 'reason' in round ? round.reason : undefined) ??
+    'no verified terminal round';
+  return `${diagnosticRefusal(identity, `${UNTRACKED_STATE} (uncertain; ${diagnosticField(reason)})`)}\nexcerpt: none (evidence unavailable (${diagnosticField(reason)}))`;
+}
+
 /**
  * Read-only status for a task the board does not track: ownership and
  * evidence both come from the shared untracked-read module — the same
@@ -705,6 +915,7 @@ async function reportUntrackedTaskStatus(
   const details = [
     `Task ${identity} is not tracked by the local background job board (its tracking does not survive a host or plugin restart).`,
     'board: untracked',
+    'last_activity_source: unknown',
   ];
 
   const evidence = await readUntrackedEvidence(

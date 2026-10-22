@@ -812,6 +812,26 @@ Do not interpret a restored task row as proof that execution resumed, and do
 not blindly resend continuation prompts after uncertain admission. This plugin
 does not add placeholder agents or automatically relaunch work to mask the race.
 
+### Read-only task diagnostics
+
+`task_status` accepts `diagnostic: true` for failed, cancelled, or stopped
+children. Its owned-untracked fallback after restart uses host outcome plus
+transcript evidence for failed/interrupted v2 children (v1 uses history).
+It never registers, prompts, or reconciles a child. Running children are
+refused; completed children use `result: true`. Missing or ambiguous evidence
+is explicit. Excerpts include assistant text and short assistant/failed-tool
+errors, not tool inputs or successful outputs; the complete response fits
+6,144 UTF-8 bytes, including labels and truncation markers.
+
+Diagnostics are read-only and not consumption or acknowledgement. Observed
+state is evidence, execution completion ends a run, and parent acceptance is
+separate; diagnostics do not replace the completion/acceptance flow.
+`last_activity_source` reports `observed-activity` (tracker event, possibly
+lagging), `host-busy` (coarse host activity beyond run start, not progress),
+`launch-time` (no activity evidence beyond the run start time, not proof of
+inactivity), or `unknown`. Session-keyed tracker entries may predate a revive;
+the underlying activity timestamps are unchanged.
+
 ### Rehydrate existence probe (`session.get`)
 
 Rehydration re-registers persisted *running* task tool parts so a plugin

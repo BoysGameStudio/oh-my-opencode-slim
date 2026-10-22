@@ -70,7 +70,7 @@ conservatively passes the path through. Disable with
 | Tool | Description |
 |------|-------------|
 | `task` | Start a specialist task and return its task ID |
-| `task_status` | Check the status of a task; `result: true` retrieves its result |
+| `task_status` | Check task status; `result: true` retrieves a completed result; `diagnostic: true` reads an unsuccessful child's partial excerpt |
 | `task_message` | Send a non-interrupting message and return `queued` (queue-only: no wake, no steer channel) |
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction (v1 only; on v2 continue with `subagent(sessionID, prompt)`) |
@@ -229,6 +229,27 @@ and only when it matches that result's session ID and original agent argument.
 A numbered alias is issued only to children of a parent created while the
 plugin instance runs (see [Background Orchestration](background-orchestration.md));
 any other new task is still created and is referred to by its exact session ID.
+
+`task_status` reports `last_activity_source` alongside tracked activity time:
+`observed-activity` means a tracker event (completed assistant/step or host
+busy/retry), which may lag the host; `host-busy` is a coarse busy observation
+beyond the run start, not proof of useful work; `launch-time` means no activity
+evidence beyond the run start time, not proof the child did nothing; `unknown`
+means no activity evidence is available. Tracker entries are session-keyed, so
+a pre-revive entry can supply an older timestamp; timestamps are unchanged.
+
+Use `diagnostic: true` only for finished-but-unsuccessful children: error,
+cancelled, or stopped. It returns a labelled, non-final tail excerpt, including
+short assistant errors and failed-tool error text, never tool inputs or
+successful tool outputs. The entire response is capped at 6,144 UTF-8 bytes,
+with at most 40 trailing messages, 100 trailing parts per message, and 2,000
+characters per message; truncation
+and unavailable evidence are explicit. Running children are refused; completed
+children point to `result: true`. The two modes are mutually exclusive.
+Diagnostics are read-only, not consumption or acknowledgement: observed state
+is evidence, execution completion ends a run, and parent acceptance is a
+separate decision. Diagnostic reads do not reconcile or resume a child.
+
 `task_status`, `task_message`, `task_reply`, `task_cancel`,
 `task_revive`, and an explicit resume ID resolve a non-exact alias from the
 board first, else from the markers in one read of the parent's readable history,

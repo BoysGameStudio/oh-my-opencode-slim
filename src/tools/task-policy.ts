@@ -4,9 +4,31 @@ import {
   type RuntimeSessionStatusSnapshot,
   runtimeSessionStatus,
 } from '../utils/session-runtime-status';
+import type { TaskActivityTracker } from './task-activity';
 
 /** A live child is reported possibly stuck after this much time without activity. */
 export const STUCK_IDLE_THRESHOLD_MS = 120_000;
+
+/** Preserve the timestamp fallback chain; provenance is not proof of progress. */
+export function resolveLastActivity(
+  record: BackgroundJobRecord,
+  tracker?: TaskActivityTracker,
+) {
+  const observed = tracker?.lastActivityAt(record.taskID);
+  const at = observed ?? record.lastLiveBusyAt ?? record.runStartedAt;
+  const source =
+    observed !== undefined
+      ? 'observed-activity'
+      : record.lastLiveBusyAt !== undefined &&
+          record.lastLiveBusyAt > record.runStartedAt
+        ? 'host-busy'
+        : at !== undefined
+          ? 'launch-time'
+          : 'unknown';
+  // Equality can also occur on a reopened run: launch-time means no activity
+  // evidence beyond the run start time, not that the child did nothing.
+  return { at, source };
+}
 
 /**
  * Bounded, explicit observation of a tracked child's live session status.

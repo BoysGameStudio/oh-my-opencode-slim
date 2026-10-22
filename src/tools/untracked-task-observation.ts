@@ -31,6 +31,7 @@ export interface UntrackedEvidence {
     | Awaited<ReturnType<typeof classifyTerminalEvidence>>
     | ReturnType<typeof composeHostRound>;
   roundError?: unknown;
+  transcript?: unknown;
 }
 
 async function boundedRead<T>(
@@ -164,7 +165,7 @@ async function readTranscript(
       'child transcript read timed out',
     );
     if (!v2) {
-      return { live, round: classifyTerminalEvidence(transcript) };
+      return { live, round: classifyTerminalEvidence(transcript), transcript };
     }
     const state = attributeHostRoundToTranscript(
       hostRoundStateOf(hostInfo),
@@ -178,10 +179,11 @@ async function readTranscript(
       else if (state.outcome === 'succeeded')
         return {
           live,
+          transcript,
           round: { verdict: 'incomplete', startedAt: latestInputAt },
         };
     }
-    return { live, round };
+    return { live, round, transcript };
   } catch (error) {
     return { live, roundError: error };
   }

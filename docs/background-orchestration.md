@@ -18,6 +18,29 @@ orchestrator plans → dispatches background specialists → monitors → reconc
 
 This is a clean rebuild, not a compatibility layer over the old blocking model.
 
+## Inspecting unsuccessful children
+
+`task_status` with `diagnostic: true` provides a read-only, bounded, non-final
+excerpt for error, cancelled, or stopped children. It also works for owned,
+untracked sessions after restart when host/history evidence verifies failure
+or interruption. Running children are refused; completed children use
+`result: true`. Unavailable or ambiguous evidence is reported, not invented.
+The entire diagnostic response is limited to 6,144 UTF-8 bytes, including its
+headers and truncation markers. Failed-tool and assistant errors may appear;
+tool inputs and successful tool outputs do not.
+
+Diagnostic reads are not consumption, acknowledgement, or parent acceptance
+and do not replace the completion/acknowledgement flow. Observed state is the
+evidence currently available; execution completion ends the child's run;
+parent acceptance decides whether its outcome satisfies the assignment.
+
+`last_activity_source` explains the unchanged activity timestamp:
+`observed-activity` is a tracker event (which may lag); `host-busy` is a coarse
+host observation beyond run start, not proof of progress; `launch-time` means
+no activity evidence beyond the run start time, not that nothing happened;
+`unknown` means no activity evidence. A session-keyed tracker entry can predate
+a revive. These labels are evidence provenance, not completion guarantees.
+
 ---
 
 ## Runtime Requirement

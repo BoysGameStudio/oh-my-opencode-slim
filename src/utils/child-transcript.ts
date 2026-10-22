@@ -145,6 +145,125 @@ interface LooseMessage {
 
 export type TranscriptMessage = LooseMessage;
 
+export const DIAGNOSTIC_MAX_BYTES = 6_144;
+const DIAGNOSTIC_MESSAGE_CHARS = 2_000;
+const DIAGNOSTIC_ITEM_CHARS = 500;
+const DIAGNOSTIC_MESSAGE_PARTS = 100;
+
+/** UTF-8-safe tail trimming, without allocating a copy of an unbounded string. */
+export function diagnosticTail(text: string, maxBytes: number): string {
+  let tail = text.slice(-Math.max(0, maxBytes));
+  if (maxBytes <= 0) return '';
+  while (new TextEncoder().encode(tail).byteLength > maxBytes) {
+    tail = tail.slice(1);
+  }
+  // Do not leave half of an astral character at the boundary.
+  if (/^[\uDC00-\uDFFF]/u.test(tail)) tail = tail.slice(1);
+  return tail;
+}
+
+/** Bounded, non-final assistant evidence. Never includes tool inputs or
+ * successful tool output. Validation uses the shared rules on the tail only. */
+export function diagnosticExcerptOf(
+  response: unknown,
+  options: { maxBytes?: number } = {},
+):
+  | { unavailable: string }
+  | { text: string; truncated: string; omittedMessages: number } {
+  if (response === undefined)
+    return { unavailable: 'transcript source not exposed by host' };
+  if (responseError(response) !== undefined)
+    return { unavailable: 'transcript read failed' };
+  if (!isRecord(response) || !Array.isArray(response.data))
+    return { unavailable: 'malformed transcript response' };
+  const start = Math.max(0, response.data.length - 40);
+  let charsCut = false;
+  const tail = response.data.slice(start).map((entry: unknown) => {
+    if (!isRecord(entry) || !Array.isArray(entry.parts)) return entry;
+    if (entry.parts.length > DIAGNOSTIC_MESSAGE_PARTS) charsCut = true;
+    return { ...entry, parts: entry.parts.slice(-DIAGNOSTIC_MESSAGE_PARTS) };
+  });
+  const entries = transcriptEntries({ data: tail });
+  if (!Array.isArray(entries)) return { unavailable: entries.reason };
+  const budget = Math.max(
+    0,
+    Math.min(DIAGNOSTIC_MAX_BYTES, options.maxBytes ?? DIAGNOSTIC_MAX_BYTES),
+  );
+  const chunks: string[] = [];
+  let omittedMessages = start;
+  let bytes = 0;
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry.info?.role !== 'assistant') continue;
+    const pieces: string[] = [];
+    let chars = 0;
+    const add = (text: string, cap: number) => {
+      const room = Math.max(0, DIAGNOSTIC_MESSAGE_CHARS - chars);
+      const clipped = room > 0 ? text.slice(-Math.min(room, cap)) : '';
+      if (text.length > clipped.length) charsCut = true;
+      if (clipped) pieces.unshift(clipped);
+      chars += clipped.length + 1;
+    };
+    const error = entry.info?.error;
+    const errorText =
+      typeof error === 'string' ? error : structuredErrorMessage(error);
+    if (errorText) {
+      if (errorText.length > 480) charsCut = true;
+      add(`assistant_error: ${errorText.slice(-480)}`, DIAGNOSTIC_ITEM_CHARS);
+    }
+    const parts = entry.parts ?? [];
+    for (let partIndex = parts.length - 1; partIndex >= 0; partIndex--) {
+      if (chars >= DIAGNOSTIC_MESSAGE_CHARS) {
+        charsCut = true;
+        break;
+      }
+      const part = parts[partIndex];
+      if (!isRecord(part)) continue;
+      if (part.type === 'text' && typeof part.text === 'string')
+        add(part.text, DIAGNOSTIC_MESSAGE_CHARS);
+      if (
+        part.type === 'tool' &&
+        isRecord(part.state) &&
+        part.state.status === 'error' &&
+        typeof part.state.error === 'string'
+      ) {
+        if (part.state.error.length > 480) charsCut = true;
+        add(
+          `tool_error: ${part.state.error.slice(-480)}`,
+          DIAGNOSTIC_ITEM_CHARS,
+        );
+      }
+    }
+    const text = pieces.join('\n').slice(-DIAGNOSTIC_MESSAGE_CHARS);
+    chunks.unshift(text);
+    bytes += new TextEncoder().encode(text).byteLength + 1;
+    if (bytes >= budget) {
+      omittedMessages += index;
+      charsCut = true;
+      break;
+    }
+  }
+  const omitted = omittedMessages
+    ? `[... ${omittedMessages} earlier messages omitted ...]\n`
+    : '';
+  let text = chunks.filter(Boolean).join('\n\n');
+  const encoder = new TextEncoder();
+  if (encoder.encode(omitted + text).byteLength > budget) charsCut = true;
+  const marker = charsCut ? '[... truncated ...]\n' : '';
+  text =
+    omitted +
+    marker +
+    diagnosticTail(text, budget - encoder.encode(omitted + marker).byteLength);
+  return {
+    text: diagnosticTail(text, budget),
+    truncated:
+      [omittedMessages ? 'messages' : '', charsCut ? 'chars' : '']
+        .filter(Boolean)
+        .join(',') || 'none',
+    omittedMessages,
+  };
+}
+
 /** A v1 compaction round (its `compaction` trigger and the `summary: true`
  * reply) is host maintenance, not the specialist's work. */
 function isCompactionRound(message: TranscriptMessage): boolean {

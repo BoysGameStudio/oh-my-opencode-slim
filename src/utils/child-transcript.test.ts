@@ -5,12 +5,121 @@ import {
   classifyAssistantTurnEvidence,
   classifyTerminalEvidence,
   classifyV2HistoricalRound,
+  diagnosticExcerptOf,
   fetchChildTranscript,
   latestInputAtOf,
   stringifyError,
   terminalTextOf,
 } from './child-transcript';
 import { composeHostRound, hostRoundStateOf } from './session-runtime-status';
+
+describe('diagnostic excerpts', () => {
+  test.each([
+    undefined,
+    { error: 'deleted' },
+    { data: 'not-array' },
+    { data: [null] },
+  ])('unavailable input is explicit, not thrown: %j', (response) => {
+    expect(diagnosticExcerptOf(response)).toHaveProperty('unavailable');
+  });
+  test('tail scan bounds ignored limit responses and marks omitted messages and character cuts', () => {
+    const result = diagnosticExcerptOf({
+      data: Array.from({ length: 100 }, (_, index) => ({
+        info: { role: 'assistant' },
+        parts: [{ type: 'text', text: `${index}: ${'界'.repeat(10_000)}` }],
+      })),
+    });
+    expect('text' in result).toBe(true);
+    if ('text' in result) {
+      expect(
+        new TextEncoder().encode(result.text).byteLength,
+      ).toBeLessThanOrEqual(6144);
+      expect(result.truncated).toBe('messages,chars');
+      expect(result.omittedMessages).toBeGreaterThanOrEqual(60);
+      expect(result.text).toContain('earlier messages omitted');
+      expect(result.text).toContain('[... truncated ...]');
+    }
+  });
+  test('assistant and failed-tool errors are labelled and capped; inputs and successful output are excluded', () => {
+    const result = diagnosticExcerptOf({
+      data: [
+        {
+          info: {
+            role: 'assistant',
+            error: { data: { message: 'provider broke' } },
+          },
+          parts: [
+            {
+              type: 'tool',
+              state: {
+                status: 'completed',
+                input: 'SECRET INPUT',
+                output: 'SECRET OUTPUT',
+              },
+            },
+            {
+              type: 'tool',
+              state: {
+                status: 'error',
+                input: 'SECRET INPUT',
+                error: `${'x'.repeat(3000)}failed command`,
+              },
+            },
+            { type: 'text', text: 'partial answer' },
+          ],
+        },
+      ],
+    });
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toContain('assistant_error: provider broke');
+    expect(result.text).toContain('tool_error:');
+    expect(result.text).toContain('failed command');
+    expect(result.text).toContain('partial answer');
+    expect(result.text).not.toContain('SECRET');
+    expect(result.text.length).toBeLessThan(1000);
+    expect(result.truncated).toBe('chars');
+  });
+  test('a small transcript is untruncated and user input is never excerpted', () => {
+    expect(
+      diagnosticExcerptOf({
+        data: [
+          {
+            info: { role: 'user' },
+            parts: [{ type: 'text', text: 'private prompt' }],
+          },
+          {
+            info: { role: 'assistant' },
+            parts: [{ type: 'text', text: 'partial answer' }],
+          },
+        ],
+      }),
+    ).toEqual({
+      text: 'partial answer',
+      truncated: 'none',
+      omittedMessages: 0,
+    });
+  });
+  test('caps per-message work even when a host returns thousands of parts', () => {
+    const result = diagnosticExcerptOf({
+      data: [
+        {
+          info: { role: 'assistant' },
+          parts: [
+            ...Array.from({ length: 10_000 }, () => ({
+              type: 'text',
+              text: 'older',
+            })),
+            { type: 'text', text: 'tail evidence' },
+          ],
+        },
+      ],
+    });
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toContain('tail evidence');
+    expect(result.text.length).toBeLessThanOrEqual(2040);
+    expect(result.truncated).toContain('chars');
+  });
+});
 
 // #1642's host-attribution cases, expressed through #1635's parser/composer
 // rather than restoring the superseded historical-round classifier.

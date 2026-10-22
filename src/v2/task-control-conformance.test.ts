@@ -12,6 +12,7 @@ import { createRevivedRunTracker } from '../hooks/task-session-manager/revived-r
 import { createV1InterviewSessionRuntime } from '../interview/runtime';
 import { createTaskMessageTool } from '../tools/task-message';
 import { createTaskReviveTool } from '../tools/task-revive';
+import { createTaskStatusTool } from '../tools/task-status';
 import { BackgroundJobBoard } from '../utils/background-job-board';
 import { boardFixture } from '../utils/background-job-fixture';
 import { createBackgroundJobTerminalGate } from '../utils/background-job-terminal-gate';
@@ -139,6 +140,103 @@ function harness(
 }
 
 describe('task controls through the real v2 client shim', () => {
+  test.each(['v1', 'v2'] as const)(
+    'read-only diagnostics on %s failed and interrupted children',
+    async (flavor) => {
+      for (const outcome of ['failed', 'interrupted']) {
+        const host = {
+          get: mock(async () => ({
+            id: 'ses_child',
+            parentID: 'parent',
+            outcome,
+            time: { idle: 20 },
+          })),
+          context: mock(async () => [
+            {
+              id: 'user',
+              type: 'user',
+              time: 10,
+              content: [{ type: 'text', text: 'private input' }],
+            },
+            {
+              id: 'answer',
+              type: 'assistant',
+              time: 11,
+              content: [{ type: 'text', text: 'partial work' }],
+            },
+          ]),
+          prompt: mock(async () => ({})),
+          interrupt: mock(async () => ({})),
+          synthetic: mock(async () => ({})),
+          wait: mock(async () => {}),
+        };
+        const input =
+          flavor === 'v2'
+            ? buildPluginInput({ session: host } as unknown as V2Context)
+            : ({
+                directory: '/test',
+                client: {
+                  session: {
+                    get: mock(async () => ({ data: await host.get() })),
+                    status: mock(async () => ({ data: {} })),
+                    messages: mock(async () => ({
+                      data: [
+                        {
+                          info: { role: 'assistant', error: 'child failed' },
+                          parts: [{ type: 'text', text: 'partial work' }],
+                        },
+                      ],
+                    })),
+                  },
+                },
+              } as unknown as PluginInput);
+        const board = new BackgroundJobBoard();
+        const gate = createBackgroundJobTerminalGate({
+          input,
+          backgroundJobBoard: board,
+        });
+        dispose.push(() => gate.dispose());
+        const capture = spyOn(gate, 'capture');
+        const observe = spyOn(gate, 'observe');
+        const reconcile = spyOn(gate, 'reconcile');
+        const output = await createTaskStatusTool({
+          input,
+          backgroundJobBoard: board,
+          terminalGate: gate,
+        }).task_status.execute(
+          {
+            ...(flavor === 'v2'
+              ? { sessionID: 'ses_child' }
+              : { task_id: 'ses_child' }),
+            diagnostic: true,
+          },
+          context,
+        );
+        expect(output).toContain('generation: untracked');
+        expect(output).toContain(
+          flavor === 'v2' && outcome === 'interrupted'
+            ? 'state: stopped'
+            : 'state: error',
+        );
+        expect(output).toContain('partial_output: true');
+        expect(output).toContain('partial work');
+        expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(
+          6144,
+        );
+        for (const fn of [
+          host.prompt,
+          host.interrupt,
+          host.synthetic,
+          host.wait,
+          capture,
+          observe,
+          reconcile,
+        ])
+          expect(fn).not.toHaveBeenCalled();
+        expect(board.get('ses_child')).toBeUndefined();
+      }
+    },
+  );
   test.each([
     'disposed',
     'lease released',
