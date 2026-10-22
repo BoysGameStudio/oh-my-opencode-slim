@@ -1843,16 +1843,22 @@ describe('clickable sidebar sessions', () => {
     sessionID: string;
     navigate?: (name: string, params?: Record<string, unknown>) => void;
     host?: 'v1' | 'v2';
+    /** Golden frames must capture settled RPC state, not race Loading… against Unavailable. */
+    waitForInitialRefresh?: boolean;
   }) {
     const disposers: Array<() => void> = [];
     let slotPlugin: { slots: { sidebar_content: () => unknown } } | undefined;
     if (opts.host === 'v2') {
+      let didRefresh = () => {};
+      const initialRefresh = new Promise<void>((resolve) => {
+        didRefresh = resolve;
+      });
       const claim: { render: (input: { sessionID: string }) => unknown } = {
         render: () => undefined,
       };
       const dispose = await tuiPlugin.setup({
         location: { directory: opts.projectDir },
-        renderer: { requestRender: () => {} },
+        renderer: { requestRender: didRefresh },
         client: undefined,
         theme: {
           text: { default: '#ffffff', subdued: '#aaaaaa' },
@@ -1876,6 +1882,7 @@ describe('clickable sidebar sessions', () => {
         },
       });
       if (dispose) disposers.push(dispose);
+      if (opts.waitForInitialRefresh) await initialRefresh;
       slotPlugin = {
         slots: {
           sidebar_content: () => claim.render({ sessionID: opts.sessionID }),
@@ -2909,6 +2916,7 @@ describe('clickable sidebar sessions', () => {
             });
             mounted = await mountClickableSidebar({
               host: 'v2',
+              waitForInitialRefresh: true,
               projectDir,
               sessionID: 'conv-1',
               navigate: () => {},
@@ -2947,6 +2955,23 @@ describe('clickable sidebar sessions', () => {
                 ]),
               );
             const key = `${compactSidebar ? 'compact' : 'full'}/${state}/${disclosure}`;
+            const lines = frame.split('\n');
+            const defaultRow = lines.findIndex((line) =>
+              line.includes('Default'),
+            );
+            expect(defaultRow).toBeGreaterThan(0);
+            expect(lines[defaultRow]).toContain('Default (none)');
+            expect(lines[defaultRow + 1]).toContain(
+              'Session team snapshot: Unavailable',
+            );
+            expect(spans[defaultRow + 1][0]).toEqual([
+              'Session team snapshot: Unavailable',
+              [170, 170, 170, 255],
+              [0, 0, 0, 0],
+            ]);
+            if (process.env.OMO_REVIEW_SIDEBAR_FRAMES === '1') {
+              console.log(JSON.stringify({ key, frame, spans }, null, 2));
+            }
             hashes[key] = createHash('sha256')
               .update(JSON.stringify({ frame, spans }))
               .digest('hex');
@@ -2959,8 +2984,15 @@ describe('clickable sidebar sessions', () => {
         }
       }
     }
-    // Baseline captured before F6; v2 only because both hosts share the
-    // renderer and the v1-only adapter paths are covered by v1 tests.
+    // Session-preset baseline: removing only the new default/snapshot block
+    // (including its top margin) reproduced all 24 pre-change frame+color hashes.
+    // Review updates with OMO_REVIEW_SIDEBAR_FRAMES=1 bun test src/tui.test.ts
+    // -t 'sidebar frame text and colors remain byte-identical'; inspect frames
+    // and colors before copying the printed hashes to sidebar-frame-golden.json.
+    // V2 only: both hosts share the renderer; v1 adapter paths have separate tests.
+    if (process.env.OMO_REVIEW_SIDEBAR_FRAMES === '1') {
+      console.log('SIDEBAR FRAME HASHES', JSON.stringify(hashes, null, 2));
+    }
     expect(hashes).toEqual(sidebarFrameGolden);
   }, 20_000);
 });

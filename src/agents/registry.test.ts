@@ -1708,6 +1708,13 @@ describe('finalized existing-agent registry', () => {
     expect(registry.finalAgentConfig['follows-session']).not.toHaveProperty(
       'model',
     );
+    expect(registry.marketplaceInferenceBase['follows-session']).toMatchObject({
+      inheritModelFrom: 'session',
+    });
+    expect(
+      registry.marketplaceInferenceBase['follows-session'],
+    ).not.toHaveProperty('prompt');
+    expect(Object.isFrozen(registry.marketplaceInferenceBase)).toBe(true);
   });
 
   test('routes only admitted packages under finalized visible names', () => {

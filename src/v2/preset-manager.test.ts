@@ -241,7 +241,190 @@ const createTrail = (
   undefined,
 ];
 
-const BALANCED_SAVE_APPLY_TRAIL = ['balanced', 'edit', '__omo_save_apply__'];
+const BALANCED_SAVE_APPLY_TRAIL = [
+  'balanced',
+  'edit',
+  '__omo_save_apply__',
+  'global',
+];
+
+describe('preset apply scopes', () => {
+  test('same-name session reapply uses the server and leaves user config untouched', async () => {
+    env.writeUserConfig(SWITCH);
+    const before = fs.readFileSync(env.userConfigPath, 'utf-8');
+    const stub = makeStub({
+      selects: ['balanced', 'apply', 'session'],
+      confirms: [true],
+    });
+    const calls: unknown[] = [];
+    stub.ctx.getSessionID = () => 'root-1';
+    stub.ctx.client = {
+      rpc: (contract: { id: string }) => {
+        expect(contract.id).toBe('oh-my-opencode-slim.session-preset.v1');
+        return {
+          read: async () => ({
+            sessionID: 'root-1',
+            status: 'bound',
+            presetName: 'balanced',
+            affects: 'future-children-only',
+          }),
+          apply: async (input: unknown, options: unknown) => {
+            calls.push({ input, options });
+            return {
+              sessionID: 'root-1',
+              status: 'bound',
+              presetName: 'balanced',
+              affects: 'future-children-only',
+            };
+          },
+        };
+      },
+    };
+    await openPresetManagerV2(stub.ctx, env.projectDir);
+    expect(calls).toEqual([
+      {
+        input: { sessionID: 'root-1', presetName: 'balanced' },
+        options: { location: { directory: env.projectDir } },
+      },
+    ]);
+    expect(stub.selectCalls[0].placeholder).toContain(
+      'Session team snapshot: balanced',
+    );
+    expect(stub.selectCalls[0].placeholder).toContain(
+      'Same name does not imply the same definition',
+    );
+    expect(stub.confirmCalls[0].message).toContain('Inference only');
+    expectToast(
+      stub,
+      'success',
+      'future children',
+      'Root model, existing children and global default unchanged',
+    );
+    expect(fs.readFileSync(env.userConfigPath, 'utf-8')).toBe(before);
+    expect(stub.reloadCalls()).toBe(0);
+  });
+
+  test('cancelled scope or confirmation, home and missing RPC never save or fall back to global', async () => {
+    for (const scenario of [
+      'scope-cancel',
+      'confirm-cancel',
+      'home',
+      'no-rpc',
+      'route-change',
+    ]) {
+      env.writeUserConfig(SWITCH);
+      const before = fs.readFileSync(env.userConfigPath, 'utf-8');
+      const stub = makeStub({
+        models: [GPT5_MODEL],
+        selects: [
+          'balanced',
+          'edit',
+          'orchestrator',
+          'openai/gpt-5',
+          '__omo_save_apply__',
+          scenario === 'scope-cancel' ? undefined : 'session',
+        ],
+        prompts: ['', '{}'],
+        confirms: [scenario !== 'confirm-cancel'],
+      });
+      let current = scenario === 'home' ? undefined : 'root-1';
+      stub.ctx.getSessionID = () => current;
+      if (scenario === 'route-change') {
+        const dialog = stub.ctx.ui?.dialog;
+        if (!dialog) throw new Error('Missing test dialog');
+        dialog.confirm = async () => {
+          current = 'root-2';
+          return true;
+        };
+      }
+      await openPresetManagerV2(stub.ctx, env.projectDir);
+      expect(fs.readFileSync(env.userConfigPath, 'utf-8')).toBe(before);
+      expect(stub.reloadCalls()).toBe(0);
+      if (scenario === 'scope-cancel' || scenario === 'confirm-cancel') {
+        expect(toastTitles(stub)).toEqual(['Agent updated']);
+      } else {
+        expect(lastToast(stub)?.title).toBe('Preset not applied');
+      }
+    }
+  });
+
+  test('session apply failures report the reason without changing global config', async () => {
+    for (const reason of [
+      'Preset not found',
+      'Session preset storage write failed',
+    ]) {
+      env.writeUserConfig(SWITCH);
+      const stub = makeStub({
+        selects: ['cheap', 'apply', 'session'],
+        confirms: [true],
+      });
+      stub.ctx.getSessionID = () => 'root-1';
+      stub.ctx.client = {
+        rpc: () => ({
+          read: async () => ({
+            sessionID: 'root-1',
+            status: 'unbound',
+            presetName: null,
+          }),
+          apply: async () => {
+            throw new Error(reason);
+          },
+        }),
+      };
+      await openPresetManagerV2(stub.ctx, env.projectDir);
+      expectToast(stub, 'warning', reason, 'Global default unchanged');
+      expect(lastToast(stub)?.title).toBe('Preset not applied');
+      expect(readUserConfig()).toEqual(SWITCH);
+      expect(stub.reloadCalls()).toBe(0);
+    }
+  });
+
+  test('Save & Apply saves before RPC and distinguishes a rejected apply from a failed save', async () => {
+    env.writeUserConfig(SWITCH);
+    const stub = makeStub({
+      models: [GPT5_MODEL],
+      selects: [
+        'balanced',
+        'edit',
+        'orchestrator',
+        'openai/gpt-5',
+        '__omo_save_apply__',
+        'session',
+      ],
+      prompts: ['', '{}'],
+      confirms: [true],
+    });
+    let applies = 0;
+    stub.ctx.getSessionID = () => 'root-1';
+    stub.ctx.client = {
+      rpc: () => ({
+        read: async () => ({
+          sessionID: 'root-1',
+          status: 'bound',
+          presetName: 'balanced',
+        }),
+        apply: async () => {
+          applies++;
+          expect(agentOverride(readUserConfig(), 'balanced').model).toBe(
+            'openai/gpt-5',
+          );
+          throw new Error('Session preset storage write failed');
+        },
+      }),
+    };
+    await openPresetManagerV2(stub.ctx, env.projectDir);
+    expect(applies).toBe(1);
+    expect(readUserConfig().preset).toBe('balanced');
+    expect(lastToast(stub)?.title).toBe('Preset saved — not applied');
+    expectToast(
+      stub,
+      'warning',
+      'Definition saved',
+      'Session preset storage write failed',
+      'Global default unchanged',
+    );
+  });
+});
 
 /** One scripted run: seed config (and project config), then trace the result. */
 interface FlowCase {
@@ -257,7 +440,7 @@ describe('openPresetManagerV2', () => {
     {
       name: 'applies a preset from the list and exits',
       config: SWITCH,
-      options: { selects: ['cheap', 'apply'] },
+      options: { selects: ['cheap', 'apply', 'global'], confirms: [true] },
       check: (stub) => {
         expect(stub.selectCalls[0]?.title).toBe('Presets');
         expect(stub.selectCalls[0]?.current).toBe('balanced');
@@ -266,9 +449,9 @@ describe('openPresetManagerV2', () => {
           'cheap',
           '__omo_new_preset__',
         ]);
-        expect(stub.selectCalls[0]?.options?.[0]?.title).toContain('(active)');
+        expect(stub.selectCalls[0]?.options?.[0]?.title).toContain('(default)');
         expect(stub.selectCalls[1]?.title).toContain('cheap');
-        expect(stub.confirmCalls).toHaveLength(0);
+        expect(stub.confirmCalls).toHaveLength(1);
         expect(stub.toasts).toHaveLength(1);
         expectToast(
           stub,
@@ -319,12 +502,13 @@ describe('openPresetManagerV2', () => {
     },
     {
       name: 'save & apply persists the preset name and toasts the switch result',
-      options: { selects: BALANCED_SAVE_APPLY_TRAIL },
+      options: { selects: BALANCED_SAVE_APPLY_TRAIL, confirms: [true] },
       check: (stub) => {
         expect(selectTitles(stub)).toEqual([
           'Presets',
           'Preset: balanced',
           'Edit preset: balanced',
+          'Save & apply: balanced',
           'Presets',
         ]);
         expectToast(
@@ -505,7 +689,10 @@ describe('openPresetManagerV2', () => {
     {
       name: 'a preset named like an action sentinel stays selectable and applicable',
       config: { presets: { __omo_new_preset__: SONNET_OVERRIDE } },
-      options: { selects: [{ user: '__omo_new_preset__' }, 'apply'] },
+      options: {
+        selects: [{ user: '__omo_new_preset__' }, 'apply', 'global'],
+        confirms: [true],
+      },
       check: (stub) => {
         // The preset option carries a wrapped value while the create action
         // keeps the raw sentinel, so neither shadows the other.
@@ -852,7 +1039,8 @@ describe('preset manager config refresh', () => {
     test(name, async () => {
       const stub = await run(SWITCH, {
         ...options,
-        selects: ['cheap', 'apply'],
+        selects: ['cheap', 'apply', 'global'],
+        confirms: [true],
       });
       await flush();
 
@@ -864,7 +1052,9 @@ describe('preset manager config refresh', () => {
       expect(lastToast(stub)?.variant).toBe('warning');
       if (title) expect(lastToast(stub)?.title).toBe(title);
       expect(lastMessage(stub)).toContain(reason);
-      expect(lastMessage(stub)).toContain('Reload OpenCode to apply.');
+      expect(lastMessage(stub)).toContain(
+        'Reload OpenCode to refresh the default',
+      );
     });
   }
 
@@ -877,7 +1067,8 @@ describe('preset manager config refresh', () => {
     }));
     try {
       const stub = await run(SWITCH, {
-        selects: ['cheap', 'apply'],
+        selects: ['cheap', 'apply', 'global'],
+        confirms: [true],
         onConfigChanged: () =>
           notifyConfigChanged(env.projectDir, 'preset-manager'),
       });
@@ -887,7 +1078,9 @@ describe('preset manager config refresh', () => {
       expect(stub.toasts).toHaveLength(1);
       expect(lastToast(stub)?.variant).toBe('warning');
       expect(lastMessage(stub)).toContain('sidebar re-read failed');
-      expect(lastMessage(stub)).toContain('Reload OpenCode to apply.');
+      expect(lastMessage(stub)).toContain(
+        'Reload OpenCode to refresh the default',
+      );
       expect(lastMessage(stub)).not.toContain('Live refresh requested');
     } finally {
       unregister();
@@ -906,7 +1099,8 @@ describe('preset manager config refresh', () => {
         },
       },
       {
-        selects: ['cheap', 'apply'],
+        selects: ['cheap', 'apply', 'global'],
+        confirms: [true],
         onConfigChanged: () => {
           changed += 1;
         },
@@ -917,7 +1111,7 @@ describe('preset manager config refresh', () => {
     expect(changed).toBe(0);
     expect(readUserConfig().preset).toBe('old');
     expect(
-      stub.toasts.some((toast) => toast.title === 'Preset switch failed'),
+      stub.toasts.some((toast) => toast.title === 'Preset not applied'),
     ).toBe(true);
   });
 });

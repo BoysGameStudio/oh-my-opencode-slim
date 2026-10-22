@@ -1,10 +1,13 @@
+import type { z } from 'zod';
+import type { sessionPresetRpc } from './preset-rpc';
+
 /**
  * v2 plugin context surface.
  *
  * These interfaces mirror the subset of the v2 promise-plugin Context
- * (`@opencode-ai/plugin`) this adapter consumes. They are defined locally
- * because the v2 plugin package is not a build-time dependency (the v1 host
- * must be able to load the main build without v2 types installed).
+ * (`@opencode/plugin`) this adapter consumes. They are defined locally
+ * because the v2 plugin package is dev-only (consumers must be able to load
+ * the published declarations without v2 types installed).
  */
 
 export interface V2AgentDraft {
@@ -40,7 +43,13 @@ export interface V2ToolDraft {
   /** Update a registered tool by id; missing ids are ignored (host
    * `tool.transform` editor semantics). The callback receives the
    * model-visible fields it may rewrite (description). */
-  update(id: string, update: (tool: { description: string }) => void): void;
+  update(
+    id: string,
+    update: (tool: {
+      description: string;
+      execute?: V2ToolDefinition['execute'];
+    }) => void,
+  ): void;
   /** Read back a registered tool's model-visible fields by id;
    * undefined when absent. */
   get(id: string): { description?: string } | undefined;
@@ -191,7 +200,23 @@ export interface V2McpDraft {
   update(name: string, update: (c: Record<string, unknown>) => void): void;
   remove(name: string): void;
 }
+/** Only this plugin's error-free, event-free Zod contract is registered.
+ * Infer handler inputs from its schemas without exposing dev-only host types.
+ * The host also supplies an error factory; these handlers only use signal. */
+export type V2SessionPresetRpcHandlers = {
+  readonly [Name in keyof typeof sessionPresetRpc.methods]: (
+    input: z.output<(typeof sessionPresetRpc.methods)[Name]['input']>,
+    context: { readonly signal: AbortSignal },
+  ) => Promise<z.input<(typeof sessionPresetRpc.methods)[Name]['output']>>;
+};
+
 export interface V2Context {
+  readonly rpc?: {
+    readonly register: (
+      definition: typeof sessionPresetRpc,
+      handlers: V2SessionPresetRpcHandlers,
+    ) => Promise<V2Registration>;
+  };
   readonly app: { readonly name: string; readonly version: string };
   readonly options: Record<string, unknown>;
   /** Host location (probe before use; fall back to process.cwd()). */

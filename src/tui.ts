@@ -52,6 +52,7 @@ import {
 import {
   canOpenPresetManagerV2,
   openPresetManagerV2,
+  readSessionPreset,
   type V2PresetManagerContext,
   type V2PresetUiSurface,
 } from './v2/preset-manager';
@@ -824,6 +825,8 @@ export interface SidebarInteraction {
  */
 export interface SidebarPresetRow {
   name: string;
+  /** V2-only: server-owned inference binding for future children, not a model. */
+  sessionLabel?: string;
   onActivate?: () => void;
 }
 
@@ -1635,7 +1638,13 @@ function buildPresetRow(
       ...(clickable ? { shouldFill: true } : {}),
     },
     [
-      text({ fg: theme.textMuted, width: 6 }, ['Preset']),
+      text(
+        {
+          fg: theme.textMuted,
+          width: presetRow.sessionLabel === undefined ? 6 : 7,
+        },
+        [presetRow.sessionLabel === undefined ? 'Preset' : 'Default'],
+      ),
       text(
         {
           fg: clickable ? theme.text : theme.textMuted,
@@ -1650,8 +1659,17 @@ function buildPresetRow(
         : []),
     ],
   );
-  if (!clickable) return row;
-  return decorateInteractiveRow(row, {
+  const content =
+    presetRow.sessionLabel === undefined
+      ? row
+      : box({ width: '100%', flexDirection: 'column' }, [
+          row,
+          text({ fg: theme.textMuted, wrapMode: 'none', truncate: true }, [
+            `Session team snapshot: ${presetRow.sessionLabel}`,
+          ]),
+        ]);
+  if (!clickable) return content;
+  return decorateInteractiveRow(content, {
     hoverBackground,
     onActivate: presetRow.onActivate,
     hasSelectedText,
@@ -1836,7 +1854,9 @@ interface SidebarRuntimeAdapter {
   getPresetRow?: (
     directory: string,
     presetName?: string,
+    sessionLabel?: string,
   ) => SidebarPresetRow | undefined;
+  readSessionPreset?: (directory: string, sessionID: string) => Promise<string>;
   onMultiplexerConfig?: (type: MultiplexerType) => void;
 }
 
@@ -1869,6 +1889,11 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
     readTuiSnapshot(configDirectory),
   );
   const [animationNow, setAnimationNow] = createSignal(Date.now());
+  const [sessionPreset, setSessionPreset] = createSignal<{
+    directory: string;
+    sessionID: string;
+    label: string;
+  }>();
   let disposed = false;
   let unregisterConfigListener = () => {};
   const remoteCache: RemoteModelCache = {};
@@ -1879,6 +1904,7 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
   const refreshSidebar = async () => {
     if (disposed) return;
     const currentDirectory = adapter.getDirectory();
+    const currentSession = adapter.getVisibleSession();
     let nextSnapshot = await readTuiSnapshotAsync(currentDirectory);
     if (disposed) return;
     const directoryChanged = currentDirectory !== configDirectory;
@@ -1916,6 +1942,36 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
     }
     if (modelNamesCache.names !== namesBefore) {
       setModelNames(modelNamesCache.names);
+    }
+    if (adapter.readSessionPreset && currentSession) {
+      let label: string;
+      try {
+        label = await adapter.readSessionPreset(
+          currentDirectory,
+          currentSession,
+        );
+      } catch {
+        label = 'Unavailable';
+      }
+      if (
+        disposed ||
+        currentDirectory !== adapter.getDirectory() ||
+        currentSession !== adapter.getVisibleSession()
+      )
+        return;
+      const previous = sessionPreset();
+      if (
+        previous?.directory !== currentDirectory ||
+        previous?.sessionID !== currentSession ||
+        previous?.label !== label
+      ) {
+        setSessionPreset({
+          directory: currentDirectory,
+          sessionID: currentSession,
+          label,
+        });
+        stateChanged = true;
+      }
     }
     const snapshotChanged =
       directoryChanged || !snapshotSectionsEqual(nextSnapshot, snapshot());
@@ -1975,6 +2031,15 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
     reactiveElement(() => {
       const visible = adapter.getVisibleSession();
       const currentSnapshot = snapshot();
+      const projection = sessionPreset();
+      const sessionLabel = !adapter.readSessionPreset
+        ? undefined
+        : visible === undefined
+          ? 'No session displayed'
+          : projection?.directory === adapter.getDirectory() &&
+              projection.sessionID === visible
+            ? projection.label
+            : 'Loading…';
       interaction.syncScope(
         configDirectory,
         visible === undefined
@@ -1990,7 +2055,7 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
         animationNow,
         visible,
         interaction,
-        adapter.getPresetRow?.(configDirectory, presetName),
+        adapter.getPresetRow?.(configDirectory, presetName, sessionLabel),
         modelNames(),
       );
     }),
@@ -2018,6 +2083,8 @@ async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
     const augmented = Object.create(ctx as object) as V2TuiContext;
     augmented.onConfigChanged = () =>
       notifyConfigChanged(directory, 'preset-manager');
+    augmented.getSessionID = () =>
+      resolveRouteSessionId(ctx.ui.router.current());
     return augmented;
   };
   // Tracks the runtime's effective `multiplexer.type` (onMultiplexerConfig).
@@ -2132,13 +2199,24 @@ async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
       warnPaneUnsupported();
       void reconcilePaneWiring();
     },
-    getPresetRow: (directory, presetName) => {
-      if (presetName === undefined) return undefined;
-      if (!canOpenPresetManagerV2(ctx)) return { name: presetName };
+    readSessionPreset: async (directory, sessionID) => {
+      const state = await readSessionPreset(ctx, sessionID, directory);
+      return state.status === 'bound'
+        ? (state.presetName ?? '(no named preset)')
+        : 'Not bound';
+    },
+    getPresetRow: (directory, presetName, sessionLabel) => {
+      const name = presetName ?? '(none)';
+      if (!canOpenPresetManagerV2(ctx)) return { name, sessionLabel };
       return {
-        name: presetName,
+        name,
+        sessionLabel,
         onActivate: () => {
-          void openPresetManagerV2(presetManagerCtx(directory), directory);
+          const currentDirectory = ctx.location?.directory ?? directory;
+          void openPresetManagerV2(
+            presetManagerCtx(currentDirectory),
+            currentDirectory,
+          );
         },
       };
     },

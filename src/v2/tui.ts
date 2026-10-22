@@ -180,6 +180,10 @@ export async function runPresetFlow(
     // Bare `/preset`: open the three-level manager with the shared
     // config-change coordinator so Apply/Save refresh the sidebar state.
     const managerCtx = Object.create(ctx as object) as V2PresetTuiContext;
+    managerCtx.getSessionID = () => {
+      const route = ctx.ui?.router?.current?.() as TuiRouteView | undefined;
+      return route ? resolveRouteSessionId(route) : undefined;
+    };
     managerCtx.onConfigChanged = () =>
       notifyConfigChanged(directory, '/preset-manager');
     await openPresetManagerV2(managerCtx, directory);
