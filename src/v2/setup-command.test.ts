@@ -1020,12 +1020,10 @@ describe('context bridge: transcript identity enrichment', () => {
   });
 
   test('end-to-end: a recognized agent now performs the phase-reminder injection it previously skipped', async () => {
-    const phaseReminder = createPhaseReminderHook({
-      shouldInject: () => true,
-    });
+    const phaseReminder = createPhaseReminderHook();
 
-    // The pre-fix behavior: the raw v2 transcript message (no
-    // sessionID/agent) fails the gate inside the real v1 hook.
+    // The pre-fix behavior: the raw v2 transcript message (no agent) fails
+    // per-message eligibility inside the real v1 hook.
     const unenriched = {
       info: { role: 'user' },
       parts: [{ type: 'text', text: 'do the work' }],

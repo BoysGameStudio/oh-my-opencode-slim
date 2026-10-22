@@ -2925,9 +2925,7 @@ describe('task-session-manager hook', () => {
       description: 'map hooks',
     });
     const { hook } = createHook({ backgroundJobBoard: board });
-    const phaseReminder = createPhaseReminderHook({
-      shouldInject: () => true,
-    });
+    const phaseReminder = createPhaseReminderHook();
     const messages = createMessages('parent-1', 'current turn');
 
     await phaseReminder['experimental.chat.messages.transform']({}, messages);
@@ -10103,7 +10101,7 @@ describe('task-session-manager hook', () => {
         agentMap.set(sessionID, 'orchestrator');
       },
     });
-    const phaseReminder = createPhaseReminderHook({ shouldInject });
+    const phaseReminder = createPhaseReminderHook();
     const messages = createMessages('orchestrator-1');
 
     await taskSessionManager['experimental.chat.messages.transform'](

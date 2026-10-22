@@ -55,8 +55,8 @@ from `index.ts`) that returns the hook points OpenCode invokes.
    composes: task-session-manager → phase-reminder → council-inject →
    task-session-manager board injection, in that order)
 3. Task-session-manager first repairs session mappings; phase-reminder then
-   injects the per-turn scheduler reminder (gated); council-inject then
-   injects the Council Mode block once per transcript, on the first
+   injects the scheduler reminder (per-message eligibility); council-inject
+   then injects the Council Mode block once per transcript, on the first
    keyword-triggered orchestrator turn (gated); finally task-session-manager
    injects the Background Job Board via cache-safe helpers
 4. Transformed messages are sent to the model
