@@ -241,8 +241,11 @@ a pre-revive entry can supply an older timestamp; timestamps are unchanged.
 Use `diagnostic: true` only for finished-but-unsuccessful children: error,
 cancelled, or stopped. It returns a labelled, non-final tail excerpt, including
 short assistant errors and failed-tool error text, never tool inputs or
-successful tool outputs. The tool's rendered diagnostic response is capped at
-6,144 UTF-8 bytes, including headers, errors, and truncation markers; plugin
+successful tool outputs. Host compaction triggers and summaries are excluded
+and counted as omitted messages. The terminal reason uses assistant error text,
+then the host outcome, then the classified verdict—not partial findings.
+The tool's rendered diagnostic response is capped at 6,144 UTF-8 bytes,
+including headers, errors, and truncation markers; plugin
 warnings may be appended separately. The fetch requests the newest 100 messages.
 Our own scanning is bounded to 40 trailing messages, 100 trailing parts per
 message, and 2,000 excerpt characters per message. A host that ignores the limit

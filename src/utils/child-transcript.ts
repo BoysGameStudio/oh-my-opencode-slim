@@ -230,8 +230,10 @@ export function diagnosticEvidenceTranscriptOf(
       unavailable: 'diagnostic attribution requires omitted message parts',
     };
   if (
-    !window.entries.some((entry) =>
-      ['user', 'synthetic'].includes(sourceTypeOf(entry) ?? ''),
+    !window.entries.some(
+      (entry) =>
+        !isCompactionRound(entry) &&
+        ['user', 'synthetic'].includes(sourceTypeOf(entry) ?? ''),
     )
   )
     return {
@@ -297,9 +299,14 @@ export function diagnosticExcerptOf(
   );
   const chunks: string[] = [];
   let omittedMessages = window.omittedMessages;
+  let compactionMessages = 0;
   let bytes = 0;
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
+    if (isCompactionRound(entry)) {
+      compactionMessages++;
+      continue;
+    }
     if (entry.info?.role !== 'assistant') continue;
     const pieces: string[] = [];
     let chars = 0;
@@ -349,9 +356,13 @@ export function diagnosticExcerptOf(
       break;
     }
   }
-  const omitted = omittedMessages
-    ? `[... ${omittedMessages} earlier messages omitted ...]\n`
-    : '';
+  const omitted =
+    (omittedMessages
+      ? `[... ${omittedMessages} earlier messages omitted ...]\n`
+      : '') +
+    (compactionMessages
+      ? `[... ${compactionMessages} compaction messages omitted ...]\n`
+      : '');
   let text = chunks.filter(Boolean).join('\n\n');
   const encoder = new TextEncoder();
   if (encoder.encode(omitted + text).byteLength > budget) charsCut = true;
@@ -363,10 +374,13 @@ export function diagnosticExcerptOf(
   return {
     text: diagnosticTail(text, budget),
     truncated:
-      [omittedMessages ? 'messages' : '', charsCut ? 'chars' : '']
+      [
+        omittedMessages || compactionMessages ? 'messages' : '',
+        charsCut ? 'chars' : '',
+      ]
         .filter(Boolean)
         .join(',') || 'none',
-    omittedMessages,
+    omittedMessages: omittedMessages + compactionMessages,
   };
 }
 

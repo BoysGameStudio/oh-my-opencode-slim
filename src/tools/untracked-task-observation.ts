@@ -33,6 +33,8 @@ export interface UntrackedEvidence {
     | ReturnType<typeof composeHostRound>;
   roundError?: unknown;
   transcript?: unknown;
+  /** Diagnostic-only end reason, separate from assistant partial output. */
+  terminalReason?: string;
 }
 
 async function boundedRead<T>(
@@ -183,10 +185,14 @@ async function readTranscript(
         transcript,
       };
     if (!v2) {
+      const round = classifyTerminalEvidence(classificationTranscript);
       return {
         live,
-        round: classifyTerminalEvidence(classificationTranscript),
+        round,
         transcript,
+        ...(options.diagnostic && round.verdict === 'error'
+          ? { terminalReason: round.text }
+          : {}),
       };
     }
     const latestInputAt = latestInputAtOf(classificationTranscript);
@@ -214,7 +220,18 @@ async function readTranscript(
           round: { verdict: 'incomplete', startedAt: latestInputAt },
         };
     }
-    return { live, round, transcript };
+    let terminalReason: string | undefined;
+    if (options.diagnostic && state.kind === 'terminal') {
+      const assistant = classifyTerminalEvidence(classificationTranscript);
+      terminalReason =
+        assistant.verdict === 'error' ? assistant.text : state.outcome;
+    }
+    return {
+      live,
+      round,
+      transcript,
+      ...(terminalReason ? { terminalReason } : {}),
+    };
   } catch (error) {
     return { live, roundError: error };
   }

@@ -161,6 +161,81 @@ function makeResultTool(
 
 describe('task_status', () => {
   test.each([
+    'v1 error',
+    'v2 failed',
+    'v2 interrupted',
+    'v2 failed with error',
+    'v2 interrupted with error',
+  ])(
+    'untracked diagnostic terminal reason excludes partial findings: %s',
+    async (kind) => {
+      const v2 = kind.startsWith('v2');
+      const hasError = !v2 || kind.endsWith('with error');
+      const outcome = kind.includes('interrupted') ? 'interrupted' : 'failed';
+      const h = makeResultTool(false, v2 ? 'v2' : undefined);
+      h.get.mockResolvedValue({
+        data: { parentID: 'parent-1', outcome, time: { idle: 3 } },
+      } as never);
+      h.messages.mockResolvedValue({
+        data: [
+          { info: { role: 'user', time: { created: 1 } }, parts: [] },
+          {
+            info: {
+              role: 'assistant',
+              time: { created: 2, completed: 2 },
+              ...(hasError
+                ? { error: { message: 'provider disconnected' } }
+                : {}),
+            },
+            parts: [{ type: 'text', text: 'partial findings from child' }],
+          },
+        ],
+      } as never);
+      const output = await h.tool.execute(
+        { task_id: 'ses_child1', diagnostic: true },
+        { sessionID: 'parent-1' } as never,
+      );
+      expect(output).toContain(
+        `terminal_reason: ${hasError ? 'provider disconnected' : outcome}\n`,
+      );
+      expect(output).not.toContain('terminal_reason: partial findings');
+      expect(output).toContain('excerpt_begin\n');
+      expect(output.slice(output.indexOf('excerpt_begin'))).toContain(
+        'partial findings from child',
+      );
+    },
+  );
+
+  test('untracked v1 diagnostic refuses compaction-only attribution after the real input leaves the window', async () => {
+    const h = makeResultTool(false);
+    h.messages.mockResolvedValue({
+      data: [
+        { info: { role: 'user' }, parts: [] },
+        ...Array.from({ length: 38 }, () => ({
+          info: { role: 'system' },
+          parts: [],
+        })),
+        { info: { role: 'assistant', error: 'older failure' }, parts: [] },
+        {
+          info: { role: 'user' },
+          parts: [{ type: 'compaction', auto: false }],
+        },
+        {
+          info: { role: 'assistant', summary: true },
+          parts: [{ type: 'text', text: 'host summary' }],
+        },
+      ],
+    } as never);
+    const output = await h.tool.execute(
+      { task_id: 'ses_child1', diagnostic: true },
+      { sessionID: 'parent-1' } as never,
+    );
+    expect(output).toContain(
+      'latest input is outside the diagnostic message window',
+    );
+    expect(output).not.toContain('partial_output: true');
+  });
+  test.each([
     'unknown',
     'foreign untracked',
     'canonical refusal',

@@ -15,6 +15,54 @@ import {
 import { composeHostRound, hostRoundStateOf } from './session-runtime-status';
 
 describe('diagnostic excerpts', () => {
+  test('compaction triggers cannot supply diagnostic input attribution', () => {
+    expect(
+      diagnosticEvidenceTranscriptOf({
+        data: [
+          { info: { role: 'assistant', error: 'older failure' }, parts: [] },
+          {
+            info: { role: 'user' },
+            parts: [{ type: 'compaction', auto: false }],
+          },
+        ],
+      }),
+    ).toEqual({
+      unavailable: 'latest input is outside the diagnostic message window',
+    });
+  });
+
+  test('excerpts omit and label compaction triggers and generated summaries', () => {
+    const result = diagnosticExcerptOf({
+      data: [
+        { info: { role: 'user' }, parts: [] },
+        {
+          info: { role: 'assistant' },
+          parts: [{ type: 'text', text: 'actual child findings' }],
+        },
+        {
+          info: { role: 'user' },
+          parts: [
+            { type: 'compaction', auto: false },
+            { type: 'text', text: 'compact request' },
+          ],
+        },
+        {
+          info: { role: 'assistant', summary: true },
+          parts: [{ type: 'text', text: 'generated host summary' }],
+        },
+      ],
+    });
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toContain('actual child findings');
+    expect(result.text).not.toContain('generated host summary');
+    expect(result.text).not.toContain('compact request');
+    expect(result.text).toContain('[... 2 compaction messages omitted ...]');
+    expect(result.truncated).toBe('messages');
+    expect(result.omittedMessages).toBe(2);
+    expect(
+      new TextEncoder().encode(result.text).byteLength,
+    ).toBeLessThanOrEqual(6144);
+  });
   test('diagnostic classification caps content before terminal parsers and never serializes arbitrary error data', () => {
     const result = diagnosticEvidenceTranscriptOf({
       data: [

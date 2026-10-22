@@ -875,7 +875,7 @@ async function readTaskDiagnostic(
         state: round.verdict === 'error' ? 'error' : 'stopped',
         generation: 'untracked',
         reason:
-          ('text' in round ? round.text : undefined) ??
+          evidence.terminalReason ??
           ('reason' in round ? round.reason : undefined) ??
           round.verdict,
         source: evidence.live.status === 'v2' ? 'host state' : 'history',
