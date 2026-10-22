@@ -25,8 +25,7 @@
  * renderer.
  */
 import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { log } from '../utils/logger';
 
 /** The package this notice is about; also the npm name on the registry. */
@@ -96,8 +95,11 @@ export interface UpdateNoticeOptions {
   timeoutMs?: number;
   /** Delay before the check; defaults to {@link UPDATE_NOTICE_DELAY_MS}. */
   delayMs?: number;
-  /** OpenCode cache root (`~/.cache/opencode`); tests point at a temp dir. */
-  opencodeCacheDir?: string;
+  /**
+   * URL of the module whose own `package.json` names the running version.
+   * Defaults to `import.meta.url`; tests point it at a fixture install.
+   */
+  moduleUrl?: string | URL;
   /** Builds the durable badge element; absent means toast-only. */
   renderBadge?: (latest: string, color: unknown) => unknown;
 }
@@ -196,80 +198,83 @@ function versionFromPluginList(result: unknown): string | undefined {
   return undefined;
 }
 
-/** `~/.cache` unless the host relocated the cache root. */
-function cacheBase(): string {
-  const xdg = process.env.XDG_CACHE_HOME?.trim();
-  return xdg !== undefined && xdg.length > 0
-    ? xdg
-    : path.join(os.homedir(), '.cache');
-}
-
-function readDirNames(dir: string): string[] {
-  try {
-    return fs.readdirSync(dir);
-  } catch {
-    return [];
-  }
-}
-
 /**
- * Fallback for hosts where `plugin.list` is unavailable: the host cache keeps
- * one directory per install, so read every candidate's `package.json` and keep
- * the highest version. Both shapes are covered because the install layout
- * differs between host-managed (`npm/<pkg>@latest/<stamp>`) and v1-wrapper
- * (`packages/<pkg>@<ver>`) installs.
+ * Read a `package.json` and return its version when it is *our* package with
+ * a version we could compare. The name check is what keeps a stray ancestor
+ * `package.json` (a host's, a parent project's) from answering the question.
  */
-function versionFromCache(opencodeCacheDir?: string): string | undefined {
+function versionAtPackageRoot(url: URL): string | undefined {
   try {
-    const root = opencodeCacheDir ?? path.join(cacheBase(), 'opencode');
-    const npmRoot = path.join(root, 'npm', `${PACKAGE_NAME}@latest`);
-    const packagesRoot = path.join(root, 'packages');
-    const candidates = [
-      ...readDirNames(npmRoot).map((stamp) =>
-        path.join(npmRoot, stamp, 'node_modules', PACKAGE_NAME),
-      ),
-      ...readDirNames(packagesRoot)
-        .filter((entry) => entry.startsWith(`${PACKAGE_NAME}@`))
-        .map((entry) =>
-          path.join(packagesRoot, entry, 'node_modules', PACKAGE_NAME),
-        ),
-    ];
-
-    let best: { raw: string; parsed: VersionTriple } | undefined;
-    for (const dir of candidates) {
-      try {
-        const manifest = JSON.parse(
-          fs.readFileSync(path.join(dir, 'package.json'), 'utf8'),
-        ) as { version?: unknown };
-        const raw =
-          typeof manifest.version === 'string' ? manifest.version : undefined;
-        const parsed = parseVersion(raw);
-        // One unreadable stamp directory must not hide the others.
-        if (
-          raw !== undefined &&
-          parsed !== undefined &&
-          (best === undefined || compareVersions(parsed, best.parsed) > 0)
-        ) {
-          best = { raw, parsed };
-        }
-      } catch {
-        // Missing/invalid package.json: try the next candidate.
-      }
-    }
-    return best?.raw;
+    const manifest = JSON.parse(
+      fs.readFileSync(fileURLToPath(url), 'utf8'),
+    ) as {
+      name?: unknown;
+      version?: unknown;
+    };
+    if (manifest.name !== PACKAGE_NAME) return undefined;
+    const version =
+      typeof manifest.version === 'string' ? manifest.version : undefined;
+    return parseVersion(version) === undefined ? undefined : version;
   } catch {
     return undefined;
   }
 }
 
 /**
- * Installed version, `plugin.list` first (it is what `opencode plugin list`
- * shows and therefore what the user can act on), then the cache scan.
+ * Version of the copy that is actually executing — the only copy whose version
+ * describes what the user is running. The module lives in three places over a
+ * release and all of them resolve to the package root's manifest:
+ * `src/v2/` in the source tree, `dist/tui2.js` in the bundle, and
+ * `node_modules/<pkg>/dist/tui2.js` in a host install.
+ *
+ * This deliberately does NOT look around at sibling install directories. The
+ * cache keeps several versions at once, so "newest on disk" can be an
+ * unrelated leftover — trusting it hides exactly the update this module exists
+ * to announce (a running 3.0.4 next to a leftover 3.0.5 reads as "up to date").
+ */
+export function resolveRunningVersion(
+  moduleUrl: string | URL = import.meta.url,
+): string | undefined {
+  let base: URL;
+  try {
+    base = new URL(moduleUrl);
+  } catch {
+    return undefined;
+  }
+  for (const relative of [
+    '../../package.json',
+    '../package.json',
+    './package.json',
+  ]) {
+    try {
+      const version = versionAtPackageRoot(new URL(relative, base));
+      if (version !== undefined) return version;
+    } catch {
+      // Unresolvable candidate: try the next one.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Installed version, in the order that describes what the user is running:
+ *
+ * 1. the running copy's own `package.json` (authoritative — nothing else can
+ *    be newer without this copy also being newer);
+ * 2. `client.plugin.list`, the same source as `opencode plugin list` and the
+ *    version the update command acts on — the fallback for hosts/layouts where
+ *    the manifest cannot be read.
+ *
+ * There is deliberately no third "scan the cache" source: the cache holds one
+ * directory per install, so a scan can only pick somebody else's copy.
  */
 export async function resolveInstalledVersion(
   context: unknown,
   options: UpdateNoticeOptions = {},
 ): Promise<string | undefined> {
+  const running = resolveRunningVersion(options.moduleUrl ?? import.meta.url);
+  if (running !== undefined) return running;
+
   const ctx = (context ?? {}) as UpdateNoticeContext;
   try {
     const client = ctx.client as
@@ -291,17 +296,18 @@ export async function resolveInstalledVersion(
       if (version !== undefined) return version;
     }
   } catch {
-    // Documented path failed: fall through to the cache scan.
+    // Documented path failed: nothing left to ask without guessing.
   }
-  return versionFromCache(options.opencodeCacheDir);
+  return undefined;
 }
 
 /**
  * Newest published version. `undefined` on any failure — offline, DNS,
  * non-OK status, a body without `version`, or a registry that outlives the
- * timeout. The race is what bounds a host `fetch` that ignores the abort
- * signal; the losing promise is subscribed by `Promise.race`, so a late
- * rejection cannot surface as an unhandled one.
+ * timeout. The timeout bounds the complete request (`fetch` *and* the body
+ * read), so a stalled response cannot hold the check past its budget; the
+ * losing promise is subscribed by `Promise.race`, so a late rejection cannot
+ * surface as an unhandled one.
  */
 export async function fetchLatestVersion(
   options: UpdateNoticeOptions = {},
@@ -321,13 +327,24 @@ export async function fetchLatestVersion(
   });
 
   try {
-    const response = await Promise.race([
-      fetchImpl(LATEST_VERSION_URL, { signal: controller.signal }),
+    // The race covers the WHOLE operation, not just the headers: a body read
+    // can stall indefinitely even when the response arrived, and the caller
+    // was promised a bounded check. The abort signal stays as belt and braces
+    // for hosts that honour it; the race covers the ones that do not.
+    const version = await Promise.race([
+      (async (): Promise<string | undefined> => {
+        const response = await fetchImpl(LATEST_VERSION_URL, {
+          signal: controller.signal,
+        });
+        if (response.ok !== true) return undefined;
+        const body = (await response.json()) as
+          | { version?: unknown }
+          | undefined;
+        return typeof body?.version === 'string' ? body.version : undefined;
+      })(),
       timedOut,
     ]);
-    if (response.ok !== true) return undefined;
-    const body = (await response.json()) as { version?: unknown } | undefined;
-    return typeof body?.version === 'string' ? body.version : undefined;
+    return version;
   } catch {
     return undefined;
   } finally {

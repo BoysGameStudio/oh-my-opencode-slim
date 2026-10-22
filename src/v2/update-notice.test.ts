@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   checkForUpdate,
   compareVersions,
@@ -32,24 +33,38 @@ async function waitFor(
   }
 }
 
-/** A temp OpenCode cache root, removed by the caller. */
-function makeCacheRoot(): string {
+/** A temp root, removed by the caller. */
+function makeTempRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'omo-update-notice-'));
 }
 
-/** Write a package.json at `<cache>/<layout>/<stamp>/node_modules/<pkg>`. */
-function writeCachedInstall(
-  cacheRoot: string,
-  layout: string,
-  stamp: string,
-  version: string,
-): void {
-  const dir = path.join(cacheRoot, layout, stamp, 'node_modules', PACKAGE_NAME);
-  fs.mkdirSync(dir, { recursive: true });
+/**
+ * A fake install tree for our package: `<root>/package.json` plus the module
+ * file the bundled entry would be (`<root>/dist/tui2.js`). The module file
+ * does not need to exist — the reader only resolves paths relative to it.
+ * Returns the module URL the notice is pointed at.
+ */
+function writeInstall(root: string, version: string): URL {
+  fs.mkdirSync(path.join(root, 'dist'), { recursive: true });
   fs.writeFileSync(
-    path.join(dir, 'package.json'),
+    path.join(root, 'package.json'),
     JSON.stringify({ name: PACKAGE_NAME, version }),
   );
+  return pathToFileURL(path.join(root, 'dist', 'tui2.js'));
+}
+
+/** A module URL whose package root has no manifest at all. */
+function writeInstallWithoutManifest(root: string): URL {
+  fs.mkdirSync(path.join(root, 'dist'), { recursive: true });
+  return pathToFileURL(path.join(root, 'dist', 'tui2.js'));
+}
+
+/** The version this checkout declares; the default module URL must find it. */
+function checkoutVersion(): string {
+  const manifest = JSON.parse(
+    fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8'),
+  ) as { version: string };
+  return manifest.version;
 }
 
 describe('parseVersion', () => {
@@ -210,11 +225,55 @@ describe('fetchLatestVersion', () => {
 
     expect(version).toBeUndefined();
   });
+
+  test('bounds the body read, not just the headers, and clears its timer', async () => {
+    // Count timers rather than inspect internals: the timeout must not only
+    // stop mattering, it must be cleared when the check returns.
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    let scheduled = 0;
+    let cleared = 0;
+    let elapsed = 0;
+
+    globalThis.setTimeout = ((handler: TimerHandler, ms?: number) => {
+      scheduled += 1;
+      return realSetTimeout(handler, ms);
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((id?: number | NodeJS.Timeout) => {
+      cleared += 1;
+      return realClearTimeout(id as number);
+    }) as typeof clearTimeout;
+
+    const started = Date.now();
+    let version: string | undefined;
+    try {
+      version = await fetchLatestVersion({
+        timeoutMs: 20,
+        // Headers arrive, the body never settles: without bounding the read
+        // this promise would hang forever.
+        fetchImpl: () =>
+          Promise.resolve({ ok: true, json: () => new Promise(() => {}) }),
+      });
+    } finally {
+      elapsed = Date.now() - started;
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+
+    expect(version).toBeUndefined();
+    expect(elapsed).toBeLessThan(1_000);
+    expect(scheduled).toBeGreaterThan(0);
+    expect(cleared).toBe(scheduled);
+  });
 });
 
 describe('resolveInstalledVersion', () => {
+  test('resolves the running copy from this module by default', async () => {
+    expect(await resolveInstalledVersion({})).toBe(checkoutVersion());
+  });
+
   test('reads the row from the { data } wrapper that the SDK returns', async () => {
-    const cacheRoot = makeCacheRoot();
+    const root = makeTempRoot();
     try {
       const context = {
         location: { directory: '/tmp/project' },
@@ -240,16 +299,16 @@ describe('resolveInstalledVersion', () => {
 
       expect(
         await resolveInstalledVersion(context, {
-          opencodeCacheDir: cacheRoot,
+          moduleUrl: writeInstallWithoutManifest(path.join(root, 'empty')),
         }),
       ).toBe('3.0.4');
     } finally {
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   test('accepts a bare array and matches on the source target', async () => {
-    const cacheRoot = makeCacheRoot();
+    const root = makeTempRoot();
     try {
       const context = {
         client: {
@@ -270,16 +329,16 @@ describe('resolveInstalledVersion', () => {
 
       expect(
         await resolveInstalledVersion(context, {
-          opencodeCacheDir: cacheRoot,
+          moduleUrl: writeInstallWithoutManifest(path.join(root, 'empty')),
         }),
       ).toBe('3.0.4');
     } finally {
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   test('ignores rows for other packages', async () => {
-    const cacheRoot = makeCacheRoot();
+    const root = makeTempRoot();
     try {
       const context = {
         client: {
@@ -302,137 +361,148 @@ describe('resolveInstalledVersion', () => {
 
       expect(
         await resolveInstalledVersion(context, {
-          opencodeCacheDir: cacheRoot,
+          moduleUrl: writeInstallWithoutManifest(path.join(root, 'empty')),
         }),
       ).toBeUndefined();
     } finally {
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test('falls back to the cache scan when plugin.list throws', async () => {
-    const cacheRoot = makeCacheRoot();
+  test('prefers the running copy over plugin.list', async () => {
+    const root = makeTempRoot();
     try {
-      writeCachedInstall(
-        cacheRoot,
-        path.join('npm', `${PACKAGE_NAME}@latest`),
-        'stamp-1',
-        '3.0.4',
-      );
       const context = {
         client: {
           plugin: {
-            list: () => Promise.reject(new Error('no such method')),
+            list: () =>
+              Promise.resolve({
+                data: [{ id: PACKAGE_NAME, source: { version: '3.0.3' } }],
+              }),
           },
         },
       };
 
       expect(
         await resolveInstalledVersion(context, {
-          opencodeCacheDir: cacheRoot,
+          moduleUrl: writeInstall(path.join(root, 'running'), '3.0.4'),
         }),
       ).toBe('3.0.4');
     } finally {
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test('cache scan keeps the highest of every stamped layout', async () => {
-    const cacheRoot = makeCacheRoot();
+  test('running copy wins over a higher leftover install on disk', async () => {
+    const root = makeTempRoot();
     try {
-      writeCachedInstall(
-        cacheRoot,
-        path.join('npm', `${PACKAGE_NAME}@latest`),
-        'stamp-old',
-        '3.0.2',
-      );
-      writeCachedInstall(
-        cacheRoot,
-        path.join('npm', `${PACKAGE_NAME}@latest`),
-        'stamp-new',
-        '3.0.4',
-      );
-      // The v1 wrapper layout is lower here, so it must not win.
-      writeCachedInstall(
-        cacheRoot,
-        path.join('packages', `${PACKAGE_NAME}@3.0.1`),
-        '',
-        '3.0.1',
-      );
+      // Exactly the shape of a host cache: several stamped copies of the same
+      // package. Only one of them is executing; a higher one is a leftover.
+      const stamped = (stamp: string) =>
+        path.join(
+          root,
+          'npm',
+          `${PACKAGE_NAME}@latest`,
+          stamp,
+          'node_modules',
+          PACKAGE_NAME,
+        );
+      const moduleUrl = writeInstall(stamped('stamp-running'), '3.0.4');
+      writeInstall(stamped('stamp-leftover'), '3.0.5');
 
-      expect(
-        await resolveInstalledVersion({}, { opencodeCacheDir: cacheRoot }),
-      ).toBe('3.0.4');
-    } finally {
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
-    }
-  });
-
-  test('cache scan tolerates a corrupt package.json next to a good one', async () => {
-    const cacheRoot = makeCacheRoot();
-    try {
-      writeCachedInstall(
-        cacheRoot,
-        path.join('npm', `${PACKAGE_NAME}@latest`),
-        'stamp-good',
-        '3.0.3',
-      );
-      const broken = path.join(
-        cacheRoot,
-        'npm',
-        `${PACKAGE_NAME}@latest`,
-        'stamp-broken',
-        'node_modules',
-        PACKAGE_NAME,
-      );
-      fs.mkdirSync(broken, { recursive: true });
-      fs.writeFileSync(path.join(broken, 'package.json'), '{ not json');
-
-      expect(
-        await resolveInstalledVersion({}, { opencodeCacheDir: cacheRoot }),
-      ).toBe('3.0.3');
-    } finally {
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
-    }
-  });
-
-  test('returns undefined with no client and an empty cache', async () => {
-    const cacheRoot = makeCacheRoot();
-    try {
-      expect(
-        await resolveInstalledVersion({}, { opencodeCacheDir: cacheRoot }),
-      ).toBeUndefined();
       expect(
         await resolveInstalledVersion(
-          { client: {} },
           {
-            opencodeCacheDir: cacheRoot,
+            client: {
+              plugin: {
+                list: () => Promise.reject(new Error('no such method')),
+              },
+            },
+          },
+          { moduleUrl },
+        ),
+      ).toBe('3.0.4');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('falls back to plugin.list when the running manifest is unreadable', async () => {
+    const root = makeTempRoot();
+    try {
+      const context = {
+        client: {
+          plugin: {
+            list: () =>
+              Promise.resolve({
+                data: [{ id: PACKAGE_NAME, source: { version: '3.0.5' } }],
+              }),
+          },
+        },
+      };
+
+      expect(
+        await resolveInstalledVersion(context, {
+          moduleUrl: writeInstallWithoutManifest(path.join(root, 'empty')),
+        }),
+      ).toBe('3.0.5');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('ignores a manifest that belongs to another package', async () => {
+    const root = makeTempRoot();
+    try {
+      fs.mkdirSync(path.join(root, 'dist'), { recursive: true });
+      fs.writeFileSync(
+        path.join(root, 'package.json'),
+        JSON.stringify({ name: 'some-other-package', version: '9.9.9' }),
+      );
+
+      expect(
+        await resolveInstalledVersion(
+          {},
+          {
+            moduleUrl: pathToFileURL(path.join(root, 'dist', 'tui2.js')),
           },
         ),
       ).toBeUndefined();
     } finally {
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('returns undefined without a readable manifest or a client', async () => {
+    const root = makeTempRoot();
+    try {
+      expect(
+        await resolveInstalledVersion(
+          {},
+          {
+            moduleUrl: writeInstallWithoutManifest(path.join(root, 'empty')),
+          },
+        ),
+      ).toBeUndefined();
+      expect(
+        await resolveInstalledVersion(undefined, {
+          moduleUrl: writeInstall(path.join(root, 'running'), '3.0.4'),
+        }),
+      ).toBe('3.0.4');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
 
 describe('checkForUpdate', () => {
   test('reports the decision for an outdated install', async () => {
-    const cacheRoot = makeCacheRoot();
+    const root = makeTempRoot();
     try {
       const check = await checkForUpdate(
+        {},
         {
-          client: {
-            plugin: {
-              list: () =>
-                Promise.resolve({
-                  data: [{ id: PACKAGE_NAME, source: { version: '3.0.4' } }],
-                }),
-            },
-          },
-        },
-        {
-          opencodeCacheDir: cacheRoot,
+          moduleUrl: writeInstall(path.join(root, 'running'), '3.0.4'),
           fetchImpl: () =>
             Promise.resolve({
               ok: true,
@@ -447,24 +517,24 @@ describe('checkForUpdate', () => {
         notify: '3.0.5',
       });
     } finally {
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   test('never throws and reports no notify without a host surface', async () => {
-    const cacheRoot = makeCacheRoot();
+    const root = makeTempRoot();
     try {
       expect(
         await checkForUpdate(
           {},
           {
-            opencodeCacheDir: cacheRoot,
+            moduleUrl: writeInstallWithoutManifest(path.join(root, 'empty')),
             fetchImpl: () => Promise.reject(new Error('offline')),
           },
         ),
       ).toEqual({ installed: undefined, latest: undefined, notify: undefined });
     } finally {
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -486,7 +556,7 @@ describe('registerUpdateNotice', () => {
   });
 
   test('toasts and registers the footer badge for an outdated install', async () => {
-    const cacheRoot = makeCacheRoot();
+    const root = makeTempRoot();
     const toasts: Array<Record<string, unknown>> = [];
     const slots: Array<{ append: string; render: () => unknown }> = [];
     const badgeCalls: Array<{ latest: string; color: unknown }> = [];
@@ -496,14 +566,6 @@ describe('registerUpdateNotice', () => {
     const dispose = registerUpdateNotice(
       {
         location: { directory: '/tmp/project' },
-        client: {
-          plugin: {
-            list: () =>
-              Promise.resolve({
-                data: [{ id: PACKAGE_NAME, source: { version: '3.0.4' } }],
-              }),
-          },
-        },
         ui: {
           toast: {
             show: (toast) => {
@@ -526,7 +588,7 @@ describe('registerUpdateNotice', () => {
       },
       {
         delayMs: 0,
-        opencodeCacheDir: cacheRoot,
+        moduleUrl: writeInstall(path.join(root, 'running'), '3.0.4'),
         fetchImpl: () =>
           Promise.resolve({
             ok: true,
@@ -564,25 +626,70 @@ describe('registerUpdateNotice', () => {
       expect(stopBadgeCalls).toBe(1);
     } finally {
       dispose();
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test('shows nothing when the install is up to date', async () => {
-    const cacheRoot = makeCacheRoot();
-    const toasts: unknown[] = [];
-    const slots: unknown[] = [];
+  test('still notifies when plugin.list fails and a higher copy sits on disk', async () => {
+    const root = makeTempRoot();
+    const toasts: Array<Record<string, unknown>> = [];
+
+    const stamped = (stamp: string) =>
+      path.join(
+        root,
+        'npm',
+        `${PACKAGE_NAME}@latest`,
+        stamp,
+        'node_modules',
+        PACKAGE_NAME,
+      );
+    const moduleUrl = writeInstall(stamped('stamp-running'), '3.0.4');
+    writeInstall(stamped('stamp-leftover'), '3.0.5');
 
     const dispose = registerUpdateNotice(
       {
         client: {
           plugin: {
-            list: () =>
-              Promise.resolve({
-                data: [{ id: PACKAGE_NAME, source: { version: '3.0.5' } }],
-              }),
+            list: () => Promise.reject(new Error('no such method')),
           },
         },
+        ui: {
+          toast: {
+            show: (toast) => {
+              toasts.push(toast as unknown as Record<string, unknown>);
+            },
+          },
+        },
+      },
+      {
+        delayMs: 0,
+        moduleUrl,
+        fetchImpl: () =>
+          Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ version: '3.0.5' }),
+          }),
+      },
+    );
+
+    try {
+      await waitFor(() => toasts.length > 0);
+      expect(toasts[0]?.message).toBe(
+        'v3.0.4 → v3.0.5 · run opencode plugin update',
+      );
+    } finally {
+      dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('shows nothing when the install is up to date', async () => {
+    const root = makeTempRoot();
+    const toasts: unknown[] = [];
+    const slots: unknown[] = [];
+
+    const dispose = registerUpdateNotice(
+      {
         ui: {
           toast: { show: (toast) => void toasts.push(toast) },
           slot: (claim) => {
@@ -593,7 +700,7 @@ describe('registerUpdateNotice', () => {
       },
       {
         delayMs: 0,
-        opencodeCacheDir: cacheRoot,
+        moduleUrl: writeInstall(path.join(root, 'running'), '3.0.5'),
         fetchImpl: () =>
           Promise.resolve({
             ok: true,
@@ -609,38 +716,30 @@ describe('registerUpdateNotice', () => {
       expect(slots).toEqual([]);
     } finally {
       dispose();
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   test('shows nothing for a new major or an unreachable registry', async () => {
-    const cacheRoot = makeCacheRoot();
+    const root = makeTempRoot();
     const toasts: unknown[] = [];
-
-    const makeContext = (version: string) => ({
-      client: {
-        plugin: {
-          list: () =>
-            Promise.resolve({
-              data: [{ id: PACKAGE_NAME, source: { version } }],
-            }),
-        },
-      },
+    const moduleUrl = writeInstall(path.join(root, 'running'), '3.0.4');
+    const makeContext = () => ({
       ui: { toast: { show: (toast: unknown) => void toasts.push(toast) } },
     });
 
-    const newMajor = registerUpdateNotice(makeContext('3.0.4'), {
+    const newMajor = registerUpdateNotice(makeContext(), {
       delayMs: 0,
-      opencodeCacheDir: cacheRoot,
+      moduleUrl,
       fetchImpl: () =>
         Promise.resolve({
           ok: true,
           json: () => Promise.resolve({ version: '4.0.0' }),
         }),
     });
-    const offline = registerUpdateNotice(makeContext('3.0.4'), {
+    const offline = registerUpdateNotice(makeContext(), {
       delayMs: 0,
-      opencodeCacheDir: cacheRoot,
+      moduleUrl,
       fetchImpl: () => Promise.reject(new Error('offline')),
     });
 
@@ -650,24 +749,16 @@ describe('registerUpdateNotice', () => {
     } finally {
       newMajor();
       offline();
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   test('survives a throwing toast and a refusing slot', async () => {
-    const cacheRoot = makeCacheRoot();
+    const root = makeTempRoot();
     let slotClaims = 0;
 
     const dispose = registerUpdateNotice(
       {
-        client: {
-          plugin: {
-            list: () =>
-              Promise.resolve({
-                data: [{ id: PACKAGE_NAME, source: { version: '3.0.4' } }],
-              }),
-          },
-        },
         ui: {
           toast: {
             show: () => {
@@ -682,7 +773,7 @@ describe('registerUpdateNotice', () => {
       },
       {
         delayMs: 0,
-        opencodeCacheDir: cacheRoot,
+        moduleUrl: writeInstall(path.join(root, 'running'), '3.0.4'),
         fetchImpl: () =>
           Promise.resolve({
             ok: true,
@@ -698,7 +789,7 @@ describe('registerUpdateNotice', () => {
       expect(slotClaims).toBe(1);
     } finally {
       dispose();
-      fs.rmSync(cacheRoot, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
