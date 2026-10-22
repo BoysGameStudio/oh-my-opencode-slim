@@ -12,10 +12,13 @@
  * Supersedes #790's mechanism; preserves #790's invariant.
  *
  * Anchor eligibility is per-message and history-derived: agent switches never
- * add or remove bytes already emitted. Residual: on v2 hosts the context
- * bridge stamps unstamped user messages with the current agent
- * (src/v2/setup.ts), so per-message eligibility is effectively present-state
- * there and the agent-switch symptom persists on v2 (tracked as a follow-up).
+ * add or remove bytes already emitted. On v2 the context bridge reconstructs
+ * per-message agent per request from durable `agent-switched` markers
+ * (src/v2/setup.ts), so switches preserve anchor bytes there too. Residuals:
+ * v1-migrated sessions carry no per-message agent and track the session's
+ * current agent (status quo); the segment before a first in-window marker
+ * lacking `previous` (pre-2026-08-10 rows) falls back the same way, bounded
+ * by the compaction window.
  *
  * Do NOT make this tail-only: a reminder pinned to the newest message rewrites
  * the previous anchor's bytes every turn and pays full input price every turn,
