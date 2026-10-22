@@ -241,10 +241,15 @@ a pre-revive entry can supply an older timestamp; timestamps are unchanged.
 Use `diagnostic: true` only for finished-but-unsuccessful children: error,
 cancelled, or stopped. It returns a labelled, non-final tail excerpt, including
 short assistant errors and failed-tool error text, never tool inputs or
-successful tool outputs. The entire response is capped at 6,144 UTF-8 bytes,
-with at most 40 trailing messages, 100 trailing parts per message, and 2,000
-characters per message; truncation
-and unavailable evidence are explicit. Running children are refused; completed
+successful tool outputs. The tool's rendered diagnostic response is capped at
+6,144 UTF-8 bytes, including headers, errors, and truncation markers; plugin
+warnings may be appended separately. The fetch requests the newest 100 messages.
+Our own scanning is bounded to 40 trailing messages, 100 trailing parts per
+message, and 2,000 excerpt characters per message. A host that ignores the limit
+still returns a full response that the adapter converts; that conversion is not
+bounded here. Attribution outside the scan window is reported as uncertain or
+unavailable, not guessed. Truncation and unavailable evidence are explicit.
+Running children are refused; completed
 children point to `result: true`. The two modes are mutually exclusive.
 Diagnostics are read-only, not consumption or acknowledgement: observed state
 is evidence, execution completion ends a run, and parent acceptance is a

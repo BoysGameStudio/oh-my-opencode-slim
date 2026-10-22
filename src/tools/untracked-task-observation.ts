@@ -2,6 +2,7 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import {
   attributeHostRoundToTranscript,
   classifyTerminalEvidence,
+  diagnosticEvidenceTranscriptOf,
   fetchChildTranscript,
   latestInputAtOf,
   terminalTextOf,
@@ -108,6 +109,7 @@ export async function readUntrackedEvidence(
     input: PluginInput;
     readTimeoutMs?: number;
     statusTimeoutMs?: number;
+    diagnostic?: boolean;
   },
   identity: string,
   hostInfo?: Record<string, unknown>,
@@ -144,7 +146,7 @@ export async function readUntrackedEvidence(
 
 async function readTranscript(
   client: ReturnType<typeof getClient>,
-  options: { input: PluginInput },
+  options: { input: PluginInput; diagnostic?: boolean },
   identity: string,
   readTimeoutMs: number,
   v2: boolean,
@@ -158,23 +160,52 @@ async function readTranscript(
           client,
           identity,
           options.input.directory,
-          undefined,
+          options.diagnostic ? 100 : undefined,
           signal,
         ),
       readTimeoutMs,
       'child transcript read timed out',
     );
+    const classificationTranscript = options.diagnostic
+      ? diagnosticEvidenceTranscriptOf(transcript)
+      : transcript;
+    if (
+      options.diagnostic &&
+      isRecord(classificationTranscript) &&
+      'unavailable' in classificationTranscript
+    )
+      return {
+        live,
+        round: {
+          verdict: 'retry',
+          reason: String(classificationTranscript.unavailable),
+        },
+        transcript,
+      };
     if (!v2) {
-      return { live, round: classifyTerminalEvidence(transcript), transcript };
+      return {
+        live,
+        round: classifyTerminalEvidence(classificationTranscript),
+        transcript,
+      };
     }
+    const latestInputAt = latestInputAtOf(classificationTranscript);
+    if (options.diagnostic && latestInputAt === undefined)
+      return {
+        live,
+        round: {
+          verdict: 'unreadable',
+          reason: 'diagnostic input time is unavailable',
+        },
+        transcript,
+      };
     const state = attributeHostRoundToTranscript(
       hostRoundStateOf(hostInfo),
-      transcript,
+      classificationTranscript,
     );
-    const latestInputAt = latestInputAtOf(transcript);
     const round = composeHostRound(state, latestInputAt);
     if (state.kind === 'terminal') {
-      const text = terminalTextOf(transcript);
+      const text = terminalTextOf(classificationTranscript);
       if (text) round.text = text;
       else if (state.outcome === 'succeeded')
         return {

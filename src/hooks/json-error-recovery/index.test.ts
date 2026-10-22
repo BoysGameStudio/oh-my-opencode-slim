@@ -67,6 +67,18 @@ describe('json-error-recovery hook', () => {
     );
   });
 
+  test.each([
+    'partial_output: true\ninvalid JSON from child',
+    'Final result: failed to parse JSON',
+  ])(
+    'does not mistake quoted task_status content for argument errors: %s',
+    async (text) => {
+      const output = createOutput(text);
+      await hook['tool.execute.after'](createInput('task_status'), output);
+      expect(output.output).toBe(text);
+    },
+  );
+
   test('does not append duplicate reminder on repeated execution', async () => {
     const output = createOutput('JSON parse error: invalid JSON arguments');
 

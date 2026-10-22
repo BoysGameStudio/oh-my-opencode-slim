@@ -5,6 +5,7 @@ import {
   classifyAssistantTurnEvidence,
   classifyTerminalEvidence,
   classifyV2HistoricalRound,
+  diagnosticEvidenceTranscriptOf,
   diagnosticExcerptOf,
   fetchChildTranscript,
   latestInputAtOf,
@@ -14,6 +15,71 @@ import {
 import { composeHostRound, hostRoundStateOf } from './session-runtime-status';
 
 describe('diagnostic excerpts', () => {
+  test('diagnostic classification caps content before terminal parsers and never serializes arbitrary error data', () => {
+    const result = diagnosticEvidenceTranscriptOf({
+      data: [
+        { info: { role: 'user' }, parts: [] },
+        {
+          info: {
+            role: 'assistant',
+            error: {
+              message: 'x'.repeat(100_000),
+              toJSON() {
+                throw new Error('must not serialize');
+              },
+            },
+          },
+          parts: Array.from({ length: 100 }, () => ({
+            type: 'text',
+            text: 'x'.repeat(100_000),
+          })),
+        },
+      ],
+    });
+    if (!('data' in result))
+      throw new Error('expected bounded classification evidence');
+    expect(String(result.data[1].info?.error).length).toBeLessThanOrEqual(480);
+    expect(
+      result.data[1].parts?.reduce(
+        (total: number, part: any) => total + (part.text?.length ?? 0),
+        0,
+      ),
+    ).toBeLessThanOrEqual(2000);
+  });
+  test.each(['text', 'assistant error', 'tool error'])(
+    'preserves surrogate pairs at intermediate %s boundaries',
+    (kind) => {
+      const text = `😀${'x'.repeat(kind === 'text' ? 1999 : 479)}`;
+      const entry = {
+        info: {
+          role: 'assistant',
+          ...(kind === 'assistant error' ? { error: { message: text } } : {}),
+        },
+        parts:
+          kind === 'text'
+            ? [{ type: 'text', text }]
+            : kind === 'tool error'
+              ? [{ type: 'tool', state: { status: 'error', error: text } }]
+              : [],
+      };
+      for (const maxBytes of [6144, 2048, 97]) {
+        const result = diagnosticExcerptOf({ data: [entry] }, { maxBytes });
+        if (!('text' in result)) throw new Error('expected excerpt');
+        expect(
+          Array.from(result.text).some((character) => {
+            const code = character.codePointAt(0) ?? 0;
+            return code >= 0xd800 && code <= 0xdfff;
+          }),
+        ).toBe(false);
+        expect(
+          new TextDecoder().decode(new TextEncoder().encode(result.text)),
+        ).not.toContain('\uFFFD');
+        expect(
+          new TextEncoder().encode(result.text).byteLength,
+        ).toBeLessThanOrEqual(maxBytes);
+      }
+    },
+  );
   test.each([
     undefined,
     { error: 'deleted' },

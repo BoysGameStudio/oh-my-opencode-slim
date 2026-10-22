@@ -214,12 +214,23 @@ export function createTaskStatusTool(options: {
           },
           { parentSessionID, idParam, requested },
         );
-      if (args.diagnostic === true)
-        return readTaskDiagnostic(options, {
-          parentSessionID,
-          idParam,
-          requested,
-        });
+      if (args.diagnostic === true) {
+        try {
+          return await readTaskDiagnostic(options, {
+            parentSessionID,
+            idParam,
+            requested,
+          });
+        } catch (error) {
+          // Resolver/host exceptions are outside this tool's control too.
+          throw new Error(
+            diagnosticField(
+              error instanceof Error ? error.message : 'Diagnostic read failed',
+              DIAGNOSTIC_MAX_BYTES - 'Error: '.length,
+            ),
+          );
+        }
+      }
       const canonical = options.resolveCanonicalTaskRef
         ? await options.resolveCanonicalTaskRef(parentSessionID, requested)
         : undefined;
@@ -697,9 +708,12 @@ const DIAGNOSTIC_TERMINALS = new Set(['error', 'cancelled', 'stopped']);
 
 /** Cap every variable header field as well as the excerpt. Newlines in host
  * reasons cannot impersonate protocol header lines. */
-function diagnosticField(value: string): string {
-  const tail = diagnosticTail(value, 512).replace(/[\r\n]/g, ' ');
-  return tail.length < value.length ? `[... truncated ...] ${tail}` : tail;
+function diagnosticField(value: string, maxBytes = 512): string {
+  const marker = '[... truncated ...] ';
+  const tail = diagnosticTail(value, maxBytes).replace(/[\r\n]/g, ' ');
+  return tail.length < value.length
+    ? marker + diagnosticTail(tail, maxBytes - marker.length)
+    : tail;
 }
 
 function diagnosticRefusal(taskID: string, state: string): string {
@@ -764,15 +778,17 @@ async function readTaskDiagnostic(
   if (resolution.kind === 'refused')
     throw new Error(
       withRecentTaskHandles(
-        resolution.reason,
-        recentTaskHandles(board, parentSessionID),
+        diagnosticField(resolution.reason),
+        diagnosticField(recentTaskHandles(board, parentSessionID) ?? ''),
       ),
     );
   const { identity } = resolution;
   const job = resolution.job ?? board.get(identity);
   if (job) {
     if (job.parentSessionID !== parentSessionID)
-      throw new Error(`Task ${identity} does not belong to this session`);
+      throw new Error(
+        `Task ${diagnosticField(identity)} does not belong to this session`,
+      );
     const state = terminalStateOf(job);
     if (!DIAGNOSTIC_TERMINALS.has(state))
       return diagnosticRefusal(
@@ -817,7 +833,7 @@ async function readTaskDiagnostic(
       !DIAGNOSTIC_TERMINALS.has(terminalStateOf(latest))
     )
       throw new Error(
-        `Task ${job.taskID} changed generation while its diagnostic was being read`,
+        `Task ${diagnosticField(job.taskID)} changed generation while its diagnostic was being read`,
       );
     return renderDiagnostic(
       { taskID: job.taskID, alias: job.alias, state, generation, reason },
@@ -831,16 +847,18 @@ async function readTaskDiagnostic(
     parentSessionID,
   );
   if (ownership.kind === 'foreign-parent')
-    throw new Error(`Task ${identity} does not belong to this session`);
+    throw new Error(
+      `Task ${diagnosticField(identity)} does not belong to this session`,
+    );
   if (ownership.kind !== 'verified' || options.isDisposed?.())
     throw new Error(
       withRecentTaskHandles(
-        `Unknown task ID or alias: ${identity}`,
-        recentTaskHandles(board, parentSessionID),
+        `Unknown task ID or alias: ${diagnosticField(identity)}`,
+        diagnosticField(recentTaskHandles(board, parentSessionID) ?? ''),
       ),
     );
   const evidence = await readUntrackedEvidence(
-    options,
+    { ...options, diagnostic: true },
     identity,
     ownership.hostInfo,
   );

@@ -149,17 +149,134 @@ export const DIAGNOSTIC_MAX_BYTES = 6_144;
 const DIAGNOSTIC_MESSAGE_CHARS = 2_000;
 const DIAGNOSTIC_ITEM_CHARS = 500;
 const DIAGNOSTIC_MESSAGE_PARTS = 100;
+const DIAGNOSTIC_MESSAGES = 40;
+
+/** Slice UTF-16 without splitting a surrogate pair at either boundary. */
+function diagnosticSlice(text: string, start: number, end?: number): string {
+  let sliced = text.slice(start, end);
+  if (/^[\uDC00-\uDFFF]/u.test(sliced)) sliced = sliced.slice(1);
+  if (/[\uD800-\uDBFF]$/u.test(sliced)) sliced = sliced.slice(0, -1);
+  return sliced;
+}
+
+/** Read only known error-message fields; never serialize arbitrary error data. */
+function diagnosticErrorText(error: unknown) {
+  const candidates =
+    typeof error === 'string'
+      ? [error]
+      : isRecord(error)
+        ? [isRecord(error.data) ? error.data.message : undefined, error.message]
+        : [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const text = diagnosticSlice(candidate, -480);
+    if (text.trim()) return { text, truncated: candidate.length > text.length };
+  }
+  return undefined;
+}
 
 /** UTF-8-safe tail trimming, without allocating a copy of an unbounded string. */
 export function diagnosticTail(text: string, maxBytes: number): string {
-  let tail = text.slice(-Math.max(0, maxBytes));
   if (maxBytes <= 0) return '';
+  let tail = diagnosticSlice(text, -maxBytes);
   while (new TextEncoder().encode(tail).byteLength > maxBytes) {
-    tail = tail.slice(1);
+    tail = diagnosticSlice(tail, 1);
   }
-  // Do not leave half of an astral character at the boundary.
-  if (/^[\uDC00-\uDFFF]/u.test(tail)) tail = tail.slice(1);
   return tail;
+}
+
+/** Select before validation: even malformed older entries must not cause an
+ * unbounded walk. Parts are bounded before the shared parser inspects them. */
+function diagnosticWindow(response: unknown):
+  | { unavailable: string }
+  | {
+      entries: TranscriptMessage[];
+      omittedMessages: number;
+      partsTruncated: boolean;
+    } {
+  if (response === undefined)
+    return { unavailable: 'transcript source not exposed by host' };
+  if (responseError(response) !== undefined)
+    return { unavailable: 'transcript read failed' };
+  if (!isRecord(response) || !Array.isArray(response.data))
+    return { unavailable: 'malformed transcript response' };
+  const omittedMessages = Math.max(
+    0,
+    response.data.length - DIAGNOSTIC_MESSAGES,
+  );
+  let partsTruncated = false;
+  const data = response.data.slice(omittedMessages).map((entry: unknown) => {
+    if (!isRecord(entry) || !Array.isArray(entry.parts)) return entry;
+    if (entry.parts.length > DIAGNOSTIC_MESSAGE_PARTS) partsTruncated = true;
+    return {
+      info: entry.info,
+      parts: entry.parts.slice(-DIAGNOSTIC_MESSAGE_PARTS),
+    };
+  });
+  const entries = transcriptEntries({ data });
+  if (!Array.isArray(entries)) return { unavailable: entries.reason };
+  return { entries, omittedMessages, partsTruncated };
+}
+
+/** Diagnostic classification cannot borrow attribution from outside its
+ * bounded window, or infer terminality from messages with omitted parts. */
+export function diagnosticEvidenceTranscriptOf(
+  response: unknown,
+): { unavailable: string } | { data: TranscriptMessage[] } {
+  const window = diagnosticWindow(response);
+  if ('unavailable' in window) return { unavailable: window.unavailable };
+  if (window.partsTruncated)
+    return {
+      unavailable: 'diagnostic attribution requires omitted message parts',
+    };
+  if (
+    !window.entries.some((entry) =>
+      ['user', 'synthetic'].includes(sourceTypeOf(entry) ?? ''),
+    )
+  )
+    return {
+      unavailable: 'latest input is outside the diagnostic message window',
+    };
+  return {
+    data: window.entries.map((entry) => {
+      const info = entry.info;
+      const error = info?.error;
+      let remaining = DIAGNOSTIC_MESSAGE_CHARS;
+      return {
+        info: {
+          id: info?.id,
+          role: info?.role,
+          sourceType: info?.sourceType,
+          finish: info?.finish,
+          summary: info?.summary,
+          time: {
+            created: info?.time?.created,
+            completed: info?.time?.completed,
+          },
+          error:
+            error === undefined || error === null
+              ? error
+              : (diagnosticErrorText(error)?.text ??
+                'assistant error (details unavailable)'),
+        },
+        parts: (entry.parts ?? []).map((part) => {
+          if (!isRecord(part)) return part;
+          if (part.type === 'text' && typeof part.text === 'string') {
+            const text =
+              remaining > 0 ? diagnosticSlice(part.text, -remaining) : '';
+            remaining -= text.length;
+            return { type: 'text', text };
+          }
+          return {
+            type: part.type,
+            state: isRecord(part.state)
+              ? { status: part.state.status }
+              : undefined,
+          };
+        }),
+      };
+    }),
+  };
 }
 
 /** Bounded, non-final assistant evidence. Never includes tool inputs or
@@ -170,27 +287,16 @@ export function diagnosticExcerptOf(
 ):
   | { unavailable: string }
   | { text: string; truncated: string; omittedMessages: number } {
-  if (response === undefined)
-    return { unavailable: 'transcript source not exposed by host' };
-  if (responseError(response) !== undefined)
-    return { unavailable: 'transcript read failed' };
-  if (!isRecord(response) || !Array.isArray(response.data))
-    return { unavailable: 'malformed transcript response' };
-  const start = Math.max(0, response.data.length - 40);
-  let charsCut = false;
-  const tail = response.data.slice(start).map((entry: unknown) => {
-    if (!isRecord(entry) || !Array.isArray(entry.parts)) return entry;
-    if (entry.parts.length > DIAGNOSTIC_MESSAGE_PARTS) charsCut = true;
-    return { ...entry, parts: entry.parts.slice(-DIAGNOSTIC_MESSAGE_PARTS) };
-  });
-  const entries = transcriptEntries({ data: tail });
-  if (!Array.isArray(entries)) return { unavailable: entries.reason };
+  const window = diagnosticWindow(response);
+  if ('unavailable' in window) return { unavailable: window.unavailable };
+  const { entries } = window;
+  let charsCut = window.partsTruncated;
   const budget = Math.max(
     0,
     Math.min(DIAGNOSTIC_MAX_BYTES, options.maxBytes ?? DIAGNOSTIC_MAX_BYTES),
   );
   const chunks: string[] = [];
-  let omittedMessages = start;
+  let omittedMessages = window.omittedMessages;
   let bytes = 0;
   for (let index = entries.length - 1; index >= 0; index--) {
     const entry = entries[index];
@@ -199,17 +305,17 @@ export function diagnosticExcerptOf(
     let chars = 0;
     const add = (text: string, cap: number) => {
       const room = Math.max(0, DIAGNOSTIC_MESSAGE_CHARS - chars);
-      const clipped = room > 0 ? text.slice(-Math.min(room, cap)) : '';
+      const clipped =
+        room > 0 ? diagnosticSlice(text, -Math.min(room, cap)) : '';
       if (text.length > clipped.length) charsCut = true;
       if (clipped) pieces.unshift(clipped);
       chars += clipped.length + 1;
     };
     const error = entry.info?.error;
-    const errorText =
-      typeof error === 'string' ? error : structuredErrorMessage(error);
-    if (errorText) {
-      if (errorText.length > 480) charsCut = true;
-      add(`assistant_error: ${errorText.slice(-480)}`, DIAGNOSTIC_ITEM_CHARS);
+    const detail = diagnosticErrorText(error);
+    if (detail) {
+      if (detail.truncated) charsCut = true;
+      add(`assistant_error: ${detail.text}`, DIAGNOSTIC_ITEM_CHARS);
     }
     const parts = entry.parts ?? [];
     for (let partIndex = parts.length - 1; partIndex >= 0; partIndex--) {
@@ -229,12 +335,12 @@ export function diagnosticExcerptOf(
       ) {
         if (part.state.error.length > 480) charsCut = true;
         add(
-          `tool_error: ${part.state.error.slice(-480)}`,
+          `tool_error: ${diagnosticSlice(part.state.error, -480)}`,
           DIAGNOSTIC_ITEM_CHARS,
         );
       }
     }
-    const text = pieces.join('\n').slice(-DIAGNOSTIC_MESSAGE_CHARS);
+    const text = diagnosticSlice(pieces.join('\n'), -DIAGNOSTIC_MESSAGE_CHARS);
     chunks.unshift(text);
     bytes += new TextEncoder().encode(text).byteLength + 1;
     if (bytes >= budget) {

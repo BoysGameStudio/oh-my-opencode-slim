@@ -160,6 +160,155 @@ function makeResultTool(
 }
 
 describe('task_status', () => {
+  test.each([
+    'unknown',
+    'foreign untracked',
+    'canonical refusal',
+    'resolver error',
+    'foreign tracked',
+    'running',
+    'completed',
+    'unavailable',
+    'race',
+  ])(
+    'bounds diagnostic errors and refusals with oversized references: %s',
+    async (kind) => {
+      const huge = `ses_${'a'.repeat(20_000)}`;
+      const detail = '💥'.repeat(20_000);
+      const board = new BackgroundJobBoard();
+      const tracked = [
+        'foreign tracked',
+        'running',
+        'completed',
+        'unavailable',
+        'race',
+      ].includes(kind);
+      if (tracked) {
+        board.registerLaunch({
+          taskID: huge,
+          parentSessionID: kind === 'foreign tracked' ? 'foreign' : 'parent-1',
+          agent: detail,
+          now: 0,
+        });
+        if (['completed', 'unavailable', 'race'].includes(kind))
+          boardFixture.updateStatus(board, {
+            taskID: huge,
+            state: kind === 'completed' ? 'completed' : 'error',
+            now: 10,
+          });
+      }
+      client = {
+        session: {
+          get: mock(async () => ({
+            data: kind === 'foreign untracked' ? { parentID: 'foreign' } : {},
+          })),
+          messages: mock(async () => {
+            if (kind === 'race')
+              board.registerLaunch({
+                taskID: huge,
+                parentSessionID: 'parent-1',
+                agent: detail,
+                now: 20,
+              });
+            throw new Error(detail);
+          }),
+        },
+      };
+      const tool = makeTool({
+        board,
+        resolveCanonicalTaskRef: async () => {
+          if (kind === 'resolver error') throw new Error(detail);
+          return kind === 'canonical refusal'
+            ? { kind: 'refused', reason: detail }
+            : { kind: 'exact', taskID: huge };
+        },
+      }).task_status;
+      let rendered: string;
+      try {
+        rendered = await tool.execute({ task_id: huge, diagnostic: true }, {
+          sessionID: 'parent-1',
+        } as never);
+        expect(['running', 'completed', 'unavailable']).toContain(kind);
+      } catch (error) {
+        rendered = String(error);
+        expect([
+          'unknown',
+          'foreign untracked',
+          'canonical refusal',
+          'resolver error',
+          'foreign tracked',
+          'race',
+        ]).toContain(kind);
+      }
+      expect(new TextEncoder().encode(rendered).byteLength).toBeLessThanOrEqual(
+        6144,
+      );
+      expect(rendered).toContain('[... truncated ...]');
+    },
+  );
+
+  test.each(['v1', 'v2'])(
+    'untracked diagnostic bounds classification before validation on %s',
+    async (flavor) => {
+      const h = makeResultTool(false, flavor);
+      const stale = {
+        get info(): never {
+          throw new Error('must not inspect older entries');
+        },
+      };
+      const input = { info: { role: 'user', time: { created: 1 } }, parts: [] };
+      const answer = {
+        info: {
+          role: 'assistant',
+          time: { created: 2 },
+          error: 'child failed',
+        },
+        parts: [{ type: 'text', text: 'partial evidence' }],
+      };
+      h.get.mockResolvedValue({
+        data: { parentID: 'parent-1', outcome: 'failed', time: { idle: 3 } },
+      } as never);
+      h.messages.mockResolvedValue({
+        data: [stale, ...Array(100).fill(answer), input, answer],
+      } as never);
+      const execute = () =>
+        h.tool.execute({ task_id: 'ses_child1', diagnostic: true }, {
+          sessionID: 'parent-1',
+        } as never);
+      expect(await execute()).toContain('generation: untracked');
+      expect(h.messages.mock.calls[0]?.[0]).toMatchObject({
+        query: { limit: 100 },
+      });
+      h.messages.mockResolvedValue({
+        data: [input, ...Array(100).fill(answer)],
+      } as never);
+      const uncertain = await execute();
+      expect(uncertain).toContain('state: running-or-incomplete (uncertain;');
+      expect(uncertain).toContain(
+        'latest input is outside the diagnostic message window',
+      );
+      expect(uncertain).not.toContain('partial_output: true');
+      h.messages.mockResolvedValue({
+        data: [
+          input,
+          { ...answer, parts: Array(101).fill({ type: 'text', text: 'part' }) },
+        ],
+      } as never);
+      expect(await execute()).toContain(
+        'diagnostic attribution requires omitted message parts',
+      );
+    },
+  );
+
+  test('ordinary untracked status and result preserve unlimited fetch defaults', async () => {
+    const h = makeResultTool(false);
+    const context = { sessionID: 'parent-1' } as never;
+    await h.tool.execute({ task_id: 'ses_child1' }, context);
+    await h.tool.execute({ task_id: 'ses_child1', result: true }, context);
+    expect(h.messages).toHaveBeenCalledTimes(2);
+    for (const [args] of h.messages.mock.calls)
+      expect(args).toMatchObject({ query: { limit: undefined } });
+  });
   test.each(['observed-activity', 'host-busy', 'launch-time', 'unknown'])(
     'activity provenance preserves timestamp: %s',
     async (source) => {
@@ -218,12 +367,7 @@ describe('task_status', () => {
       const reconciles = spyOn(h.gate, 'reconcile');
       const markUsed = spyOn(h.board, 'markUsed');
       const terminal = mock(() => {});
-      const otherGate = createBackgroundJobTerminalGate({
-        input: h.input,
-        backgroundJobBoard: h.board,
-        onTerminal: terminal,
-      });
-      statusGates.push(otherGate);
+      h.board.addTerminalStateListener(terminal);
       const before = structuredClone(h.board.get('ses_child1'));
       h.get.mockClear();
       h.status.mockClear();
@@ -260,6 +404,7 @@ describe('task_status', () => {
       observes.mockRestore();
       reconciles.mockRestore();
       markUsed.mockRestore();
+      h.board.removeTerminalStateListener(terminal);
       if (state === 'error') {
         const used = spyOn(h.board, 'markUsed');
         await expect(h.execute()).rejects.toThrow('ended in error');
@@ -354,6 +499,7 @@ describe('task_status', () => {
     const h = makeResultTool(false);
     h.messages.mockResolvedValue({
       data: [
+        { info: { role: 'user', time: { created: 1 } }, parts: [] },
         {
           info: { role: 'assistant', error: { message: 'provider failed' } },
           parts: [{ type: 'text', text: 'partial work' }],
@@ -446,6 +592,20 @@ describe('task_status', () => {
     'untracked diagnostic refuses ambiguous or ineligible evidence: %s',
     async (kind) => {
       const h = makeResultTool(false);
+      if (kind === 'completed')
+        h.messages.mockResolvedValue({
+          data: [
+            { info: { role: 'user', time: { created: 1 } }, parts: [] },
+            {
+              info: {
+                role: 'assistant',
+                finish: 'stop',
+                time: { completed: 10 },
+              },
+              parts: [{ type: 'text', text: 'final findings' }],
+            },
+          ],
+        } as never);
       if (kind === 'busy')
         h.status.mockResolvedValue({
           data: { ses_child1: { type: 'busy' } },

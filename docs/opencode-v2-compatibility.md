@@ -820,8 +820,13 @@ transcript evidence for failed/interrupted v2 children (v1 uses history).
 It never registers, prompts, or reconciles a child. Running children are
 refused; completed children use `result: true`. Missing or ambiguous evidence
 is explicit. Excerpts include assistant text and short assistant/failed-tool
-errors, not tool inputs or successful outputs; the complete response fits
-6,144 UTF-8 bytes, including labels and truncation markers.
+errors, not tool inputs or successful outputs. The tool's rendered diagnostic
+response fits 6,144 UTF-8 bytes, including headers, errors, and truncation
+markers; plugin warnings may be appended separately. The fetch requests a
+limit and our own scans are bounded. A host that ignores the limit still
+returns a full response that the adapter converts; that synchronous shim
+conversion is not bounded here. Missing attribution outside the scan window
+is reported as uncertain or unavailable, never guessed.
 
 Diagnostics are read-only and not consumption or acknowledgement. Observed
 state is evidence, execution completion ends a run, and parent acceptance is

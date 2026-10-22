@@ -177,10 +177,18 @@ describe('task controls through the real v2 client shim', () => {
                 directory: '/test',
                 client: {
                   session: {
+                    prompt: host.prompt,
+                    abort: host.interrupt,
+                    synthetic: host.synthetic,
+                    wait: host.wait,
                     get: mock(async () => ({ data: await host.get() })),
                     status: mock(async () => ({ data: {} })),
                     messages: mock(async () => ({
                       data: [
+                        {
+                          info: { role: 'user', time: { created: 10 } },
+                          parts: [],
+                        },
                         {
                           info: { role: 'assistant', error: 'child failed' },
                           parts: [{ type: 'text', text: 'partial work' }],

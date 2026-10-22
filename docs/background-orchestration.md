@@ -25,8 +25,12 @@ excerpt for error, cancelled, or stopped children. It also works for owned,
 untracked sessions after restart when host/history evidence verifies failure
 or interruption. Running children are refused; completed children use
 `result: true`. Unavailable or ambiguous evidence is reported, not invented.
-The entire diagnostic response is limited to 6,144 UTF-8 bytes, including its
-headers and truncation markers. Failed-tool and assistant errors may appear;
+The tool's rendered diagnostic response is limited to 6,144 UTF-8 bytes,
+including headers, errors, and truncation markers; plugin warnings may be
+appended separately. The fetch requests a limit and our own scans are bounded;
+a host that ignores the limit still returns a full response the adapter
+converts. Missing attribution outside the scan window means uncertainty.
+Failed-tool and assistant errors may appear;
 tool inputs and successful tool outputs do not.
 
 Diagnostic reads are not consumption, acknowledgement, or parent acceptance
