@@ -359,8 +359,7 @@ export function diagnosticExcerptOf(
     chunks.unshift(text);
     bytes += new TextEncoder().encode(text).byteLength + 1;
     if (bytes >= budget) {
-      omittedMessages +=
-        index - Math.max(0, boundary) - (boundaryCounted ? 1 : 0);
+      omittedMessages += index - boundary - 1;
       charsCut = true;
       break;
     }

@@ -588,6 +588,30 @@ describe('task_status', () => {
     },
   );
 
+  test('whole rendered single-message diagnostic reports only character truncation within 6144 bytes', async () => {
+    const h = makeResultTool();
+    await h.settle('error');
+    h.messages.mockResolvedValue({
+      data: [
+        { info: { role: 'user', time: { created: 0 } }, parts: [] },
+        {
+          info: { role: 'assistant', time: { created: 1 } },
+          parts: [{ type: 'text', text: '界'.repeat(2000) }],
+        },
+      ],
+    } as never);
+    const output = await h.tool.execute(
+      { task_id: 'exp-1', diagnostic: true },
+      { sessionID: 'parent-1' } as never,
+    );
+    expect(output).toContain('excerpt_begin\n');
+    expect(output).toContain('truncated: chars\n');
+    expect(output).not.toContain('earlier messages omitted');
+    expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(
+      6144,
+    );
+  });
+
   test('whole rendered diagnostic including huge reason and multibyte transcript fits 6144 bytes', async () => {
     const h = makeResultTool();
     await h.settle('error');

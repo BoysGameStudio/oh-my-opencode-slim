@@ -87,6 +87,43 @@ describe('diagnostic excerpts', () => {
     },
   );
 
+  test.each([false, true])(
+    'budget stop counts only unvisited entries (earlier assistant=%s)',
+    (earlierAssistant) => {
+      const result = diagnosticExcerptOf(
+        {
+          data: [
+            { info: { role: 'user', time: { created: 0 } }, parts: [] },
+            ...(earlierAssistant
+              ? [
+                  {
+                    info: { role: 'assistant', time: { created: 1 } },
+                    parts: [{ type: 'text', text: 'earlier step' }],
+                  },
+                ]
+              : []),
+            {
+              info: { role: 'assistant', time: { created: 2 } },
+              parts: [{ type: 'text', text: '界'.repeat(2000) }],
+            },
+          ],
+        },
+        { runStartedAt: 0, maxBytes: 1000 },
+      );
+      if (!('text' in result)) throw new Error('expected excerpt');
+      expect(result.omittedMessages).toBe(earlierAssistant ? 1 : 0);
+      expect(result.truncated).toBe(
+        earlierAssistant ? 'messages,chars' : 'chars',
+      );
+      if (earlierAssistant)
+        expect(result.text).toContain('1 earlier messages omitted');
+      else expect(result.text).not.toContain('earlier messages omitted');
+      expect(
+        new TextEncoder().encode(result.text).byteLength,
+      ).toBeLessThanOrEqual(1000);
+    },
+  );
+
   test('budget truncation counts a pre-start boundary input only once', () => {
     const result = diagnosticExcerptOf(
       {
