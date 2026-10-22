@@ -735,6 +735,7 @@ function renderDiagnostic(
     generation: number | 'untracked';
     reason: string;
     source?: string;
+    runStartedAt?: number;
   },
   transcript: unknown,
   unavailable?: string,
@@ -754,7 +755,10 @@ function renderDiagnostic(
     new TextEncoder().encode(`${header}\nexcerpt_begin\n${footer}`).byteLength;
   const excerpt = unavailable
     ? { unavailable }
-    : diagnosticExcerptOf(transcript, { maxBytes: budget });
+    : diagnosticExcerptOf(transcript, {
+        maxBytes: budget,
+        runStartedAt: info.runStartedAt,
+      });
   if ('unavailable' in excerpt)
     return `${header}\nexcerpt: none (evidence unavailable)\nevidence: unavailable (${diagnosticField(excerpt.unavailable)})`;
   return `${header}\nexcerpt_begin\n${excerpt.text}\nexcerpt_end\ntruncated: ${excerpt.truncated}\nevidence: ${info.source ?? 'transcript'}`;
@@ -797,6 +801,7 @@ async function readTaskDiagnostic(
       );
     const generation = job.generation;
     const revision = job.terminalRevision;
+    const runStartedAt = job.runStartedAt;
     const reason =
       state === 'error'
         ? (job.lastStatusError ??
@@ -836,7 +841,14 @@ async function readTaskDiagnostic(
         `Task ${diagnosticField(job.taskID)} changed generation while its diagnostic was being read`,
       );
     return renderDiagnostic(
-      { taskID: job.taskID, alias: job.alias, state, generation, reason },
+      {
+        taskID: job.taskID,
+        alias: job.alias,
+        state,
+        generation,
+        reason,
+        runStartedAt,
+      },
       transcript,
       unavailable,
     );

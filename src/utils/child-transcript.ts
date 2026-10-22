@@ -293,7 +293,7 @@ export function diagnosticEvidenceTranscriptOf(
  * successful tool output. Validation uses the shared rules on the tail only. */
 export function diagnosticExcerptOf(
   response: unknown,
-  options: { maxBytes?: number } = {},
+  options: { maxBytes?: number; runStartedAt?: number } = {},
 ):
   | { unavailable: string }
   | { text: string; truncated: string; omittedMessages: number } {
@@ -305,6 +305,40 @@ export function diagnosticExcerptOf(
     return {
       unavailable: 'latest input is outside the diagnostic message window',
     };
+  const { runStartedAt } = options;
+  if (runStartedAt !== undefined) {
+    // Native registration can follow the prompt, whereas revive captures its
+    // start before admission. Do not require the input to postdate registration
+    // or guess a launch-time tolerance. Only assistant creation in this run's
+    // time range is safe to excerpt; completion alone could belong to old work.
+    const assistants = entries
+      .slice(boundary + 1)
+      .filter(
+        (entry) =>
+          entry.info?.role === 'assistant' &&
+          !isDiagnosticCompactionRound(entry),
+      );
+    if (
+      !Number.isFinite(runStartedAt) ||
+      assistants.some(
+        (entry) =>
+          typeof entry.info?.time?.created !== 'number' ||
+          !Number.isFinite(entry.info.time.created),
+      )
+    )
+      return {
+        unavailable:
+          'tracked run attribution requires assistant creation timestamps',
+      };
+    if (
+      !assistants.some(
+        (entry) => (entry.info?.time?.created as number) >= runStartedAt,
+      )
+    )
+      return {
+        unavailable: 'no assistant evidence at or after the tracked run start',
+      };
+  }
   let charsCut = window.partsTruncated;
   const budget = Math.max(
     0,
@@ -312,6 +346,12 @@ export function diagnosticExcerptOf(
   );
   const chunks: string[] = [];
   let omittedMessages = window.omittedMessages + Math.max(0, boundary);
+  if (
+    runStartedAt !== undefined &&
+    typeof entries[boundary]?.info?.time?.created === 'number' &&
+    (entries[boundary].info?.time?.created as number) < runStartedAt
+  )
+    omittedMessages++;
   let compactionMessages = 0;
   let bytes = 0;
   for (let index = entries.length - 1; index > boundary; index--) {
@@ -321,6 +361,13 @@ export function diagnosticExcerptOf(
       continue;
     }
     if (entry.info?.role !== 'assistant') continue;
+    if (
+      runStartedAt !== undefined &&
+      (entry.info?.time?.created as number) < runStartedAt
+    ) {
+      omittedMessages++;
+      continue;
+    }
     const pieces: string[] = [];
     let chars = 0;
     const add = (text: string, cap: number) => {

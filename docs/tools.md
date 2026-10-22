@@ -257,6 +257,10 @@ children point to `result: true`. The two modes are mutually exclusive.
 Excerpts start after the latest real input in that window; earlier runs and
 host compaction messages are omitted and labelled. If that input is missing,
 the excerpt is unavailable rather than attributed to the wrong run.
+Tracked excerpts also exclude assistant messages created before the board's
+run start. The input itself may predate registration. Missing assistant creation
+times or only pre-start evidence makes the excerpt unavailable; late registration
+can therefore omit genuine early output rather than risk showing stale work.
 Diagnostics are read-only, not consumption or acknowledgement: observed state
 is evidence, execution completion ends a run, and parent acceptance is a
 separate decision. Diagnostic reads do not reconcile or resume a child.

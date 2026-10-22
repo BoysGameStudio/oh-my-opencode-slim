@@ -87,7 +87,7 @@ describe('diagnostic excerpts', () => {
     });
   });
 
-  test('v2 compaction source cannot supply diagnostic input attribution', () => {
+  test('v2 compaction source remains ineligible as input (existing attribution guard)', () => {
     const transcript = {
       data: [
         {

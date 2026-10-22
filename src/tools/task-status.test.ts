@@ -433,7 +433,7 @@ describe('task_status', () => {
         data: [
           { info: { role: 'user' }, parts: [] },
           {
-            info: { role: 'assistant' },
+            info: { role: 'assistant', time: { created: 10 } },
             parts: [{ type: 'text', text: 'partial findings' }],
           },
         ],
@@ -605,11 +605,7 @@ describe('task_status', () => {
         { sessionID: 'parent-1' } as never,
       );
       expect(output).toContain('state: error');
-      expect(output).toContain(
-        transcript && Array.isArray(transcript.data)
-          ? 'excerpt_begin'
-          : 'evidence: unavailable',
-      );
+      expect(output).toContain('evidence: unavailable');
     },
   );
 
@@ -621,7 +617,10 @@ describe('task_status', () => {
     job.lastStatusError = '💥'.repeat(100_000);
     h.messages.mockResolvedValue({
       data: Array.from({ length: 100 }, (_, index) => ({
-        info: { role: index === 61 ? 'user' : 'assistant' },
+        info: {
+          role: index === 61 ? 'user' : 'assistant',
+          time: { created: index },
+        },
         parts: [{ type: 'text', text: '💥'.repeat(100_000) }],
       })),
     } as never);
