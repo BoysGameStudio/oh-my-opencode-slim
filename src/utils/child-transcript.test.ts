@@ -16,6 +16,77 @@ import {
 import { composeHostRound, hostRoundStateOf } from './session-runtime-status';
 
 describe('diagnostic excerpts', () => {
+  test.each(['v1', 'v2'] as const)(
+    'failed-tool diagnostic preserves %s host errors without inputs or outputs',
+    async (flavor) => {
+      const parts = [
+        {
+          type: 'tool',
+          state: {
+            status: 'error',
+            input: { command: 'SECRET INPUT' },
+            error:
+              flavor === 'v2'
+                ? { type: 'tool', message: 'permission denied' }
+                : 'permission denied',
+            content: [{ type: 'text', text: 'SECRET FAILED CONTENT' }],
+          },
+        },
+        {
+          type: 'tool',
+          state: {
+            status: 'completed',
+            input: { command: 'SECRET INPUT' },
+            output: 'SECRET OUTPUT',
+            content: [{ type: 'text', text: 'SECRET SUCCESS CONTENT' }],
+          },
+        },
+      ];
+      const client =
+        flavor === 'v2'
+          ? buildPluginInput({
+              session: {
+                context: async () => [
+                  { id: 'input', type: 'user', time: 100, content: [] },
+                  {
+                    id: 'answer',
+                    type: 'assistant',
+                    time: 110,
+                    content: parts,
+                  },
+                ],
+              },
+            } as unknown as V2Context).client
+          : ({
+              session: {
+                messages: async () => ({
+                  data: [
+                    {
+                      info: { role: 'user', time: { created: 100 } },
+                      parts: [],
+                    },
+                    {
+                      info: { role: 'assistant', time: { created: 110 } },
+                      parts,
+                    },
+                  ],
+                }),
+              },
+            } as unknown as PluginInput['client']);
+      const transcript = await fetchChildTranscript(
+        client,
+        'child',
+        '/test',
+        100,
+      );
+      const result = diagnosticExcerptOf(transcript, { runStartedAt: 100 });
+      if (!('text' in result)) throw new Error('expected excerpt');
+      expect(result.text).toContain('tool_error: permission denied');
+      expect(result.text).not.toContain('SECRET');
+      expect(result.truncated).toBe('none');
+    },
+  );
+
   test('budget truncation counts a pre-start boundary input only once', () => {
     const result = diagnosticExcerptOf(
       {
@@ -196,7 +267,7 @@ describe('diagnostic excerpts', () => {
       new TextEncoder().encode(result.text).byteLength,
     ).toBeLessThanOrEqual(6144);
   });
-  test.each(['text', 'assistant error', 'tool error'])(
+  test.each(['text', 'assistant error', 'tool error', 'structured tool error'])(
     'preserves surrogate pairs at intermediate %s boundaries',
     (kind) => {
       const text = `😀${'x'.repeat(kind === 'text' ? 1999 : 479)}`;
@@ -208,8 +279,19 @@ describe('diagnostic excerpts', () => {
         parts:
           kind === 'text'
             ? [{ type: 'text', text }]
-            : kind === 'tool error'
-              ? [{ type: 'tool', state: { status: 'error', error: text } }]
+            : kind.endsWith('tool error')
+              ? [
+                  {
+                    type: 'tool',
+                    state: {
+                      status: 'error',
+                      error:
+                        kind === 'structured tool error'
+                          ? { type: 'tool', message: text }
+                          : text,
+                    },
+                  },
+                ]
               : [],
       };
       for (const maxBytes of [6144, 2048, 97]) {
@@ -218,6 +300,10 @@ describe('diagnostic excerpts', () => {
           { maxBytes },
         );
         if (!('text' in result)) throw new Error('expected excerpt');
+        if (kind === 'structured tool error' && maxBytes === 6144) {
+          expect(result.text).toContain('tool_error:');
+          expect(result.truncated).toBe('chars');
+        }
         expect(
           Array.from(result.text).some((character) => {
             const code = character.codePointAt(0) ?? 0;

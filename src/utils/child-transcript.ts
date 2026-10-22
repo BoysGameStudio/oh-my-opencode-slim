@@ -346,14 +346,13 @@ export function diagnosticExcerptOf(
       if (
         part.type === 'tool' &&
         isRecord(part.state) &&
-        part.state.status === 'error' &&
-        typeof part.state.error === 'string'
+        part.state.status === 'error'
       ) {
-        if (part.state.error.length > 480) charsCut = true;
-        add(
-          `tool_error: ${diagnosticSlice(part.state.error, -480)}`,
-          DIAGNOSTIC_ITEM_CHARS,
-        );
+        const toolError = diagnosticErrorText(part.state.error);
+        if (toolError) {
+          if (toolError.truncated) charsCut = true;
+          add(`tool_error: ${toolError.text}`, DIAGNOSTIC_ITEM_CHARS);
+        }
       }
     }
     const text = diagnosticSlice(pieces.join('\n'), -DIAGNOSTIC_MESSAGE_CHARS);
