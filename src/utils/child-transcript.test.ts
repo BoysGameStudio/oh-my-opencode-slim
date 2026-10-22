@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { PluginInput } from '@opencode-ai/plugin';
+import { buildPluginInput } from '../v2/client-shim';
+import type { V2Context } from '../v2/types';
 import {
   attributeHostRoundToTranscript,
   classifyAssistantTurnEvidence,
@@ -15,6 +17,91 @@ import {
 import { composeHostRound, hostRoundStateOf } from './session-runtime-status';
 
 describe('diagnostic excerpts', () => {
+  test('real v2 compacted context reports omitted maintenance messages', async () => {
+    const input = buildPluginInput({
+      session: {
+        context: async () => [
+          { id: 'input', type: 'user', time: 10, content: [] },
+          { id: 'compact', type: 'compaction', status: 'completed' },
+          {
+            id: 'answer',
+            type: 'assistant',
+            time: 11,
+            content: [{ type: 'text', text: 'partial work' }],
+          },
+        ],
+      },
+    } as unknown as V2Context);
+    const transcript = await fetchChildTranscript(
+      input.client,
+      'child',
+      '/test',
+      100,
+    );
+    expect(transcript).toMatchObject({ page: { complete: false } });
+    const result = diagnosticExcerptOf(transcript);
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toContain('partial work');
+    expect(result.text).toContain('1 compaction messages omitted');
+    expect(result.truncated).toBe('messages');
+    expect(result.omittedMessages).toBe(1);
+  });
+  test.each(['user', 'synthetic'])(
+    'excerpts fence earlier runs at the latest real %s input',
+    (role) => {
+      const result = diagnosticExcerptOf({
+        data: [
+          { info: { role: 'user' }, parts: [] },
+          {
+            info: { role: 'assistant' },
+            parts: [{ type: 'text', text: 'STALE SUCCESS' }],
+          },
+          { info: { id: 'new-input', role }, parts: [] },
+          {
+            info: { role: 'assistant' },
+            parts: [{ type: 'text', text: 'current step' }],
+          },
+          { info: { role: 'user' }, parts: [{ type: 'compaction' }] },
+          { info: { role: 'system' }, parts: [] },
+          { info: { role: 'assistant', error: 'current failure' }, parts: [] },
+        ],
+      });
+      if (!('text' in result)) throw new Error('expected excerpt');
+      expect(result.text).not.toContain('STALE SUCCESS');
+      expect(result.text).toContain('current step');
+      expect(result.text).toContain('current failure');
+      expect(result.text).toContain('2 earlier messages omitted');
+      expect(result.omittedMessages).toBe(3);
+    },
+  );
+
+  test('excerpts fail closed when the bounded window has no real input', () => {
+    const result = diagnosticExcerptOf({
+      data: Array.from({ length: 41 }, (_, i) => ({
+        info: { role: i === 0 ? 'user' : 'assistant' },
+        parts: [{ type: 'text', text: 'unattributable output' }],
+      })),
+    });
+    expect(result).toEqual({
+      unavailable: 'latest input is outside the diagnostic message window',
+    });
+  });
+
+  test('v2 compaction source cannot supply diagnostic input attribution', () => {
+    const transcript = {
+      data: [
+        {
+          info: { id: 'compact', role: 'user', sourceType: 'compaction' },
+          parts: [],
+        },
+        { info: { role: 'assistant', error: 'failure' }, parts: [] },
+      ],
+    };
+    expect(diagnosticEvidenceTranscriptOf(transcript)).toHaveProperty(
+      'unavailable',
+    );
+  });
+
   test('compaction triggers cannot supply diagnostic input attribution', () => {
     expect(
       diagnosticEvidenceTranscriptOf({
@@ -111,7 +198,10 @@ describe('diagnostic excerpts', () => {
               : [],
       };
       for (const maxBytes of [6144, 2048, 97]) {
-        const result = diagnosticExcerptOf({ data: [entry] }, { maxBytes });
+        const result = diagnosticExcerptOf(
+          { data: [{ info: { role: 'user' }, parts: [] }, entry] },
+          { maxBytes },
+        );
         if (!('text' in result)) throw new Error('expected excerpt');
         expect(
           Array.from(result.text).some((character) => {
@@ -139,7 +229,7 @@ describe('diagnostic excerpts', () => {
   test('tail scan bounds ignored limit responses and marks omitted messages and character cuts', () => {
     const result = diagnosticExcerptOf({
       data: Array.from({ length: 100 }, (_, index) => ({
-        info: { role: 'assistant' },
+        info: { role: index === 61 ? 'user' : 'assistant' },
         parts: [{ type: 'text', text: `${index}: ${'界'.repeat(10_000)}` }],
       })),
     });
@@ -157,6 +247,7 @@ describe('diagnostic excerpts', () => {
   test('assistant and failed-tool errors are labelled and capped; inputs and successful output are excluded', () => {
     const result = diagnosticExcerptOf({
       data: [
+        { info: { role: 'user' }, parts: [] },
         {
           info: {
             role: 'assistant',
@@ -216,6 +307,7 @@ describe('diagnostic excerpts', () => {
   test('caps per-message work even when a host returns thousands of parts', () => {
     const result = diagnosticExcerptOf({
       data: [
+        { info: { role: 'user' }, parts: [] },
         {
           info: { role: 'assistant' },
           parts: [

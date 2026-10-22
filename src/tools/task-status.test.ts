@@ -431,6 +431,7 @@ describe('task_status', () => {
       await h.settle(state);
       h.messages.mockResolvedValue({
         data: [
+          { info: { role: 'user' }, parts: [] },
           {
             info: { role: 'assistant' },
             parts: [{ type: 'text', text: 'partial findings' }],
@@ -619,8 +620,8 @@ describe('task_status', () => {
     if (!job) throw new Error('expected tracked child');
     job.lastStatusError = '💥'.repeat(100_000);
     h.messages.mockResolvedValue({
-      data: Array.from({ length: 100 }, () => ({
-        info: { role: 'assistant' },
+      data: Array.from({ length: 100 }, (_, index) => ({
+        info: { role: index === 61 ? 'user' : 'assistant' },
         parts: [{ type: 'text', text: '💥'.repeat(100_000) }],
       })),
     } as never);

@@ -218,6 +218,20 @@ function diagnosticWindow(response: unknown):
   return { entries, omittedMessages, partsTruncated };
 }
 
+/** Keep v2 maintenance recognition local: ordinary terminal readers retain
+ * their existing host-specific classification contracts. */
+function isDiagnosticCompactionRound(message: TranscriptMessage): boolean {
+  return sourceTypeOf(message) === 'compaction' || isCompactionRound(message);
+}
+
+function diagnosticInputIndex(entries: TranscriptMessage[]): number {
+  return entries.findLastIndex(
+    (entry) =>
+      !isDiagnosticCompactionRound(entry) &&
+      ['user', 'synthetic'].includes(sourceTypeOf(entry) ?? ''),
+  );
+}
+
 /** Diagnostic classification cannot borrow attribution from outside its
  * bounded window, or infer terminality from messages with omitted parts. */
 export function diagnosticEvidenceTranscriptOf(
@@ -229,13 +243,7 @@ export function diagnosticEvidenceTranscriptOf(
     return {
       unavailable: 'diagnostic attribution requires omitted message parts',
     };
-  if (
-    !window.entries.some(
-      (entry) =>
-        !isCompactionRound(entry) &&
-        ['user', 'synthetic'].includes(sourceTypeOf(entry) ?? ''),
-    )
-  )
+  if (diagnosticInputIndex(window.entries) < 0)
     return {
       unavailable: 'latest input is outside the diagnostic message window',
     };
@@ -292,18 +300,23 @@ export function diagnosticExcerptOf(
   const window = diagnosticWindow(response);
   if ('unavailable' in window) return { unavailable: window.unavailable };
   const { entries } = window;
+  const boundary = diagnosticInputIndex(entries);
+  if (boundary < 0 && entries.length > 0)
+    return {
+      unavailable: 'latest input is outside the diagnostic message window',
+    };
   let charsCut = window.partsTruncated;
   const budget = Math.max(
     0,
     Math.min(DIAGNOSTIC_MAX_BYTES, options.maxBytes ?? DIAGNOSTIC_MAX_BYTES),
   );
   const chunks: string[] = [];
-  let omittedMessages = window.omittedMessages;
+  let omittedMessages = window.omittedMessages + Math.max(0, boundary);
   let compactionMessages = 0;
   let bytes = 0;
-  for (let index = entries.length - 1; index >= 0; index--) {
+  for (let index = entries.length - 1; index > boundary; index--) {
     const entry = entries[index];
-    if (isCompactionRound(entry)) {
+    if (isDiagnosticCompactionRound(entry)) {
       compactionMessages++;
       continue;
     }
@@ -351,7 +364,7 @@ export function diagnosticExcerptOf(
     chunks.unshift(text);
     bytes += new TextEncoder().encode(text).byteLength + 1;
     if (bytes >= budget) {
-      omittedMessages += index;
+      omittedMessages += index - Math.max(0, boundary);
       charsCut = true;
       break;
     }

@@ -140,9 +140,15 @@ function harness(
 }
 
 describe('task controls through the real v2 client shim', () => {
-  test.each(['v1', 'v2'] as const)(
-    'read-only diagnostics on %s failed and interrupted children',
-    async (flavor) => {
+  test.each(
+    (['v1', 'v2'] as const).flatMap((flavor) =>
+      [true, false].flatMap((tracked) =>
+        [true, false].map((partial) => ({ flavor, tracked, partial })),
+      ),
+    ),
+  )(
+    'read-only diagnostics fence runs on %j failed and interrupted children',
+    async ({ flavor, tracked, partial }) => {
       for (const outcome of ['failed', 'interrupted']) {
         const host = {
           get: mock(async () => ({
@@ -153,6 +159,18 @@ describe('task controls through the real v2 client shim', () => {
           })),
           context: mock(async () => [
             {
+              id: 'old-input',
+              type: 'user',
+              time: 1,
+              content: [],
+            },
+            {
+              id: 'old-answer',
+              type: 'assistant',
+              time: 2,
+              content: [{ type: 'text', text: 'STALE SUCCESS' }],
+            },
+            {
               id: 'user',
               type: 'user',
               time: 10,
@@ -162,7 +180,7 @@ describe('task controls through the real v2 client shim', () => {
               id: 'answer',
               type: 'assistant',
               time: 11,
-              content: [{ type: 'text', text: 'partial work' }],
+              content: partial ? [{ type: 'text', text: 'partial work' }] : [],
             },
           ]),
           prompt: mock(async () => ({})),
@@ -185,13 +203,20 @@ describe('task controls through the real v2 client shim', () => {
                     status: mock(async () => ({ data: {} })),
                     messages: mock(async () => ({
                       data: [
+                        { info: { role: 'user' }, parts: [] },
+                        {
+                          info: { role: 'assistant' },
+                          parts: [{ type: 'text', text: 'STALE SUCCESS' }],
+                        },
                         {
                           info: { role: 'user', time: { created: 10 } },
                           parts: [],
                         },
                         {
                           info: { role: 'assistant', error: 'child failed' },
-                          parts: [{ type: 'text', text: 'partial work' }],
+                          parts: partial
+                            ? [{ type: 'text', text: 'partial work' }]
+                            : [],
                         },
                       ],
                     })),
@@ -199,6 +224,19 @@ describe('task controls through the real v2 client shim', () => {
                 },
               } as unknown as PluginInput);
         const board = new BackgroundJobBoard();
+        if (tracked) {
+          board.registerLaunch({
+            taskID: 'ses_child',
+            parentSessionID: 'parent',
+            agent: 'explorer',
+            now: 10,
+          });
+          boardFixture.updateStatus(board, {
+            taskID: 'ses_child',
+            state: 'error',
+            now: 20,
+          });
+        }
         const gate = createBackgroundJobTerminalGate({
           input,
           backgroundJobBoard: board,
@@ -220,14 +258,16 @@ describe('task controls through the real v2 client shim', () => {
           },
           context,
         );
-        expect(output).toContain('generation: untracked');
+        expect(output).toContain(`generation: ${tracked ? 1 : 'untracked'}`);
         expect(output).toContain(
-          flavor === 'v2' && outcome === 'interrupted'
+          !tracked && flavor === 'v2' && outcome === 'interrupted'
             ? 'state: stopped'
             : 'state: error',
         );
         expect(output).toContain('partial_output: true');
-        expect(output).toContain('partial work');
+        if (partial) expect(output).toContain('partial work');
+        expect(output).not.toContain('STALE SUCCESS');
+        expect(output).toContain('2 earlier messages omitted');
         expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(
           6144,
         );
@@ -241,7 +281,7 @@ describe('task controls through the real v2 client shim', () => {
           reconcile,
         ])
           expect(fn).not.toHaveBeenCalled();
-        expect(board.get('ses_child')).toBeUndefined();
+        if (!tracked) expect(board.get('ses_child')).toBeUndefined();
       }
     },
   );
