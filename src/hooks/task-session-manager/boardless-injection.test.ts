@@ -140,6 +140,86 @@ describe('boardless injection', () => {
 });
 
 describe('retirement by observed delta', () => {
+  test('a metadata fence retires ONLY its exact run (never the current one)', async () => {
+    const board = terminalBoard();
+    const state = createInjectionState(board);
+    await injectBackgroundJobBoard(state, {}, {
+      messages: [
+        pushPart(
+          [
+            {
+              taskID: 'child-1',
+              generation: 2,
+              terminalRevision: 1,
+              state: 'completed',
+            },
+          ],
+          '<completed-job>\nalias: exp-1\ntask: child-1\nstate: completed\nresult: mapped hooks\n</completed-job>',
+        ),
+      ],
+    } as never);
+    // The fence names generation 2; the record is at generation 1 — the
+    // stale fence must not ack the current run (Greptile P1 4344212805).
+    expect(board.get('child-1')).toMatchObject({
+      state: 'completed',
+      terminalUnreconciled: true,
+    });
+  });
+
+  test('a consumed text notice cannot pair a later reopened run', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'child-1',
+      parentSessionID: SESSION,
+      agent: 'explorer',
+      description: 'map hooks',
+      now: BASE_TIME,
+    });
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'mapped hooks',
+      now: BASE_TIME + 5,
+    });
+    const state = createInjectionState(board);
+    const notice = {
+      info: {
+        id: 'msg_notice_1',
+        sessionID: SESSION,
+        role: 'user',
+        agent: 'orchestrator',
+        time: { created: BASE_TIME + 10 },
+      },
+      parts: [
+        {
+          type: 'text',
+          text: '<task id="child-1" state="completed">\nmapped hooks\n</task>',
+          synthetic: true,
+          metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+        },
+      ],
+    };
+    await injectBackgroundJobBoard(state, {}, { messages: [notice] } as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'reconciled',
+      terminalUnreconciled: false,
+    });
+    // Reopen: the same notice replays in history but must never pair the
+    // reopened round.
+    board.markRunningFromLiveSession('child-1', BASE_TIME + 9_000);
+    board.updateStatus({
+      taskID: 'child-1',
+      state: 'completed',
+      resultSummary: 'mapped hooks again',
+      now: BASE_TIME + 10_000,
+    });
+    await injectBackgroundJobBoard(state, {}, { messages: [notice] } as never);
+    expect(board.get('child-1')).toMatchObject({
+      state: 'completed',
+      terminalUnreconciled: true,
+    });
+  });
+
   function terminalBoard(): BackgroundJobBoard {
     const board = new BackgroundJobBoard();
     board.registerLaunch({

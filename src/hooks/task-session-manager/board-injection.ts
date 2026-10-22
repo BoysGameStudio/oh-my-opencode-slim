@@ -1475,21 +1475,38 @@ function reconcileObservedTerminalDeltas(
   state: InjectionState,
   messages: unknown[],
 ): void {
+  state.observedNativeDeliveries ??= new Map<string, Map<string, true>>();
+  const seenByParent = state.observedNativeDeliveries;
   for (const message of messages) {
     if (!isMessageWithParts(message)) continue;
     const parentSessionID = message.info.sessionID;
     if (!parentSessionID || !state.shouldManageSession(parentSessionID)) {
       continue;
     }
+    let seen = seenByParent.get(parentSessionID);
+    if (!seen) {
+      seen = new Map<string, true>();
+      seenByParent.set(parentSessionID, seen);
+    }
     const createdAt = messageCreatedAt(message);
-    for (const part of message.parts) {
-      if (part.type !== 'text' || typeof part.text !== 'string') continue;
+    message.parts.forEach((part, partIndex) => {
+      if (part.type !== 'text' || typeof part.text !== 'string') return;
       const metadata = isRecord(part.metadata) ? part.metadata : undefined;
-      const fences = metadata
-        ? parseObservedCompletedJobFences(metadata[TERMINAL_DELTA_METADATA_KEY])
-        : [];
-      if (fences.length > 0) {
-        for (const fence of fences) {
+      const hasMetadataFence =
+        metadata !== undefined &&
+        Object.hasOwn(metadata, TERMINAL_DELTA_METADATA_KEY);
+      if (hasMetadataFence) {
+        const seenKey = nativeDeliverySeenKey(message, partIndex, part.text);
+        if (seen.has(seenKey)) {
+          rememberDeliveryKey(seen, seenKey);
+          return;
+        }
+        // A present fence is authoritative even when malformed or stale:
+        // never let its body fall through to the weaker text pairing.
+        rememberDeliveryKey(seen, seenKey);
+        for (const fence of parseObservedCompletedJobFences(
+          metadata[TERMINAL_DELTA_METADATA_KEY],
+        )) {
           const record = state.backgroundJobBoard.get(fence.taskID);
           if (!record || record.parentSessionID !== parentSessionID) continue;
           if (!record.terminalUnreconciled) continue;
@@ -1500,14 +1517,14 @@ function reconcileObservedTerminalDeltas(
           reconcileExecutionBatch(state, parentSessionID, [
             {
               taskID: record.taskID,
-              generation: record.generation,
-              terminalRevision: record.terminalRevision,
+              generation: fence.generation,
+              terminalRevision: fence.terminalRevision,
             },
           ]);
         }
-        continue;
+        return;
       }
-      if (!isInternalInitiatorPart(part)) continue;
+      if (!isInternalInitiatorPart(part)) return;
       const observedDeliveries = [
         ...parseCompletedJobDeltaText(part.text),
         ...parseRevivedTerminalNotification(part.text),
@@ -1515,21 +1532,46 @@ function reconcileObservedTerminalDeltas(
       for (const block of observedDeliveries) {
         const record = state.backgroundJobBoard.get(block.taskID);
         if (!record || record.parentSessionID !== parentSessionID) continue;
-        if (!record.terminalUnreconciled) continue;
-        const terminalState = record.terminalState ?? record.state;
-        if (terminalState !== block.state) continue;
-        // Timestamp fence (generation fence without metadata): the part
-        // reports only the publication that already existed when the wake
-        // was authored. A later re-publication is newer than this part.
-        if (createdAt === undefined || record.completedAt === undefined) {
+        if (createdAt === undefined) continue;
+        const seenKey = nativeDeliverySeenKey(message, partIndex, part.text);
+        if (seen.has(seenKey)) {
+          rememberDeliveryKey(seen, seenKey);
           continue;
         }
+        if (!record.terminalUnreconciled) {
+          if (
+            record.state === 'running' &&
+            ((record.lastLiveBusyAt !== undefined &&
+              createdAt < record.lastLiveBusyAt) ||
+              createdAt < record.lastLaunchedAt)
+          ) {
+            // This notice predates the current run; consume it while the
+            // record is running so it cannot pair after a quick completion.
+            rememberDeliveryKey(seen, seenKey);
+          }
+          continue;
+        }
+        if (record.completedAt === undefined) continue;
+        // The first terminal observation consumes this notice, whether it
+        // matches or not. A later reopen cannot make an old notice current.
+        rememberDeliveryKey(seen, seenKey);
+        if (createdAt < record.lastLaunchedAt) continue;
+        if (
+          record.lastLiveBusyAt !== undefined &&
+          createdAt < record.lastLiveBusyAt
+        ) {
+          continue;
+        }
+        // Timestamp tolerance covers publication/transport skew only; the
+        // launch and live-busy fences above identify a later reopened run.
         if (
           createdAt <
           record.completedAt - NATIVE_DELIVERY_PUBLICATION_SKEW_MS
         ) {
           continue;
         }
+        const terminalState = record.terminalState ?? record.state;
+        if (terminalState !== block.state) continue;
         reconcileExecutionBatch(state, parentSessionID, [
           {
             taskID: record.taskID,
@@ -1538,7 +1580,7 @@ function reconcileObservedTerminalDeltas(
           },
         ]);
       }
-    }
+    });
   }
 }
 
