@@ -175,6 +175,50 @@ describe('v2 client shim delegation', () => {
     ).toEqual(['m1', 'm2']);
   });
 
+  test.each([false, true])(
+    'context fallback maps only the requested tail and preserves compaction evidence (compacted=%s)',
+    async (compacted) => {
+      const mapped = new Set<number>();
+      const raw = Array.from({ length: 250 }, (_, index) => ({
+        id: `m${index}`,
+        type: compacted && index === 0 ? 'compaction' : 'assistant',
+        status: 'completed',
+        get content() {
+          mapped.add(index);
+          return [{ type: 'text', text: `message ${index}` }];
+        },
+      }));
+      const input = buildPluginInput(
+        makeCtx({ context: async () => raw } as never),
+      );
+      const read = (limit?: number) =>
+        input.client.session.messages({
+          path: { id: 'ses_1' },
+          ...(limit === undefined ? {} : { query: { limit } }),
+        });
+      const limited = await read(3);
+      expect(limited.data?.map((entry) => entry.info.id)).toEqual([
+        'm247',
+        'm248',
+        'm249',
+      ]);
+      expect([...mapped]).toEqual([247, 248, 249]);
+      expect(limited).toMatchObject({
+        page: { source: 'session.context', complete: false },
+      });
+      mapped.clear();
+      const unbounded = await read();
+      expect(unbounded.data).toHaveLength(250);
+      expect(mapped.size).toBe(250);
+      expect(unbounded).toMatchObject({ page: { complete: !compacted } });
+      mapped.clear();
+      const wholePage = await read(250);
+      expect(wholePage.data).toHaveLength(250);
+      expect(mapped.size).toBe(250);
+      expect(wholePage).toMatchObject({ page: { complete: !compacted } });
+    },
+  );
+
   test('messages without query.limit keeps the full context read', async () => {
     const messageCalls: unknown[] = [];
     const input = buildPluginInput(

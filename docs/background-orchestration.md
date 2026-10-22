@@ -30,9 +30,12 @@ refused; completed children use `result: true`. Unavailable or ambiguous evidenc
 is reported, not invented.
 The tool's rendered diagnostic response is limited to 6,144 UTF-8 bytes,
 including headers, errors, and truncation markers; plugin warnings may be
-appended separately. The fetch requests a limit and our own scans are bounded;
-a host that ignores the limit still returns a full response the adapter
-converts. Missing attribution outside the scan window means uncertainty.
+appended separately. The fetch requests a limit and our own scans are bounded.
+The v2 paged route honours it; without that route, the shim fetches full context
+but selects only the newest requested entries before conversion. It checks
+compaction over the full raw context and marks compaction or dropped entries
+incomplete. V1 hosts may ignore the limit, but the excerpt scan stays bounded.
+Missing attribution outside the scan window means uncertainty.
 Failed-tool and assistant errors may appear;
 tool inputs and successful tool outputs do not.
 Excerpts are fenced after the latest real input in the bounded window and

@@ -826,9 +826,12 @@ is explicit. Excerpts include assistant text and short assistant/failed-tool
 errors, not tool inputs or successful outputs. The tool's rendered diagnostic
 response fits 6,144 UTF-8 bytes, including headers, errors, and truncation
 markers; plugin warnings may be appended separately. The fetch requests a
-limit and our own scans are bounded. A host that ignores the limit still
-returns a full response that the adapter converts; that synchronous shim
-conversion is not bounded here. Missing attribution outside the scan window
+limit and our own scans are bounded. The paged messages route honours the limit.
+Without that route, the context fallback fetches full raw context, checks it for
+compaction, then selects only the newest requested entries before conversion.
+Dropped entries or compaction mark the page incomplete; fetching raw context
+itself is not bounded by the shim. No-limit and paged history-boundary reads are
+unchanged. Missing attribution outside the scan window
 is reported as uncertain or unavailable, never guessed.
 Excerpts start after the latest real input in the scan window and exclude
 assistant messages created before the tracked run start. Input may predate

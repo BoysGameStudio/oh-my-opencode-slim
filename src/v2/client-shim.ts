@@ -447,17 +447,16 @@ export function buildPluginInput(
               }
               const query = isRecord(args?.query) ? args.query : undefined;
               const limit = query?.limit;
+              const hasLimit =
+                typeof limit === 'number' &&
+                Number.isFinite(limit) &&
+                limit > 0;
               // Bounded tail read (foreground-fallback replay): the v2
               // messages route paginates natively, so `limit` maps to the
               // LAST N projected messages newest-first, reversed back to
-              // the v1 ascending shape. Hosts without the route keep the
-              // full context read.
-              if (
-                typeof limit === 'number' &&
-                Number.isFinite(limit) &&
-                limit > 0 &&
-                typeof s.messages === 'function'
-              ) {
+              // the v1 ascending shape. Hosts without the route still fetch
+              // full context, but convert only the requested tail below.
+              if (hasLimit && typeof s.messages === 'function') {
                 const page = await s.messages({
                   sessionID: sessionIDOf(args),
                   limit,
@@ -564,9 +563,15 @@ export function buildPluginInput(
                   page: { source: 'session.messages', complete: !cursor },
                 };
               }
+              const tail = hasLimit
+                ? raw.slice(Math.max(0, raw.length - Math.floor(limit)))
+                : raw;
               return {
-                data: raw.map(toV1Message),
-                page: { source: 'session.context', complete: !cut },
+                data: tail.map(toV1Message),
+                page: {
+                  source: 'session.context',
+                  complete: !cut && tail.length === raw.length,
+                },
               };
             },
           }

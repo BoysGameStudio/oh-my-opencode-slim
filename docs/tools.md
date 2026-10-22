@@ -249,10 +249,13 @@ The tool's rendered diagnostic response is capped at 6,144 UTF-8 bytes,
 including headers, errors, and truncation markers; plugin
 warnings may be appended separately. The fetch requests the newest 100 messages.
 Our own scanning is bounded to 40 trailing messages, 100 trailing parts per
-message, and 2,000 excerpt characters per message. A host that ignores the limit
-still returns a full response that the adapter converts; that conversion is not
-bounded here. Attribution outside the scan window is reported as uncertain or
-unavailable, not guessed. Truncation and unavailable evidence are explicit.
+message, and 2,000 excerpt characters per message. On v2 the paged messages route
+honours the limit. Without that route the shim fetches full context, checks it
+for compaction, then selects the newest requested entries before conversion;
+dropped context or compaction is marked incomplete. A v1 host may ignore the
+limit; the excerpt scan still stays bounded. Attribution outside the scan window
+is reported as uncertain or unavailable, not guessed. Truncation and unavailable
+evidence are explicit.
 Running children are refused; completed
 children point to `result: true`. The two modes are mutually exclusive.
 Excerpts start after the latest real input in that window; earlier runs and
