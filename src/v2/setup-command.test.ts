@@ -34,10 +34,10 @@ import { createV2InterviewBridge, markerText } from './interview-bridge';
 import { createSessionSubmit } from './session-submit';
 import {
   applyCommandMarkerToContext,
+  attributeAgentsByHistory,
   createCommandRegistration,
   createSessionContextHandler,
   createSessionPromptBridge,
-  attributeAgentsByHistory,
   createToolExecuteBridges,
   parseCommandMarker,
   registerSynthCommands,

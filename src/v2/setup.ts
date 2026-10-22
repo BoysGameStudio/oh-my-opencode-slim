@@ -324,17 +324,13 @@ export interface V2SessionContextHandlerDeps {
 }
 
 /**
- * Reconstruct per-message agent attribution from stored history: walk the
- * compaction-bounded `SessionMessage.Info` stream (ordered by seq) and map
- * each stored user-message id to the agent that owned it at send time.
- * Durable `agent-switched` markers are the only source: a preceding marker
- * is authoritative over `previous`; `previous` seeds the pre-segment only
- * when no earlier marker established one; a marker without `previous`
- * (pre-2026-08-10 rows) leaves its pre-segment unmapped. Callers apply the
- * result as `map.get(id) ?? event.agent` — every miss degrades to the
- * session's current agent (the pre-attribution behavior), never fabricates.
- * Pure: no I/O, no state; rebuilt per request so it is restart-safe by
- * construction.
+ * Map each stored user-message id to the agent that owned it at send time,
+ * walking the compaction-bounded history stream: durable `agent-switched`
+ * markers are the only source — a preceding marker is authoritative,
+ * `previous` seeds a window-start pre-segment, and a marker without one
+ * (pre-2026-08-10 rows) leaves its pre-segment unmapped. Callers apply
+ * `map.get(id) ?? event.agent`: misses degrade, never fabricate. Pure and
+ * stateless — rebuilt per request, restart-safe by construction.
  */
 export function attributeAgentsByHistory(
   history: ReadonlyArray<Record<string, unknown>> | undefined,
@@ -456,19 +452,15 @@ export function createSessionContextHandler(
     // injection does), so rebuild event.messages from the transformed
     // v1messages rather than index-based content copy-back.
     if (deps.messagesTransform && Array.isArray(event.messages)) {
-      // Transcript identity enrichment (v2-only): frozen board replay
-      // reads info.sessionID from the real-message tail, which may be an
-      // assistant or tool result. Stamp missing session IDs on every role.
-      // Agent identity is reconstructed per request from the durable
-      // `agent-switched` markers in stored history (the same compaction
-      // window the request loader reads): each user message gets the agent
-      // that owned it at send time, so agent switches never re-write
-      // attribution. Identity is envelope-only and strictly absence-gated:
-      // host-provided values win; a history-read failure or a map miss
-      // degrades to the context event's current agent. Synthetic wakes
-      // additionally need their first text part re-flagged because the host
-      // discards its internal part metadata. All enrichments are idempotent
-      // across context events.
+      // Transcript identity enrichment (v2-only): stamp missing session IDs
+      // on every role (frozen board replay reads the real-message tail);
+      // reconstruct each user message's agent per request from durable
+      // `agent-switched` markers in stored history (same compaction window
+      // the request loader reads) so switches never re-write attribution.
+      // Envelope-only and absence-gated: host-provided values win; read
+      // failure or map miss degrades to the event's current agent. Synthetic
+      // wakes need their first text part re-flagged (host drops internal
+      // part metadata). Idempotent across context events.
       let storedHistory: Array<Record<string, unknown>> | undefined;
       try {
         storedHistory = await deps.sessionContext?.(event.sessionID);
