@@ -969,14 +969,21 @@ function prunedToEmpty(queue: DeltaQueue, batch: DeltaBatch): boolean {
   return hadDetails && batch.deltas.size === 0 && batch.overflowCount === 0;
 }
 
-/** Retire the delivered overflow identities, not a now-stale positional count. */
+/** Retire the delivered overflow identities, not a now-stale positional count.
+ * A sent entry is retired by IDENTITY, not by key alone: an add() that
+ * replaced the queued entry under the same dedupe key while the send was in
+ * flight (a newer terminal revision of the same task) must survive the older
+ * send's confirmation, otherwise the newest answer is lost (Greptile P1
+ * 4344212804). */
 function retireDeltaBatch(
   batch: DeltaBatch,
-  keys: string[],
+  entries: Array<[string, DeltaEntry]>,
   overflowKeys: string[],
   overflowCount: number,
 ): boolean {
-  for (const key of keys) batch.deltas.delete(key);
+  for (const [key, entry] of entries) {
+    if (batch.deltas.get(key) === entry) batch.deltas.delete(key);
+  }
   const delivered = new Set(overflowKeys);
   const retainedCount = batch.overflowedKeys.length;
   batch.overflowedKeys = batch.overflowedKeys.filter(
@@ -2301,6 +2308,9 @@ export function createOrchestratorWakeScheduler(
       const sendInputKeys = sendInputDeltas
         ? [...sendInputDeltas.deltas.keys()].slice(0, CHILD_INPUT_WAKE_CHUNK)
         : [];
+      const sentInputEntries: Array<[string, DeltaEntry]> = sendInputDeltas
+        ? [...sendInputDeltas.deltas.entries()].slice(0, CHILD_INPUT_WAKE_CHUNK)
+        : [];
       const sentInputOverflowCount = sendInputDeltas?.overflowCount ?? 0;
       const sentInputOverflowKeys = [
         ...(sendInputDeltas?.overflowedKeys ?? []),
@@ -2359,9 +2369,16 @@ export function createOrchestratorWakeScheduler(
           : '';
       // Snapshot keys/values at send time. Do not detach the map: a stop
       // arriving during promptAsync lands in the same entry and must survive
-      // confirmation. After delivery, retire only the keys that were sent.
+      // confirmation. After delivery, retire only the ENTRIES that were
+      // sent — a same-key add() that replaced them mid-flight survives.
       const sentKeys = recoveryBatch
         ? [...recoveryBatch.deltas.keys()].slice(0, STOPPED_RECOVERY_WAKE_CHUNK)
+        : [];
+      const sentEntries: Array<[string, DeltaEntry]> = recoveryBatch
+        ? [...recoveryBatch.deltas.entries()].slice(
+            0,
+            STOPPED_RECOVERY_WAKE_CHUNK,
+          )
         : [];
       const sentOverflowCount = recoveryBatch?.overflowCount ?? 0;
       const sentOverflowKeys = [...(recoveryBatch?.overflowedKeys ?? [])];
@@ -2387,6 +2404,12 @@ export function createOrchestratorWakeScheduler(
       // can be observed from parent history without extra prompt bytes.
       const sentCompletedKeys = completedBatch
         ? [...completedBatch.deltas.keys()].slice(0, COMPLETED_JOB_WAKE_CHUNK)
+        : [];
+      const sentCompletedEntries: Array<[string, DeltaEntry]> = completedBatch
+        ? [...completedBatch.deltas.entries()].slice(
+            0,
+            COMPLETED_JOB_WAKE_CHUNK,
+          )
         : [];
       const sentCompletedOverflowCount = completedBatch?.overflowCount ?? 0;
       const sentCompletedOverflowKeys = [
@@ -2582,32 +2605,32 @@ export function createOrchestratorWakeScheduler(
         });
       }
       if (recoveryWake) {
-        for (const [queue, sentBatch, keys, overflowKeys, count] of [
+        for (const [queue, sentBatch, entries, overflowKeys, count] of [
           [
             stoppedRecoveryQueue,
             recoveryBatch,
-            sentKeys,
+            sentEntries,
             sentOverflowKeys,
             sentOverflowCount,
           ],
           [
             completedJobQueue,
             completedBatch,
-            sentCompletedKeys,
+            sentCompletedEntries,
             sentCompletedOverflowKeys,
             sentCompletedOverflowCount,
           ],
           [
             childInputQueue,
             sendInputDeltas,
-            sendInputKeys,
+            sentInputEntries,
             sentInputOverflowKeys,
             sentInputOverflowCount,
           ],
         ] as const) {
           const remaining = queue.batches.get(sessionID);
           if (!remaining || remaining !== sentBatch) continue;
-          if (retireDeltaBatch(remaining, keys, overflowKeys, count)) {
+          if (retireDeltaBatch(remaining, entries, overflowKeys, count)) {
             queue.batches.delete(sessionID);
           } else {
             rearmWakeProgress(sessionID);
@@ -3257,6 +3280,16 @@ export function createOrchestratorWakeScheduler(
     triggerCompletedJobPublication,
     triggerTerminalPublicationWake,
     triggerChildInputWaitWake,
+    /** Whether a completed-job push for this exact run is still queued and
+     * undelivered (the stale-timestamp fallback must not ack it first). */
+    hasPendingCompletedPush: (
+      sessionID: string,
+      taskID: string,
+      generation: number,
+    ): boolean =>
+      completedJobQueue.batches
+        .get(sessionID)
+        ?.deltas.has(`${taskID}:${generation}`) === true,
     /** Clear timers when wait_for_user or fallback begins. */
     suppress,
     /** Test seam */

@@ -1163,6 +1163,15 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       backgroundJobSupervisor,
       backgroundTaskConcurrency,
       pendingCallTracker: admissionRuntimeLease.pendingCallTracker,
+      // The stale-timestamp retirement fallback must not ack a run whose
+      // completed-job push is still queued undelivered (its own observed
+      // push retires it; acking first fences the answer out forever).
+      hasUndeliveredTerminalPush: (parentSessionID, taskID, generation) =>
+        orchestratorWakeScheduler?.hasPendingCompletedPush(
+          parentSessionID,
+          taskID,
+          generation,
+        ) === true,
       getModelForAgent: (agentType: string, parentSessionID?: string) => {
         const delegated = resolveDelegatedModelForParent(
           agentType,

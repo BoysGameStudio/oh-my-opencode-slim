@@ -211,6 +211,18 @@ export interface InjectionState {
   backgroundJobBoard: BackgroundJobStore;
   terminalGate: BackgroundJobTerminalGate;
   lifecycleLedger: BackgroundJobLifecycleLedger;
+  /**
+   * Whether a completed-job push for this exact run is still queued and
+   * UNDELIVERED in the wake scheduler. The stale-timestamp fallback must not
+   * retire such a run: its own push is the delivery, and acking it first
+   * would make the delivery fence reject the queued answer forever
+   * (Greptile P1 4344212799). Absent (tests) means no probe.
+   */
+  hasUndeliveredTerminalPush?: (
+    parentSessionID: string,
+    taskID: string,
+    generation: number,
+  ) => boolean;
   processedInjectedCompletions: Set<string>;
   processedInjectedCompletionOrder: string[];
   /**
@@ -1349,6 +1361,18 @@ function retireStaleTerminalRecords(
       }
       if (record.completedAt === undefined) continue;
       if (record.completedAt >= newestAssistantTurn) continue;
+      // An undelivered queued push IS this publication's delivery: acking
+      // the run here would fence the queued answer out forever. Its own
+      // observed push (or a later fallback pass after delivery) retires it.
+      if (
+        state.hasUndeliveredTerminalPush?.(
+          parentSessionID,
+          record.taskID,
+          record.generation,
+        ) === true
+      ) {
+        continue;
+      }
       reconcileExecutionBatch(state, parentSessionID, [
         {
           taskID: record.taskID,

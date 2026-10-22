@@ -328,6 +328,14 @@ export function createTaskSessionManagerHook(
     hostOutcomeClock?: 'shared-unix-ms';
     backgroundJobSupervisor?: BackgroundJobSupervisor;
     backgroundTaskConcurrency?: BackgroundTaskConcurrency;
+    /** Whether a completed-job push for this exact run is still queued and
+     *  undelivered in the wake scheduler; consulted by the stale-timestamp
+     *  retirement fallback so an undelivered answer is never acked first. */
+    hasUndeliveredTerminalPush?: (
+      parentSessionID: string,
+      taskID: string,
+      generation: number,
+    ) => boolean;
     /** Shared by plugin generations for one admission runtime. */
     pendingCallTracker?: PendingCallTracker;
     getModelForAgent?: (
@@ -745,6 +753,7 @@ export function createTaskSessionManagerHook(
       rehydrateState.syntheticTerminalOccurrenceOrder,
     getLifecycleEpoch: () => rehydrateState.nextEpoch,
     getDeletionEpoch: (taskID) => rehydrateState.deletionEpochs.get(taskID),
+    hasUndeliveredTerminalPush: options.hasUndeliveredTerminalPush,
     metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
     shouldManageSession: options.shouldManageSession,
     taskContextTracker,
