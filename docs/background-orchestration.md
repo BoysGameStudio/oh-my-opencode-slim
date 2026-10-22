@@ -38,12 +38,17 @@ incomplete. V1 hosts may ignore the limit, but the excerpt scan stays bounded.
 Missing attribution outside the scan window means uncertainty.
 Failed-tool and assistant errors may appear;
 tool inputs and successful tool outputs do not.
-Excerpts are fenced after the latest real input in the bounded window and
-exclude assistant messages created before the tracked run start. Input can
-predate registration; unavailable attribution fails closed instead of borrowing
-earlier-run text. Host compaction is omitted and labelled. Terminal reasons use
-recorded host error/outcome reasons, attributable assistant errors, or the state
-name, never stored partial findings.
+Attribution is timestamp-based: most runs lack recorded message identities.
+Excerpts start after the latest real input and exclude assistant messages from
+before the recorded run start. A delivered same-run queued message moves that
+start too, omitting earlier output without changing the recorded generation.
+Missing completion times or legacy times predating the final message cause
+conservative refusals. A rare host-finish/plugin-publication gap can still show
+new-run output under the old generation. See the
+[diagnostic attribution limits](tools.md#background-task-control), including the
+identity-recording follow-up. Host compaction is omitted and labelled. Terminal
+reasons use recorded host error/outcome reasons, attributable assistant errors,
+or the state name, never stored partial findings.
 
 Diagnostic reads are not consumption, acknowledgement, or parent acceptance
 and do not replace the completion/acknowledgement flow. Observed state is the

@@ -258,17 +258,27 @@ is reported as uncertain or unavailable, not guessed. Truncation and unavailable
 evidence are explicit.
 Running children are refused; completed
 children point to `result: true`. The two modes are mutually exclusive.
-Excerpts start after the latest real input in that window; earlier runs and
-host compaction messages are omitted and labelled. If that input is missing,
-the excerpt is unavailable rather than attributed to the wrong run.
-Tracked excerpts also exclude assistant messages created before the board's
-run start. The input itself may predate registration. Missing assistant creation
-times or only pre-start evidence makes the excerpt unavailable; late registration
-can therefore omit genuine early output rather than risk showing stale work.
-Real input or assistant activity created after the recorded terminal time makes
-the excerpt unavailable (`activity after the recorded terminal outcome`), as
-does a missing terminal time. Compaction and system maintenance do not count as
-new run activity.
+Most runs lack recorded message identities, so attribution is timestamp-based.
+Excerpts start after the latest real input in the window and exclude assistant
+messages created before the recorded run start. Input may predate registration;
+late registration can omit genuine early output. A missing input boundary,
+missing assistant creation times, or only pre-start evidence makes the excerpt
+unavailable.
+A delivered same-run queued `task_message` also moves the excerpt start:
+earlier output is omitted and labelled, without changing the recorded generation.
+Without an attributable assistant after that input, the excerpt is unavailable.
+
+Real input or assistant activity created after the recorded completion time
+returns `evidence: unavailable`. So do records without a completion time and
+legacy records whose recorded time predates their final assistant message.
+Compaction and system maintenance do not count as new run activity.
+A rare publication gap remains: a new run whose input reaches the child after
+the host finishes but before the plugin publishes the old outcome can still
+appear under the old generation. In practice this normally needs an actor other
+than the parent to re-prompt the child before the completion notice.
+Run-identity fencing would require launch-time recording of run anchors and
+queued-input identities; that is a possible follow-up.
+
 An owned untracked handle returns the ordinary read-only status plus a short
 notice that diagnostics require a tracked task record, not an excerpt or an
 extra transcript read. Startup recovery normally re-adopts restarted children
