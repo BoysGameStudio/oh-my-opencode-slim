@@ -281,13 +281,11 @@ describe('task controls through the real v2 client shim', () => {
 
   test.each(
     (['v1', 'v2'] as const).flatMap((flavor) =>
-      [true, false].flatMap((tracked) =>
-        [true, false].map((partial) => ({ flavor, tracked, partial })),
-      ),
+      [true, false].map((partial) => ({ flavor, partial })),
     ),
   )(
     'read-only diagnostics fence runs on %j failed and interrupted children',
-    async ({ flavor, tracked, partial }) => {
+    async ({ flavor, partial }) => {
       for (const outcome of ['failed', 'interrupted']) {
         const host = {
           get: mock(async () => ({
@@ -367,19 +365,17 @@ describe('task controls through the real v2 client shim', () => {
                 },
               } as unknown as PluginInput);
         const board = new BackgroundJobBoard();
-        if (tracked) {
-          board.registerLaunch({
-            taskID: 'ses_child',
-            parentSessionID: 'parent',
-            agent: 'explorer',
-            now: 10,
-          });
-          boardFixture.updateStatus(board, {
-            taskID: 'ses_child',
-            state: 'error',
-            now: 20,
-          });
-        }
+        board.registerLaunch({
+          taskID: 'ses_child',
+          parentSessionID: 'parent',
+          agent: 'explorer',
+          now: 10,
+        });
+        boardFixture.updateStatus(board, {
+          taskID: 'ses_child',
+          state: 'error',
+          now: 20,
+        });
         const gate = createBackgroundJobTerminalGate({
           input,
           backgroundJobBoard: board,
@@ -401,12 +397,8 @@ describe('task controls through the real v2 client shim', () => {
           },
           context,
         );
-        expect(output).toContain(`generation: ${tracked ? 1 : 'untracked'}`);
-        expect(output).toContain(
-          !tracked && flavor === 'v2' && outcome === 'interrupted'
-            ? 'state: stopped'
-            : 'state: error',
-        );
+        expect(output).toContain('generation: 1');
+        expect(output).toContain('state: error');
         expect(output).toContain('partial_output: true');
         if (partial) expect(output).toContain('partial work');
         expect(output).not.toContain('STALE SUCCESS');
@@ -416,6 +408,7 @@ describe('task controls through the real v2 client shim', () => {
         );
         for (const fn of [
           host.prompt,
+          host.get,
           host.interrupt,
           host.synthetic,
           host.wait,
@@ -424,7 +417,6 @@ describe('task controls through the real v2 client shim', () => {
           reconcile,
         ])
           expect(fn).not.toHaveBeenCalled();
-        if (!tracked) expect(board.get('ses_child')).toBeUndefined();
       }
     },
   );

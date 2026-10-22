@@ -814,9 +814,12 @@ does not add placeholder agents or automatically relaunch work to mask the race.
 
 ### Read-only task diagnostics
 
-`task_status` accepts `diagnostic: true` for failed, cancelled, or stopped
-children. Its owned-untracked fallback after restart uses host outcome plus
-transcript evidence for failed/interrupted v2 children (v1 uses history).
+`task_status` accepts `diagnostic: true` for tracked failed, cancelled, or stopped
+children. Startup recovery normally re-adopts restarted children onto the board
+with their historical run start; v2 also re-delivers completions. An owned
+untracked handle returns ordinary read-only observed status plus a notice that
+diagnostics require a tracked record, with no excerpt or extra transcript read.
+Foreign-parent handles remain rejected.
 It never registers, prompts, or reconciles a child. Running children are
 refused; completed children use `result: true`. Missing or ambiguous evidence
 is explicit. Excerpts include assistant text and short assistant/failed-tool
@@ -827,10 +830,18 @@ limit and our own scans are bounded. A host that ignores the limit still
 returns a full response that the adapter converts; that synchronous shim
 conversion is not bounded here. Missing attribution outside the scan window
 is reported as uncertain or unavailable, never guessed.
+Excerpts start after the latest real input in the scan window and exclude
+assistant messages created before the tracked run start. Input may predate
+registration; missing creation times or only pre-start evidence makes the
+excerpt unavailable. Host compaction messages are excluded and labelled.
+Terminal reasons use recorded host error/outcome reasons, then attributable
+assistant error text, then the state name, not stored partial findings.
 
 Diagnostics are read-only and not consumption or acknowledgement. Observed
 state is evidence, execution completion ends a run, and parent acceptance is
 separate; diagnostics do not replace the completion/acceptance flow.
+The fixed next-step line advises awaiting or re-delegating, not marking the task
+accepted; it does not depend on a host-specific revival tool.
 `last_activity_source` reports `observed-activity` (tracker event, possibly
 lagging), `host-busy` (coarse host activity beyond run start, not progress),
 `launch-time` (no activity evidence beyond the run start time, not proof of

@@ -7,7 +7,6 @@ import {
   classifyAssistantTurnEvidence,
   classifyTerminalEvidence,
   classifyV2HistoricalRound,
-  diagnosticEvidenceTranscriptOf,
   diagnosticExcerptOf,
   fetchChildTranscript,
   latestInputAtOf,
@@ -109,7 +108,7 @@ describe('diagnostic excerpts', () => {
     });
   });
 
-  test('v2 compaction source remains ineligible as input (existing attribution guard)', () => {
+  test('v2 compaction source cannot fence an excerpt', () => {
     const transcript = {
       data: [
         {
@@ -119,14 +118,12 @@ describe('diagnostic excerpts', () => {
         { info: { role: 'assistant', error: 'failure' }, parts: [] },
       ],
     };
-    expect(diagnosticEvidenceTranscriptOf(transcript)).toHaveProperty(
-      'unavailable',
-    );
+    expect(diagnosticExcerptOf(transcript)).toHaveProperty('unavailable');
   });
 
-  test('compaction triggers cannot supply diagnostic input attribution', () => {
+  test('compaction triggers cannot fence an excerpt', () => {
     expect(
-      diagnosticEvidenceTranscriptOf({
+      diagnosticExcerptOf({
         data: [
           { info: { role: 'assistant', error: 'older failure' }, parts: [] },
           {
@@ -172,8 +169,8 @@ describe('diagnostic excerpts', () => {
       new TextEncoder().encode(result.text).byteLength,
     ).toBeLessThanOrEqual(6144);
   });
-  test('diagnostic classification caps content before terminal parsers and never serializes arbitrary error data', () => {
-    const result = diagnosticEvidenceTranscriptOf({
+  test('diagnostic excerpts cap errors without serializing arbitrary error data', () => {
+    const result = diagnosticExcerptOf({
       data: [
         { info: { role: 'user' }, parts: [] },
         {
@@ -193,15 +190,11 @@ describe('diagnostic excerpts', () => {
         },
       ],
     });
-    if (!('data' in result))
-      throw new Error('expected bounded classification evidence');
-    expect(String(result.data[1].info?.error).length).toBeLessThanOrEqual(480);
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.assistantError?.length).toBeLessThanOrEqual(480);
     expect(
-      result.data[1].parts?.reduce(
-        (total: number, part: any) => total + (part.text?.length ?? 0),
-        0,
-      ),
-    ).toBeLessThanOrEqual(2000);
+      new TextEncoder().encode(result.text).byteLength,
+    ).toBeLessThanOrEqual(6144);
   });
   test.each(['text', 'assistant error', 'tool error'])(
     'preserves surrogate pairs at intermediate %s boundaries',

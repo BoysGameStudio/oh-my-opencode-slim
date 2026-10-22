@@ -160,83 +160,80 @@ function makeResultTool(
 }
 
 describe('task_status', () => {
-  test.each([
-    'v1 error',
-    'v2 failed',
-    'v2 interrupted',
-    'v2 failed with error',
-    'v2 interrupted with error',
-  ])(
-    'untracked diagnostic terminal reason excludes partial findings: %s',
-    async (kind) => {
-      const v2 = kind.startsWith('v2');
-      const hasError = !v2 || kind.endsWith('with error');
-      const outcome = kind.includes('interrupted') ? 'interrupted' : 'failed';
-      const h = makeResultTool(false, v2 ? 'v2' : undefined);
-      h.get.mockResolvedValue({
-        data: { parentID: 'parent-1', outcome, time: { idle: 3 } },
-      } as never);
+  test.each(
+    (['v1', 'v2'] as const).flatMap((flavor) =>
+      (['error', 'cancelled', 'stopped'] as const).map((state) => ({
+        flavor,
+        state,
+      })),
+    ),
+  )(
+    'tracked terminal reasons never borrow partial findings: %j',
+    async ({ flavor, state }) => {
+      const h = makeResultTool(true, flavor);
+      await h.settle(state);
+      const job = h.board.get('ses_child1');
+      if (!job) throw new Error('expected tracked record');
+      job.resultSummary = 'PARTIAL FINDINGS';
+      job.lastStatusError = undefined;
+      const answer = {
+        info: {
+          role: 'assistant',
+          time: { created: 2 },
+          error: 'assistant failed' as string | undefined,
+        },
+        parts: [{ type: 'text', text: 'PARTIAL FINDINGS' }],
+      };
       h.messages.mockResolvedValue({
         data: [
           { info: { role: 'user', time: { created: 1 } }, parts: [] },
-          {
-            info: {
-              role: 'assistant',
-              time: { created: 2, completed: 2 },
-              ...(hasError
-                ? { error: { message: 'provider disconnected' } }
-                : {}),
-            },
-            parts: [{ type: 'text', text: 'partial findings from child' }],
-          },
+          answer,
         ],
       } as never);
-      const output = await h.tool.execute(
-        { task_id: 'ses_child1', diagnostic: true },
-        { sessionID: 'parent-1' } as never,
+      const read = () =>
+        h.tool.execute({ task_id: 'ses_child1', diagnostic: true }, {
+          sessionID: 'parent-1',
+        } as never);
+      const output = await read();
+      expect(output).toContain('terminal_reason: assistant failed\n');
+      expect(output.slice(0, output.indexOf('excerpt_begin'))).not.toContain(
+        'PARTIAL FINDINGS',
       );
-      expect(output).toContain(
-        `terminal_reason: ${hasError ? 'provider disconnected' : outcome}\n`,
-      );
-      expect(output).not.toContain('terminal_reason: partial findings');
-      expect(output).toContain('excerpt_begin\n');
       expect(output.slice(output.indexOf('excerpt_begin'))).toContain(
-        'partial findings from child',
+        'PARTIAL FINDINGS',
+      );
+      expect(output).toEndWith(
+        'next: treat this as non-final evidence; await or re-delegate, do not mark the task accepted',
+      );
+      answer.info.error = undefined;
+      expect(await read()).toContain(`terminal_reason: ${state}\n`);
+      job.lastStatusError = 'host error';
+      expect(await read()).toContain('terminal_reason: host error\n');
+      job.lastStatusError = undefined;
+      job.resultSummary = 'Host reported outcome: failed.';
+      answer.info.error = 'assistant failed';
+      expect(await read()).toContain(
+        'terminal_reason: Host reported outcome: failed.\n',
       );
     },
   );
 
-  test('untracked v1 diagnostic refuses compaction-only attribution after the real input leaves the window', async () => {
-    const h = makeResultTool(false);
-    h.messages.mockResolvedValue({
-      data: [
-        { info: { role: 'user' }, parts: [] },
-        ...Array.from({ length: 38 }, () => ({
-          info: { role: 'system' },
-          parts: [],
-        })),
-        { info: { role: 'assistant', error: 'older failure' }, parts: [] },
-        {
-          info: { role: 'user' },
-          parts: [{ type: 'compaction', auto: false }],
-        },
-        {
-          info: { role: 'assistant', summary: true },
-          parts: [{ type: 'text', text: 'host summary' }],
-        },
-      ],
-    } as never);
-    const output = await h.tool.execute(
-      { task_id: 'ses_child1', diagnostic: true },
-      { sessionID: 'parent-1' } as never,
+  test('tool description stays status-focused and diagnostic parameter is concise', () => {
+    const h = makeResultTool();
+    expect(h.tool.description).not.toContain('diagnostic: true');
+    expect(h.tool.description).toContain(
+      'For an untracked session (e.g. after a restart), reports a read-only observed state.',
     );
-    expect(output).toContain(
-      'latest input is outside the diagnostic message window',
-    );
-    expect(output).not.toContain('partial_output: true');
+    const description = h.tool.args.diagnostic.description ?? '';
+    expect(description).toContain('tracked');
+    expect(
+      new TextEncoder().encode(description).byteLength,
+    ).toBeLessThanOrEqual(135);
   });
+
   test.each([
     'unknown',
+    'untracked status',
     'foreign untracked',
     'canonical refusal',
     'resolver error',
@@ -275,7 +272,12 @@ describe('task_status', () => {
       client = {
         session: {
           get: mock(async () => ({
-            data: kind === 'foreign untracked' ? { parentID: 'foreign' } : {},
+            data:
+              kind === 'foreign untracked'
+                ? { parentID: 'foreign' }
+                : kind === 'untracked status'
+                  ? { parentID: 'parent-1' }
+                  : {},
           })),
           messages: mock(async () => {
             if (kind === 'race')
@@ -303,7 +305,12 @@ describe('task_status', () => {
         rendered = await tool.execute({ task_id: huge, diagnostic: true }, {
           sessionID: 'parent-1',
         } as never);
-        expect(['running', 'completed', 'unavailable']).toContain(kind);
+        expect([
+          'running',
+          'completed',
+          'unavailable',
+          'untracked status',
+        ]).toContain(kind);
       } catch (error) {
         rendered = String(error);
         expect([
@@ -323,14 +330,9 @@ describe('task_status', () => {
   );
 
   test.each(['v1', 'v2'])(
-    'untracked diagnostic bounds classification before validation on %s',
+    'untracked diagnostic returns ordinary status with no excerpt read on %s',
     async (flavor) => {
       const h = makeResultTool(false, flavor);
-      const stale = {
-        get info(): never {
-          throw new Error('must not inspect older entries');
-        },
-      };
       const input = { info: { role: 'user', time: { created: 1 } }, parts: [] };
       const answer = {
         info: {
@@ -344,34 +346,34 @@ describe('task_status', () => {
         data: { parentID: 'parent-1', outcome: 'failed', time: { idle: 3 } },
       } as never);
       h.messages.mockResolvedValue({
-        data: [stale, ...Array(100).fill(answer), input, answer],
+        data: [input, answer],
       } as never);
-      const execute = () =>
-        h.tool.execute({ task_id: 'ses_child1', diagnostic: true }, {
-          sessionID: 'parent-1',
-        } as never);
-      expect(await execute()).toContain('generation: untracked');
+      const args = { task_id: 'ses_child1' };
+      const context = { sessionID: 'parent-1' } as never;
+      const status = await h.tool.execute(args, context);
+      h.get.mockClear();
+      h.messages.mockClear();
+      const markUsed = spyOn(h.board, 'markUsed');
+      const output = await h.tool.execute(
+        { ...args, diagnostic: true },
+        context,
+      );
+      expect(output).toBe(
+        `${status}\nmessage: Diagnostics require a tracked task record.`,
+      );
+      expect(output).toContain(
+        `state: error (verified from ${flavor === 'v2' ? 'host state' : 'history'})`,
+      );
+      expect(output).not.toContain('partial evidence');
+      expect(output).not.toContain('excerpt_begin');
+      expect(h.get).toHaveBeenCalledTimes(1);
+      expect(h.messages).toHaveBeenCalledTimes(1);
       expect(h.messages.mock.calls[0]?.[0]).toMatchObject({
-        query: { limit: 100 },
+        query: { limit: undefined },
       });
-      h.messages.mockResolvedValue({
-        data: [input, ...Array(100).fill(answer)],
-      } as never);
-      const uncertain = await execute();
-      expect(uncertain).toContain('state: running-or-incomplete (uncertain;');
-      expect(uncertain).toContain(
-        'latest input is outside the diagnostic message window',
-      );
-      expect(uncertain).not.toContain('partial_output: true');
-      h.messages.mockResolvedValue({
-        data: [
-          input,
-          { ...answer, parts: Array(101).fill({ type: 'text', text: 'part' }) },
-        ],
-      } as never);
-      expect(await execute()).toContain(
-        'diagnostic attribution requires omitted message parts',
-      );
+      expect(markUsed).not.toHaveBeenCalled();
+      expect(h.board.get('ses_child1')).toBeUndefined();
+      markUsed.mockRestore();
     },
   );
 
@@ -415,7 +417,7 @@ describe('task_status', () => {
       const output = await tool.execute({ task_id: 'ses_child1' }, {
         sessionID: 'parent-1',
       } as never);
-      expect(output).toContain(`last_activity_source: ${source}`);
+      expect(output.match(/^last_activity_source: (.+)$/m)?.[1]).toBe(source);
       if (source !== 'unknown')
         expect(output).toContain(
           `last_activity_at: ${new Date(source === 'observed-activity' ? 175 : source === 'host-busy' ? 150 : 100).toISOString()}`,
@@ -571,29 +573,6 @@ describe('task_status', () => {
     },
   );
 
-  test('owned untracked diagnostic uses one history read, not registration or consumption', async () => {
-    const h = makeResultTool(false);
-    h.messages.mockResolvedValue({
-      data: [
-        { info: { role: 'user', time: { created: 1 } }, parts: [] },
-        {
-          info: { role: 'assistant', error: { message: 'provider failed' } },
-          parts: [{ type: 'text', text: 'partial work' }],
-        },
-      ],
-    } as never);
-    const output = await h.tool.execute(
-      { task_id: 'ses_child1', diagnostic: true },
-      { sessionID: 'parent-1' } as never,
-    );
-    expect(output).toContain('generation: untracked');
-    expect(output).toContain('evidence: history');
-    expect(output).toContain('assistant_error: provider failed');
-    expect(h.get).toHaveBeenCalledTimes(1);
-    expect(h.messages).toHaveBeenCalledTimes(1);
-    expect(h.board.get('ses_child1')).toBeUndefined();
-  });
-
   test.each([undefined, { data: 'not-array' }, { data: [] }])(
     'diagnostic unavailable or empty evidence stays truthful: %j',
     async (transcript) => {
@@ -648,7 +627,7 @@ describe('task_status', () => {
         { sessionID: 'parent-1' } as never,
       );
       expect(output).toContain(`evidence: unavailable (${message})`);
-      expect(output).toContain('terminal_reason: provider failed');
+      expect(output).toContain('terminal_reason: error');
       expect(output).not.toContain('excerpt_begin');
       expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(
         6144,
@@ -656,58 +635,26 @@ describe('task_status', () => {
     },
   );
 
-  test.each([
-    'busy',
-    'unknown',
-    'malformed',
-    'absent',
-    'completed',
-    'unreadable',
-  ])(
-    'untracked diagnostic refuses ambiguous or ineligible evidence: %s',
+  test.each(['busy', 'unknown'])(
+    'untracked diagnostic keeps the ordinary live-status short circuit: %s',
     async (kind) => {
       const h = makeResultTool(false);
-      if (kind === 'completed')
-        h.messages.mockResolvedValue({
-          data: [
-            { info: { role: 'user', time: { created: 1 } }, parts: [] },
-            {
-              info: {
-                role: 'assistant',
-                finish: 'stop',
-                time: { completed: 10 },
-              },
-              parts: [{ type: 'text', text: 'final findings' }],
-            },
-          ],
-        } as never);
       if (kind === 'busy')
         h.status.mockResolvedValue({
           data: { ses_child1: { type: 'busy' } },
         } as never);
       if (kind === 'unknown')
         h.status.mockRejectedValue(new Error('status unreadable'));
-      if (kind === 'malformed')
-        h.messages.mockResolvedValue({ data: 'not-array' } as never);
-      if (kind === 'absent') h.messages.mockResolvedValue({ data: [] });
-      if (kind === 'unreadable')
-        h.messages.mockRejectedValue(new Error('transcript unreadable'));
       const output = await h.tool.execute(
         { task_id: 'ses_child1', diagnostic: true },
         { sessionID: 'parent-1' } as never,
       );
       expect(output).not.toContain('partial_output: true');
       expect(output).toContain(
-        kind === 'completed'
-          ? 'result: true'
-          : kind === 'busy'
-            ? 'state: running'
-            : 'state: running-or-incomplete (uncertain;',
+        kind === 'busy' ? 'state: busy (live)' : 'state: unknown (uncertain;',
       );
-      if (kind === 'unknown' || kind === 'busy')
-        expect(h.messages).not.toHaveBeenCalled();
-      if (kind === 'malformed' || kind === 'unreadable')
-        expect(output).toContain('evidence unavailable');
+      expect(output).toContain('Diagnostics require a tracked task record.');
+      expect(h.messages).not.toHaveBeenCalled();
       expect(h.board.get('ses_child1')).toBeUndefined();
     },
   );

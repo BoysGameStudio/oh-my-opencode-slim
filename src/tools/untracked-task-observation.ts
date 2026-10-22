@@ -2,7 +2,6 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import {
   attributeHostRoundToTranscript,
   classifyTerminalEvidence,
-  diagnosticEvidenceTranscriptOf,
   fetchChildTranscript,
   latestInputAtOf,
   terminalTextOf,
@@ -32,9 +31,6 @@ export interface UntrackedEvidence {
     | Awaited<ReturnType<typeof classifyTerminalEvidence>>
     | ReturnType<typeof composeHostRound>;
   roundError?: unknown;
-  transcript?: unknown;
-  /** Diagnostic-only end reason, separate from assistant partial output. */
-  terminalReason?: string;
 }
 
 async function boundedRead<T>(
@@ -111,7 +107,6 @@ export async function readUntrackedEvidence(
     input: PluginInput;
     readTimeoutMs?: number;
     statusTimeoutMs?: number;
-    diagnostic?: boolean;
   },
   identity: string,
   hostInfo?: Record<string, unknown>,
@@ -148,7 +143,7 @@ export async function readUntrackedEvidence(
 
 async function readTranscript(
   client: ReturnType<typeof getClient>,
-  options: { input: PluginInput; diagnostic?: boolean },
+  options: { input: PluginInput },
   identity: string,
   readTimeoutMs: number,
   v2: boolean,
@@ -162,76 +157,31 @@ async function readTranscript(
           client,
           identity,
           options.input.directory,
-          options.diagnostic ? 100 : undefined,
+          undefined,
           signal,
         ),
       readTimeoutMs,
       'child transcript read timed out',
     );
-    const classificationTranscript = options.diagnostic
-      ? diagnosticEvidenceTranscriptOf(transcript)
-      : transcript;
-    if (
-      options.diagnostic &&
-      isRecord(classificationTranscript) &&
-      'unavailable' in classificationTranscript
-    )
-      return {
-        live,
-        round: {
-          verdict: 'retry',
-          reason: String(classificationTranscript.unavailable),
-        },
-        transcript,
-      };
     if (!v2) {
-      const round = classifyTerminalEvidence(classificationTranscript);
-      return {
-        live,
-        round,
-        transcript,
-        ...(options.diagnostic && round.verdict === 'error'
-          ? { terminalReason: round.text }
-          : {}),
-      };
+      return { live, round: classifyTerminalEvidence(transcript) };
     }
-    const latestInputAt = latestInputAtOf(classificationTranscript);
-    if (options.diagnostic && latestInputAt === undefined)
-      return {
-        live,
-        round: {
-          verdict: 'unreadable',
-          reason: 'diagnostic input time is unavailable',
-        },
-        transcript,
-      };
     const state = attributeHostRoundToTranscript(
       hostRoundStateOf(hostInfo),
-      classificationTranscript,
+      transcript,
     );
+    const latestInputAt = latestInputAtOf(transcript);
     const round = composeHostRound(state, latestInputAt);
     if (state.kind === 'terminal') {
-      const text = terminalTextOf(classificationTranscript);
+      const text = terminalTextOf(transcript);
       if (text) round.text = text;
       else if (state.outcome === 'succeeded')
         return {
           live,
-          transcript,
           round: { verdict: 'incomplete', startedAt: latestInputAt },
         };
     }
-    let terminalReason: string | undefined;
-    if (options.diagnostic && state.kind === 'terminal') {
-      const assistant = classifyTerminalEvidence(classificationTranscript);
-      terminalReason =
-        assistant.verdict === 'error' ? assistant.text : state.outcome;
-    }
-    return {
-      live,
-      round,
-      transcript,
-      ...(terminalReason ? { terminalReason } : {}),
-    };
+    return { live, round };
   } catch (error) {
     return { live, roundError: error };
   }

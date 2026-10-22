@@ -238,12 +238,13 @@ evidence beyond the run start time, not proof the child did nothing; `unknown`
 means no activity evidence is available. Tracker entries are session-keyed, so
 a pre-revive entry can supply an older timestamp; timestamps are unchanged.
 
-Use `diagnostic: true` only for finished-but-unsuccessful children: error,
-cancelled, or stopped. It returns a labelled, non-final tail excerpt, including
-short assistant errors and failed-tool error text, never tool inputs or
+Use `diagnostic: true` only for tracked, finished-but-unsuccessful children:
+error, cancelled, or stopped. It returns a labelled, non-final tail excerpt,
+including short assistant errors and failed-tool error text, never tool inputs or
 successful tool outputs. Host compaction triggers and summaries are excluded
-and counted as omitted messages. The terminal reason uses assistant error text,
-then the host outcome, then the classified verdict—not partial findings.
+and counted as omitted messages. The terminal reason uses a recorded host
+error/outcome reason, then attributable assistant error text, then the state
+name—not partial findings from the stored result summary.
 The tool's rendered diagnostic response is capped at 6,144 UTF-8 bytes,
 including headers, errors, and truncation markers; plugin
 warnings may be appended separately. The fetch requests the newest 100 messages.
@@ -261,9 +262,16 @@ Tracked excerpts also exclude assistant messages created before the board's
 run start. The input itself may predate registration. Missing assistant creation
 times or only pre-start evidence makes the excerpt unavailable; late registration
 can therefore omit genuine early output rather than risk showing stale work.
+An owned untracked handle returns the ordinary read-only status plus a short
+notice that diagnostics require a tracked task record, not an excerpt or an
+extra transcript read. Startup recovery normally re-adopts restarted children
+onto the board with their historical run start. Foreign-parent handles are
+still rejected.
 Diagnostics are read-only, not consumption or acknowledgement: observed state
 is evidence, execution completion ends a run, and parent acceptance is a
 separate decision. Diagnostic reads do not reconcile or resume a child.
+The fixed next-step line reminds callers to treat the excerpt as non-final
+evidence and await or re-delegate, not mark the task accepted.
 
 `task_status`, `task_message`, `task_reply`, `task_cancel`,
 `task_revive`, and an explicit resume ID resolve a non-exact alias from the

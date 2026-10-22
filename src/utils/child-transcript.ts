@@ -232,63 +232,6 @@ function diagnosticInputIndex(entries: TranscriptMessage[]): number {
   );
 }
 
-/** Diagnostic classification cannot borrow attribution from outside its
- * bounded window, or infer terminality from messages with omitted parts. */
-export function diagnosticEvidenceTranscriptOf(
-  response: unknown,
-): { unavailable: string } | { data: TranscriptMessage[] } {
-  const window = diagnosticWindow(response);
-  if ('unavailable' in window) return { unavailable: window.unavailable };
-  if (window.partsTruncated)
-    return {
-      unavailable: 'diagnostic attribution requires omitted message parts',
-    };
-  if (diagnosticInputIndex(window.entries) < 0)
-    return {
-      unavailable: 'latest input is outside the diagnostic message window',
-    };
-  return {
-    data: window.entries.map((entry) => {
-      const info = entry.info;
-      const error = info?.error;
-      let remaining = DIAGNOSTIC_MESSAGE_CHARS;
-      return {
-        info: {
-          id: info?.id,
-          role: info?.role,
-          sourceType: info?.sourceType,
-          finish: info?.finish,
-          summary: info?.summary,
-          time: {
-            created: info?.time?.created,
-            completed: info?.time?.completed,
-          },
-          error:
-            error === undefined || error === null
-              ? error
-              : (diagnosticErrorText(error)?.text ??
-                'assistant error (details unavailable)'),
-        },
-        parts: (entry.parts ?? []).map((part) => {
-          if (!isRecord(part)) return part;
-          if (part.type === 'text' && typeof part.text === 'string') {
-            const text =
-              remaining > 0 ? diagnosticSlice(part.text, -remaining) : '';
-            remaining -= text.length;
-            return { type: 'text', text };
-          }
-          return {
-            type: part.type,
-            state: isRecord(part.state)
-              ? { status: part.state.status }
-              : undefined,
-          };
-        }),
-      };
-    }),
-  };
-}
-
 /** Bounded, non-final assistant evidence. Never includes tool inputs or
  * successful tool output. Validation uses the shared rules on the tail only. */
 export function diagnosticExcerptOf(
@@ -296,7 +239,12 @@ export function diagnosticExcerptOf(
   options: { maxBytes?: number; runStartedAt?: number } = {},
 ):
   | { unavailable: string }
-  | { text: string; truncated: string; omittedMessages: number } {
+  | {
+      text: string;
+      truncated: string;
+      omittedMessages: number;
+      assistantError?: string;
+    } {
   const window = diagnosticWindow(response);
   if ('unavailable' in window) return { unavailable: window.unavailable };
   const { entries } = window;
@@ -352,6 +300,7 @@ export function diagnosticExcerptOf(
     (entries[boundary].info?.time?.created as number) < runStartedAt;
   if (boundaryCounted) omittedMessages++;
   let compactionMessages = 0;
+  let assistantError: string | undefined;
   let bytes = 0;
   for (let index = entries.length - 1; index > boundary; index--) {
     const entry = entries[index];
@@ -380,6 +329,7 @@ export function diagnosticExcerptOf(
     const error = entry.info?.error;
     const detail = diagnosticErrorText(error);
     if (detail) {
+      assistantError ??= detail.text;
       if (detail.truncated) charsCut = true;
       add(`assistant_error: ${detail.text}`, DIAGNOSTIC_ITEM_CHARS);
     }
@@ -441,6 +391,7 @@ export function diagnosticExcerptOf(
         .filter(Boolean)
         .join(',') || 'none',
     omittedMessages: omittedMessages + compactionMessages,
+    ...(assistantError ? { assistantError } : {}),
   };
 }
 
