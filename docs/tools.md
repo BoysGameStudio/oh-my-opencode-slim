@@ -272,10 +272,10 @@ Real input or assistant activity created after the recorded completion time
 returns `evidence: unavailable`. So do records without a completion time and
 legacy records whose recorded time predates their final assistant message.
 Compaction and system maintenance do not count as new run activity.
-A rare publication gap remains: a new run whose input reaches the child after
-the host finishes but before the plugin publishes the old outcome can still
-appear under the old generation. In practice this normally needs an actor other
-than the parent to re-prompt the child before the completion notice.
+A timing-dependent publication gap remains: a new run whose input reaches the
+child after the host finishes but before the plugin publishes the old outcome
+can still appear under the old generation. This can occur if the parent or
+another actor re-prompts the child during that gap.
 Run-identity fencing would require launch-time recording of run anchors and
 queued-input identities; that is a possible follow-up.
 

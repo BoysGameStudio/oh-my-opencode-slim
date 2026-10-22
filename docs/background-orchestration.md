@@ -40,10 +40,11 @@ Failed-tool and assistant errors may appear;
 tool inputs and successful tool outputs do not.
 Attribution is timestamp-based: most runs lack recorded message identities.
 Excerpts start after the latest real input and exclude assistant messages from
-before the recorded run start. A delivered same-run queued message moves that
-start too, omitting earlier output without changing the recorded generation.
+before the recorded run start. A delivered same-run queued message moves the
+excerpt boundary, omitting earlier output without changing the recorded
+generation or run start.
 Missing completion times or legacy times predating the final message cause
-conservative refusals. A rare host-finish/plugin-publication gap can still show
+conservative refusals. A timing-dependent host-finish/plugin-publication gap can show
 new-run output under the old generation. See the
 [diagnostic attribution limits](tools.md#background-task-control), including the
 identity-recording follow-up. Host compaction is omitted and labelled. Terminal
