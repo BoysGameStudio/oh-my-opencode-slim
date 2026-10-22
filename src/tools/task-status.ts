@@ -743,6 +743,7 @@ function renderDiagnostic(
     generation: number;
     reason?: string;
     runStartedAt: number;
+    completedAt?: number;
   },
   transcript: unknown,
   unavailable?: string,
@@ -768,6 +769,7 @@ function renderDiagnostic(
     : diagnosticExcerptOf(transcript, {
         maxBytes: budget,
         runStartedAt: info.runStartedAt,
+        completedAt: info.completedAt,
       });
   const header = headerFor(
     info.reason ??
@@ -817,6 +819,7 @@ async function readTaskDiagnostic(
     const generation = job.generation;
     const revision = job.terminalRevision;
     const runStartedAt = job.runStartedAt;
+    const completedAt = job.completedAt;
     // resultSummary is also a native return/partial-output carrier. Only the
     // gate's fixed host-outcome literals are safe reasons, not arbitrary prose.
     const reason =
@@ -866,6 +869,7 @@ async function readTaskDiagnostic(
         generation,
         reason,
         runStartedAt,
+        completedAt,
       },
       transcript,
       unavailable,

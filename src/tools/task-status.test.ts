@@ -622,7 +622,7 @@ describe('task_status', () => {
       data: Array.from({ length: 100 }, (_, index) => ({
         info: {
           role: index === 61 ? 'user' : 'assistant',
-          time: { created: index },
+          time: { created: index / 10 },
         },
         parts: [{ type: 'text', text: '💥'.repeat(100_000) }],
       })),

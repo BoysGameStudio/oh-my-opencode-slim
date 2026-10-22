@@ -143,6 +143,153 @@ describe('task controls through the real v2 client shim', () => {
   test.each(
     (['v1', 'v2'] as const).flatMap((flavor) =>
       [
+        'new input',
+        'new input without assistant',
+        'new synthetic',
+        'new assistant',
+        'same run',
+        'same tick',
+        'host maintenance',
+        'missing terminal time',
+      ].map((scenario) => ({ flavor, scenario })),
+    ),
+  )(
+    'diagnostics refuse activity beyond the recorded terminal on %j',
+    async ({ flavor, scenario }) => {
+      const native: Array<Record<string, unknown>> = [
+        { id: 'input', type: 'user', time: 100, content: [] },
+        {
+          id: 'answer',
+          type: 'assistant',
+          time: scenario === 'same tick' ? 200 : 199,
+          content: [{ type: 'text', text: 'CURRENT PARTIAL' }],
+        },
+      ];
+      if (scenario.startsWith('new input') || scenario === 'new synthetic')
+        native.push({
+          id: 'new-input',
+          type: scenario === 'new synthetic' ? 'synthetic' : 'user',
+          time: 300,
+          content: [],
+        });
+      if (
+        scenario.startsWith('new ') &&
+        scenario !== 'new input without assistant'
+      )
+        native.push({
+          id: 'new-answer',
+          type: 'assistant',
+          time: 310,
+          content: [{ type: 'text', text: 'NEW RUN PARTIAL' }],
+        });
+      if (scenario === 'host maintenance')
+        native.push(
+          {
+            id: 'compact',
+            type: 'compaction',
+            status: 'completed',
+            time: 300,
+            content: [],
+          },
+          { id: 'idle', type: 'idle', time: 310, content: [] },
+        );
+      const input =
+        flavor === 'v2'
+          ? buildPluginInput({
+              session: { context: async () => native },
+            } as unknown as V2Context)
+          : ({
+              directory: '/test',
+              client: {
+                session: {
+                  messages: async () => ({
+                    data: native.map((message) => ({
+                      info: {
+                        id: message.id,
+                        role:
+                          message.type === 'idle'
+                            ? 'system'
+                            : ['compaction', 'synthetic'].includes(
+                                  String(message.type),
+                                )
+                              ? 'user'
+                              : message.type,
+                        ...(message.type === 'synthetic'
+                          ? { sourceType: 'synthetic' }
+                          : {}),
+                        time: { created: message.time },
+                      },
+                      parts:
+                        message.type === 'compaction'
+                          ? [{ type: 'compaction' }]
+                          : message.content,
+                    })),
+                  }),
+                },
+              },
+            } as unknown as PluginInput);
+      const board = new BackgroundJobBoard();
+      board.registerLaunch({
+        taskID: 'ses_child',
+        parentSessionID: 'parent',
+        agent: 'explorer',
+        now: 100,
+      });
+      boardFixture.updateStatus(board, {
+        taskID: 'ses_child',
+        state: 'error',
+        now: 200,
+      });
+      const job = board.get('ses_child');
+      if (!job) throw new Error('expected tracked record');
+      if (scenario === 'missing terminal time') job.completedAt = undefined;
+      const before = structuredClone(job);
+      const gate = createBackgroundJobTerminalGate({
+        input,
+        backgroundJobBoard: board,
+      });
+      dispose.push(() => gate.dispose());
+      const writes = [
+        spyOn(gate, 'capture'),
+        spyOn(gate, 'observe'),
+        spyOn(gate, 'reconcile'),
+        spyOn(board, 'markUsed'),
+      ];
+      const output = await createTaskStatusTool({
+        input,
+        backgroundJobBoard: board,
+        terminalGate: gate,
+      }).task_status.execute(
+        {
+          ...(flavor === 'v2'
+            ? { sessionID: 'ses_child' }
+            : { task_id: 'ses_child' }),
+          diagnostic: true,
+        },
+        context,
+      );
+      expect(output).toContain('generation: 1');
+      expect(output).not.toContain('NEW RUN PARTIAL');
+      if (scenario.startsWith('new '))
+        expect(output).toContain(
+          'evidence: unavailable (activity after the recorded terminal outcome)',
+        );
+      else if (scenario === 'missing terminal time')
+        expect(output).toContain(
+          'evidence: unavailable (recorded terminal time is unavailable)',
+        );
+      else {
+        expect(output).toContain('CURRENT PARTIAL');
+        expect(output).toContain('evidence: transcript');
+      }
+      for (const write of writes) expect(write).not.toHaveBeenCalled();
+      expect(board.get('ses_child')).toEqual(before);
+    },
+  );
+
+  test.each(
+    (['v1', 'v2'] as const).flatMap((flavor) =>
+      [
         'textless failure',
         'input before registration',
         'missing time',

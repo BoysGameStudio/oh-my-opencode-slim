@@ -265,6 +265,10 @@ Tracked excerpts also exclude assistant messages created before the board's
 run start. The input itself may predate registration. Missing assistant creation
 times or only pre-start evidence makes the excerpt unavailable; late registration
 can therefore omit genuine early output rather than risk showing stale work.
+Real input or assistant activity created after the recorded terminal time makes
+the excerpt unavailable (`activity after the recorded terminal outcome`), as
+does a missing terminal time. Compaction and system maintenance do not count as
+new run activity.
 An owned untracked handle returns the ordinary read-only status plus a short
 notice that diagnostics require a tracked task record, not an excerpt or an
 extra transcript read. Startup recovery normally re-adopts restarted children

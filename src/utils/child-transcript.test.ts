@@ -16,6 +16,50 @@ import {
 import { composeHostRound, hostRoundStateOf } from './session-runtime-status';
 
 describe('diagnostic excerpts', () => {
+  test('a full text part followed by ignored tool output is not character-truncated', () => {
+    const text = 'x'.repeat(2000);
+    const result = diagnosticExcerptOf({
+      data: [
+        { info: { role: 'user' }, parts: [] },
+        {
+          info: { role: 'assistant' },
+          parts: [
+            { type: 'tool', state: { status: 'completed' } },
+            { type: 'text', text },
+          ],
+        },
+      ],
+    });
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toBe(text);
+    expect(result.truncated).toBe('none');
+  });
+
+  test.each(['tool', 'assistant'])(
+    'a %s error clipped to whitespace still reports truncation',
+    (kind) => {
+      const error = `permission denied${' '.repeat(480)}`;
+      const result = diagnosticExcerptOf({
+        data: [
+          { info: { role: 'user' }, parts: [] },
+          {
+            info: {
+              role: 'assistant',
+              ...(kind === 'assistant' ? { error } : {}),
+            },
+            parts:
+              kind === 'tool'
+                ? [{ type: 'tool', state: { status: 'error', error } }]
+                : [],
+          },
+        ],
+      });
+      if (!('text' in result)) throw new Error('expected excerpt');
+      expect(result.truncated).toBe('chars');
+      expect(result.text).toContain('error details truncated');
+    },
+  );
+
   test.each(['v1', 'v2'] as const)(
     'failed-tool diagnostic preserves %s host errors without inputs or outputs',
     async (flavor) => {

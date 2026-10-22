@@ -167,12 +167,16 @@ function diagnosticErrorText(error: unknown) {
       : isRecord(error)
         ? [isRecord(error.data) ? error.data.message : undefined, error.message]
         : [];
+  let truncated = false;
   for (const candidate of candidates) {
     if (typeof candidate !== 'string') continue;
     const text = diagnosticSlice(candidate, -480);
-    if (text.trim()) return { text, truncated: candidate.length > text.length };
+    truncated ||= candidate.length > text.length;
+    if (text.trim()) return { text, truncated };
   }
-  return undefined;
+  return truncated
+    ? { text: '[error details truncated]', truncated: true }
+    : undefined;
 }
 
 /** UTF-8-safe tail trimming, without allocating a copy of an unbounded string. */
@@ -236,7 +240,11 @@ function diagnosticInputIndex(entries: TranscriptMessage[]): number {
  * successful tool output. Validation uses the shared rules on the tail only. */
 export function diagnosticExcerptOf(
   response: unknown,
-  options: { maxBytes?: number; runStartedAt?: number } = {},
+  options: {
+    maxBytes?: number;
+    runStartedAt?: number;
+    completedAt?: number;
+  } = {},
 ):
   | { unavailable: string }
   | {
@@ -248,12 +256,36 @@ export function diagnosticExcerptOf(
   const window = diagnosticWindow(response);
   if ('unavailable' in window) return { unavailable: window.unavailable };
   const { entries } = window;
+  const { runStartedAt, completedAt } = options;
+  // The tracked reader always supplies this field, even when the record lacks
+  // a usable terminal time; standalone excerpt-only callers may omit it.
+  if ('completedAt' in options) {
+    if (typeof completedAt !== 'number' || !Number.isFinite(completedAt))
+      return { unavailable: 'recorded terminal time is unavailable' };
+    // Like the lower fence, this relies on the production shared-Unix-ms
+    // clock contract. Ignore maintenance, but never borrow later execution
+    // activity merely because native registration has not updated the board.
+    if (
+      entries.some((entry) => {
+        if (entry.info?.role === 'system' || isDiagnosticCompactionRound(entry))
+          return false;
+        const source = sourceTypeOf(entry);
+        const created = entry.info?.time?.created;
+        return (
+          ['user', 'synthetic', 'assistant'].includes(source ?? '') &&
+          typeof created === 'number' &&
+          Number.isFinite(created) &&
+          created > completedAt
+        );
+      })
+    )
+      return { unavailable: 'activity after the recorded terminal outcome' };
+  }
   const boundary = diagnosticInputIndex(entries);
   if (boundary < 0 && entries.length > 0)
     return {
       unavailable: 'latest input is outside the diagnostic message window',
     };
-  const { runStartedAt } = options;
   if (runStartedAt !== undefined) {
     // Native registration can follow the prompt, whereas revive captures its
     // start before admission. Do not require the input to postdate registration
@@ -323,8 +355,10 @@ export function diagnosticExcerptOf(
       const clipped =
         room > 0 ? diagnosticSlice(text, -Math.min(room, cap)) : '';
       if (text.length > clipped.length) charsCut = true;
-      if (clipped) pieces.unshift(clipped);
-      chars += clipped.length + 1;
+      if (clipped) {
+        pieces.unshift(clipped);
+        chars += clipped.length + 1;
+      }
     };
     const error = entry.info?.error;
     const detail = diagnosticErrorText(error);
@@ -335,10 +369,6 @@ export function diagnosticExcerptOf(
     }
     const parts = entry.parts ?? [];
     for (let partIndex = parts.length - 1; partIndex >= 0; partIndex--) {
-      if (chars >= DIAGNOSTIC_MESSAGE_CHARS) {
-        charsCut = true;
-        break;
-      }
       const part = parts[partIndex];
       if (!isRecord(part)) continue;
       if (part.type === 'text' && typeof part.text === 'string')
