@@ -2078,6 +2078,8 @@ export function createOrchestratorWakeScheduler(
           reservation: Map<string, number>;
         }
       | undefined;
+    /** Set once the transport accepted this attempt's wake. */
+    let accepted = false;
 
     try {
       const snapshot =
@@ -2689,6 +2691,7 @@ export function createOrchestratorWakeScheduler(
         boundTrackedMap(lastPublicationWakeAt);
         acknowledgePendingPublications(sessionID, publicationBatch);
       }
+      accepted = true;
       return true;
     } catch (error) {
       // Only accepted sends consume the cap. Preserve the reservation's
@@ -2743,6 +2746,36 @@ export function createOrchestratorWakeScheduler(
                 lastWakeAt + publicationWakeMinIntervalMs - now(),
               ),
         );
+      }
+      // The same committed-send rule strands queued deltas: an idle event or
+      // a new delta that arrived during the send bumped the generation and
+      // parked its re-drive as a waiter this release just discarded, and no
+      // further idle is guaranteed. Arm one timer under the CURRENT
+      // generation (a timer controls cadence after a commit, like the
+      // publication retry above): completed-only work waits out the
+      // publication spacing, other deltas the backstop interval. A later
+      // idle or busy event supersedes it; an armed spacing or settle timer
+      // already owns the re-drive.
+      if (
+        accepted &&
+        current &&
+        current.generation !== generation &&
+        current.continuousIdle &&
+        current.timer === undefined &&
+        !disposed &&
+        hasPendingDeltas(sessionID) &&
+        !completedSpacingTimers.has(sessionID) &&
+        !childInputTimers.has(sessionID) &&
+        !isParentActiveByEvents(sessionID)
+      ) {
+        const completedOnly =
+          !pendingStoppedRecoveries.has(sessionID) &&
+          !pendingChildInputWakes.has(sessionID);
+        const spacing = completedOnly
+          ? publicationSpacingRemaining(sessionID)
+          : 0;
+        current.retryReason = 'recovery';
+        schedule(sessionID, spacing > 0 ? spacing : intervalMs);
       }
       if (
         current?.generation === generation &&
@@ -2930,6 +2963,14 @@ export function createOrchestratorWakeScheduler(
     bumpGeneration(state);
     state.continuousIdle = true;
     void evaluate(sessionID, state.generation, 'recovery');
+  }
+
+  function hasPendingDeltas(sessionID: string): boolean {
+    return (
+      pendingStoppedRecoveries.has(sessionID) ||
+      pendingCompletedJobs.has(sessionID) ||
+      pendingChildInputWakes.has(sessionID)
+    );
   }
 
   function triggerStoppedJobRecovery(

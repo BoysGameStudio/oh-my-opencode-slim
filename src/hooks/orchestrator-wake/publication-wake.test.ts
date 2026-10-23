@@ -32,6 +32,7 @@ import { resetUserWaitGateForTests } from '../task-session-manager/user-wait-gat
 import {
   createOrchestratorWakeScheduler,
   formatCompletedJobDelta,
+  formatStoppedJobDelta,
   ORCHESTRATOR_PUBLICATION_WAKE_TEXT,
   ORCHESTRATOR_WAKE_TEXT,
   PUBLICATION_WAKE_METADATA_KEY,
@@ -1691,5 +1692,136 @@ describe('terminal-publication wake', () => {
     expect(bodies[1]).toContain('result: result-b');
     expect(bodies[1]).toContain('result: result-c');
     expect(bodies[1]).not.toContain('result-a');
+  });
+
+  test('results queued while a send is in flight are re-driven after an idle invalidates the flight', async () => {
+    // Repo timer harness on both seams: deterministic, no real delay.
+    const harness = createTimerHarness();
+    const bodies: string[] = [];
+    const sends: Array<ReturnType<typeof deferred<unknown>>> = [];
+    const promptAsync = mock((args: Record<string, unknown>) => {
+      const body = args.body as { parts?: Array<{ text?: string }> };
+      bodies.push(body.parts?.[0]?.text ?? '');
+      const send = deferred<unknown>();
+      sends.push(send);
+      return send.promise;
+    });
+    const { scheduler } = createPublicationScheduler({
+      publicationWakeMinIntervalMs: 30_000,
+      setTimeout: harness.setTimeout as unknown as Parameters<
+        typeof createOrchestratorWakeScheduler
+      >[1]['setTimeout'],
+      clearTimeout: harness.clearTimeout as unknown as Parameters<
+        typeof createOrchestratorWakeScheduler
+      >[1]['clearTimeout'],
+      now: harness.now,
+      sessionClient: makeV1Client({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-busy' }],
+        statusData: { 'child-busy': { type: 'busy' } },
+      }),
+    });
+    const push = (taskID: string, result: string) =>
+      scheduler.triggerCompletedJobPublication(
+        'p1',
+        formatCompletedJobDelta({
+          alias: taskID,
+          taskID,
+          state: 'completed',
+          resultSummary: result,
+        }),
+        `${taskID}:2`,
+        { taskID, generation: 2, terminalRevision: 3, state: 'completed' },
+      );
+
+    push('ses_a', 'result-a');
+    await harness.tick();
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    // While the send is pending: two more results queue and the parent
+    // reports idle. Both re-drives lose the one-flight race and wait behind
+    // the committed send, which never releases its waiters.
+    push('ses_b', 'result-b');
+    push('ses_c', 'result-c');
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await harness.tick();
+    sends[0]?.resolve({});
+    await harness.tick();
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    // The accepted send consumed the spacing window: the leftover results
+    // are delivered together, once, when it elapses — not stranded.
+    await harness.advance(30_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(bodies[1]).toContain('result: result-b');
+    expect(bodies[1]).toContain('result: result-c');
+    expect(bodies[1]).not.toContain('result-a');
+    sends[1]?.resolve({});
+    await harness.advance(30_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+  });
+
+  test('a stop queued while a send is in flight is re-driven after an idle invalidates the flight', async () => {
+    // Repo timer harness on both seams: deterministic, no real delay.
+    const harness = createTimerHarness();
+    const bodies: string[] = [];
+    const sends: Array<ReturnType<typeof deferred<unknown>>> = [];
+    const promptAsync = mock((args: Record<string, unknown>) => {
+      const body = args.body as { parts?: Array<{ text?: string }> };
+      bodies.push(body.parts?.[0]?.text ?? '');
+      const send = deferred<unknown>();
+      sends.push(send);
+      return send.promise;
+    });
+    const { scheduler } = createPublicationScheduler({
+      intervalMs: 60_000,
+      setTimeout: harness.setTimeout as unknown as Parameters<
+        typeof createOrchestratorWakeScheduler
+      >[1]['setTimeout'],
+      clearTimeout: harness.clearTimeout as unknown as Parameters<
+        typeof createOrchestratorWakeScheduler
+      >[1]['clearTimeout'],
+      now: harness.now,
+      sessionClient: makeV1Client({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-busy' }],
+        statusData: { 'child-busy': { type: 'busy' } },
+      }),
+    });
+    const stop = (taskID: string, generation: number) =>
+      scheduler.triggerStoppedJobRecovery(
+        'p1',
+        formatStoppedJobDelta({
+          alias: taskID,
+          taskID,
+          generation,
+          state: 'stopped',
+          reason: 'stopped without a terminal result',
+        }),
+        `${taskID}:${generation}`,
+      );
+
+    stop('ses_a', 1);
+    await harness.tick();
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    stop('ses_b', 2);
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await harness.tick();
+    sends[0]?.resolve({});
+    await harness.tick();
+    // No back-to-back prompt: after a commit a timer controls cadence.
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    await harness.advance(60_000);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(bodies[1]).toContain('task: ses_b');
+    expect(bodies[1]).not.toContain('task: ses_a');
   });
 });
