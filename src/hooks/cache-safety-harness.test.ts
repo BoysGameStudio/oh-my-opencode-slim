@@ -86,9 +86,7 @@ export function createPipeline(options: PipelineOptions = {}): Pipeline {
     },
   );
 
-  const phaseReminder = createPhaseReminderHook({
-    shouldInject: shouldInjectOrchestratorReminder,
-  });
+  const phaseReminder = createPhaseReminderHook();
 
   const councilInject = createCouncilInjectHook({
     wording: {

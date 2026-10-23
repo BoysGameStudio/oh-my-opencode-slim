@@ -34,6 +34,7 @@ import { createV2InterviewBridge, markerText } from './interview-bridge';
 import { createSessionSubmit } from './session-submit';
 import {
   applyCommandMarkerToContext,
+  attributeAgentsByHistory,
   createCommandRegistration,
   createSessionContextHandler,
   createSessionPromptBridge,
@@ -65,6 +66,80 @@ function makeEvent(
     ...overrides,
   };
 }
+
+describe('attributeAgentsByHistory (marker-walk attribution)', () => {
+  const user = (id: string): Record<string, unknown> => ({
+    id,
+    type: 'user',
+    text: 'x',
+    time: { created: 1 },
+  });
+  const marker = (
+    id: string,
+    agent: string,
+    previous?: string,
+  ): Record<string, unknown> => ({
+    id,
+    type: 'agent-switched',
+    agent,
+    ...(previous ? { previous } : {}),
+    time: { created: 1 },
+  });
+
+  test('undefined/empty history yields an empty map', () => {
+    expect(attributeAgentsByHistory(undefined).size).toBe(0);
+    expect(attributeAgentsByHistory([]).size).toBe(0);
+  });
+
+  test('a marker without previous leaves its pre-segment unmapped', () => {
+    const map = attributeAgentsByHistory([
+      user('a'),
+      user('b'),
+      marker('m', 'build'),
+      user('c'),
+    ]);
+    expect(map.has('a')).toBe(false);
+    expect(map.has('b')).toBe(false);
+    expect(map.get('c')).toBe('build');
+  });
+
+  test('previous seeds the pre-segment when no earlier marker established one', () => {
+    // Doubles as the compaction-window-start case: a post-compaction
+    // window whose first in-window marker carries `previous` attributes
+    // the retained pre-segment from that field alone.
+    const map = attributeAgentsByHistory([
+      user('a'),
+      marker('m', 'build', 'orchestrator'),
+      user('b'),
+    ]);
+    expect(map.get('a')).toBe('orchestrator');
+    expect(map.get('b')).toBe('build');
+  });
+
+  test('a preceding in-window marker is authoritative over previous', () => {
+    const map = attributeAgentsByHistory([
+      user('a'),
+      marker('m1', 'build', 'orchestrator'),
+      user('b'),
+      marker('m2', 'design', 'stale'),
+      user('c'),
+    ]);
+    expect(map.get('a')).toBe('orchestrator');
+    expect(map.get('b')).toBe('build');
+    expect(map.get('c')).toBe('design');
+  });
+
+  test('non-user/non-marker entries are ignored; ids are the join keys', () => {
+    const map = attributeAgentsByHistory([
+      { id: 'asst_1', type: 'assistant', agent: 'build', time: { created: 1 } },
+      { id: 'idle_1', type: 'idle', time: { created: 2 } },
+      user('msg_1'),
+      marker('msg_m', 'design', 'build'),
+    ]);
+    expect(map.size).toBe(1);
+    expect(map.get('msg_1')).toBe('build');
+  });
+});
 
 describe('command marker wrap/parse', () => {
   test('round-trips empty, simple, and multiline args', () => {
@@ -892,7 +967,7 @@ describe('context bridge: transcript identity enrichment', () => {
     },
   );
 
-  test('agent falls back to the prompt-bridge learned state when the event carries none', async () => {
+  test('attribution falls back to the event agent on a markerless history', async () => {
     const user = {
       id: 'u1',
       role: 'user',
@@ -901,14 +976,143 @@ describe('context bridge: transcript identity enrichment', () => {
     const handler = createSessionContextHandler({
       interviewHandleContext: async () => {},
       messagesTransform: async () => {},
-      knownAgentForSession: (sessionID) =>
-        sessionID === 'ses_cmd' ? 'oracle' : undefined,
+      // v1-migrated / markerless session: no per-message data exists, so
+      // the context event's current agent is the exact attribution.
+      sessionContext: async () => [{ id: 'u9', type: 'user', text: 'x' }],
     });
 
-    await handler(makeEvent([user], { agent: '' }));
+    await handler(makeEvent([user], { agent: 'build' }));
 
     expect(user.sessionID).toBe('ses_cmd');
-    expect(user.agent).toBe('oracle');
+    expect(user.agent).toBe('build');
+  });
+
+  test('a failed history read degrades attribution to the event agent', async () => {
+    const user = {
+      id: 'u1',
+      role: 'user',
+      content: [{ type: 'text', text: 'hi' }],
+    };
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async () => {},
+      sessionContext: async () => {
+        throw new Error('store unavailable');
+      },
+    });
+
+    await handler(makeEvent([user], { agent: 'build' }));
+
+    expect(user.agent).toBe('build');
+  });
+
+  test('attribution joins payload users to their send-time agent across switches (issue #1640 v2)', async () => {
+    const mkUser = (id: string) => ({
+      id,
+      role: 'user',
+      content: [{ type: 'text', text: `msg ${id}` }],
+    });
+    const u1 = mkUser('msg_1');
+    const u1b = mkUser('msg_2');
+    const u2 = mkUser('msg_3');
+    const u3 = mkUser('msg_4');
+    const marker = (id: string, agent: string, previous?: string) => ({
+      id,
+      type: 'agent-switched',
+      agent,
+      ...(previous ? { previous } : {}),
+      time: { created: 1 },
+    });
+    const history = [
+      { id: 'msg_1', type: 'user', text: 'x', time: { created: 1 } },
+      { id: 'msg_2', type: 'user', text: 'x', time: { created: 2 } },
+      marker('msg_m1', 'build', 'orchestrator'),
+      { id: 'msg_3', type: 'user', text: 'x', time: { created: 3 } },
+      marker('msg_m2', 'design', 'build'),
+      { id: 'msg_4', type: 'user', text: 'x', time: { created: 4 } },
+    ];
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async () => {},
+      sessionContext: async () => history,
+    });
+
+    const ghost = mkUser('msg_ghost');
+    await handler(makeEvent([u1, u1b, u2, u3, ghost], { agent: 'design' }));
+
+    // u1/u1b were sent under orchestrator (marker.previous), u2 under
+    // build, u3 under design — attribution survives the switches.
+    // msg_ghost has no history row: per-message fallback → event.agent.
+    expect(u1.agent).toBe('orchestrator');
+    expect(u1b.agent).toBe('orchestrator');
+    expect(u2.agent).toBe('build');
+    expect(u3.agent).toBe('design');
+    expect(ghost.agent).toBe('design');
+  });
+
+  test('attribution is stateless: a fresh handler instance reproduces it from the same history', async () => {
+    const mkUser = (id: string) => ({
+      id,
+      role: 'user',
+      content: [{ type: 'text', text: `msg ${id}` }],
+    });
+    const history = [
+      { id: 'msg_1', type: 'user', text: 'x', time: { created: 1 } },
+      {
+        id: 'msg_m1',
+        type: 'agent-switched',
+        agent: 'build',
+        previous: 'orchestrator',
+        time: { created: 2 },
+      },
+      { id: 'msg_2', type: 'user', text: 'x', time: { created: 3 } },
+    ];
+    const deps = () =>
+      createSessionContextHandler({
+        interviewHandleContext: async () => {},
+        messagesTransform: async () => {},
+        sessionContext: async () => history,
+      });
+    const first = mkUser('msg_1');
+    const second = mkUser('msg_1');
+
+    await deps()(makeEvent([first], { agent: 'build' }));
+    await deps()(makeEvent([second], { agent: 'build' }));
+
+    // Simulated restart (fresh instance, same durable rows): identical
+    // attribution — no in-memory state participates.
+    expect(first.agent).toBe('orchestrator');
+    expect(second.agent).toBe('orchestrator');
+  });
+
+  test('the attribution read never mutates stored history (#448 guard)', async () => {
+    const user = {
+      id: 'msg_1',
+      role: 'user',
+      content: [{ type: 'text', text: 'hi' }],
+    };
+    const history = [
+      { id: 'msg_1', type: 'user', text: 'x', time: { created: 1 } },
+    ];
+    const historyBefore = JSON.stringify(history);
+    let seen: Array<{ id?: string; parts: unknown[] }> = [];
+    const handler = createSessionContextHandler({
+      interviewHandleContext: async () => {},
+      messagesTransform: async (_input, output) => {
+        seen = output.messages as never;
+      },
+      sessionContext: async () => history,
+    });
+
+    await handler(makeEvent([user], { agent: 'orchestrator' }));
+
+    expect(JSON.stringify(history)).toBe(historyBefore);
+    // The bridge itself adds nothing: the transform sees exactly the
+    // payload message, no synthetic part injected by the bridge (the only
+    // enrichment is the absence-gated envelope stamp).
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.parts).toHaveLength(1);
+    expect(user.agent).toBe('orchestrator');
   });
 
   test('no enrichment without a messagesTransform dep (mutation stays scoped)', async () => {
@@ -1020,12 +1224,10 @@ describe('context bridge: transcript identity enrichment', () => {
   });
 
   test('end-to-end: a recognized agent now performs the phase-reminder injection it previously skipped', async () => {
-    const phaseReminder = createPhaseReminderHook({
-      shouldInject: () => true,
-    });
+    const phaseReminder = createPhaseReminderHook();
 
-    // The pre-fix behavior: the raw v2 transcript message (no
-    // sessionID/agent) fails the gate inside the real v1 hook.
+    // The pre-fix behavior: the raw v2 transcript message (no agent) fails
+    // per-message eligibility inside the real v1 hook.
     const unenriched = {
       info: { role: 'user' },
       parts: [{ type: 'text', text: 'do the work' }],

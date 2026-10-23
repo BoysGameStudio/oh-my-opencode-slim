@@ -268,19 +268,37 @@ describe('createCouncilInjectHook', () => {
     expect(injected.text).toContain('## Council Mode');
   });
 
-  test('does not inject for specialist agents (passthrough)', async () => {
+  test('council block persists across a specialist turn (issue #1640)', async () => {
     const output = {
       messages: [
         {
-          info: { role: 'user', agent: 'explorer', sessionID: 's1' },
-          parts: [{ type: 'text', text: 'run a council please' }],
+          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+          parts: [{ type: 'text', text: 'run a council on this' }],
         },
       ],
     };
 
     await transform({}, output);
+    const anchorBytes = JSON.stringify(output.messages[0]);
+    expect(
+      output.messages[0].parts.some(
+        (part) => part.metadata?.[COUNCIL_INJECT_METADATA_KEY] === true,
+      ),
+    ).toBe(true);
 
-    expect(output.messages[0].parts.length).toBe(1);
+    output.messages.push({
+      info: { role: 'user', agent: 'explorer', sessionID: 's1' },
+      parts: [{ type: 'text', text: 'specialist turn' }],
+    });
+    await transform({}, output);
+
+    expect(JSON.stringify(output.messages[0])).toBe(anchorBytes);
+    expect(
+      output.messages[0].parts.some(
+        (part) => part.metadata?.[COUNCIL_INJECT_METADATA_KEY] === true,
+      ),
+    ).toBe(true);
+    expect(output.messages[1].parts).toHaveLength(1);
   });
 
   test('scans every text part, not just the first', async () => {

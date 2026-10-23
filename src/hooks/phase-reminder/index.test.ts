@@ -131,55 +131,6 @@ describe('createPhaseReminderHook', () => {
     expect(output.messages[0].parts).toHaveLength(2);
   });
 
-  test('skips non-orchestrator sessions', async () => {
-    const hook = createPhaseReminderHook();
-    const output = {
-      messages: [
-        {
-          info: { role: 'user', agent: 'explorer' },
-          parts: [{ type: 'text', text: 'hello' }],
-        },
-      ],
-    };
-
-    await hook['experimental.chat.messages.transform']({}, output);
-
-    expect(output.messages[0].parts.length).toBe(1);
-    expect(output.messages[0].parts[0].text).toBe('hello');
-  });
-
-  test('skips turns without an explicit orchestrator agent', async () => {
-    const hook = createPhaseReminderHook();
-    const output = {
-      messages: [
-        {
-          info: { role: 'user', sessionID: 's1' },
-          parts: [{ type: 'text', text: 'hello' }],
-        },
-      ],
-    };
-
-    await hook['experimental.chat.messages.transform']({}, output);
-
-    expect(output.messages[0].parts).toHaveLength(1);
-  });
-
-  test('skips turns without a session ID', async () => {
-    const hook = createPhaseReminderHook();
-    const output = {
-      messages: [
-        {
-          info: { role: 'user', agent: 'orchestrator' },
-          parts: [{ type: 'text', text: 'hello' }],
-        },
-      ],
-    };
-
-    await hook['experimental.chat.messages.transform']({}, output);
-
-    expect(output.messages[0].parts).toHaveLength(1);
-  });
-
   test('does not mutate internal notification turns', async () => {
     const hook = createPhaseReminderHook();
     const text = `[Background task "x" completed]\n${SLIM_INTERNAL_INITIATOR_MARKER}`;
@@ -547,45 +498,34 @@ describe('createPhaseReminderHook', () => {
     expect(output.messages[2].parts).toHaveLength(1);
   });
 
-  test('T7: a non-orchestrator latest message or no sessionID injects nothing', async () => {
+  test('anchor persists across an agent switch (issue #1640)', async () => {
     const hook = createPhaseReminderHook();
-    const nonOrchestrator = {
+    const output = {
       messages: [
         {
           info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
           parts: [{ type: 'text', text: 'first' }],
         },
         {
-          info: { role: 'user', agent: 'explorer', sessionID: 's1' },
-          parts: [{ type: 'text', text: 'latest' }],
+          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
+          parts: [{ type: 'text', text: 'second' }],
         },
       ],
     };
-    await hook['experimental.chat.messages.transform']({}, nonOrchestrator);
-    expect(
-      nonOrchestrator.messages.flatMap((message) =>
-        message.parts.filter(hasPhaseReminder),
-      ),
-    ).toHaveLength(0);
 
-    const noSessionID = {
-      messages: [
-        {
-          info: { role: 'user', agent: 'orchestrator', sessionID: 's1' },
-          parts: [{ type: 'text', text: 'first' }],
-        },
-        {
-          info: { role: 'user', agent: 'orchestrator' },
-          parts: [{ type: 'text', text: 'latest' }],
-        },
-      ],
-    };
-    await hook['experimental.chat.messages.transform']({}, noSessionID);
-    expect(
-      noSessionID.messages.flatMap((message) =>
-        message.parts.filter(hasPhaseReminder),
-      ),
-    ).toHaveLength(0);
+    await hook['experimental.chat.messages.transform']({}, output);
+    const anchorBytes = JSON.stringify(output.messages[0]);
+    expect(output.messages[0].parts.some(hasPhaseReminder)).toBe(true);
+
+    output.messages.push({
+      info: { role: 'user', agent: 'build', sessionID: 's1' },
+      parts: [{ type: 'text', text: 'next phase' }],
+    });
+    await hook['experimental.chat.messages.transform']({}, output);
+
+    expect(JSON.stringify(output.messages[0])).toBe(anchorBytes);
+    expect(output.messages[0].parts.some(hasPhaseReminder)).toBe(true);
+    expect(output.messages[2].parts).toHaveLength(1);
   });
 
   test('T8: injected text is the PHASE_REMINDER constant byte-for-byte', async () => {

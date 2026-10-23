@@ -1521,14 +1521,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       };
     };
 
-    // Only orchestrator sessions receive phase reminders.
-    const shouldInjectOrchestratorReminder = (sessionID: string) =>
-      sessionMetadata.getAgent(sessionID) === 'orchestrator';
-
     if (!runtime.disabledHooks.has('phase-reminder')) {
-      phaseReminder = createPhaseReminderHook({
-        shouldInject: shouldInjectOrchestratorReminder,
-      });
+      phaseReminder = createPhaseReminderHook();
     }
 
     // Deepwork goal pointer: re-derives one state-neutral pointer from disk
@@ -1545,10 +1539,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       });
     }
 
-    // Keyword-triggered Council Mode injection: same gate pattern as the
-    // phase reminder, scoped to sessions with configured councillor seats.
-    // The seat gate uses the same agentDefs the orchestrator prompt's seat
-    // pointer lists; the injected block no longer enumerates seats (the
+    // Keyword-triggered Council Mode injection: per-message eligibility just
+    // like the phase reminder, scoped to sessions with configured councillor
+    // seats. The seat gate uses the same agentDefs the orchestrator prompt's
+    // seat pointer lists; the injected block no longer enumerates seats (the
     // pointer already does), so the hook only needs the delegation wording.
     if (!runtime.disabledHooks.has('council-inject')) {
       const councilSeats = agentDefs

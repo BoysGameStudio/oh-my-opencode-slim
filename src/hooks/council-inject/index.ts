@@ -119,10 +119,10 @@ interface CouncilInjectOptions {
 /**
  * Creates the experimental.chat.messages.transform hook for keyword-triggered
  * Council Mode injection. Runs right before sending to API (no UI display).
- * Only injects for the orchestrator agent, and only onto the FIRST message
- * whose text matches a council trigger — later triggering messages reuse
- * the block already planted in history (first-hit, one block per
- * transcript).
+ * Injection eligibility is per-message: only the FIRST orchestrator-authored
+ * message whose text matches a council trigger carries the block — later
+ * triggering messages reuse the block already planted in history (first-hit,
+ * one block per transcript).
  */
 export function createCouncilInjectHook(options: CouncilInjectOptions) {
   const block = formatSystemReminder(buildCouncilModeBlock(options.wording));
@@ -139,10 +139,7 @@ export function createCouncilInjectHook(options: CouncilInjectOptions) {
         return;
       }
 
-      const { agent, sessionID } = lastUserMessage.info;
-      if (agent !== 'orchestrator' || !sessionID) {
-        return;
-      }
+      const { sessionID } = lastUserMessage.info;
 
       // First-hit dedupe: if this payload already carries a block (e.g. the
       // same output object transformed twice), add nothing anywhere.
