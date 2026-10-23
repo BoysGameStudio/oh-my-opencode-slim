@@ -2108,6 +2108,46 @@ describe('plugin reload generation cleanup', () => {
     },
   );
 
+  test.each(['v1', 'v2'] as const)(
+    "%s terminal outcome clears the child's open input waits",
+    async (hostFlavor) => {
+      const subscriptions = spyOn(
+        BackgroundJobCoordinator.prototype,
+        'addTerminalOutcomeListener',
+      );
+      let hooks: Awaited<ReturnType<typeof plugin>> | undefined;
+      try {
+        hooks = await createHooks({ hostFlavor });
+        const board = new BackgroundJobBoard();
+        board.registerLaunch({
+          taskID: 'child-ask',
+          parentSessionID: 'parent-1',
+          agent: 'fixer',
+          description: 'child with an open ask',
+          now: 100,
+        });
+        noteChildInputWait({
+          taskID: 'child-ask',
+          parentSessionID: 'parent-1',
+          kind: 'question',
+          requestID: 'req_old',
+          questions: [{ question: 'continue?', header: 'Ask', options: [] }],
+          now: 150,
+        });
+        const stopped = board.markStopped('child-ask', 'no outcome', 200);
+        if (!stopped) throw new Error('missing stopped record');
+        for (const [listener] of subscriptions.mock.calls) listener(stopped);
+        // The ask died with the run: a restarted child must not inherit it
+        // in task_status (the store has no generation fence of its own).
+        expect(listChildInputWaits('child-ask')).toHaveLength(0);
+      } finally {
+        await hooks?.dispose?.();
+        subscriptions.mockRestore();
+        resetChildInputWaitForTests();
+      }
+    },
+  );
+
   // ── Terminal publication push (issue #1647) ─────────────────────────────
   //
   // rev-1 completed/error is delivered natively by the host (both hosts), so

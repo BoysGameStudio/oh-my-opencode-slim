@@ -1365,16 +1365,18 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       });
     });
     backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
-      // v2 has no wake machinery (no scheduler): native delivery owns
-      // stops for job-backed runs, and the plugin does not push one for
-      // a non-job run (council 2026-10-23).
-      if (hostFlavor === 'v2') return;
       // A placeholder is not delegated work; its stop is not recoverable
       // by the parent until a task launch has attributed the session.
       if (record.provisional === true) return;
       // A child's terminal state resolves any of its open input waits: the
-      // ask is gone with the run, so a queued wake must not fire for it.
+      // ask is gone with the run, so a queued wake must not fire for it and
+      // task_status must not show it after a restart. Runs on both hosts —
+      // the ask store has no run-generation fence of its own.
       clearChildInputWaitsForSession(record.taskID);
+      // v2 has no wake machinery (no scheduler): native delivery owns
+      // stops for job-backed runs, and the plugin does not push one for
+      // a non-job run (council 2026-10-23).
+      if (hostFlavor === 'v2') return;
       if (record.state !== 'stopped' || !record.terminalUnreconciled) return;
       // Symmetric tracker suppression (M4): when the revived-run tracker
       // owns this generation's delivery — it already delivered the run's
