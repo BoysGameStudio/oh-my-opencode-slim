@@ -1153,11 +1153,12 @@ report is superseded") in the cache-safe tail zone, pointing at `task_status`.
 
 On v1 hosts the same first-publication rule holds (the native task-tool
 notifier delivers it), and a LATER publication of the same run — which has no
-native notifier on either host — is delivered by the plugin itself: on v1 as
-one self-contained `<completed-job>` delta through the bounded delta queue
-(so it survives a busy parent and the per-parent publication throttle), on v2
-as the bare publication wake below with the result pulled through
-`task_status`.
+native notifier on either host — is delivered by the plugin itself on v1 only,
+as one self-contained `<completed-job>` delta through the bounded delta queue
+(it survives a busy parent, and inside the per-parent publication spacing it
+stays queued until the window elapses). On v2 the plugin sends no wake: a
+relaunch through the `subagent` tool re-arms the native notifier, and any
+other later result is pulled through `task_status`.
 
 ### Host outcome quirks the terminal gate defends against
 

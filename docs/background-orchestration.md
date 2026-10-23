@@ -734,8 +734,8 @@ error, or cancelled record once the parent demonstrably moved past the terminal
 report. The board is never injected on any host: `backgroundJobs.boardInjection`
 was removed, and `task_status` is always the pull channel.
 
-Child-input wakes wait 250 ms before notifying the parent, on both host
-versions. Per-kind policy applies: by default only question asks wake the
+On v1, child-input wakes wait 250 ms before notifying the parent. v2 sends no
+child-input wake: open asks surface only through `task_status`. Per-kind policy applies: by default only question asks wake the
 parent; permission asks do not (#1504). Built-in subagents no longer receive
 the `question` tool by default (`question` defaults to `deny` for every
 non-orchestrator agent), so question wakes fire only for agents with an
@@ -757,10 +757,10 @@ stays parked (visible via `task_status` as `waiting_input`), so either set
 `backgroundJobs.childInputWakeKinds.permission = true` or rely on
 `wallClockTimeoutMs`.
 
-Wake and `task_status` share compact request details and reply guidance.
+Wake (v1) and `task_status` share compact request details and reply guidance.
 V1 questions and permission requests use `task_reply`; v2 forms require the
-host UI, waiting, or `task_cancel`. V2 notices keep question summaries and option
-labels; full option descriptions stay in the host UI. A pending request
+host UI, waiting, or `task_cancel`. V2 `task_status` details keep question
+summaries and option labels; full option descriptions stay in the host UI. A pending request
 suppresses the generic “await completion” status guidance. Shorter notices do not skip the host's
 normal model step after a tool result or guarantee that a model emits no filler.
 
@@ -814,7 +814,8 @@ Terminal facts travel as one-shot pushes instead:
   dropping: results inside the window stay queued and one wake delivers them
   together when it elapses.
   The wake that carries it is a bare resume pointer: the delta holds the
-  facts. On v2 the publication wake stays a bare resume pointer and the
+  facts. On v2 the plugin sends no wake for it: a later run relaunched
+  through the `subagent` tool is delivered natively, and any other later
   result is pulled with `task_status`.
 - Overflowed pushes keep a durable pointer to `task_status` instead of
   listing the coalesced facts inline.

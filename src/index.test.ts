@@ -2153,8 +2153,8 @@ describe('plugin reload generation cleanup', () => {
   // rev-1 completed/error is delivered natively by the host (both hosts), so
   // OMOS publishes NOTHING for it. A later publication (rev>1) has no native
   // notifier: v1 pushes ONE self-contained `<completed-job>` delta through
-  // the bounded delta queue (never the drop-prone publication wake), and v2
-  // keeps the bare publication wake.
+  // the bounded delta queue (never the drop-prone publication wake); v2
+  // creates no wake scheduler, so it pushes nothing.
 
   async function emitTerminalPublication(record: {
     pluginConfig?: Record<string, unknown>;

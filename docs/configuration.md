@@ -570,7 +570,8 @@ to the parent — idle parents get a new turn, busy parents get a steer — so t
 periodic evaluation duplicates that channel. Setting
 `orchestratorWake.periodicWakeEnabled` has no effect on v2 (the key stays
 honored on v1); an explicit `true` is ignored with a warning. Event-driven wakes (stopped-job recovery, later terminal
-publications, child-input asks) keep working on both flavors.
+publications, child-input asks) are v1-only: on v2 no wake scheduler exists,
+so later results and open child asks are seen through `task_status`.
 
 `routingBlock` deliberately gets **no** v2-derived default. Unlike the board
 injection, the `<Agents>` block is not duplicated by a native channel: the
@@ -584,7 +585,8 @@ Board-off behavioral notes: the consumption bookkeeping that retires
 completed/error/cancelled jobs registers on orchestrator turns driven by a
 real user message (pure event-wake turns are internal-initiator and do not
 register), so retirement waits for the next real user turn; stopped jobs
-never register there — the stopped-job recovery wake surfaces them and
+never register there — the stopped-job recovery wake (v1; `task_status` on
+v2) surfaces them and
 retirement goes through the recovery flow; reopen corrections (a previously
 terminal job running again) still deliver, in a board-free wording that
 points at `task_status`; and a natively delivered result lost host-side has
