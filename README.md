@@ -747,7 +747,7 @@ Use this section as a map: start with installation, then jump to features, confi
   <p><sub>Every merged contribution leaves a mark on the realm.</sub></p>
 
   <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-139-orange.svg?style=flat-square)](#contributors-)
+[![All Contributors](https://img.shields.io/badge/all_contributors-140-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 </div>
 
@@ -944,6 +944,7 @@ Use this section as a map: start with installation, then jump to features, confi
     </tr>
     <tr>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/Phototonic"><img src="https://avatars.githubusercontent.com/u/35551999?v=4?s=100" width="100px;" alt="Lucas Wright"/><br /><sub><b>Lucas Wright</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=Phototonic" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/monsterlag"><img src="https://avatars.githubusercontent.com/u/64719697?v=4?s=100" width="100px;" alt="monsterlag"/><br /><sub><b>monsterlag</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=monsterlag" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>
