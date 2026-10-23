@@ -1988,13 +1988,18 @@ test('v2 hosts are structurally boardless and still retire consumed terminal job
 
     // The parent consumes the natively delivered report: two real
     // request cycles, and no board part ever appears in the payload.
+    // Message times strictly after the terminal publication: retirement
+    // requires an assistant turn newer than completedAt, and a same-ms
+    // Date.now() tie made this test flaky.
+    let clock = Date.now() + 60_000;
+    const afterTerminal = () => clock++;
     const userMsg = (id: string, text: string) => ({
       info: {
         id,
         sessionID: 'parent',
         role: 'user',
         agent: 'orchestrator',
-        time: { created: Date.now() },
+        time: { created: afterTerminal() },
       },
       parts: [{ type: 'text', text }],
     });
@@ -2003,7 +2008,7 @@ test('v2 hosts are structurally boardless and still retire consumed terminal job
         id,
         sessionID: 'parent',
         role: 'assistant',
-        time: { completed: Date.now() },
+        time: { completed: afterTerminal() },
       },
       parts: [{ type: 'text', text }],
     });
@@ -2120,13 +2125,18 @@ test('reopen-after-reconcile: child self-continuation republishes without a plug
 
     // The parent consumes the report: two real request cycles (deliver,
     // then reconcile once the prompt shape advanced past the delivery).
+    // Message times strictly after the terminal publication: retirement
+    // requires an assistant turn newer than completedAt, and a same-ms
+    // Date.now() tie made this test flaky.
+    let clock = Date.now() + 60_000;
+    const afterTerminal = () => clock++;
     const userMsg = (id: string, text: string) => ({
       info: {
         id,
         sessionID: 'parent',
         role: 'user',
         agent: 'orchestrator',
-        time: { created: Date.now() },
+        time: { created: afterTerminal() },
       },
       parts: [{ type: 'text', text }],
     });
@@ -2135,7 +2145,7 @@ test('reopen-after-reconcile: child self-continuation republishes without a plug
         id,
         sessionID: 'parent',
         role: 'assistant',
-        time: { completed: Date.now() },
+        time: { completed: afterTerminal() },
       },
       parts: [{ type: 'text', text }],
     });
