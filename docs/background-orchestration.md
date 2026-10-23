@@ -577,6 +577,11 @@ mode (an explicit `"todo"` degrades to children on hosts without the todo
 API). Set `enabled: false` to disable wakes while keeping idle reconciliation
 and background-job orchestration.
 
+This whole section is **v1-only**: on OpenCode v2 hosts the plugin creates no
+wake scheduler at all — the native background notifier owns terminal delivery
+(council 2026-10-23) — and every `backgroundJobs.orchestratorWake` key warns
+as ignored there.
+
 Behavior:
 
 - Per-session recursive `setTimeout(...).unref()` after continuous parent-idle
@@ -628,20 +633,10 @@ The scheduler does **not** perform automatic cancellation and does not rely on
 the local job board. When no incomplete TODOs remain, it ends the current idle
 spell and stops polling until new activity.
 
-**v2 hosts (children-driven degraded mode):** v2 has no todo/children/status
-surfaces, so with `mode: "auto"` the scheduler runs in children-driven mode.
-The wake condition becomes "children without a terminal `outcome`" — v2
-records an outcome (succeeded|failed|interrupted) only on terminal transition —
-plus pending stopped-job recovery. Children are enumerated via
-`session.list({parentID})` (event-tracked fallback from `session.created`
-links when the listing is unavailable), scoped to the session's directory, and
-a child with no fresh update evidence (host `time.updated` or a tracked status
-change within 3× the interval) counts as inactive. The wake prompt asks the
-orchestrator to check on unfinished background child sessions and unreconciled
-jobs, is delivered with `queue` semantics (like v1's queued prompt_async), and
-the children-only fingerprint keeps the two-wake no-progress cap bounding
-cost. v2's native subagent completion nudges still cover the happy path; this
-watchdog covers stuck children and unreconciled jobs.
+**v2 hosts: no scheduler.** On OpenCode v2 the plugin creates no wake
+scheduler at all (council 2026-10-23): the native background notifier owns
+terminal delivery, restart recovery re-delivers anything lost, and the
+parent discovers open child asks via `task_status` pull.
 
 #### v2 structural defaults
 
@@ -654,16 +649,16 @@ channels would duplicate that delivery, so on v2 they are **structurally off**
 - The passive Background Job Board is never injected into orchestrator
   prompts. That is true on v1 too: the board render was removed (#1647), so
   there is no `backgroundJobs.boardInjection` switch left.
-- The periodic idle evaluation described above never runs.
-  `backgroundJobs.orchestratorWake.periodicWakeEnabled` is honored on v1
-  only: on v2 an explicit `true` is ignored with a load-time warning.
+- The periodic idle evaluation described above never runs — on v2 no wake
+  scheduler exists at all, and every `backgroundJobs.orchestratorWake` key
+  is v1-only: an explicit value is ignored with a load-time warning.
 
-Event-driven wakes keep working on both flavors: stopped-job recovery, later
-terminal publications of the same run (for example a child that
-self-continued), and child-input asks still wake an idle parent, and their
-SDK-error retries still use the idle timer. A failed publication retry survives
-parent busy/idle transitions, including when periodic wakes are disabled.
-Deletion clears the retry. On v2, later-result wakes carry explicit
+Event-driven wakes keep working on v1: stopped-job recovery, later terminal
+publications of the same run (for example a child that self-continued), and
+child-input asks still wake an idle parent, and their SDK-error retries still
+use the idle timer. A failed publication retry survives parent busy/idle
+transitions, including when periodic wakes are disabled. Deletion clears the
+retry. On v1, later-result wakes carry explicit
 `task_status { sessionID: "<child>", result: true }` pointers for every queued
 publishing child, rather than asking the parent to guess from delegation
 history. Failed sends and throttled bursts retain those identities; only the
@@ -673,6 +668,17 @@ tagged volatile message through the cache-safe injection helper; historical
 messages, frozen prompts, and tool definitions are not rewritten. The shared
 input-wait, parent-busy, and no-progress gates still apply. This does not add
 restart persistence; v1's throttle behavior is unchanged.
+
+On v2 hosts the plugin runs none of this (council 2026-10-23): no wake
+scheduler is created. The host's native background notifier delivers terminal
+results — to busy parents via steer at the next step boundary, to idle parents
+by starting a successor turn — restart recovery re-delivers anything lost,
+and the durable inbox dedupes by message ID. Later runs of the same child
+(rev>1) are covered when relaunched through the `subagent` tool, which re-arms
+the native notifier; child permission/question asks are a host-UI boundary the
+host does not route to the parent agent, and the parent discovers open asks
+via `task_status` pull. The whole `backgroundJobs.orchestratorWake` config
+section is v1-only and warns as ignored on v2.
 On both hosts, terminal retirement is observation-based: the plugin watches
 the parent's transcript for a delivery it can attribute — the host's native
 `<subagent>` delivery on v2, the plugin's own tagged `<completed-job>` push on

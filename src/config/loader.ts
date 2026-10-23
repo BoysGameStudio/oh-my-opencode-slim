@@ -802,9 +802,10 @@ export function loadPluginConfig(
     }
   }
 
-  // periodicWakeEnabled needs no derivation here: v2 disables the periodic
-  // evaluation structurally where the wake scheduler is wired (src/index.ts).
-  // An explicit true warns the same way, so the override is never silent.
+  // v2 hosts have no plugin wake machinery at all (council 2026-10-23):
+  // the native background notifier owns terminal delivery and the whole
+  // backgroundJobs.orchestratorWake section is v1-only. Warn so the
+  // override is never silent.
   if (options?.hostFlavor === 'v2' && !options?.silent) {
     const backgroundJobs = (config.backgroundJobs ?? {}) as Record<
       string,
@@ -814,11 +815,10 @@ export function loadPluginConfig(
     if (
       orchestratorWake !== null &&
       typeof orchestratorWake === 'object' &&
-      Object.hasOwn(orchestratorWake, 'periodicWakeEnabled') &&
-      (orchestratorWake as Record<string, unknown>).periodicWakeEnabled === true
+      Object.keys(orchestratorWake as Record<string, unknown>).length > 0
     ) {
       console.warn(
-        '[oh-my-opencode-slim] backgroundJobs.orchestratorWake.periodicWakeEnabled is ignored on OpenCode v2 hosts: the native background notifier delivers terminal publications to an idle parent, so the periodic idle evaluation is off. Run oh-my-opencode-slim doctor for details.',
+        '[oh-my-opencode-slim] backgroundJobs.orchestratorWake is v1-only and ignored on OpenCode v2 hosts: the native background notifier owns terminal delivery. Run oh-my-opencode-slim doctor for details.',
       );
     }
   }

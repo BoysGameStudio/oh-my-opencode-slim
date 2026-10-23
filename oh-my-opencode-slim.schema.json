@@ -1401,7 +1401,7 @@
             "wakeOnTerminalPublication": true,
             "publicationWakeMinIntervalMs": 30000
           },
-          "description": "Periodic orchestrator wake scheduler for idle sessions. v1: requires host session APIs (session.get, todo, children, status, promptAsync) and wakes while incomplete todos remain. v2: runs in children-driven degraded mode (requires session.list + promptAsync) and wakes while un-finished child sessions remain. Default enabled at a 5-minute interval.",
+          "description": "Periodic orchestrator wake scheduler for idle sessions (v1 hosts only; ignored on OpenCode v2 hosts, where the native background notifier owns terminal delivery). Requires host session APIs (session.get, todo, children, status, promptAsync) and wakes while incomplete todos remain. Default enabled at a 5-minute interval.",
           "type": "object",
           "properties": {
             "enabled": {
@@ -1418,7 +1418,7 @@
             },
             "mode": {
               "default": "auto",
-              "description": "Wake-condition source. \"auto\" uses todo-gating on v1 hosts and children-driven degraded mode on v2 hosts (no todo surface there); \"todo\" or \"children\" pin one mode, degrading to children when the host lacks the todo API. Default \"auto\".",
+              "description": "Wake-condition source (v1 hosts only). \"auto\" uses todo-gating; \"todo\" or \"children\" pin one mode, degrading to children when the host lacks the todo API. On OpenCode v2 hosts the whole section is ignored: the native background notifier owns terminal delivery. Default \"auto\".",
               "type": "string",
               "enum": [
                 "auto",
@@ -1428,12 +1428,12 @@
             },
             "periodicWakeEnabled": {
               "default": true,
-              "description": "When false, the periodic idle evaluation never runs; only event-driven wakes (stopped-job recovery, terminal-publication rev>1, child-input) still deliver. Failed event wakes keep their timer-based retry path. Default enabled on v1 hosts; v2 hosts never run the periodic evaluation (the native background notifier delivers first terminal publications).",
+              "description": "When false, the periodic idle evaluation never runs; only event-driven wakes (stopped-job recovery, terminal-publication rev>1, child-input) still deliver. Failed event wakes keep their timer-based retry path. v1 hosts only; v2 hosts run no plugin wake machinery at all. Default enabled.",
               "type": "boolean"
             },
             "wakeOnTerminalPublication": {
               "default": true,
-              "description": "When true, a terminal completed/error publication wakes an idle parent orchestrator immediately (bounded by publicationWakeMinIntervalMs) instead of waiting for the next periodic evaluation. Busy parents are skipped: the native steer already delivered the completion. Default enabled.",
+              "description": "When true, a terminal completed/error publication wakes an idle parent orchestrator immediately (bounded by publicationWakeMinIntervalMs) instead of waiting for the next periodic evaluation. v1 hosts only. Default enabled.",
               "type": "boolean"
             },
             "publicationWakeMinIntervalMs": {

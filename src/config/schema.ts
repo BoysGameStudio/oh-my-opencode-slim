@@ -553,19 +553,19 @@ export const BackgroundJobsConfigStrictSchema = z.object({
         .enum(['auto', 'todo', 'children'])
         .default('auto')
         .describe(
-          'Wake-condition source. "auto" uses todo-gating on v1 hosts and children-driven degraded mode on v2 hosts (no todo surface there); "todo" or "children" pin one mode, degrading to children when the host lacks the todo API. Default "auto".',
+          'Wake-condition source (v1 hosts only). "auto" uses todo-gating; "todo" or "children" pin one mode, degrading to children when the host lacks the todo API. On OpenCode v2 hosts the whole section is ignored: the native background notifier owns terminal delivery. Default "auto".',
         ),
       periodicWakeEnabled: z
         .boolean()
         .default(true)
         .describe(
-          'When false, the periodic idle evaluation never runs; only event-driven wakes (stopped-job recovery, terminal-publication rev>1, child-input) still deliver. Failed event wakes keep their timer-based retry path. Default enabled on v1 hosts; v2 hosts never run the periodic evaluation (the native background notifier delivers first terminal publications).',
+          'When false, the periodic idle evaluation never runs; only event-driven wakes (stopped-job recovery, terminal-publication rev>1, child-input) still deliver. Failed event wakes keep their timer-based retry path. v1 hosts only; v2 hosts run no plugin wake machinery at all. Default enabled.',
         ),
       wakeOnTerminalPublication: z
         .boolean()
         .default(true)
         .describe(
-          'When true, a terminal completed/error publication wakes an idle parent orchestrator immediately (bounded by publicationWakeMinIntervalMs) instead of waiting for the next periodic evaluation. Busy parents are skipped: the native steer already delivered the completion. Default enabled.',
+          'When true, a terminal completed/error publication wakes an idle parent orchestrator immediately (bounded by publicationWakeMinIntervalMs) instead of waiting for the next periodic evaluation. v1 hosts only. Default enabled.',
         ),
       publicationWakeMinIntervalMs: z
         .number()
@@ -586,7 +586,7 @@ export const BackgroundJobsConfigStrictSchema = z.object({
       publicationWakeMinIntervalMs: 30_000,
     })
     .describe(
-      'Periodic orchestrator wake scheduler for idle sessions. v1: requires host session APIs (session.get, todo, children, status, promptAsync) and wakes while incomplete todos remain. v2: runs in children-driven degraded mode (requires session.list + promptAsync) and wakes while un-finished child sessions remain. Default enabled at a 5-minute interval.',
+      'Periodic orchestrator wake scheduler for idle sessions (v1 hosts only; ignored on OpenCode v2 hosts, where the native background notifier owns terminal delivery). Requires host session APIs (session.get, todo, children, status, promptAsync) and wakes while incomplete todos remain. Default enabled at a 5-minute interval.',
     ),
   wallClockTimeoutMs: z
     .union([z.literal(0), z.number().int().min(60_000).max(2_147_483_647)])

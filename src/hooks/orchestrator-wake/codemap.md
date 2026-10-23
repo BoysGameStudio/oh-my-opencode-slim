@@ -11,17 +11,14 @@ job board is never consulted. Progress/reservation state is process-global so
 independently created hook instances share one-flight and the two-wake
 no-progress cap.
 
-On v2 hosts (hostFlavor 'v2' from the client shim) the scheduler runs in a
-children-driven degraded mode: no todo/children/status surfaces exist there,
-so children are enumerated via `session.list({parentID})` (event-tracked
-fallback), the wake condition is children without a terminal `outcome`
-(staleness-bounded at 3× the interval), and the wake prompt is delivered with
-`delivery: 'queue'`. Config: `orchestratorWake.mode` ('auto' | 'todo' |
-'children', default auto) and `orchestratorWake.periodicWakeEnabled`
-(default true; the config loader derives false on v2 hosts when no layer
-configures the key — the native background notifier owns first-terminal
-delivery there, so only event-driven wakes and their timer-based retries
-run by default). The v1 code path is unchanged.
+On v2 hosts (hostFlavor 'v2' from the client shim) the plugin creates NO wake
+scheduler at all (council 2026-10-23): the host's native background notifier
+owns terminal delivery — steer reaches a busy parent at its next step
+boundary, restart recovery re-delivers from the durable KV job marker, and
+the durable inbox dedupes by message ID — and child permission/question asks
+are a host-UI boundary the host does not route to the parent agent. Every
+`orchestratorWake` config key is v1-only and warns as ignored on v2; asks
+stay discoverable via `task_status` pull. The v1 code path is unchanged.
 
 ## Design
 

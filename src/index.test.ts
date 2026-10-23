@@ -2013,11 +2013,11 @@ describe('plugin reload generation cleanup', () => {
   });
 
   test.each([
-    { hostFlavor: 'v2', periodic: false },
-    { hostFlavor: 'v1', periodic: true },
+    { hostFlavor: 'v2', schedulerCreated: false, periodicWakeEnabled: false },
+    { hostFlavor: 'v1', schedulerCreated: true, periodicWakeEnabled: true },
   ] as const)(
-    '$hostFlavor wake scheduler periodic gate is structural (periodic=$periodic)',
-    async ({ hostFlavor, periodic }) => {
+    '$hostFlavor wake scheduler creation is structural (created=$schedulerCreated)',
+    async ({ hostFlavor, schedulerCreated, periodicWakeEnabled }) => {
       const createScheduler = wakeHooks.createOrchestratorWakeScheduler;
       const scheduler = spyOn(
         wakeHooks,
@@ -2027,10 +2027,16 @@ describe('plugin reload generation cleanup', () => {
       );
       try {
         await createHooks({ hostFlavor });
-        const options = scheduler.mock.calls[0]?.[1] as {
-          config: { periodicWakeEnabled?: boolean };
-        };
-        expect(options.config.periodicWakeEnabled).toBe(periodic);
+        // v2 has NO wake machinery at all (council 2026-10-23): the
+        // scheduler is never created, so no periodic prompt can ever
+        // fire. v1 keeps the scheduler with the configured periodic gate.
+        expect(scheduler.mock.calls).toHaveLength(schedulerCreated ? 1 : 0);
+        if (schedulerCreated) {
+          const options = scheduler.mock.calls[0]?.[1] as {
+            config: { periodicWakeEnabled?: boolean };
+          };
+          expect(options.config.periodicWakeEnabled).toBe(periodicWakeEnabled);
+        }
       } finally {
         scheduler.mockRestore();
       }
@@ -2323,7 +2329,7 @@ describe('plugin reload generation cleanup', () => {
         ([message]) =>
           message === '[orchestrator-wake] stopped-job recovery wake skipped',
       );
-      return { wake, skipLogs };
+      return { wake, skipLogs, scheduler };
     } finally {
       await hooks?.dispose?.();
       scheduler.mockRestore();
@@ -2333,61 +2339,63 @@ describe('plugin reload generation cleanup', () => {
     }
   }
 
-  test('C3: tool-launched host-attributed stop suppresses the recovery wake (native delivers once)', async () => {
-    const { wake, skipLogs } = await emitStoppedRecovery({
+  test('C3: v2 tool-launched host-attributed stop injects nothing (native notifier owns the stop)', async () => {
+    const { wake, skipLogs, scheduler } = await emitStoppedRecovery({
       resultSummary: HOST_INTERRUPTED_SUMMARY,
       pluginConfig: { hostFlavor: 'v2' },
     });
 
+    // v2 has no wake machinery (council 2026-10-23): the scheduler is
+    // never created, the stopped-job listener early-returns, and the
+    // host's native notifier owns the stop. Nothing is injected — no
+    // wake, and no skip log either (the listener never evaluates the
+    // attribution gate on v2).
+    expect(scheduler.mock.calls).toHaveLength(0);
     expect(wake).not.toHaveBeenCalled();
-    expect(skipLogs).toHaveLength(1);
-    expect(skipLogs[0]?.[1]).toMatchObject({
-      verdict: 'skipped',
-      reason: 'native-delivers-host-attributed-stop',
-      taskID: 'child-host-stop',
-    });
+    expect(skipLogs).toHaveLength(0);
   });
 
-  test('C3: revived generation (tracker owns delivery) still wakes beside its host-attributed stop', async () => {
-    const { wake, skipLogs } = await emitStoppedRecovery({
+  test('C3: v2 revived generation injects nothing beside its host-attributed stop', async () => {
+    const { wake, skipLogs, scheduler } = await emitStoppedRecovery({
       resultSummary: HOST_INTERRUPTED_SUMMARY,
       pluginConfig: { hostFlavor: 'v2' },
       forceWillNotifyParent: true,
     });
 
-    expect(wake).toHaveBeenCalledTimes(1);
-    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
-    expect(String(wake.mock.calls[0]?.[1])).toContain('<stopped-job>');
+    // Tracker ownership no longer adds a wake on v2: the whole stopped-job
+    // recovery path is gone (council 2026-10-23), so a generation the
+    // tracker owns produces no plugin injection beside its stop.
+    expect(scheduler.mock.calls).toHaveLength(0);
+    expect(wake).not.toHaveBeenCalled();
     expect(skipLogs).toHaveLength(0);
   });
 
-  test('C3: tracker with no record falls back to skipping ONLY host-attributed stops (v2)', async () => {
-    const { wake, skipLogs } = await emitStoppedRecovery({
+  test('C3: v2 non-host-attributed stop injects nothing (result is pull-only)', async () => {
+    const { wake, skipLogs, scheduler } = await emitStoppedRecovery({
       resultSummary: 'no outcome',
       pluginConfig: { hostFlavor: 'v2' },
     });
 
-    expect(wake).toHaveBeenCalledTimes(1);
-    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
-    const delta = String(wake.mock.calls[0]?.[1]);
-    expect(delta).toContain('<stopped-job>');
-    expect(delta).toContain('stopped without a terminal result');
+    // Every stop shape is silent on v2 (council 2026-10-23); the parent
+    // discovers the stop through task_status pull.
+    expect(scheduler.mock.calls).toHaveLength(0);
+    expect(wake).not.toHaveBeenCalled();
     expect(skipLogs).toHaveLength(0);
   });
 
-  test('C3: later publication after a direct prompt keeps its recovery wake (no native observer for the re-run)', async () => {
-    const { wake, skipLogs } = await emitStoppedRecovery({
+  test('C3: v2 later publication after a direct prompt injects nothing (pull-only)', async () => {
+    const { wake, skipLogs, scheduler } = await emitStoppedRecovery({
       resultSummary: HOST_INTERRUPTED_SUMMARY,
       pluginConfig: { hostFlavor: 'v2' },
       republishAfterDirectPrompt: true,
     });
 
-    // rev > 1: the child ran again WITHOUT a tool launch, so no native
-    // observer covers the re-run's stop — this recovery wake is the only
-    // notification the parent gets and must not be skipped.
-    expect(wake).toHaveBeenCalledTimes(1);
-    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
-    expect(String(wake.mock.calls[0]?.[1])).toContain('<stopped-job>');
+    // rev > 1 used to be a wake the plugin owned (no native observer for
+    // the re-run). On v2 the notify/retry path is a lane parallel to the
+    // deleted wake machinery (council 2026-10-23): no wake is injected,
+    // and the parent reads the stop via task_status pull.
+    expect(scheduler.mock.calls).toHaveLength(0);
+    expect(wake).not.toHaveBeenCalled();
     expect(skipLogs).toHaveLength(0);
   });
 

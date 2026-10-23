@@ -1162,9 +1162,7 @@ describe('onWarning callback', () => {
       } finally {
         console.warn = originalWarn;
       }
-      return warnings.filter((message) =>
-        message.includes('periodicWakeEnabled'),
-      );
+      return warnings.filter((message) => message.includes('orchestratorWake'));
     };
 
     const explicitTrue = mkProject('wake-explicit', {
@@ -1173,19 +1171,14 @@ describe('onWarning callback', () => {
     const warnings = capture(explicitTrue, { hostFlavor: 'v2' });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(
-      'backgroundJobs.orchestratorWake.periodicWakeEnabled is ignored on OpenCode v2',
+      'backgroundJobs.orchestratorWake is v1-only and ignored on OpenCode v2',
     );
 
-    // An explicit false already matches the v2 behaviour: nothing to warn.
-    const explicitFalse = mkProject('wake-false', {
-      orchestratorWake: { periodicWakeEnabled: false },
-    });
-    expect(capture(explicitFalse, { hostFlavor: 'v2' })).toHaveLength(0);
-
+    // Any orchestratorWake key is inert on v2, not just periodicWakeEnabled.
     const unset = mkProject('wake-unset', {
       orchestratorWake: { intervalMs: 60_000 },
     });
-    expect(capture(unset, { hostFlavor: 'v2' })).toHaveLength(0);
+    expect(capture(unset, { hostFlavor: 'v2' })).toHaveLength(1);
 
     expect(capture(explicitTrue)).toHaveLength(0);
   });
