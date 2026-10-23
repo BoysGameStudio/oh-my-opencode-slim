@@ -152,6 +152,9 @@ const MultiplexerMainPaneSizeSchema = z
  */
 const MultiplexerCmuxTuiBinarySchema = z.string().min(1);
 
+/** Gates Herdr's agent-pane equalization after each spawn/close. */
+const MultiplexerEqualizePanesSchema = z.boolean();
+
 /**
  * Subagent pane surface: the full `tui` (v1 default) or the lightweight
  * `mini` interface (v2 default). The host wiring resolves an omitted value.
@@ -161,15 +164,15 @@ export const MultiplexerViewerSchema = z.enum(['tui', 'mini']);
 export type MultiplexerViewer = z.infer<typeof MultiplexerViewerSchema>;
 
 /**
- * Invalid `type` / `layout` / `main_pane_size` / `cmux_tui_binary` / `viewer`
- * values disable pane management with one diagnostic.
+ * Invalid `type` / `layout` / `main_pane_size` / `cmux_tui_binary` / `viewer` /
+ * `equalize_panes` values disable pane management with one diagnostic.
  */
 export const MULTIPLEXER_INVALID_VALUE_MESSAGE =
   'Invalid multiplexer config value; pane management is disabled. Expected ' +
   'type (auto|tmux|zellij|herdr|kitty|wezterm|cmux-tui|none), layout ' +
   '(main-horizontal|main-vertical|tiled|even-horizontal|even-vertical), ' +
   'main_pane_size (20-80), cmux_tui_binary (non-empty string), ' +
-  'viewer (tui|mini).';
+  'viewer (tui|mini), equalize_panes (boolean).';
 
 export const MULTIPLEXER_RENAMED_TYPE_MESSAGE =
   'multiplexer.type "cmux" was renamed to "cmux-tui"; update your config.';
@@ -235,6 +238,12 @@ function invalidMultiplexerKeys(config: Record<string, unknown>): string[] {
   ) {
     invalid.push('viewer');
   }
+  if (
+    'equalize_panes' in config &&
+    !MultiplexerEqualizePanesSchema.safeParse(config.equalize_panes).success
+  ) {
+    invalid.push('equalize_panes');
+  }
   return invalid;
 }
 
@@ -242,10 +251,10 @@ function invalidMultiplexerKeys(config: Record<string, unknown>): string[] {
  * Pre-parse normalization for the raw `multiplexer` block.
  *
  * Semantics (spec "配置面"):
- * - an invalid `type` / `layout` / `main_pane_size` / `cmux_tui_binary` / `viewer`
- *   value (or a non-object `multiplexer` value) disables pane management
- *   (`type: "none"`) with a once-per-process diagnostic instead of failing
- *   the whole plugin config;
+ * - an invalid `type` / `layout` / `main_pane_size` / `cmux_tui_binary` /
+ *   `viewer` / `equalize_panes` value (or a non-object `multiplexer` value)
+ *   disables pane management (`type: "none"`) with a once-per-process
+ *   diagnostic instead of failing the whole plugin config;
  * - the old `cmux` type value is a hard rename to `cmux-tui` (no alias): it
  *   goes through the same invalid-value path, plus a specific
  *   once-per-process diagnostic naming the replacement.
@@ -309,6 +318,10 @@ export const MultiplexerConfigStrictSchema = z.object({
       'OpenCode v1 and "mini" on v2. "mini" uses `attach ... --mini` on v1 ' +
       '(requires OpenCode >= 1.17.10) and `opencode mini` on v2; "tui" runs ' +
       'the full interface.',
+  ),
+  equalize_panes: MultiplexerEqualizePanesSchema.default(true).describe(
+    'Herdr only: re-equalize the agent panes after each spawn and ' +
+      'agent-pane close. Set false to keep manual pane sizes.',
   ),
   zellij_pane_mode: z
     .never({ error: 'multiplexer.zellij_pane_mode was removed' })

@@ -1323,6 +1323,11 @@
             "mini"
           ]
         },
+        "equalize_panes": {
+          "default": true,
+          "description": "Herdr only: re-equalize the agent panes after each spawn and agent-pane close. Set false to keep manual pane sizes.",
+          "type": "boolean"
+        },
         "zellij_pane_mode": {
           "not": {}
         }

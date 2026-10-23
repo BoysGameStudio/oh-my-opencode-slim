@@ -203,6 +203,7 @@ describe('RuntimeConfig', () => {
       type: 'none',
       layout: 'main-vertical',
       main_pane_size: 60,
+      equalize_panes: true,
     });
     expect(runtime.backgroundJobs.maxSessionsPerAgent).toBe(2);
     // boardInjection is a v1-honoured switch, default true (see the

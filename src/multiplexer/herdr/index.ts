@@ -24,8 +24,13 @@ import {
   redactViewerSecretArgs,
 } from '../shared';
 import type { Multiplexer, PaneResult, PaneSpawnOptions } from '../types';
+import {
+  type EqualizeAgentPanesOptions,
+  equalizeAgentPanes,
+} from './layout-equalize';
 
 type HerdrPaneDirection = 'right' | 'down';
+type LayoutEqualizer = (opts: EqualizeAgentPanesOptions) => Promise<boolean>;
 
 interface HerdrCliResponse {
   result?: {
@@ -42,16 +47,28 @@ export class HerdrMultiplexer implements Multiplexer {
   private hasChecked = false;
   private layout: MultiplexerLayout;
   private paneDirection: HerdrPaneDirection;
+  private stackDirection: HerdrPaneDirection;
+  private mainPaneSize: number;
   private agentAreaPaneId: string | null = null;
+  private mainPaneId: string | null = null;
+  private agentPaneIds = new Set<string>();
+  private equalize: LayoutEqualizer;
+  private equalizePanes: boolean;
   // ponytail: serialize spawnPane to prevent concurrent races on agentAreaPaneId
   private spawnMutex: Promise<unknown> = Promise.resolve();
 
-  constructor(layout: MultiplexerLayout = 'main-vertical', mainPaneSize = 60) {
-    // Herdr does not support exact main pane sizing like tmux.
-    // Layout config is mapped to pane split direction.
-    void mainPaneSize;
+  constructor(
+    layout: MultiplexerLayout = 'main-vertical',
+    mainPaneSize = 60,
+    equalizer: LayoutEqualizer = equalizeAgentPanes,
+    equalizePanes = true,
+  ) {
     this.layout = layout;
     this.paneDirection = getPaneDirection(layout);
+    this.stackDirection = getStackDirection(layout);
+    this.mainPaneSize = mainPaneSize;
+    this.equalize = equalizer;
+    this.equalizePanes = equalizePanes;
   }
 
   async isAvailable(): Promise<boolean> {
@@ -137,11 +154,12 @@ export class HerdrMultiplexer implements Multiplexer {
       let paneId: string | null = null;
       let lastRawOutput = '';
 
-      if (this.layout === 'main-vertical' && this.agentAreaPaneId) {
+      if (this.isMainLayout() && this.agentAreaPaneId) {
         const result = await this.runSplit(
           this.agentAreaPaneId,
-          'down',
+          this.stackDirection,
           attachDir,
+          false,
           viewerSecretArgs,
         );
         paneId = result.paneId;
@@ -153,15 +171,23 @@ export class HerdrMultiplexer implements Multiplexer {
         }
       }
 
-      if (!this.agentAreaPaneId) {
+      // A split from the parent creates the agent area, so only this split is
+      // sized by main_pane_size; siblings inside the area keep herdr's 50/50
+      // default. even-*/tiled never create an agent area, so they carry none.
+      const sized = this.isMainLayout() && this.agentAreaPaneId == null;
+      if (!paneId) {
         const result = await this.runSplit(
           parentPaneId,
           this.paneDirection,
           attachDir,
+          sized,
           viewerSecretArgs,
         );
         paneId = result.paneId;
         lastRawOutput = result.rawOutput;
+        if (paneId) {
+          this.mainPaneId = parentPaneId;
+        }
       }
 
       if (!paneId) {
@@ -203,7 +229,7 @@ export class HerdrMultiplexer implements Multiplexer {
           stderr: runStderr.trim(),
         });
         // ponytail: split succeeded but attach failed; close the orphaned pane
-        // so it does not linger in the agent column. Session manager gets no
+        // so it does not linger in the agent area. Session manager gets no
         // paneId on failure, so we must clean it up here.
         try {
           await this.closePane(paneId);
@@ -217,9 +243,13 @@ export class HerdrMultiplexer implements Multiplexer {
       }
 
       // 4. Track agent area pane ID only after successful attach
-      if (this.layout === 'main-vertical' && !this.agentAreaPaneId) {
+      if (this.isMainLayout() && !this.agentAreaPaneId) {
         this.agentAreaPaneId = paneId;
       }
+      this.agentPaneIds.add(paneId);
+
+      // 5. Even out the agent area only; the main pane keeps its share.
+      await this.equalizeAgentArea();
 
       log('[herdr] spawnPane: SUCCESS', { paneId });
       return { success: true, paneId };
@@ -288,30 +318,46 @@ export class HerdrMultiplexer implements Multiplexer {
       acceptExitCode1: true,
       emptyPaneReturnsTrue: true,
     });
-    if (closed && paneId === this.agentAreaPaneId) {
+    if (!closed) return false;
+
+    if (paneId === this.agentAreaPaneId) {
       this.agentAreaPaneId = null;
     }
-    return closed;
+    // Only panes this client spawned live in this set; a sweep-closed
+    // leftover must not trigger a rebalance of somebody else's layout.
+    const wasAgentPane = this.agentPaneIds.delete(paneId);
+    if (wasAgentPane) {
+      await this.equalizeAgentArea();
+    }
+    return true;
   }
 
   async applyLayout(
     layout: MultiplexerLayout,
-    _mainPaneSize: number,
+    mainPaneSize: number,
   ): Promise<void> {
     // ponytail: herdr has no rebalancing API; a layout *switch* starts fresh
     // from the parent pane, but re-applying the same layout must keep the
-    // agent-column anchor so later children stack below the first one.
+    // agent-area anchor so later children stack inside it (below for
+    // main-vertical, to the right for main-horizontal).
     if (this.layout !== layout) {
       this.agentAreaPaneId = null;
     }
     this.layout = layout;
     this.paneDirection = getPaneDirection(layout);
+    this.stackDirection = getStackDirection(layout);
+    this.mainPaneSize = mainPaneSize;
+  }
+
+  private isMainLayout(): boolean {
+    return this.layout === 'main-vertical' || this.layout === 'main-horizontal';
   }
 
   private async runSplit(
     target: string,
     direction: HerdrPaneDirection,
     directory: string,
+    sized: boolean,
     viewerSecretArgs: string[] = [],
   ): Promise<{ paneId: string | null; rawOutput: string }> {
     const herdr = await this.getBinary();
@@ -327,6 +373,7 @@ export class HerdrMultiplexer implements Multiplexer {
       '--cwd',
       directory,
       '--no-focus',
+      ...(sized ? ['--ratio', String(agentPaneRatio(this.mainPaneSize))] : []),
       ...viewerSecretArgs,
     ];
 
@@ -352,6 +399,29 @@ export class HerdrMultiplexer implements Multiplexer {
     }
 
     return { paneId: parsePaneId(splitStdout), rawOutput: splitStdout.trim() };
+  }
+
+  /**
+   * Best-effort re-equalization of the agent panes. It never changes the
+   * spawn/close result: missing context is skipped silently and any failure
+   * is logged only. `multiplexer.equalize_panes: false` disables the step
+   * before any environment or socket access.
+   */
+  private async equalizeAgentArea(): Promise<void> {
+    if (!this.equalizePanes) return;
+
+    const mainPaneId = this.mainPaneId;
+    const tabId = process.env.HERDR_TAB_ID?.trim();
+    const socketPath = process.env.HERDR_SOCKET_PATH?.trim();
+    if (!mainPaneId || !tabId || !socketPath) return;
+
+    try {
+      await this.equalize({ socketPath, tabId, mainPaneId });
+    } catch (error) {
+      log('[herdr] equalizeAgentPanes: unexpected failure', {
+        error: String(error),
+      });
+    }
   }
 
   private async getBinary(): Promise<string | null> {
@@ -396,4 +466,25 @@ function getPaneDirection(layout: MultiplexerLayout): HerdrPaneDirection {
     case 'tiled':
       return 'right';
   }
+}
+
+/**
+ * Direction later children stack inside the agent area. Only the `main-*`
+ * layouts create one: below for `main-vertical`, to the right for
+ * `main-horizontal` (mirroring the WezTerm agent row).
+ */
+function getStackDirection(layout: MultiplexerLayout): HerdrPaneDirection {
+  return layout === 'main-vertical' ? 'down' : 'right';
+}
+
+/**
+ * Herdr's `--ratio` is the fraction RETAINED BY THE ANCHOR pane: splitting an
+ * anchor with `--ratio 0.8` leaves the anchor at 80% and gives the new pane
+ * the remaining 20% (verified against herdr 0.2.x `pane layout` geometry).
+ * `main_pane_size` describes that anchor (the main pane), so it maps directly.
+ * Clamped to 0.2–0.8 so a hand-edited config can never make either side
+ * unusable.
+ */
+function agentPaneRatio(mainPaneSize: number): number {
+  return Math.max(0.2, Math.min(0.8, mainPaneSize / 100));
 }

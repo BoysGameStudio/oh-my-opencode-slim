@@ -8,6 +8,7 @@ async function importFreshFactory(suffix: string) {
 const BASE_CONFIG: Omit<MultiplexerConfig, 'type'> = {
   layout: 'main-vertical',
   main_pane_size: 60,
+  equalize_panes: true,
 };
 
 const PANE_ENV_KEYS = [
@@ -108,6 +109,38 @@ describe('multiplexer factory', () => {
 
     expect(multiplexer).not.toBeNull();
     expect(multiplexer?.type).toBe('herdr');
+  });
+
+  test('forwards equalize_panes to an explicitly configured herdr adapter', async () => {
+    process.env.HERDR_PANE_ID = 'w1:p1';
+
+    const { getMultiplexer } = await importFreshFactory('herdr-equalize');
+
+    const multiplexer = getMultiplexer({
+      ...BASE_CONFIG,
+      type: 'herdr',
+      equalize_panes: false,
+    });
+
+    expect(
+      (multiplexer as unknown as { equalizePanes?: boolean }).equalizePanes,
+    ).toBe(false);
+  });
+
+  test('forwards equalize_panes to an auto-detected herdr adapter', async () => {
+    process.env.HERDR_PANE_ID = 'w1:p1';
+
+    const { getMultiplexer } = await importFreshFactory('auto-herdr-equalize');
+
+    const multiplexer = getMultiplexer({
+      ...BASE_CONFIG,
+      type: 'auto',
+      equalize_panes: false,
+    });
+
+    expect(
+      (multiplexer as unknown as { equalizePanes?: boolean }).equalizePanes,
+    ).toBe(false);
   });
 
   test('auto does not detect herdr from HERDR_ENV alone', async () => {
