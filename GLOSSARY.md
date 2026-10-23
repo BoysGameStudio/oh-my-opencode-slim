@@ -38,7 +38,7 @@ A glossary of the terms used in this project's domain. Definitions describe what
 ## Background Jobs
 
 - **Background job** — A delegated specialist task that runs asynchronously; tracked until its result is reconciled into the orchestrator's response.
-- **Background Job Board** — The store of background job state and metadata.
+- **Background Job Board** — The store of background job state and metadata. It is machine-side only: it is never rendered into a prompt.
 - **Background Job Coordinator** — The layer that owns background-job lifecycle policy and deferred-close state, writing through the board.
 - **Job state** — A background job's status: `running`, `completed`, `error`, `cancelled`, or `reconciled`. `reconciled` is a distinct post-consumption phase marking that a terminal job's result has been folded into the orchestrator's response; it is not a terminal outcome itself.
 - **Job alias** — A short human-readable identifier for a background job (e.g., `fix-1`, `exp-2`).

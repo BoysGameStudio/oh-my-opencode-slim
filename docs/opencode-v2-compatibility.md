@@ -131,11 +131,9 @@ nothing.
 
 Verified live on OpenCode v2 (all bridges green — health check
 `bridges:11`, +1 on hosts that accept the `session.model.request` hook
-name for the chat.headers bridge; the event stream, bridges, and
-orchestrator-wake children-driven degraded mode are exercised end-to-end
-on the stable host — live mock-driven re-verification on 2026-09-09
-included a queued wake firing after 60 s of parent idle with a stalled
-background child). v2 conformance is compile-time-pinned by the
+name for the chat.headers bridge; the event stream and bridges are exercised end-to-end on the stable host;
+since the council 2026-10-23 removal the plugin creates no wake scheduler on
+v2 — terminal delivery is the host's native background notifier). v2 conformance is compile-time-pinned by the
 mirror-conformance guard against the `@opencode/plugin` 2.1.2
 devDependency and exercised by the mock-driven bridge tests. Every v2
 API the adapter touches is
@@ -448,7 +446,7 @@ side cannot be observed.
 | Default primary agent | ✅ finalized visible orchestrator identity | ✅ `draft.default(<visible orchestrator identity>)`; the canonical `orchestrator` entry remains a hidden alias when `displayName` is configured | v1 `default_agent` and v2 draft default target the same visible entry |
 | TUI default agent | ✅ orchestrator | ✅ host follows the default primary agent and hoists it to the head of the agent list | — |
 | Multiplexer (tmux/zellij/herdr/cmux-tui panes) | ✅ | ✅ TUI plugin entry wires the client-owned pane lifecycle through a v2 host adapter: shared background service and `--server` hosts are supported, `--standalone` is fail-closed (one diagnostic per process, `/subagent` fallback — opens a tab without moving focus) | Defaults are host-specific: `"tui"` on v1 (`opencode attach <url> --session <id> --dir <dir>`); `"mini"` on v2 shared (`opencode mini --session <id>`) and remote (`opencode mini --server <url> --session <id>`), with the pane cwd pinned by the adapter. Explicit `viewer: "tui"` retains the v2 full-TUI commands with a positional directory; v1 `viewer: "mini"` appends `--mini` to attach (OpenCode >= 1.17.10), without extra cwd pinning. The `OPENCODE_PASSWORD` secret is injected through the multiplexer's spawn-time environment (or a Linux + POSIX-shell `/proc` bridge on zellij/cmux-tui), never through the viewer's command line — see [Secret handling](multiplexer-integration.md#known-limitations). Events are projected from `session.created` / `session.execution.*` / `session.idle` / `session.deleted`; directory attribution is recorded at `session.created` because execution events carry none |
-| Orchestrator-wake scheduler | ✅ todo-gated (host `todo`/`children`/`status` APIs) | ✅ children-driven degraded mode (`backgroundJobs.orchestratorWake.mode`) | v2 wake enumerates children via `session.list({parentID})` with an event-tracked fallback, gates on children without a terminal `outcome` (staleness-bounded), and delivers with `queue`; v2's native subagent completion nudges still cover the happy path — the port adds a periodic watchdog for stuck children and unreconciled jobs |
+| Orchestrator-wake scheduler | ✅ todo-gated (host `todo`/`children`/`status` APIs) | ❌ not created (council 2026-10-23) | v2 runs no plugin wake machinery: the native background notifier owns terminal delivery and `task_status` is the pull channel; the whole `backgroundJobs.orchestratorWake` section is v1-only |
 | `chat.headers` (Copilot `x-initiator` routing) | ✅ | ✅ via `session.hook("model.request")` | transport-level only; auxiliary kinds are covered by v2's built-in Copilot provider hook |
 | Companion app | ✅ | ⚠️ unverified | independent desktop app; test separately against v2 |
 
@@ -1081,64 +1079,18 @@ The guards are module-level booleans with fixed text — no timestamps,
 session ids, or per-call payloads — so repeated wake polls and cleanup
 calls do not flood the log.
 
-### Orchestrator-wake on v2 (children-driven degraded mode)
+### No orchestrator-wake on v2
 
-The wake scheduler is **active on v2** in a degraded mode, configured with
-`backgroundJobs.orchestratorWake.mode` (`"auto"` | `"todo"` | `"children"`,
-default `"auto"`: todo-gating on v1, children-driven on v2; an explicit
-`"todo"` degrades to children because v2 has no todo surface exposed to
-plugins — logged once).
-
-How it differs from the v1 path:
-
-- **Gate:** v2 requires only the shim's `session.list` + `promptAsync`
-  (`session.get` is optional model enrichment). v1 keeps its exact
-  historical probe set (`get`/`todo`/`children`/`status`/`promptAsync`).
-- **Children enumeration:** `session.list({ parentID })` through the shim
-  (v2 `Session.Info` → v1 envelope; `outcome` and `time.updated` mapped).
-  When the listing is unavailable (missing/erroring/empty), an event-tracked
-  fallback uses the adapter-synthesized `session.created` parentID links plus
-  tracked busy/idle statuses — refreshed on every evaluation with the host's
-  authoritative `outcome`/`time.updated` via `session.get` (fail-soft per
-  child). A finished child is therefore terminal immediately instead of
-  reading active for the whole staleness window, and a live child stays
-  visible on its host evidence rather than dropping out on stale local
-  evidence. `session.list` is not exposed to plugins on any stable
-  host
-  (see
-  [Not exposed to plugins](#not-exposed-to-plugins-sessionlist-sessionremove)),
-  so the event-tracked fallback is the operative path. Results are scoped
-  to the session's directory when the host reports one.
-- **Wake condition:** children with `outcome === undefined` (v2 records an
-  outcome only on terminal transition: succeeded|failed|interrupted) that
-  still have fresh update evidence — host `time.updated` or a tracked status
-  change newer than 3× the wake interval (staleness bound for children that
-  crash mid-run without recording an outcome). Stopped-job recovery wakes
-  bypass the condition, as on v1.
-- **Wake delivery:** `delivery: "queue"` — v1 `prompt_async` queued, and a
-  v2 `steer` would hijack an in-flight run. The shim's `promptAsync` keeps
-  `steer` as the default for callers that request steering.
-  The wake model pin carries the session model's variant as the v2-only
-  `modelVariant` argument, so `switchModel` preserves the reasoning-effort
-  setting instead of resetting it to the host default.
-- **Variant-preserving skip (shim-level guard):** a variant-less model pin
-  that already matches the session's current model (same provider + id,
-  read via `session.get` at delivery time) is treated as "continue on this
-  model": the shim skips `switchModel` entirely instead of resetting the
-  variant to default. This covers every internal caller that pins the
-  current model without a variant opinion (wake pins and task-message)
-  even when the pin's source lost the variant.
-  Explicit variants (including `default` via `modelVariant`) and
-  cross-model pins still switch. Hosts without `session.get`, or a failing
-  `get`, keep the legacy variant-free switch.
-- **Fingerprint:** children-only (id + outcome + tracked status + update
-  evidence); the two-wake no-progress cap still bounds cost.
-
-v2's built-in `subagent` tool still posts completion notifications to the
-parent natively — that covers the happy path. What the port adds is a
-periodic watchdog: an idle parent with a stuck or unreconciled child (or a
-job that stopped without a terminal result) gets woken to assess, cancel, or
-respawn, bounded by the same no-progress cap as v1.
+The wake scheduler is **not created on v2** (council 2026-10-23). The host's
+native background notifier owns terminal delivery: a busy parent is reached
+by steer at its next step boundary, an idle parent gets a successor turn,
+restart recovery re-delivers from the durable KV job marker, and the durable
+inbox dedupes by message ID. A rev>1 continuation relaunched through the
+`subagent` tool re-arms the native notifier. Child permission/question asks
+are a host-UI boundary the host does not route to the parent agent; the
+parent discovers open asks via `task_status` pull. The whole
+`backgroundJobs.orchestratorWake` config section is v1-only and warns as
+ignored on v2.
 
 ### Terminal-publication wake
 
@@ -1151,7 +1103,8 @@ revision of the same generation (a child that self-continues via its own
 background-shell notification and finishes again, or a completion after a
 direct prompt to the child session) would otherwise wait for the periodic
 idle evaluation (up to `orchestratorWake.intervalMs`, default 5 minutes).
-The **terminal-publication wake** closes that gap on both host flavors:
+The **terminal-publication wake** closes that gap on v1 (on v2 no plugin wake
+exists — the native notifier and `task_status` pull are the only channels):
 
 - **Trigger:** the terminal gate publishes a `completed` or `error` host
   outcome (state-disjoint from the stopped-job recovery listener, which
@@ -1166,8 +1119,8 @@ The **terminal-publication wake** closes that gap on both host flavors:
   (`terminalRevision` 1) is suppressed with `reason:
   "first-publication-native-owned"` — the native notifier armed by that
   generation's `subagent` tool call already delivers it to an idle
-  parent; if that native delivery is ever lost host-side, the job falls
-  back to board injection on the parent's next activity. Exception: a
+  parent; if that native delivery is ever lost host-side, the job stays
+  pullable with `task_status` on the parent's next activity. Exception: a
   revived run whose tracker-owned `<task>` notification exhausts its
   whole retry budget releases ownership and re-emits the publication
   wake directly through the scheduler (a revived lineage has no native
@@ -1187,16 +1140,25 @@ The **terminal-publication wake** closes that gap on both host flavors:
   fingerprint keeps the cap tripped.
 
 Config knobs (see the `backgroundJobs.orchestratorWake` rows in the
-[configuration reference](configuration.md#background-job-management)):
-`wakeOnTerminalPublication` (boolean, default `true` — the feature flag)
-and `publicationWakeMinIntervalMs` (integer ms, default `30_000` — the
+[configuration reference](configuration.md#background-job-management); v1
+only): `wakeOnTerminalPublication` (boolean, default `true` — the feature
+flag) and `publicationWakeMinIntervalMs` (integer ms, default `30_000` — the
 per-parent throttle window; a burst of publications collapses into one
 wake).
 
 Related: when a job whose terminal report the parent already consumed
-(reconciled) reopens to running, the board injection appends exactly one
-corrective trailing notice ("previously reported terminal, now running
-again; the earlier report is superseded") in the cache-safe tail zone.
+(reconciled) reopens to running, the plugin appends exactly one corrective
+trailing notice ("previously reported terminal, now running again; the earlier
+report is superseded") in the cache-safe tail zone, pointing at `task_status`.
+
+On v1 hosts the same first-publication rule holds (the native task-tool
+notifier delivers it), and a LATER publication of the same run — which has no
+native notifier on either host — is delivered by the plugin itself on v1 only,
+as one self-contained `<completed-job>` delta through the bounded delta queue
+(it survives a busy parent, and inside the per-parent publication spacing it
+stays queued until the window elapses). On v2 the plugin sends no wake: a
+relaunch through the `subagent` tool re-arms the native notifier, and any
+other later result is pulled through `task_status`.
 
 ### Host outcome quirks the terminal gate defends against
 

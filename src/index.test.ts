@@ -1876,7 +1876,8 @@ describe('plugin reload generation cleanup', () => {
       });
       const control = await transform(hooks, fixture);
       expect(reminderParts(control.messages)).toHaveLength(1);
-      expect(boardParts(control.messages)).toHaveLength(1);
+      // The job board is never rendered (issue #1647).
+      expect(boardParts(control.messages)).toHaveLength(0);
 
       await hooks['experimental.session.compacting']?.(
         { sessionID },
@@ -1887,9 +1888,7 @@ describe('plugin reload generation cleanup', () => {
       stripTaggedContent(expected.messages, PHASE_REMINDER_METADATA_KEY);
       expect(compacted).toEqual(expected);
       expect(reminderParts(compacted.messages)).toHaveLength(0);
-      expect(boardParts(compacted.messages)).toEqual(
-        boardParts(control.messages),
-      );
+      expect(boardParts(compacted.messages)).toHaveLength(0);
     } finally {
       await hooks.dispose?.();
     }
@@ -2014,11 +2013,11 @@ describe('plugin reload generation cleanup', () => {
   });
 
   test.each([
-    { hostFlavor: 'v2', periodic: false },
-    { hostFlavor: 'v1', periodic: true },
+    { hostFlavor: 'v2', schedulerCreated: false, periodicWakeEnabled: false },
+    { hostFlavor: 'v1', schedulerCreated: true, periodicWakeEnabled: true },
   ] as const)(
-    '$hostFlavor wake scheduler periodic gate is structural (periodic=$periodic)',
-    async ({ hostFlavor, periodic }) => {
+    '$hostFlavor wake scheduler creation is structural (created=$schedulerCreated)',
+    async ({ hostFlavor, schedulerCreated, periodicWakeEnabled }) => {
       const createScheduler = wakeHooks.createOrchestratorWakeScheduler;
       const scheduler = spyOn(
         wakeHooks,
@@ -2028,10 +2027,16 @@ describe('plugin reload generation cleanup', () => {
       );
       try {
         await createHooks({ hostFlavor });
-        const options = scheduler.mock.calls[0]?.[1] as {
-          config: { periodicWakeEnabled?: boolean };
-        };
-        expect(options.config.periodicWakeEnabled).toBe(periodic);
+        // v2 has NO wake machinery at all (council 2026-10-23): the
+        // scheduler is never created, so no periodic prompt can ever
+        // fire. v1 keeps the scheduler with the configured periodic gate.
+        expect(scheduler.mock.calls).toHaveLength(schedulerCreated ? 1 : 0);
+        if (schedulerCreated) {
+          const options = scheduler.mock.calls[0]?.[1] as {
+            config: { periodicWakeEnabled?: boolean };
+          };
+          expect(options.config.periodicWakeEnabled).toBe(periodicWakeEnabled);
+        }
       } finally {
         scheduler.mockRestore();
       }
@@ -2087,7 +2092,13 @@ describe('plugin reload generation cleanup', () => {
         expect(wake).toHaveBeenCalledTimes(kind === 'provisional' ? 0 : 1);
         if (kind !== 'provisional') {
           expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
-          expect(board.formatForPrompt('parent-1')).toContain(launch.taskID);
+          // The machine board keeps the record (the board is never
+          // rendered into a prompt — issue #1647).
+          expect(board.get(launch.taskID)).toMatchObject({
+            taskID: launch.taskID,
+            state: 'stopped',
+            terminalUnreconciled: true,
+          });
         }
       } finally {
         await hooks?.dispose?.();
@@ -2096,6 +2107,167 @@ describe('plugin reload generation cleanup', () => {
       }
     },
   );
+
+  test.each(['v1', 'v2'] as const)(
+    "%s terminal outcome clears the child's open input waits",
+    async (hostFlavor) => {
+      const subscriptions = spyOn(
+        BackgroundJobCoordinator.prototype,
+        'addTerminalOutcomeListener',
+      );
+      let hooks: Awaited<ReturnType<typeof plugin>> | undefined;
+      try {
+        hooks = await createHooks({ hostFlavor });
+        const board = new BackgroundJobBoard();
+        board.registerLaunch({
+          taskID: 'child-ask',
+          parentSessionID: 'parent-1',
+          agent: 'fixer',
+          description: 'child with an open ask',
+          now: 100,
+        });
+        noteChildInputWait({
+          taskID: 'child-ask',
+          parentSessionID: 'parent-1',
+          kind: 'question',
+          requestID: 'req_old',
+          questions: [{ question: 'continue?', header: 'Ask', options: [] }],
+          now: 150,
+        });
+        const stopped = board.markStopped('child-ask', 'no outcome', 200);
+        if (!stopped) throw new Error('missing stopped record');
+        for (const [listener] of subscriptions.mock.calls) listener(stopped);
+        // The ask died with the run: a restarted child must not inherit it
+        // in task_status (the store has no generation fence of its own).
+        expect(listChildInputWaits('child-ask')).toHaveLength(0);
+      } finally {
+        await hooks?.dispose?.();
+        subscriptions.mockRestore();
+        resetChildInputWaitForTests();
+      }
+    },
+  );
+
+  // ── Terminal publication push (issue #1647) ─────────────────────────────
+  //
+  // rev-1 completed/error is delivered natively by the host (both hosts), so
+  // OMOS publishes NOTHING for it. A later publication (rev>1) has no native
+  // notifier: v1 pushes ONE self-contained `<completed-job>` delta through
+  // the bounded delta queue (never the drop-prone publication wake); v2
+  // creates no wake scheduler, so it pushes nothing.
+
+  async function emitTerminalPublication(record: {
+    pluginConfig?: Record<string, unknown>;
+    /** Terminal revision of the published record (1 = native-owned). */
+    terminalRevision?: number;
+    state?: 'completed' | 'error' | 'cancelled';
+  }) {
+    const completedPush = mock(() => {});
+    const publicationWake = mock(() => {});
+    const createScheduler = wakeHooks.createOrchestratorWakeScheduler;
+    const scheduler = spyOn(
+      wakeHooks,
+      'createOrchestratorWakeScheduler',
+    ).mockImplementation((...args: Parameters<typeof createScheduler>) => ({
+      ...createScheduler(...args),
+      triggerCompletedJobPublication: completedPush,
+      triggerTerminalPublicationWake: publicationWake,
+    }));
+    const subscriptions = spyOn(
+      BackgroundJobCoordinator.prototype,
+      'addTerminalOutcomeListener',
+    );
+    let hooks: Awaited<ReturnType<typeof plugin>> | undefined;
+    try {
+      hooks = await createHooks(record.pluginConfig ?? {});
+      const board = new BackgroundJobBoard();
+      const launch = {
+        taskID: 'child-terminal',
+        parentSessionID: 'parent-1',
+        agent: 'fixer',
+        description: 'terminal publication probe',
+        now: 100,
+      };
+      board.registerLaunch(launch);
+      const state = record.state ?? 'completed';
+      const published = board.updateStatus({
+        taskID: launch.taskID,
+        state,
+        resultSummary: 'the result',
+        now: 200,
+      });
+      if (!published) throw new Error('missing published record');
+      if ((record.terminalRevision ?? 1) > 1) {
+        // A later publication of the same generation: the record runs again
+        // and terminates once more.
+        board.markRunningFromLiveSession(launch.taskID, 300);
+        board.updateStatus({
+          taskID: launch.taskID,
+          state,
+          resultSummary: 'the later result',
+          now: 400,
+        });
+      }
+      const terminal = board.get(launch.taskID);
+      if (!terminal) throw new Error('missing terminal record');
+      for (const [listener] of subscriptions.mock.calls) listener(terminal);
+      return {
+        completedPush,
+        publicationWake,
+        terminal,
+      };
+    } finally {
+      await hooks?.dispose?.();
+      scheduler.mockRestore();
+      subscriptions.mockRestore();
+    }
+  }
+
+  test('rev-1 completed stays native: no plugin push, no wake', async () => {
+    const { completedPush, publicationWake } = await emitTerminalPublication({
+      terminalRevision: 1,
+    });
+    expect(completedPush).not.toHaveBeenCalled();
+    expect(publicationWake).not.toHaveBeenCalled();
+  });
+
+  test('rev>1 completed pushes one self-contained completed-job delta (v1)', async () => {
+    const { completedPush, publicationWake, terminal } =
+      await emitTerminalPublication({
+        terminalRevision: 2,
+      });
+    expect(completedPush).toHaveBeenCalledTimes(1);
+    expect(publicationWake).not.toHaveBeenCalled();
+    const [sessionID, delta, dedupeKey, fence] = completedPush.mock
+      .calls[0] as [
+      string,
+      string,
+      string,
+      { taskID: string; generation: number; terminalRevision: number },
+    ];
+    expect(sessionID).toBe('parent-1');
+    expect(delta).toContain('<completed-job>');
+    expect(delta).toContain('task: child-terminal');
+    expect(delta).toContain('state: completed');
+    expect(delta).toContain('result: the later result');
+    expect(dedupeKey).toBe('child-terminal:1');
+    expect(fence).toMatchObject({
+      taskID: 'child-terminal',
+      generation: 1,
+      terminalRevision: terminal.terminalRevision,
+      state: 'completed',
+    });
+    expect(terminal.terminalRevision).toBeGreaterThan(1);
+  });
+
+  test('a cancelled publication pushes nothing (the stop path owns it)', async () => {
+    const { completedPush, publicationWake } = await emitTerminalPublication({
+      terminalRevision: 2,
+      state: 'cancelled',
+    });
+    expect(completedPush).not.toHaveBeenCalled();
+    expect(publicationWake).not.toHaveBeenCalled();
+  });
 
   // ── C3 host-attributed double-delivery gate ─────────────────────────────
   // A stop the host itself reported (`Host reported outcome:
@@ -2197,7 +2369,7 @@ describe('plugin reload generation cleanup', () => {
         ([message]) =>
           message === '[orchestrator-wake] stopped-job recovery wake skipped',
       );
-      return { wake, skipLogs };
+      return { wake, skipLogs, scheduler };
     } finally {
       await hooks?.dispose?.();
       scheduler.mockRestore();
@@ -2207,61 +2379,63 @@ describe('plugin reload generation cleanup', () => {
     }
   }
 
-  test('C3: tool-launched host-attributed stop suppresses the recovery wake (native delivers once)', async () => {
-    const { wake, skipLogs } = await emitStoppedRecovery({
+  test('C3: v2 tool-launched host-attributed stop injects nothing (native notifier owns the stop)', async () => {
+    const { wake, skipLogs, scheduler } = await emitStoppedRecovery({
       resultSummary: HOST_INTERRUPTED_SUMMARY,
       pluginConfig: { hostFlavor: 'v2' },
     });
 
+    // v2 has no wake machinery (council 2026-10-23): the scheduler is
+    // never created, the stopped-job listener early-returns, and the
+    // host's native notifier owns the stop. Nothing is injected — no
+    // wake, and no skip log either (the listener never evaluates the
+    // attribution gate on v2).
+    expect(scheduler.mock.calls).toHaveLength(0);
     expect(wake).not.toHaveBeenCalled();
-    expect(skipLogs).toHaveLength(1);
-    expect(skipLogs[0]?.[1]).toMatchObject({
-      verdict: 'skipped',
-      reason: 'native-delivers-host-attributed-stop',
-      taskID: 'child-host-stop',
-    });
+    expect(skipLogs).toHaveLength(0);
   });
 
-  test('C3: revived generation (tracker owns delivery) still wakes beside its host-attributed stop', async () => {
-    const { wake, skipLogs } = await emitStoppedRecovery({
+  test('C3: v2 revived generation injects nothing beside its host-attributed stop', async () => {
+    const { wake, skipLogs, scheduler } = await emitStoppedRecovery({
       resultSummary: HOST_INTERRUPTED_SUMMARY,
       pluginConfig: { hostFlavor: 'v2' },
       forceWillNotifyParent: true,
     });
 
-    expect(wake).toHaveBeenCalledTimes(1);
-    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
-    expect(String(wake.mock.calls[0]?.[1])).toContain('<stopped-job>');
+    // Tracker ownership no longer adds a wake on v2: the whole stopped-job
+    // recovery path is gone (council 2026-10-23), so a generation the
+    // tracker owns produces no plugin injection beside its stop.
+    expect(scheduler.mock.calls).toHaveLength(0);
+    expect(wake).not.toHaveBeenCalled();
     expect(skipLogs).toHaveLength(0);
   });
 
-  test('C3: tracker with no record falls back to skipping ONLY host-attributed stops (v2)', async () => {
-    const { wake, skipLogs } = await emitStoppedRecovery({
+  test('C3: v2 non-host-attributed stop injects nothing (result is pull-only)', async () => {
+    const { wake, skipLogs, scheduler } = await emitStoppedRecovery({
       resultSummary: 'no outcome',
       pluginConfig: { hostFlavor: 'v2' },
     });
 
-    expect(wake).toHaveBeenCalledTimes(1);
-    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
-    const delta = String(wake.mock.calls[0]?.[1]);
-    expect(delta).toContain('<stopped-job>');
-    expect(delta).toContain('stopped without a terminal result');
+    // Every stop shape is silent on v2 (council 2026-10-23); the parent
+    // discovers the stop through task_status pull.
+    expect(scheduler.mock.calls).toHaveLength(0);
+    expect(wake).not.toHaveBeenCalled();
     expect(skipLogs).toHaveLength(0);
   });
 
-  test('C3: later publication after a direct prompt keeps its recovery wake (no native observer for the re-run)', async () => {
-    const { wake, skipLogs } = await emitStoppedRecovery({
+  test('C3: v2 later publication after a direct prompt injects nothing (pull-only)', async () => {
+    const { wake, skipLogs, scheduler } = await emitStoppedRecovery({
       resultSummary: HOST_INTERRUPTED_SUMMARY,
       pluginConfig: { hostFlavor: 'v2' },
       republishAfterDirectPrompt: true,
     });
 
-    // rev > 1: the child ran again WITHOUT a tool launch, so no native
-    // observer covers the re-run's stop — this recovery wake is the only
-    // notification the parent gets and must not be skipped.
-    expect(wake).toHaveBeenCalledTimes(1);
-    expect(wake.mock.calls[0]?.[0]).toBe('parent-1');
-    expect(String(wake.mock.calls[0]?.[1])).toContain('<stopped-job>');
+    // rev > 1 used to be a wake the plugin owned (no native observer for
+    // the re-run). On v2 the notify/retry path is a lane parallel to the
+    // deleted wake machinery (council 2026-10-23): no wake is injected,
+    // and the parent reads the stop via task_status pull.
+    expect(scheduler.mock.calls).toHaveLength(0);
+    expect(wake).not.toHaveBeenCalled();
     expect(skipLogs).toHaveLength(0);
   });
 
@@ -4070,7 +4244,14 @@ describe('plugin config model inheritance', () => {
         transcript as never,
       );
       transcript.messages.push({
-        info: { sessionID: 'parent', role: 'assistant' },
+        info: {
+          sessionID: 'parent',
+          role: 'assistant',
+          // The host always stamps a turn; the timestamp is what lets the
+          // stale-terminal fallback see that the parent moved past the
+          // terminal report (issue #1647 — no board, no prompt shape).
+          time: { completed: Date.now() + 1_000 },
+        },
         parts: [{ type: 'text', text: 'completion acknowledged' }],
       });
       await hooks['experimental.chat.messages.transform']?.(

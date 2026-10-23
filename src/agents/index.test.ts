@@ -2158,7 +2158,6 @@ describe('PluginConfigSchema custom-agent-only prompt fields', () => {
     const result = PluginConfigSchema.safeParse({
       backgroundJobs: {
         maxSessionsPerAgent: 2,
-        boardInjection: true,
       },
     });
 

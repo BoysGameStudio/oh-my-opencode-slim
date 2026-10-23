@@ -62,6 +62,7 @@ import {
   createToolLoopGuardHook,
   ForegroundFallbackManager,
   formatChildInputWaitDelta,
+  formatCompletedJobDelta,
   formatStoppedJobDelta,
   GOAL_POINTER_METADATA_KEY,
   HOST_ATTRIBUTED_STOP_OUTCOME,
@@ -658,7 +659,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   // the scheduler exists. The ask stays recorded in the sidecar and
   // task_status still surfaces it, so the parent can answer via task_reply.
   // In practice the scheduler is created synchronously in the same init,
-  // before any host event can arrive.
+  // before any host event can arrive. On v2 no scheduler exists (council
+  // 2026-10-23): asks are pull-only by design — task_status surfaces them,
+  // the host UI routes the reply.
   let orchestratorWakeScheduler:
     | ReturnType<typeof createOrchestratorWakeScheduler>
     | undefined;
@@ -1198,14 +1201,23 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       terminalGate,
       // Flip mechanism half reads the per-instance box declared above.
       isBackgroundDefaultFlipArmed: backgroundDefaultFlip.isArmed,
+      // Host flavor marker; v1 hosts are structurally boardless (issue
+      // #1647): the machine board is never rendered.
       hostFlavor,
-      // v1-only honoured switch (forced false on v2 at RuntimeConfig).
-      boardInjection: runtime.backgroundJobs.boardInjection,
       maxSessionsPerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
       backgroundJobBoard: backgroundJobCoordinator,
       backgroundJobSupervisor,
       backgroundTaskConcurrency,
       pendingCallTracker: admissionRuntimeLease.pendingCallTracker,
+      // The stale-timestamp retirement fallback must not ack a run whose
+      // completed-job push is still queued undelivered (its own observed
+      // push retires it; acking first fences the answer out forever).
+      hasUndeliveredTerminalPush: (parentSessionID, taskID, generation) =>
+        orchestratorWakeScheduler?.hasPendingCompletedPush(
+          parentSessionID,
+          taskID,
+          generation,
+        ) === true,
       getModelForAgent,
       sameProviderPolicy: runtime.backgroundJobs.sameProviderPolicy,
       getSessionModel: liveSessionModel,
@@ -1245,76 +1257,94 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     getRevivedContextFiles = taskSessionManagerHook.contextFilesForTask;
     pruneRevivedContext = taskSessionManagerHook.pruneTaskContext;
 
-    orchestratorWakeScheduler = createOrchestratorWakeScheduler(ctx, {
-      // v2 hosts deliver each run's first terminal publication natively, so
-      // the periodic idle evaluation is structurally off there; event-driven
-      // wakes keep their own keys. v1 honors the configured key.
-      config: {
-        ...runtime.backgroundJobs.orchestratorWake,
-        periodicWakeEnabled:
-          hostFlavor === 'v2'
-            ? false
-            : (runtime.backgroundJobs.orchestratorWake.periodicWakeEnabled ??
-              true),
-      },
-      // Honoured switch: wake annotations follow the board the parent
-      // actually sees — rendered on v1 unless boardInjection is false;
-      // RuntimeConfig forces it false on v2 (structural boardless, see
-      // injectBackgroundJobBoard).
-      boardInjectionEnabled: runtime.backgroundJobs.boardInjection,
-      childInputWakeKinds: runtime.backgroundJobs.childInputWakeKinds,
-      shouldManageSession: (sessionID) =>
-        sessionMetadata.getAgent(sessionID) === 'orchestrator',
-      hasInputWait: (sessionID) =>
-        taskSessionManagerHook.hasInputWait(sessionID),
-      isFallbackInProgress: (sessionID) =>
-        foregroundFallback.isFallbackInProgress(sessionID),
-      resolveSelection: lifecycleSelectionResolver,
-      // C2 writer-lane predicate: the queued child's agent from the board
-      // record, graded by its role's write permission data. A missing
-      // record/agent reads as writer (fail-safe, verdict defaults to
-      // attaching the verification sentence).
-      isWriterLaneTask: (taskID) =>
-        roleHasWriteCapability(backgroundJobCoordinator.get(taskID)?.agent),
-      isStoppedJobRecoveryCurrent: (taskID, generation) => {
-        const record = backgroundJobCoordinator.get(taskID);
-        return (
-          record?.generation === generation &&
-          record.state === 'stopped' &&
-          record.terminalUnreconciled
-        );
-      },
-      isChildInputWaitCurrent: (taskID, requestID) => {
-        const record = backgroundJobCoordinator.get(taskID);
-        return (
-          record?.state === 'running' &&
-          getChildInputWait(taskID, requestID) !== undefined
-        );
-      },
-      hasPendingDelegatedWork: (sessionID) =>
-        backgroundJobCoordinator.hasRunning(sessionID) ||
-        backgroundJobCoordinator.hasTerminalUnreconciled(sessionID),
-      isPublicationCurrent: (publication) => {
-        const record = backgroundJobCoordinator.get(publication.taskID);
-        return (
-          record !== undefined &&
-          record.state !== 'running' &&
-          record.terminalUnreconciled === true &&
-          record.generation === publication.generation &&
-          (publication.terminalRevision === undefined ||
-            record.terminalRevision === publication.terminalRevision)
-        );
-      },
-      onPublicationAccepted: (publication) => {
-        const record = backgroundJobCoordinator.get(publication.taskID);
-        markPersistedBackgroundChildDelivered(
-          publication.taskID,
-          Date.now(),
-          record?.runStartedAt,
-        );
-      },
-      coordinator: sessionLifecycle,
-    });
+    // v2: the host's native background notifier owns terminal delivery —
+    // steer reaches a busy parent at its next step boundary, restart
+    // recovery re-delivers from the durable KV job marker, and the inbox
+    // dedupes by message ID — and child permission/question asks are a
+    // host UI boundary the host does not route to the parent agent. No
+    // plugin wake machinery exists on v2 (council 2026-10-23): no
+    // scheduler is created, so every trigger call no-ops through the
+    // undefined optional chain, and asks stay in the sidecar for
+    // task_status pull. v1 keeps the scheduler.
+    orchestratorWakeScheduler =
+      hostFlavor === 'v2'
+        ? undefined
+        : createOrchestratorWakeScheduler(ctx, {
+            // v1 honors the configured key.
+            config: {
+              ...runtime.backgroundJobs.orchestratorWake,
+              periodicWakeEnabled:
+                runtime.backgroundJobs.orchestratorWake.periodicWakeEnabled ??
+                true,
+            },
+            // The machine board is never rendered, so wake annotations always point
+            // at the pull channel (`task_status`).
+            childInputWakeKinds: runtime.backgroundJobs.childInputWakeKinds,
+            shouldManageSession: (sessionID) =>
+              sessionMetadata.getAgent(sessionID) === 'orchestrator',
+            hasInputWait: (sessionID) =>
+              taskSessionManagerHook.hasInputWait(sessionID),
+            isFallbackInProgress: (sessionID) =>
+              foregroundFallback.isFallbackInProgress(sessionID),
+            resolveSelection: lifecycleSelectionResolver,
+            // C2 writer-lane predicate: the queued child's agent from the board
+            // record, graded by its role's write permission data. A missing
+            // record/agent reads as writer (fail-safe, verdict defaults to
+            // attaching the verification sentence).
+            isWriterLaneTask: (taskID) =>
+              roleHasWriteCapability(
+                backgroundJobCoordinator.get(taskID)?.agent,
+              ),
+            isStoppedJobRecoveryCurrent: (taskID, generation) => {
+              const record = backgroundJobCoordinator.get(taskID);
+              return (
+                record?.generation === generation &&
+                record.state === 'stopped' &&
+                record.terminalUnreconciled
+              );
+            },
+            // A queued completed-job result stays actionable only while the record
+            // is still the SAME run's terminal publication: a reopened record (or
+            // one that published again) must not be reported from a stale delta.
+            isCompletedJobCurrent: (taskID, generation) => {
+              const record = backgroundJobCoordinator.get(taskID);
+              return (
+                record?.generation === generation &&
+                record.terminalUnreconciled === true &&
+                (record.state === 'completed' || record.state === 'error')
+              );
+            },
+            isChildInputWaitCurrent: (taskID, requestID) => {
+              const record = backgroundJobCoordinator.get(taskID);
+              return (
+                record?.state === 'running' &&
+                getChildInputWait(taskID, requestID) !== undefined
+              );
+            },
+            hasPendingDelegatedWork: (sessionID) =>
+              backgroundJobCoordinator.hasRunning(sessionID) ||
+              backgroundJobCoordinator.hasTerminalUnreconciled(sessionID),
+            isPublicationCurrent: (publication) => {
+              const record = backgroundJobCoordinator.get(publication.taskID);
+              return (
+                record !== undefined &&
+                record.state !== 'running' &&
+                record.terminalUnreconciled === true &&
+                record.generation === publication.generation &&
+                (publication.terminalRevision === undefined ||
+                  record.terminalRevision === publication.terminalRevision)
+              );
+            },
+            onPublicationAccepted: (publication) => {
+              const record = backgroundJobCoordinator.get(publication.taskID);
+              markPersistedBackgroundChildDelivered(
+                publication.taskID,
+                Date.now(),
+                record?.runStartedAt,
+              );
+            },
+            coordinator: sessionLifecycle,
+          });
     // A restarted plugin starts with an empty board. If the parent stays idle
     // it never transforms history, so restore owned children here from host
     // state instead of waiting for the next parent request. Verification is
@@ -1355,8 +1385,14 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // by the parent until a task launch has attributed the session.
       if (record.provisional === true) return;
       // A child's terminal state resolves any of its open input waits: the
-      // ask is gone with the run, so a queued wake must not fire for it.
+      // ask is gone with the run, so a queued wake must not fire for it and
+      // task_status must not show it after a restart. Runs on both hosts —
+      // the ask store has no run-generation fence of its own.
       clearChildInputWaitsForSession(record.taskID);
+      // v2 has no wake machinery (no scheduler): native delivery owns
+      // stops for job-backed runs, and the plugin does not push one for
+      // a non-job run (council 2026-10-23).
+      if (hostFlavor === 'v2') return;
       if (record.state !== 'stopped' || !record.terminalUnreconciled) return;
       // Symmetric tracker suppression (M4): when the revived-run tracker
       // owns this generation's delivery — it already delivered the run's
@@ -1440,6 +1476,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     // delivered the first completion, so a queued wake would
     // double-notify.
     backgroundJobCoordinator.addTerminalOutcomeListener((record) => {
+      // v2 has no wake machinery: rev-1 is natively delivered, a rev>1
+      // tool relaunch re-arms the native observer, and a direct-prompt
+      // rev>1 run is out of plugin scope (council 2026-10-23).
+      if (hostFlavor === 'v2') return;
       // Unattributed child sessions are not delegated work, just as in
       // stopped-job recovery; their owner controls parent notifications.
       if (record.provisional === true) return;
@@ -1465,7 +1505,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
       // First-publication ownership (live-verified on a 2.0.8 host): the
       // native notifier delivers a run's FIRST terminal publication to
-      // the parent even while it sits idle, so a plugin wake beside it
+      // the parent even while it sits idle, so a plugin push beside it
       // would double-notify. On v2 EVERY plugin task launch AND relaunch
       // is a host `subagent` tool call that arms the host's native
       // background notifier — a relaunch re-arms it with a fresh
@@ -1477,9 +1517,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // native notifier and remain the plugin's to deliver (v1 behaves
       // the same: the native task tool arms notifyBackgroundResult per
       // background call). Edge: if a native delivery is ever lost
-      // host-side, the job falls back to the passive display channel on
-      // the parent's next activity — board injection when enabled, or
-      // nothing until the next task_status pull otherwise.
+      // host-side, the job falls back to the stale-terminal display on
+      // the parent's next activity, or stays silent until the next
+      // task_status pull.
       // A startup-adopted row was launched before this plugin instance
       // existed, so no native observer survives to deliver its first
       // publication. The plugin owns that wake.
@@ -1488,6 +1528,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         // is not proof of delivery, so nothing is acknowledged here: the
         // next restart's history scan either finds a trusted current-run
         // delivery or re-owns this terminal outcome.
+
         log('[orchestrator-wake] terminal publication wake skipped', {
           sessionID: record.parentSessionID,
           taskID: record.taskID,
@@ -1498,14 +1539,41 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         });
         return;
       }
-      void (async () => {
-        await orchestratorWakeScheduler?.triggerTerminalPublicationWake(
-          record.parentSessionID,
-          record.taskID,
-          record.generation,
-          record.terminalRevision,
-        );
-      })().catch(() => undefined);
+      // v1 is structurally boardless: the board no longer carries later
+      // terminal results. Push ONE self-contained `<completed-job>` delta
+      // through the bounded delta queue (durable across a busy parent and
+      // the publication throttle) instead of the drop-prone publication
+      // wake. The fence in the part metadata retires exactly this
+      // publication when the parent observes it.
+      if (
+        runtime.backgroundJobs.orchestratorWake.wakeOnTerminalPublication ===
+        false
+      ) {
+        return;
+      }
+      const state =
+        record.terminalState === 'completed' || record.terminalState === 'error'
+          ? record.terminalState
+          : record.state === 'completed' || record.state === 'error'
+            ? record.state
+            : undefined;
+      if (!state) return;
+      orchestratorWakeScheduler?.triggerCompletedJobPublication(
+        record.parentSessionID,
+        formatCompletedJobDelta({
+          alias: record.alias,
+          taskID: record.taskID,
+          state,
+          resultSummary: record.resultSummary ?? state,
+        }),
+        `${record.taskID}:${record.generation}`,
+        {
+          taskID: record.taskID,
+          generation: record.generation,
+          terminalRevision: record.terminalRevision,
+          state,
+        },
+      );
     });
 
     // Initialize hooks and wrapPostToolHook helper for error isolation
@@ -2771,7 +2839,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         clearTuiActivities();
       }
 
-      await orchestratorWakeScheduler.event(
+      await orchestratorWakeScheduler?.event(
         input as {
           event: {
             type: string;
@@ -2869,7 +2937,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       await taskSessionManagerHook.event({
         event: { type: 'server.instance.disposed' },
       });
-      await orchestratorWakeScheduler.event({
+      await orchestratorWakeScheduler?.event({
         event: { type: 'server.instance.disposed' },
       });
       // The wake gate is process-global (globalThis + Symbol.for) and survives
@@ -3349,7 +3417,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         backgroundTaskConcurrency.migrateTask(input.sessionID, model);
       }
       taskSessionManagerHook.observeChatMessage(input, output);
-      orchestratorWakeScheduler.observeChatMessage(input, output);
+      orchestratorWakeScheduler?.observeChatMessage(input, output);
       if (messageID) {
         toolLoopGuard.observeNewUserMessage(input.sessionID, messageID);
       }

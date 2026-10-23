@@ -301,30 +301,6 @@ When the conversation calls for multi-model consensus, run this procedure:
 ,
         "type": "text",
       },
-      {
-        "metadata": {
-          "oh-my-opencode-slim.backgroundJobBoard": true,
-        },
-        "synthetic": true,
-        "text": 
-"<system-reminder>
-### Background Job Board
-SENTINEL: background-job-board-v2
-Completed or reconciled sessions are reusable by alias for the same specialist/context.
-Timed-out running sessions are recoverable by alias for safe resume after a live busy signal.
-Cancelled or errored sessions are not reusable.
-Continue an existing session with task_revive even when it is not listed here. A result read is not required before task_revive.
-
-#### Active / Unreconciled
-- exp-1 / task-snapshot / explorer / running
-  Objective: snapshot fixture job
-
-#### Reusable Sessions
-- none
-</system-reminder>"
-,
-        "type": "text",
-      },
     ],
   },
   {

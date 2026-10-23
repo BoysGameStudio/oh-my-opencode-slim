@@ -76,8 +76,10 @@ conservatively passes the path through. Disable with
 | `task_revive` | Resume a retained session with a new instruction (v1 only; on v2 continue with `subagent(sessionID, prompt)`) |
 | `wait_for_user` | Pause automatic orchestrator wake prompts until the next distinct external user message (v1 only; not registered on v2 — use the native `question` tool there) |
 
-The task controls use the task ID or Background Job Board alias for the task being
-managed. `task_message` does not interrupt the current generation. `task_cancel`
+The task controls use the task ID or its parent-scoped alias for the task being
+managed. `task_status` with an unknown or placeholder ID enumerates the
+session's recent task handles, including recently finished sessions, so a
+handle lost to compaction is recoverable from the error itself. `task_message` does not interrupt the current generation. `task_cancel`
 stops the generation but retains its session; it does not roll back partial edits.
 After cancelling a write-capable task, inspect and reconcile file changes before
 launching replacement work.
@@ -86,7 +88,7 @@ launching replacement work.
 and custom primary agents that have delegated work. Host tool permissions still
 apply, and a parent can only control its own children. Switching primary agents
 does not transfer child ownership. Completed results are surfaced and
-acknowledged for reuse in both board modes regardless of the parent's agent name.
+acknowledged for reuse regardless of the parent's agent name.
 History recovery and injected completion handling use the same managed-session
 admission; an unmanaged Build turn is not promoted to Orchestrator.
 This does not add the Orchestrator prompt to Build or make it delegate automatically.
@@ -292,7 +294,7 @@ evidence and await or re-delegate, not mark the task accepted.
 
 `task_status`, `task_message`, `task_reply`, `task_cancel`,
 `task_revive`, and an explicit resume ID resolve a non-exact alias from the
-board first, else from the markers in one read of the parent's readable history,
+tracked job records first, else from the markers in one read of the parent's readable history,
 before reading or sending anything. On v1, the read covers the 1,000 most recent
 messages; a longer history counts as cut. Multiple saved targets, no marked
 target, or a cut or unreadable history produce no action: use the exact session

@@ -7,6 +7,9 @@ export const SLIM_INTERNAL_INITIATOR_MARKER =
 export const INTERNAL_INITIATOR_METADATA_KEY =
   'oh-my-opencode-slim.internalInitiator';
 
+/** Host-side fence attached to queued completed-job push parts. */
+export const TERMINAL_DELTA_METADATA_KEY = 'oh-my-opencode-slim.terminalDelta';
+
 /**
  * OpenCode v1's native background-task notifier submits an untagged
  * synthetic user message when a child finishes. It is still an internal
@@ -41,18 +44,24 @@ export function isNativeBackgroundTaskNotification(part: unknown): boolean {
   return false;
 }
 
-export function createInternalAgentTextPart(text: string): {
+export function createInternalAgentTextPart(
+  text: string,
+  extraMetadata?: Record<string, unknown>,
+): {
   type: 'text';
   text: string;
   synthetic: true;
-  metadata: { 'oh-my-opencode-slim.internalInitiator': true };
+  metadata: Record<string, unknown>;
 } {
   return {
     type: 'text',
     synthetic: true,
     text: `${text}\n${SLIM_INTERNAL_INITIATOR_MARKER}`,
-    metadata: { [INTERNAL_INITIATOR_METADATA_KEY]: true },
-  } as const;
+    metadata: {
+      [INTERNAL_INITIATOR_METADATA_KEY]: true,
+      ...extraMetadata,
+    },
+  };
 }
 
 export function isInternalInitiatorPart(part: unknown): boolean {

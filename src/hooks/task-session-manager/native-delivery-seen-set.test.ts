@@ -26,7 +26,6 @@ function createInjectionState(board: BackgroundJobBoard): InjectionState {
       contextFilesForPrompt: () => [],
       prune: () => {},
     },
-    retainedTailBoards: new Map(),
   } as unknown as InjectionState;
 }
 

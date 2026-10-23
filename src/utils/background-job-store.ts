@@ -2,7 +2,6 @@ import type {
   BackgroundJobAdoptionInput,
   BackgroundJobLaunchInput,
   BackgroundJobLease,
-  BackgroundJobPromptMetadata,
   BackgroundJobRecord,
   BackgroundJobStatusInput,
   BackgroundJobTerminalInput,
@@ -313,11 +312,6 @@ export interface BackgroundJobStore {
     },
   ): BackgroundJobRecord | undefined;
   hasConvergenceSignals(taskID: string, threshold?: number): boolean;
-  formatForPrompt(parentSessionID: string, now?: number): string | undefined;
-  formatForPromptWithMetadata(
-    parentSessionID: string,
-    now?: number,
-  ): BackgroundJobPromptMetadata | undefined;
 
   // ── Lifecycle policy ─────────────────────────────────────────────
   /** Evaluate close policy. Returns true if session should close now.

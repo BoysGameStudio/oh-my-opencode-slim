@@ -1081,6 +1081,7 @@ describe('onWarning callback', () => {
         'backgroundJobs.readContextMaxFiles',
         'backgroundJobs.strategy',
         'backgroundJobs.maxRetainedSnapshots',
+        'backgroundJobs.boardInjection',
       ]) {
         const matching = warnings.filter((message) =>
           message.includes(`"${key}"`),
@@ -1095,18 +1096,18 @@ describe('onWarning callback', () => {
         'readContextMaxFiles',
         'strategy',
         'maxRetainedSnapshots',
+        'boardInjection',
       ]) {
         expect(key in bj).toBe(false);
       }
-      // boardInjection stays a live key (v1-honoured switch): a v2 false
-      // parses silently — RuntimeConfig forces false at read time — and
-      // no removed-key warning fires for it.
+      // boardInjection is removed with the board render: it warns once and
+      // is dropped like the other deleted board tuning keys.
       expect(
-        warnings.some((message) =>
+        warnings.filter((message) =>
           message.includes('"backgroundJobs.boardInjection"'),
         ),
-      ).toBe(false);
-      expect(bj.boardInjection).toBe(false);
+      ).toHaveLength(1);
+      expect('boardInjection' in bj).toBe(false);
       // Valid siblings and explicit wake keys still load.
       expect(config.backgroundJobs?.maxSessionsPerAgent).toBe(4);
       expect(config.backgroundJobs?.orchestratorWake.periodicWakeEnabled).toBe(
@@ -1144,52 +1145,6 @@ describe('onWarning callback', () => {
     );
   });
 
-  test('v2 warns only on an explicit boardInjection true; unset and v1 stay silent', () => {
-    // The warning must distinguish explicit user intent from the applied
-    // schema default: it fires pre-parse on the merged explicit-only config,
-    // so a v2 host without the key never warns.
-    const mkProject = (name: string, backgroundJobs: unknown) => {
-      const dir = path.join(tempDir, name);
-      const configDir = path.join(dir, '.opencode');
-      fs.mkdirSync(configDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(configDir, 'oh-my-opencode-slim.json'),
-        JSON.stringify({ backgroundJobs }),
-      );
-      return dir;
-    };
-    const capture = (dir: string, options?: { hostFlavor?: string }) => {
-      const warnings: string[] = [];
-      const originalWarn = console.warn;
-      console.warn = (message: string) => warnings.push(message);
-      try {
-        loadPluginConfig(dir, options);
-      } finally {
-        console.warn = originalWarn;
-      }
-      return warnings;
-    };
-
-    const explicitTrue = mkProject('warn-explicit', { boardInjection: true });
-    expect(
-      capture(explicitTrue, { hostFlavor: 'v2' }).filter((message) =>
-        message.includes('boardInjection is ignored on OpenCode v2'),
-      ),
-    ).toHaveLength(1);
-
-    const unset = mkProject('warn-unset', { maxSessionsPerAgent: 3 });
-    expect(
-      capture(unset, { hostFlavor: 'v2' }).filter((message) =>
-        message.includes('boardInjection'),
-      ),
-    ).toHaveLength(0);
-
-    const v1False = mkProject('warn-v1', { boardInjection: false });
-    expect(
-      capture(v1False).filter((message) => message.includes('boardInjection')),
-    ).toHaveLength(0);
-  });
-
   test('v2 warns only on an explicit periodicWakeEnabled true; unset and v1 stay silent', () => {
     // Mirrors the boardInjection warning: v2 forces the periodic wake off
     // where the scheduler is wired, so an explicit true must not be lost
@@ -1213,9 +1168,7 @@ describe('onWarning callback', () => {
       } finally {
         console.warn = originalWarn;
       }
-      return warnings.filter((message) =>
-        message.includes('periodicWakeEnabled'),
-      );
+      return warnings.filter((message) => message.includes('orchestratorWake'));
     };
 
     const explicitTrue = mkProject('wake-explicit', {
@@ -1224,19 +1177,14 @@ describe('onWarning callback', () => {
     const warnings = capture(explicitTrue, { hostFlavor: 'v2' });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain(
-      'backgroundJobs.orchestratorWake.periodicWakeEnabled is ignored on OpenCode v2',
+      'backgroundJobs.orchestratorWake is v1-only and ignored on OpenCode v2',
     );
 
-    // An explicit false already matches the v2 behaviour: nothing to warn.
-    const explicitFalse = mkProject('wake-false', {
-      orchestratorWake: { periodicWakeEnabled: false },
-    });
-    expect(capture(explicitFalse, { hostFlavor: 'v2' })).toHaveLength(0);
-
+    // Any orchestratorWake key is inert on v2, not just periodicWakeEnabled.
     const unset = mkProject('wake-unset', {
       orchestratorWake: { intervalMs: 60_000 },
     });
-    expect(capture(unset, { hostFlavor: 'v2' })).toHaveLength(0);
+    expect(capture(unset, { hostFlavor: 'v2' })).toHaveLength(1);
 
     expect(capture(explicitTrue)).toHaveLength(0);
   });

@@ -23,18 +23,19 @@ export { createLoopCommandHook } from './loop-command';
 export {
   CHILD_INPUT_QUEUE_CAP,
   CHILD_INPUT_WAKE_CHUNK,
+  COMPLETED_JOB_OVERFLOW_TEXT,
   createOrchestratorWakeScheduler,
   formatChildInputWaitDelta,
+  formatCompletedJobDelta,
   formatStoppedJobDelta,
   HOST_ATTRIBUTED_STOP_OUTCOME,
   ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT,
   ORCHESTRATOR_CHILDREN_WAKE_TEXT,
+  ORCHESTRATOR_PUBLICATION_WAKE_TEXT,
   ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT,
-  ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD,
   ORCHESTRATOR_WAKE_TEXT,
   ORCHESTRATOR_WAKE_UNCHANGED_CAP,
   STOPPED_RECOVERY_OVERFLOW_TEXT,
-  STOPPED_RECOVERY_OVERFLOW_TEXT_NO_BOARD,
   stoppedJobRecoveryReason,
 } from './orchestrator-wake';
 export { createPhaseReminderHook } from './phase-reminder';

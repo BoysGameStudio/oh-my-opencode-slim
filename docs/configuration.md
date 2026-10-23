@@ -239,12 +239,12 @@ All config files support **JSONC** (JSON with Comments):
 | `backgroundJobs.maxSessionsPerAgent` | integer | `2` | Maximum completed/reconciled reusable child sessions per specialist type in the current orchestrator session (1–10) See [Background Job Management](#background-job-management). |
 | `backgroundJobs.maxRetainedSnapshots` | — | — | Removed: ignored with a warning. See [Removed config keys](#removed-config-keys). |
 | `backgroundJobs.strategy` | — | — | Removed: board placement is change-only. See [Removed config keys](#removed-config-keys). |
-| `backgroundJobs.orchestratorWake.enabled` | boolean | `true` | When true, idle orchestrator sessions with incomplete todos may receive periodic internal wake prompts (default every 5 minutes of continuous parent idle). Requires host session APIs. See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler) See [Background Job Management](#background-job-management). |
+| `backgroundJobs.orchestratorWake.enabled` | boolean | `true` | When true, idle orchestrator sessions with incomplete todos may receive periodic internal wake prompts (default every 5 minutes of continuous parent idle). Requires host session APIs. v1 hosts only. See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler) See [Background Job Management](#background-job-management). |
 | `backgroundJobs.orchestratorWake.intervalMs` | integer | `300000` | Continuous parent-idle interval between wake evaluations (`60000`–`2147483647` ms). `0` is invalid. See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler) See [Background Job Management](#background-job-management). |
-| `backgroundJobs.orchestratorWake.mode` | string | `"auto"` | Wake-condition source: `"auto"` uses todo-gating on OpenCode v1 and children-driven degraded mode on v2 hosts; `"todo"`/`"children"` pin one mode (explicit `"todo"` degrades to children where no todo API exists). See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler). |
-| `backgroundJobs.orchestratorWake.periodicWakeEnabled` | boolean | `true` | When false, the periodic idle evaluation never runs; only event-driven wakes (stopped-job recovery, later terminal publications, child-input asks) still deliver, and failed event wakes keep their timer-based retry. On v2 hosts the periodic evaluation is structurally off regardless of this key — the native background notifier already delivers first terminal publications to an idle parent; the key is honored on v1 only, and an explicit `true` on v2 is ignored with a warning. See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler). |
+| `backgroundJobs.orchestratorWake.mode` | string | `"auto"` | Wake-condition source (v1 hosts only): `"auto"` uses todo-gating; `"todo"`/`"children"` pin one mode (explicit `"todo"` degrades to children where no todo API exists). | See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler). |
+| `backgroundJobs.orchestratorWake.periodicWakeEnabled` | boolean | `true` | When false, the periodic idle evaluation never runs; only event-driven wakes (stopped-job recovery, later terminal publications, child-input asks) still deliver, and failed event wakes keep their timer-based retry. v1 hosts only: on v2 the whole `orchestratorWake` section is ignored with a warning (the native background notifier owns terminal delivery). | See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler). |
 | `backgroundJobs.orchestratorWake.wakeOnTerminalPublication` | boolean | `true` | When true, a terminal completed/error publication that reaches an idle parent wakes it immediately instead of waiting for the next periodic evaluation. The first terminal publication of any generation (terminalRevision 1) is skipped (the native notifier armed by that generation's `subagent` tool call already delivers it); busy parents are skipped the same way See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler) See [Background Job Management](#background-job-management). |
-| `backgroundJobs.orchestratorWake.publicationWakeMinIntervalMs` | integer | `30000` | Per-parent minimum spacing between terminal-publication wakes (`1000`–`2147483647` ms; `0` is invalid — the schema floor is 1,000ms). A burst of publications collapses into one wake; the window is consumed only when a wake is actually delivered See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler) See [Background Job Management](#background-job-management). |
+| `backgroundJobs.orchestratorWake.publicationWakeMinIntervalMs` | integer | `30000` | Per-parent minimum spacing between terminal-publication wakes (`1000`–`2147483647` ms; `0` is invalid — the schema floor is 1,000ms). A burst of publications collapses into one wake; later-result `<completed-job>` pushes honor the same spacing (queued, then delivered together when the window elapses); the window is consumed only when a wake is actually delivered. See [Background Orchestration](background-orchestration.md#orchestrator-wake-scheduler) See [Background Job Management](#background-job-management). |
 | `backgroundJobs.wallClockTimeoutMs` | integer | `0` | **Opt-in wall-clock supervisor.** `0` disables it. Otherwise, only native background child sessions (`task(..., background: true)` on v1, `subagent(..., background: true)` on v2) are supervised; accepted values are `60000`–`2147483647` milliseconds See [Background Job Management](#background-job-management). |
 | `backgroundJobs.abortGraceMs` | integer | `10000` | Grace period after a wall-clock deadline for a terminal confirmation. Accepted values are `1000`–`60000` milliseconds; a hanging or failed abort does not extend this grace See [Background Job Management](#background-job-management). |
 | `backgroundJobs.stopConfirmationMs` | integer | `5000` | Terminal-gate grace period the background-job terminal gate waits for stop confirmation evidence before publishing a stopped job. Accepted values are `1000`–`60000` milliseconds See [Background Job Management](#background-job-management). |
@@ -255,7 +255,6 @@ All config files support **JSONC** (JSON with Comments):
 | `backgroundJobs.childInputWake` | boolean | `true` | Master switch for child-input wakes: when true, each ask kind wakes its parent only if enabled in `backgroundJobs.childInputWakeKinds` (default: questions wake, permissions do not). When false, no child ask wakes the parent. |
 | `backgroundJobs.childInputWakeKinds` | object | `{ permission: false, question: true }` | Which child ask kinds may wake the parent. Permission asks default off (#1504) because their replies carry no host wake and are resolved by the UI or an external responder. Invalid or partial values fall back to per-field defaults silently. See [Background Job Management](#background-job-management). |
 | `backgroundJobs.waitForUserGuard` | boolean | `true` | v1 only (`wait_for_user` is not registered on v2). When true, intercepts `wait_for_user` calls while background tasks are still running and the orchestrator wake scheduler is enabled, returning guidance to end the turn instead of blocking on manual input. See [Background Job Management](#background-job-management). |
-| `backgroundJobs.boardInjection` | boolean | `true` | When false, the Background Job Board reminder is never injected into prompts. Background task tracking, wake, and task_status all keep working; the orchestrator simply no longer passively sees the board. v1 hosts only: on v2 the key is ignored with a warning because the native background notifier and inbox delivery replace the passive board entirely. See [Background Job Management](#background-job-management). |
 | `backgroundJobs.pruneEvictedSessions` | boolean | `false` | When true, removes the host child session when a retention trim (per-agent count cap or context budget, reusable or retained-stopped) evicts its terminal or retained-stopped background job record. Only background children this plugin launched itself through a tracked `task(..., background: true)` call are eligible: foreground task children, unattributed placeholder sessions, and adopted, restored, or rehydrated sessions are never deleted. Bounded host reads must also confirm the session's `parentID` still matches the record's parent and that the session is idle; a session the board tracks again (revived, re-registered, or leased) or with a parked child-input wait is never removed, and the delete itself has a deadline; parent deletion (`session.deleted`) and explicit drops never remove host sessions. v1 hosts only for now: v2 has no live session-status map, so every prune is skipped there. See [Background Job Management](#background-job-management). |
 | `disabled_mcps` | string[] | `[]` | MCP server IDs to disable globally |
 | `disabled_tools` | string[] | `[]` | Slim tool names to disable globally. Disabled Slim tools are not registered with OpenCode and cannot be used by agents; OpenCode built-in tools are not affected |
@@ -542,12 +541,10 @@ process, not once per session).
 
 Background job management is enabled by default and does not need to be present
 in the starter config. Add `backgroundJobs` only if you want to tune how many
-completed/reconciled child-agent sessions are reusable, whether the board is
-injected at all (`boardInjection`, v1 only), or to change the default-on
-orchestrator wake interval. Board placement itself is not configurable: it is
-change-only — one frozen board per state change, replayed byte-identically on
-later turns, nothing injected on unchanged turns. For glossary definitions of
-background-job terms, see
+completed/reconciled child-agent sessions are reusable or to change the
+default-on orchestrator wake interval. The job board itself is never rendered
+into a prompt on any host, so there is no injection switch. For glossary
+definitions of background-job terms, see
 [GLOSSARY.md — Background Jobs](../GLOSSARY.md#background-jobs).
 
 **What gates reusability.** A completed child session enters the reusable pool
@@ -557,17 +554,15 @@ large files never disqualifies a session, and an explicit resume by session id
 is never refused for budget reasons. The only retention bound is the
 `maxSessionsPerAgent` count cap (LRU eviction).
 
-**What the read-context list shows.** Each reusable or retained-stopped board
-entry can carry one `Context read by <alias>: …` line listing the paths that
-child read via the `read` tool (deduped per path, most recently read first,
-internal display cap with a `(+N more)` tail). It is informational only — the
+**What the read-context list shows.** Each tracked job record keeps the paths
+that child read via the `read` tool (deduped per path, most recently read
+first, internal cap with a `(+N more)` tail). It is informational only — the
 list never feeds reusability, eviction, or any policy decision.
 
-**Board injection on v2.** On OpenCode v2 hosts the passive board reminder is
-always off: the native background notifier and inbox delivery surface each
-run's first terminal publication, and `task_status` covers on-demand
-discovery. An explicitly configured `backgroundJobs.boardInjection: true` is
-ignored with a warning on v2.
+**No board in the prompt.** The job board is a machine-side projection on every
+host: the native background notifier and inbox delivery surface each run's
+first terminal publication, later publications are pushed as one-shot deltas,
+and `task_status` covers on-demand discovery.
 
 **v2 structural wake.** On OpenCode v2 hosts the periodic idle evaluation is
 structurally off regardless of configuration: the v2 native background
@@ -576,8 +571,8 @@ to the parent — idle parents get a new turn, busy parents get a steer — so t
 periodic evaluation duplicates that channel. Setting
 `orchestratorWake.periodicWakeEnabled` has no effect on v2 (the key stays
 honored on v1); an explicit `true` is ignored with a warning. Event-driven wakes (stopped-job recovery, later terminal
-publications, child-input asks) keep working on both flavors. `boardInjection`
-is likewise v1-only, forced off on v2 (see above).
+publications, child-input asks) are v1-only: on v2 no wake scheduler exists,
+so later results and open child asks are seen through `task_status`.
 
 `routingBlock` deliberately gets **no** v2-derived default. Unlike the board
 injection, the `<Agents>` block is not duplicated by a native channel: the
@@ -591,7 +586,8 @@ Board-off behavioral notes: the consumption bookkeeping that retires
 completed/error/cancelled jobs registers on orchestrator turns driven by a
 real user message (pure event-wake turns are internal-initiator and do not
 register), so retirement waits for the next real user turn; stopped jobs
-never register there — the stopped-job recovery wake surfaces them and
+never register there — the stopped-job recovery wake (v1; `task_status` on
+v2) surfaces them and
 retirement goes through the recovery flow; reopen corrections (a previously
 terminal job running again) still deliver, in a board-free wording that
 points at `task_status`; and a natively delivered result lost host-side has
@@ -1189,7 +1185,7 @@ Guards such as `tool-loop-guard`, `search-path-guard`, `absolute-path-rescue`, a
 
 Notes:
 
-- Injection surfaces that have dedicated switches are not listed here: the Background Job Board (`backgroundJobs.boardInjection`), wake prompts (`backgroundJobs.orchestratorWake.enabled`, `backgroundJobs.childInputWake`), and image routing (`image_routing`). `autoUpdate` controls automatic installation of updates; update notifications may still appear when it is false.
+- Injection surfaces that have dedicated switches are not listed here: wake prompts (`backgroundJobs.orchestratorWake.enabled`, `backgroundJobs.childInputWake`) and image routing (`image_routing`). `autoUpdate` controls automatic installation of updates; update notifications may still appear when it is false.
 - Invalid entries are stripped with a warning when the config loads; a value consisting only of unknown names is treated as unset, so a lower config layer's list still applies.
 
 ### Slash Commands

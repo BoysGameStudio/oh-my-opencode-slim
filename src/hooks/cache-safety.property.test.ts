@@ -240,7 +240,10 @@ describe('cache-safety: skill-list conversation text', () => {
 });
 
 describe('cache-safety: volatile content isolation', () => {
-  test('background-job state only ever changes the tagged trailing message', async () => {
+  test('background-job state never enters the payload', async () => {
+    // Issue #1647: the job board is never rendered. A launch, a completion,
+    // or a stop must not add a single byte to the prompt — the only prompt
+    // surfaces left are the one-shot pushes and the on-demand tool.
     const history = buildHistory();
     const lastTurn = history.length - 1;
 
@@ -260,46 +263,19 @@ describe('cache-safety: volatile content isolation', () => {
     expect(stableFingerprints(withJobs.messages)).toEqual(
       stableFingerprints(withoutJobs.messages),
     );
-
-    // The board is a single tagged part appended to the very end of the last
-    // message (never a separate trailing message that the provider SDK would
-    // coalesce into the last real message and rob of its cache breakpoint).
-    // Keeping the message COUNT identical to the no-board render lets the
-    // provider's last-two-messages breakpoint land on stable real content.
     expect(withJobs.messages).toHaveLength(withoutJobs.messages.length);
 
-    const allTaggedParts = withJobs.messages.flatMap((message, index) =>
-      (message as MessageWithParts).parts
-        .map((part, partIndex) => ({ index, partIndex, part }))
-        .filter(
-          ({ part }) =>
-            // Board parts only: the goal pointer also carries the board
-            // key to live in the same volatile zone (dual-tag contract).
-            isTaggedPart(part, BACKGROUND_JOB_BOARD_METADATA_KEY) &&
-            !isTaggedPart(part, GOAL_POINTER_METADATA_KEY),
-        ),
-    );
-    expect(allTaggedParts).toHaveLength(1);
-
-    const boardHit = allTaggedParts[0];
-    // The one board part lives on the last real message and is its last
-    // part; the goal pointer trails it as its own volatile message.
-    expect(boardHit.index).toBe(withJobs.messages.length - 2);
-    expect(boardHit.partIndex).toBe(
-      (withJobs.messages.at(-2) as MessageWithParts).parts.length - 1,
-    );
-    expect(goalMessages(withJobs.messages)).toHaveLength(1);
-
-    // The no-board render carries no board part anywhere.
-    expect(
-      withoutJobs.messages.some((message) =>
-        (message as MessageWithParts).parts.some(
-          (part) =>
-            isTaggedPart(part, BACKGROUND_JOB_BOARD_METADATA_KEY) &&
-            !isTaggedPart(part, GOAL_POINTER_METADATA_KEY),
-        ),
+    // No board part anywhere in either render: the board key is used only
+    // by the goal pointer (dual-tag contract) and never by a job listing.
+    const boardParts = withJobs.messages.flatMap((message) =>
+      (message as MessageWithParts).parts.filter(
+        (part) =>
+          isTaggedPart(part, BACKGROUND_JOB_BOARD_METADATA_KEY) &&
+          !isTaggedPart(part, GOAL_POINTER_METADATA_KEY),
       ),
-    ).toBe(false);
+    );
+    expect(boardParts).toHaveLength(0);
+    expect(goalMessages(withJobs.messages)).toHaveLength(1);
   });
 });
 
@@ -362,9 +338,6 @@ describe('cache-safety: pipeline drift guard', () => {
       'deepworkGoal',
     ]);
     expect(source).toContain('collapseInterviewHistory(typedOutput.messages);');
-    expect(source).toContain(
-      'await taskSessionManagerHook.injectBackgroundJobBoard(',
-    );
 
     // One handler definition plus the three remaining dispatch calls above.
     const literalCount = source.split(

@@ -15,7 +15,6 @@ const MAX_DEFERRED_ERROR_RENEWALS = 5;
  * outlive the fallback window that gate observations cannot see. */
 export function createIdleReconciler(options: {
   terminalGate: BackgroundJobTerminalGate;
-  reconcileInjectedTerminalJobs: (parentSessionID: string) => void;
   idleReconcileDelayMs: number;
   isFallbackInProgress?: (sessionID: string) => boolean;
   hasInputWait: (sessionID: string) => boolean;
@@ -27,23 +26,6 @@ export function createIdleReconciler(options: {
   consumeDeferredError?: (sessionID: string) => string | undefined;
 }) {
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
-
-  function scheduleIdleReconciliation(parentSessionID: string): void {
-    if (
-      timers.has(parentSessionID) ||
-      options.hasInputWait(parentSessionID) ||
-      options.isFallbackInProgress?.(parentSessionID)
-    )
-      return;
-    const token = options.getIdleSessionToken(parentSessionID);
-    const timer = setTimeout(() => {
-      timers.delete(parentSessionID);
-      if (!options.isCurrentIdleSessionToken(parentSessionID, token)) return;
-      options.reconcileInjectedTerminalJobs(parentSessionID);
-    }, options.idleReconcileDelayMs);
-    timer.unref?.();
-    timers.set(parentSessionID, timer);
-  }
 
   function scheduleChildIdleReconciliation(
     sessionID: string,
@@ -142,7 +124,6 @@ export function createIdleReconciler(options: {
   }
 
   return {
-    scheduleIdleReconciliation,
     scheduleChildIdleReconciliation,
     scheduleDeferredErrorBackstop,
     clearIdleTimers,

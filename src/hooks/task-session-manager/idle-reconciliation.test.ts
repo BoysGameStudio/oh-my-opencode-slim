@@ -37,7 +37,6 @@ test('child idle preserves event provenance and requests runtime inspection', ()
       },
       dispose() {},
     } as never,
-    reconcileInjectedTerminalJobs: () => {},
     idleReconcileDelayMs: 1,
     hasInputWait: () => false,
     getIdleSessionToken: () => Symbol(),
@@ -47,22 +46,20 @@ test('child idle preserves event provenance and requests runtime inspection', ()
   expect(calls).toEqual(['observe', 'inspect']);
   expect(reconciler.clearAllTimers()).toEqual([]);
 });
-test('parent reconciliation retains its independent delay and invalidation', async () => {
-  const acknowledge = mock(() => {});
+test('no parent-level terminal-reconciliation seam survives (issue #1647)', () => {
+  // Retirement moved to the observed-delivery path; the idle reconciler
+  // keeps only the child-side and deferred-error timers.
   const reconciler = createIdleReconciler({
     terminalGate: {} as never,
-    reconcileInjectedTerminalJobs: acknowledge,
     idleReconcileDelayMs: 1,
     hasInputWait: () => false,
     getIdleSessionToken: () => Symbol(),
     isCurrentIdleSessionToken: () => true,
   });
-  reconciler.scheduleIdleReconciliation('cancelled');
-  reconciler.onInvalidateIdle('cancelled');
-  reconciler.scheduleIdleReconciliation('parent');
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  expect(acknowledge).toHaveBeenCalledTimes(1);
-  expect(acknowledge).toHaveBeenCalledWith('parent');
+  expect(
+    (reconciler as unknown as Record<string, unknown>)
+      .scheduleIdleReconciliation,
+  ).toBeUndefined();
   reconciler.clearAllTimers();
 });
 
@@ -73,7 +70,6 @@ test('deferred-error backstop renews while the fallback is in flight, then consu
   const consumed: string[] = [];
   const reconciler = createIdleReconciler({
     terminalGate: gate as never,
-    reconcileInjectedTerminalJobs: () => {},
     idleReconcileDelayMs: 5,
     isFallbackInProgress: () => fallbackInFlight,
     hasInputWait: () => false,
@@ -113,7 +109,6 @@ test('deferred-error backstop renewal is bounded when the fallback never leaves 
   const deferred = 'rate limit exceeded';
   const reconciler = createIdleReconciler({
     terminalGate: gate as never,
-    reconcileInjectedTerminalJobs: () => {},
     idleReconcileDelayMs: 2,
     // Stuck fallback: always claims to be in flight.
     isFallbackInProgress: () => true,
@@ -139,7 +134,6 @@ test('deferred-error backstop skips the publish when nothing is deferred at fire
   const { gate, reconciles } = fakeGate();
   const reconciler = createIdleReconciler({
     terminalGate: gate as never,
-    reconcileInjectedTerminalJobs: () => {},
     idleReconcileDelayMs: 2,
     isFallbackInProgress: () => false,
     hasInputWait: () => false,
@@ -160,7 +154,6 @@ test('busy cancels a pending deferred-error backstop', async () => {
   const { gate, reconciles } = fakeGate();
   const reconciler = createIdleReconciler({
     terminalGate: gate as never,
-    reconcileInjectedTerminalJobs: () => {},
     idleReconcileDelayMs: 10,
     isFallbackInProgress: () => false,
     hasInputWait: () => false,
