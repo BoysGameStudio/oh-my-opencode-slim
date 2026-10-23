@@ -809,7 +809,10 @@ Terminal facts travel as one-shot pushes instead:
   a direct prompt to the child session) has no native notifier. On v1 the
   plugin pushes ONE self-contained `<completed-job>` delta (alias, task, state,
   result) through the same bounded delta queue the stopped-job recovery uses,
-  so the result survives a busy parent and the per-parent publication throttle.
+  so the result survives a busy parent. The push honors the per-parent
+  publication spacing (`publicationWakeMinIntervalMs`) by deferring, not
+  dropping: results inside the window stay queued and one wake delivers them
+  together when it elapses.
   The wake that carries it is a bare resume pointer: the delta holds the
   facts. On v2 the publication wake stays a bare resume pointer and the
   result is pulled with `task_status`.

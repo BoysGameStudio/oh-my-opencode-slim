@@ -31,6 +31,7 @@ import { isVolatileTaggedMessage } from '../cache-safe-injection';
 import { resetUserWaitGateForTests } from '../task-session-manager/user-wait-gate';
 import {
   createOrchestratorWakeScheduler,
+  formatCompletedJobDelta,
   ORCHESTRATOR_PUBLICATION_WAKE_TEXT,
   ORCHESTRATOR_WAKE_TEXT,
   PUBLICATION_WAKE_METADATA_KEY,
@@ -1630,5 +1631,65 @@ describe('terminal-publication wake', () => {
     await clock.advance(60_000);
     await clock.advance(60_000);
     expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('completed-result pushes honor publication spacing and coalesce instead of dropping', async () => {
+    // Repo timer harness on both seams: deterministic, no real delay.
+    const harness = createTimerHarness();
+    const bodies: string[] = [];
+    const promptAsync = mock(async (args: Record<string, unknown>) => {
+      const body = args.body as { parts?: Array<{ text?: string }> };
+      bodies.push(body.parts?.[0]?.text ?? '');
+      return {};
+    });
+    const { scheduler } = createPublicationScheduler({
+      publicationWakeMinIntervalMs: 30_000,
+      setTimeout: harness.setTimeout as unknown as Parameters<
+        typeof createOrchestratorWakeScheduler
+      >[1]['setTimeout'],
+      clearTimeout: harness.clearTimeout as unknown as Parameters<
+        typeof createOrchestratorWakeScheduler
+      >[1]['clearTimeout'],
+      now: harness.now,
+      sessionClient: makeV1Client({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-busy' }],
+        statusData: { 'child-busy': { type: 'busy' } },
+      }),
+    });
+    const push = (taskID: string, result: string) =>
+      scheduler.triggerCompletedJobPublication(
+        'p1',
+        formatCompletedJobDelta({
+          alias: taskID,
+          taskID,
+          state: 'completed',
+          resultSummary: result,
+        }),
+        `${taskID}:2`,
+        { taskID, generation: 2, terminalRevision: 3, state: 'completed' },
+      );
+
+    push('ses_a', 'result-a');
+    await harness.tick();
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    // Inside the window: both results stay queued, no extra model turn.
+    push('ses_b', 'result-b');
+    await harness.tick();
+    push('ses_c', 'result-c');
+    await harness.tick();
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    await harness.advance(29_999);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+
+    // Window elapsed: ONE wake carries both deferred results.
+    await harness.advance(1);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(bodies[1]).toContain('result: result-b');
+    expect(bodies[1]).toContain('result: result-c');
+    expect(bodies[1]).not.toContain('result-a');
   });
 });

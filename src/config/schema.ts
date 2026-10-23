@@ -574,7 +574,7 @@ export const BackgroundJobsConfigStrictSchema = z.object({
         .max(2_147_483_647)
         .default(30_000)
         .describe(
-          'Per-parent minimum spacing between terminal-publication wakes (1,000–2,147,483,647ms; 0 is invalid at the config layer). Default 30,000 (30 seconds). A burst of publications collapses into one wake.',
+          'Per-parent minimum spacing between terminal-publication wakes (1,000–2,147,483,647ms; 0 is invalid at the config layer). Default 30,000 (30 seconds). A burst of publications collapses into one wake. Later-result (<completed-job>) pushes honor the same spacing: inside the window they stay queued and are delivered together when it elapses.',
         ),
     })
     .default({

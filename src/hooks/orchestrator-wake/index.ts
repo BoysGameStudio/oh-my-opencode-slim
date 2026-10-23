@@ -1235,6 +1235,31 @@ export function createOrchestratorWakeScheduler(
     childInputTimers.delete(sessionID);
   }
 
+  /** Deferred completed-result pushes held back by the per-parent
+   * `publicationWakeMinIntervalMs` spacing. The queued deltas stay in
+   * `completedJobQueue`; the timer only re-drives delivery once the window
+   * has elapsed, so a burst of results coalesces into one wake. */
+  const completedSpacingTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+
+  function clearCompletedSpacingTimer(sessionID: string): void {
+    const timer = completedSpacingTimers.get(sessionID);
+    if (timer === undefined) return;
+    cancelTimeout(timer);
+    completedSpacingTimers.delete(sessionID);
+  }
+
+  /** Remaining publication spacing for a parent (ms, 0 when clear). */
+  function publicationSpacingRemaining(sessionID: string): number {
+    const lastWakeAt = lastPublicationWakeAt.get(sessionID);
+    if (lastWakeAt === undefined || publicationWakeMinIntervalMs <= 0) {
+      return 0;
+    }
+    return Math.max(0, lastWakeAt + publicationWakeMinIntervalMs - now());
+  }
+
   /** Event-tracked session statuses (busy-set + parent race guard). */
   const lastStatusBySession = new Map<string, TrackedSessionStatus>();
   /** parentID → child session ids observed via session.created events. */
@@ -1335,6 +1360,7 @@ export function createOrchestratorWakeScheduler(
 
   function clearSession(sessionID: string): void {
     clearChildInputTimer(sessionID);
+    clearCompletedSpacingTimer(sessionID);
     releaseLocalWakeOwner(sessionID);
     clearLocalSession(sessionID);
     clearWakeSession(sessionID);
@@ -1348,6 +1374,7 @@ export function createOrchestratorWakeScheduler(
 
   function suppressArchivedSession(sessionID: string): void {
     clearChildInputTimer(sessionID);
+    clearCompletedSpacingTimer(sessionID);
     const state = touchLocal(sessionID);
     clearTimer(state);
     bumpGeneration(state);
@@ -1373,6 +1400,9 @@ export function createOrchestratorWakeScheduler(
    */
   function suppress(sessionID: string): void {
     clearChildInputTimer(sessionID);
+    // The queued results survive; the next idle re-drives them through the
+    // same spacing check.
+    clearCompletedSpacingTimer(sessionID);
     const state = localSessions.get(sessionID);
     if (!state) return;
     clearTimer(state);
@@ -2645,6 +2675,12 @@ export function createOrchestratorWakeScheduler(
             rearmWakeProgress(sessionID);
           }
         }
+        // A delivered completed-result push consumes the per-parent
+        // publication spacing window, like a publication wake does.
+        if (sentCompletedEntries.length > 0 || sentCompletedOverflowCount > 0) {
+          lastPublicationWakeAt.set(sessionID, now());
+          boundTrackedMap(lastPublicationWakeAt);
+        }
       }
       // Delivered: the wake admission was queued and accepted above.
       if (state.generation === generation) state.retryReason = undefined;
@@ -2859,6 +2895,36 @@ export function createOrchestratorWakeScheduler(
       timer.unref?.();
       return;
     }
+    if (queue === completedJobQueue) {
+      // Completed-result pushes honor `publicationWakeMinIntervalMs`: inside
+      // the window the entry stays queued and one deferred re-drive fires
+      // when it elapses, so results coalesce instead of each costing the
+      // parent a separate model turn. Keep the first deadline.
+      const remaining = publicationSpacingRemaining(sessionID);
+      if (remaining > 0) {
+        if (completedSpacingTimers.has(sessionID)) return;
+        log('[orchestrator-wake] completed-job push deferred', {
+          sessionID,
+          trigger: queue.blockerTrigger,
+          verdict: 'deferred',
+          reason: 'throttled',
+          windowMs: publicationWakeMinIntervalMs,
+        });
+        const timer = scheduleTimeout(() => {
+          completedSpacingTimers.delete(sessionID);
+          const batch = queue.batches.get(sessionID);
+          if (!batch) return;
+          if (prunedToEmpty(queue, batch)) {
+            queue.batches.delete(sessionID);
+            return;
+          }
+          triggerDeltaWake(queue, sessionID);
+        }, remaining);
+        completedSpacingTimers.set(sessionID, timer);
+        timer.unref?.();
+        return;
+      }
+    }
     const state = touchLocal(sessionID);
     clearTimer(state);
     bumpGeneration(state);
@@ -2882,7 +2948,9 @@ export function createOrchestratorWakeScheduler(
    *
    * Deliberately NOT the terminal-publication wake: that path drops on a busy
    * parent and on the per-parent throttle, which would silently lose the
-   * result. Here the delta is durable in the per-parent queue (cap
+   * result. The push still honors the same per-parent spacing
+   * (`publicationWakeMinIntervalMs`), but by deferring, not dropping: the
+   * delta is durable in the per-parent queue (cap
    * `COMPLETED_JOB_QUEUE_CAP`, `COMPLETED_JOB_WAKE_CHUNK` per wake) until a
    * wake actually delivers it; overflow becomes a `task_status` pointer.
    * Revalidated by `isCompletedJobCurrent` immediately before delivery so a
@@ -3119,6 +3187,9 @@ export function createOrchestratorWakeScheduler(
       disposed = true;
       for (const parentID of childInputTimers.keys()) {
         clearChildInputTimer(parentID);
+      }
+      for (const parentID of completedSpacingTimers.keys()) {
+        clearCompletedSpacingTimer(parentID);
       }
       pendingStoppedRecoveries.clear();
       pendingCompletedJobs.clear();
