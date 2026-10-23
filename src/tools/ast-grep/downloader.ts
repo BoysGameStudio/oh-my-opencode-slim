@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { extractZip } from '../../utils';
 import { crossWrite } from '../../utils/compat';
 
@@ -120,10 +120,18 @@ export async function downloadAstGrep(
   }
 }
 
-export async function ensureAstGrepBinary(): Promise<string | null> {
+export async function ensureAstGrepBinary(
+  failedPath?: string,
+): Promise<string | null> {
   const cachedPath = getCachedBinaryPath();
   if (cachedPath) {
-    return cachedPath;
+    // Execution is the validity check: size alone cannot detect missing loaders.
+    // Evict only our own failed cache entry, never a package or system binary.
+    if (failedPath && resolve(failedPath) === resolve(cachedPath)) {
+      unlinkSync(cachedPath);
+    } else {
+      return cachedPath;
+    }
   }
 
   const version = getAstGrepVersion();
