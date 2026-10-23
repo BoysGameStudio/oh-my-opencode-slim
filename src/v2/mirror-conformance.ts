@@ -31,19 +31,83 @@
  * referenced from docs/opencode-v2-compatibility.md instead.
  */
 
+import type { RpcCallOptions } from '@opencode/client';
 import type { EventDomain } from '@opencode/plugin/promise/event';
 import type { PermissionDomain } from '@opencode/plugin/promise/permission';
+import type { RpcDomain, RpcHandlers } from '@opencode/plugin/promise/rpc';
 import type {
   SessionDomain,
   SessionHooks,
 } from '@opencode/plugin/promise/session';
-import type { V2Context, V2PermissionRule } from './types';
+import type { Rpc } from '@opencode/plugin/rpc';
+import type { V2PresetRpcCallOptions } from './preset-manager';
+import type { sessionPresetRpc } from './preset-rpc';
+import type {
+  V2Context,
+  V2PermissionRule,
+  V2SessionPresetRpcHandlers,
+} from './types';
 
 type Expect<T extends true> = T;
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
     ? true
     : false;
+
+/** The deliberately narrow RPC mirror supports only our portable Zod
+ * contract. Keep handler inference, cancellation and client location options
+ * pinned to the official 2.1.2 API without exporting its dev-only types. */
+type PresetRpc = typeof sessionPresetRpc;
+type _presetRpcPortable = Expect<
+  PresetRpc extends Rpc.PortableDefinition ? true : false
+>;
+type _presetRpcNoEvents = Expect<Equal<keyof PresetRpc['events'], never>>;
+type _presetRpcNoErrors = Expect<
+  Equal<
+    {
+      [K in keyof PresetRpc['methods']]: 'errors' extends keyof PresetRpc['methods'][K]
+        ? true
+        : false;
+    }[keyof PresetRpc['methods']],
+    false
+  >
+>;
+type _rpcRegistrationCompatible = Expect<
+  RpcDomain extends NonNullable<V2Context['rpc']> ? true : false
+>;
+type _rpcHandlerInputs = Expect<
+  Equal<
+    {
+      [K in keyof PresetRpc['methods']]: Parameters<
+        V2SessionPresetRpcHandlers[K]
+      >[0];
+    },
+    {
+      [K in keyof PresetRpc['methods']]: Parameters<
+        RpcHandlers<PresetRpc>[K]
+      >[0];
+    }
+  >
+>;
+type _rpcHandlerOutputs = Expect<
+  Equal<
+    {
+      [K in keyof PresetRpc['methods']]: ReturnType<
+        V2SessionPresetRpcHandlers[K]
+      >;
+    },
+    { [K in keyof PresetRpc['methods']]: ReturnType<RpcHandlers<PresetRpc>[K]> }
+  >
+>;
+type _rpcHandlerSignal = Expect<
+  Equal<
+    Parameters<V2SessionPresetRpcHandlers['apply']>[1],
+    Pick<Parameters<RpcHandlers<PresetRpc>['apply']>[1], 'signal'>
+  >
+>;
+type _rpcCallOptions = Expect<
+  Equal<V2PresetRpcCallOptions, Pick<RpcCallOptions, 'location' | 'signal'>>
+>;
 
 /** Official session hook surface as of the pinned @opencode/plugin.
  * `experimental.ws.send`/`receive` were added upstream in 2.0.6 (#49136);

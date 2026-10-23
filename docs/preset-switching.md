@@ -1,6 +1,7 @@
 # Preset Switching
 
-Switch agent model presets at runtime using the `/preset` TUI slash command.
+Use `/preset` to choose a session's subagent inference configuration or change
+the default for future sessions.
 
 ## Controls
 
@@ -19,57 +20,87 @@ the built-in `/models`, so it triggers no LLM turn.
 > argument.
 >
 > On v2 hosts, typing `/preset` + Enter opens the same three-level manager,
-> and the sidebar's active-preset row opens it on click. `/preset <name>`
-> stays the fast path: it persists the named preset and requests the live
-> refresh directly, no dialogs needed.
+> and the sidebar's preset row opens it on click. Applying a preset asks you
+> to choose **Current session** or **Global default**. `/preset <name>` keeps
+> its configuration-writing fast path: it changes the global default, not
+> the current session's binding.
 
-## How It Works
+## Scope and when changes take effect
 
-1. Define named presets in `oh-my-opencode-slim.jsonc` under the `presets`
-   field, or create them interactively from the manager
-2. **Save** writes the preset definition to the user config file. **Save &
-   Apply** also selects the preset as the active one. Neither claims a live
-   apply: both persist the file and *request* the live refresh (below); the
-   running session is untouched either way
-3. On v2 hosts a saved/applied preset requests the live refresh: the
-   server-side watcher re-reads the config, resolves **only** the inference
-   fields (`model`, `variant`, `temperature`, `options`) into per-agent
-   runtime profiles, republishes the fallback chains (a `model` array's full
-   chain, not just its head) in the same generation, and freezes the current
-   profile — and that chain generation — for each **new child session**
-   (dispatched subagents) before its first request. The sidebar's
-   model/variant rows are rewritten by the same server-side projection, and
-   the TUI sidebar re-reads its config-backed rows. The TUI only persists
-   the file and requests this refresh — the refresh itself runs in the
-   server process and its outcome is not observable from the TUI
-4. Manual edits to the config file(s) trigger the same refresh (the plugin
-   watches the user and project config candidates — `.json` and `.jsonc`,
-   including files/directories created after startup, under any
-   `OPENCODE_CONFIG_DIR`, XDG, or project `.opencode` location — debounced
-   ~300 ms)
-5. The current session is **not** touched — this is deliberate. Existing and
-   resumed sessions keep the profiles captured when they were first seen, and
-   every non-inference field (`prompt`, `tools`, `permission`, `skills`,
-   `mcps`, `description`, `displayName`) stays frozen for the session
-   lifetime. Hot-swapping the agent tree mid-conversation could truncate
-   context (a new model may have a smaller window), drift prior assistant
-   turns under a changed system prompt, leave running subagents referencing
-   stale agent definitions, or shift tool/skill availability
+On v2, a root work session captures its subagent inference configuration before
+its first managed prompt is admitted. Its new native subagents inherit their
+direct parent's snapshot, including model variants, inference options and fallback
+chains. Changing the default does not change that snapshot, even for children
+the existing session creates later.
 
-The TUI reports `Saved … Live refresh requested` on success — it never claims
-the refresh was applied. If the config file is malformed (invalid JSON,
-schema rejection, read error), the refresh is rejected **before anything is
-swapped**: the last-known-good profiles and sidebar stay in place and the
-server logs the failure with its cause. A refresh request that fails in the
-TUI process degrades to the actionable **reload OpenCode to apply**
-fallback; if new child dispatches still use the old inference fields after a
-malformed edit, fix the config and reload OpenCode. A rejected refresh never
-swaps profiles, never rewrites the sidebar, and never claims success.
+| Action | What is saved | Who uses the change |
+|--------|---------------|---------------------|
+| Manager → Current session | The session's inference snapshot in OpenCode's plugin storage | New delegations from that session after the switch |
+| Manager → Global default, or `/preset <name>` | The selected preset in the user configuration | Sessions that first bind after the configuration refresh, subject to project and environment overrides |
+| Edit the user configuration's `preset` | The global default | Future bindings that inherit the global default |
+| Edit a project configuration's `preset` | That project's default | Future bindings in that project |
+| Edit a preset definition or its `extends` base; manager → Save | The shared preset definition | Future bindings, or a session that explicitly reapplies the preset |
 
-`/preset` writes the selected preset name to the user config file. It does not
-create an in-memory agent override. On v1 hosts, **reload OpenCode** after
-applying a preset. In both cases a running conversation keeps its existing
-models.
+**Manual configuration edits do not update existing session snapshots.**
+This includes edits to the same preset name. To use its updated definition in
+an existing work session, open `/preset`, select that preset, and apply it to
+**Current session**. Reloading OpenCode does not reset a saved binding.
+
+**Save & Apply** asks for the application scope before saving the definition
+and applying it. A session-only application does not change the selected
+configuration default. A project override still takes precedence over the
+global default; the existing writer reports conflicting overrides rather than
+pretending a global selection changed that project's effective default.
+
+### Two concurrent work sessions
+
+1. Session A starts with `cheap` and captures its team configuration.
+2. You change the global default to `powerful`, then start session B.
+3. A's new subagents still use its `cheap` snapshot; B's use `powerful`.
+4. Changing the global default back to `cheap` does not change B.
+5. Applying `powerful` to A's **Current session** changes A's future
+   delegations. Its already-created children keep their own snapshots.
+
+A bound child also retains its snapshot when resumed. If it creates a
+grandchild after its parent switches presets, the grandchild inherits that
+child's older snapshot, not the root's latest selection. An explicit model
+or variant supplied to a delegation takes precedence over the preset default;
+an explicit model selection does not opt into that child's preset fallback chain.
+
+### Persistence and failures
+
+Snapshots contain resolved inference settings, not a live reference to a
+preset name. They survive plugin and host restarts through OpenCode's
+`ctx.storage`; no separate snapshot directory or database is created. The
+plugin binds a new native child from a bound parent before its first prompt.
+A failed binding prevents that invocation from submitting the prompt.
+
+Sessions created before this feature have no historical snapshot to recover.
+A root's first binding uses the then-current effective default. A child with
+no saved binding, including an older child or one created by a host command,
+keeps the previous behavior rather than being assigned its parent's current
+preset. These unbound children and their delegations are outside session-preset
+isolation; the manager reports no binding. Current-session application requires
+a root or an already-bound child.
+
+If the host stops after creating a child but before its binding is saved, the
+plugin cannot reconstruct that child's original team after restart. It treats
+that child as unbound; it does not claim to recover its prior configuration.
+Unreadable or corrupt stored records are errors, not unbound-session fallbacks.
+
+Session isolation requires the host's plugin storage and session identity APIs.
+Reduced hosts without these APIs retain the previous execution behavior and
+cannot apply a session-only preset; they do not report a persistent binding.
+
+User and project configuration files are still watched, including `.json`
+and `.jsonc` candidates created after startup. A successful configuration
+write requests refresh; it does not acknowledge the separate server-side
+watcher's completion. Invalid configuration preserves the last-known-good
+defaults. Fix the configuration before retrying the refresh or applying it
+to a session.
+
+On v1, `/preset` retains its configuration-writing behavior. **Reload
+OpenCode** after applying a preset.
 
 ## Editing inherited presets
 
@@ -80,10 +111,11 @@ create a local override, then edit it at Level 3.
 
 Saving an inherited preset preserves its `extends` value and writes only its
 local agent overrides; it does not flatten or copy inherited agents into the
-child. Editing the base preset therefore affects its children after the next
-live refresh (v2: new child dispatches pick the inference changes up once the
-watcher refresh lands) or reload. A base preset with dependents cannot be
-deleted until those children choose another base or clear inheritance.
+child. Editing the base preset updates derived definitions for future v2
+session bindings or an explicit session reapplication; it does not rewrite
+saved inference snapshots. On v1, reload to apply the edited definition.
+A base preset with dependents cannot be deleted until those presets choose
+another base or clear inheritance.
 
 ### Level 3 — model and variant selection
 
@@ -100,12 +132,10 @@ a raw JSON prompt for provider-specific settings (e.g.
 {
   "presets": {
     "cheap": {
-      "orchestrator": { "model": "anthropic/claude-3.5-haiku" },
       "explorer": { "model": "openai/gpt-6-luna" },
       "oracle": { "model": "anthropic/claude-sonnet-4-6" }
     },
     "powerful": {
-      "orchestrator": { "model": "openai/gpt-6" },
       "oracle": { "model": "anthropic/claude-opus-4-6" }
     },
     "thinking": {
@@ -121,15 +151,15 @@ a raw JSON prompt for provider-specific settings (e.g.
 
 ## Supported Fields
 
-On v2 hosts the live refresh hot-applies **only** these inference fields, and
-only to **new child sessions** (captured before their first request) plus the
-sidebar; every other preset field applies after a full OpenCode reload. A
-malformed config keeps the last-known-good profiles and sidebar (the refresh
-is rejected, not applied):
+V2 session selection applies **only subagent inference settings**. It does
+not change the main session's model selection or hot-reload its agent
+registry. The default configuration and the current session's binding are
+different states; a default label is not evidence that a running child has
+changed models.
 
 | Field | Description |
 |-------|-------------|
-| `model` | Model ID in `provider/model` format. Array form (fallback chains) is resolved to the first entry, and the full fallback chain is refreshed with it — new child sessions descend the refreshed chain, a child already registered keeps the chain generation it registered with. Removing a marketplace agent's override reverts new children to the package's own chain |
+| `model` | Model ID in `provider/model` format, or an ordered fallback chain. The selected model and its fallback chain come from the same inherited snapshot |
 | `temperature` | Inference temperature (0-2) |
 | `variant` | Model variant (e.g. `"thinking"`) |
 | `options` | Provider-specific options (e.g. thinking budget) |
@@ -137,26 +167,17 @@ is rejected, not applied):
 The `extends` field is resolved when the preset is applied. Presets support
 one parent only; multi-parent inheritance is not supported.
 
-Frozen for the session lifetime — new child dispatches do **not** receive
-these until a full OpenCode reload: `prompt`, `tools`, `permission`,
-`skills`, `mcps`, `description`, `displayName`.
+Session selection does not apply `prompt`, `tools`, `permission`, `skills`,
+`mcps`, `description`, `displayName`, or marketplace activation. Those remain
+subject to the normal host configuration and agent-registry lifecycle.
+Choose the main session's model with OpenCode's native model controls.
 
 ## Startup Preset vs Runtime Switching
 
-There are two ways to activate a preset:
-
-| Method | How | Persists? |
-|--------|-----|-----------|
-| Config file | Set `"preset": "cheap"` in `oh-my-opencode-slim.jsonc` | Yes, across restarts |
-| `/preset` TUI command | Open the manager and apply a preset (v2: or the sidebar's preset row, or `/preset <name>`) | Yes — writes to config file; v2 hosts request the live refresh (inference fields apply to new child sessions once the watcher refresh lands), v1 hosts need a reload |
-
-The `/preset` TUI command writes the selected preset name to the config file,
-so the switch persists across restarts. On v2 hosts the write also requests
-the live refresh: once the server-side watcher refresh succeeds, new child
-dispatches and the sidebar use the new inference fields, while the current
-session continues uninterrupted with its existing models and frozen
-prompt/tool surfaces. A malformed config leaves the last-known-good state in
-place until it is fixed (and reloaded). On v1 hosts, **reload OpenCode** for
-the new preset to take effect on the agent registry.
+The configuration selects the default for new work. A session binding selects
+that work's subagent inference settings. Both persist across restarts, but
+changing one does not overwrite the other. Use **Global default** to change
+future work and **Current session** to change future delegations in work that
+is already bound.
 
 > See [Configuration](configuration.md) for the full preset option reference.
