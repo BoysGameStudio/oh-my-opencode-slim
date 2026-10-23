@@ -322,24 +322,31 @@ config file invalid.
 
 ### Runtime Preset Switching
 
-Presets can also be selected from the TUI with `/preset`. The selection is
-written to the user config file. On v2 hosts the write requests the live
-refresh: after the server-side watcher has re-read the config, the
-saved/applied preset's inference fields (`model`, `variant`, `temperature`,
-`options`) apply to **new child dispatches** (frozen for each child before
-its first request) and the sidebar, and the fallback chains (a `model`
-array's full chain) are refreshed in the same generation — a child already
-registered keeps the chain generation it registered with. Every existing
-session and every
-non-inference preset field (`prompt`, `tools`, `permission`, `skills`,
-`mcps`, `displayName`) stays frozen until a full reload. A malformed config
-is rejected before any swap — the last-known-good profiles, chains, and
-sidebar are
-kept until the config is fixed. The TUI reports `Saved … Live refresh
-requested` (it cannot observe the server-side watcher); fix the config and
-reload if new dispatches still use the old fields. On v1 hosts, reload
-OpenCode for the change to take effect. See
-[Preset Switching](preset-switching.md) for details.
+On v2, `/preset` opens a manager with two application scopes:
+
+- **Current session** saves that session's subagent inference configuration
+  without changing the configuration file's selected preset. It affects
+  future delegations, not already-created children or the main session's
+  native model selection.
+- **Global default** writes the user configuration. `/preset <name>` retains
+  this configuration-writing behavior. It affects sessions that first bind
+  after the refresh, subject to project and environment overrides.
+
+Each work session binds its resolved inference settings before its first
+managed prompt. New children inherit their direct parent's snapshot,
+including variants, options and fallback chains. **Manual edits to the user
+or project configuration, and edits to the same preset definition, do not
+change existing bindings or their future children.** Explicitly reapply the
+preset to Current session to use an updated definition. Bindings persist in
+OpenCode's plugin storage across restarts.
+
+Only subagent inference settings (`model`, `variant`, `temperature`,
+`options`, and fallback chains) are isolated. Prompts, tools, permissions,
+skills, MCPs and marketplace activation keep their normal host lifecycle.
+Invalid configuration preserves the last-known-good defaults. On v1, apply
+the preset to the configuration and reload OpenCode as before. See
+[Preset Switching](preset-switching.md) for scope, timing and concurrent-session
+examples.
 
 ### Preset inheritance
 
@@ -376,16 +383,10 @@ config means the agent entry in OpenCode's `opencode.json`. A root `agents`
 entry is global: it overrides the active preset, so do not put an agent there
 if its value should vary by preset. Host config remains the final override.
 
-The `/preset` TUI persists the selected preset name and does not create an
-in-memory agent override. On v2 hosts the write requests the live refresh and
-the re-resolved inference fields apply to new child dispatches (captured
-before their first request) and the sidebar once the server-side watcher has
-refreshed; the fallback chains are refreshed in the same generation (a child
-already registered keeps the chain generation it registered with); existing
-sessions and the prompt/tool/permission/skill/MCP surfaces
-stay frozen until a full reload. A malformed config keeps the last-known-good
-profiles, chains, and sidebar and must be fixed (then reloaded) before the
-change can apply. On v1 hosts, reload OpenCode after changing the active preset.
+These precedence rules also apply when resolving a named preset for a v2
+session binding. Editing an inherited definition updates future bindings;
+existing sessions retain their resolved inference snapshots until an explicit
+Current session application. On v1, reload after changing the active preset.
 
 > **niri note:** `companion-v0.1.3` includes the fixed native companion release.
 > To make it open as a bottom-right overlay, add a niri rule matching its stable
@@ -873,8 +874,8 @@ when its provider, model ID, or variant differs from the startup selection.
 An omitted variant and `default` identify the same default variant.
 If the agent started without a model, any child model is kept, including the
 parent model v2 gives new subagents; a model added later applies after reload.
-Children still on that startup model receive the current profile, including
-hot-refreshed inference fields; captured profiles remain frozen for later turns.
+New managed children receive the inference profile bound to their parent,
+not the latest global default. Captured profiles remain frozen for later turns.
 
 Model selection follows these rules:
 
@@ -988,9 +989,9 @@ An ancestor supplies defaults, the child preset overrides them, the plugin's
 top-level `agents` object overrides the active preset, and the agent entry in
 OpenCode's `opencode.json` is the final override. A root `agents` entry is
 global rather than per-preset, so put an agent inside each preset when its
-value should vary by preset. This precedence also applies after `/preset`
-selects a preset; `/preset` persists the selection and does not create an
-in-memory override.
+value should vary by preset. This precedence applies both to configuration
+defaults and to v2 session inference snapshots; choosing a session preset
+does not give it higher precedence than root `agents` or host configuration.
 
 #### Sharing a prompt across presets (custom agents)
 

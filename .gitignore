@@ -103,3 +103,10 @@ captures/
 .slim/deepwork/
 .codegraph/
 .worktrees/
+
+# Local agent runtime artifacts
+.cortexkit/
+.tokpulse/
+.tokpulse-writer-locks/
+.tokpulse-migrate-*/
+.opencode/oc-tps/

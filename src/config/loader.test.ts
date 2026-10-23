@@ -225,6 +225,10 @@ describe('loadPluginConfig', () => {
       onWarning: (warning) => warnings.push(warning),
     });
     expect(warnings).toHaveLength(2);
+    expect(warnings.map((warning) => warning.presetName)).toEqual([
+      'broken',
+      'child',
+    ]);
     expect(warnings.every((warning) => warning.path === ancestorPath)).toBe(
       true,
     );
@@ -768,6 +772,7 @@ describe('onWarning callback', () => {
       path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
     );
     expect(warnings[0]?.message).toBe('Config does not match schema');
+    expect(warnings[0]).not.toHaveProperty('presetName');
     expect(config).toEqual({});
   });
 
@@ -787,6 +792,7 @@ describe('onWarning callback', () => {
 
     expect(warnings).toHaveLength(1);
     expect(warnings[0]?.kind).toBe('invalid-json');
+    expect(warnings[0]).not.toHaveProperty('presetName');
     expect(warnings[0]?.path).toBe(
       path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
     );

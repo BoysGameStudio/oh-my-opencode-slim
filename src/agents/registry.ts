@@ -53,6 +53,20 @@ export interface ResolvedAgentRegistry {
   readonly marketplaceManifestChains: Readonly<
     Record<string, readonly { id: string; variant?: string }[]>
   >;
+  /** Pure pre-owner inference only; never a resource/activation projection. */
+  readonly marketplaceInferenceBase: Readonly<
+    Record<
+      string,
+      {
+        model?: string;
+        variant?: string;
+        temperature?: number;
+        options?: Record<string, unknown>;
+        inheritModelFrom?: 'session';
+        modelFrom?: string;
+      }
+    >
+  >;
   readonly effectiveStartupModels: Readonly<
     Record<string, { model?: string; variant?: string }>
   >;
@@ -830,6 +844,10 @@ export function buildResolvedAgentRegistry(
     string,
     readonly { id: string; variant?: string }[]
   > = {};
+  const marketplaceInferenceBase: Record<
+    string,
+    ResolvedAgentRegistry['marketplaceInferenceBase'][string]
+  > = {};
   const hostFlavor = options.hostFlavor;
   const pluginMcps = clone(options.pluginMcps ?? {});
   let definitions = options.definitions
@@ -900,11 +918,43 @@ export function buildResolvedAgentRegistry(
     // `_modelArray` on the admitted definitions (see
     // applyMarketplaceOwnerOverride) — the merged modelCandidates cannot
     // serve a refresh that removes an override.
+    const sessionInherited = new Set(
+      plan.agents
+        .filter(({ manifest }) => manifest.model.source === 'session')
+        .map(({ agentName }) => agentName),
+    );
+    const modelSources = new Map(
+      plan.agents.flatMap(({ agentName, manifest }) => {
+        const source =
+          manifest.model.source === 'orchestrator'
+            ? 'orchestrator'
+            : manifest.model.source === 'builtin'
+              ? manifest.extends?.builtin
+              : undefined;
+        return source ? [[agentName, source] as const] : [];
+      }),
+    );
     for (const sourceAgent of constructed.agents) {
+      const config = sourceAgent.config;
+      marketplaceInferenceBase[sourceAgent.name] = {
+        ...(modelSources.has(sourceAgent.name)
+          ? { modelFrom: modelSources.get(sourceAgent.name) }
+          : {}),
+        ...(typeof config.model === 'string' ? { model: config.model } : {}),
+        ...(typeof config.variant === 'string'
+          ? { variant: config.variant }
+          : {}),
+        ...(typeof config.temperature === 'number'
+          ? { temperature: config.temperature }
+          : {}),
+        ...(config.options ? { options: clone(config.options) } : {}),
+        ...(sessionInherited.has(sourceAgent.name)
+          ? { inheritModelFrom: 'session' as const }
+          : {}),
+      };
       const manifest = sourceAgent._modelArray;
-      if (!manifest || manifest.length <= 1) continue;
-      marketplaceManifestChains[sourceAgent.name] = manifest.map((entry) =>
-        typeof entry === 'string' ? { id: entry } : { ...entry },
+      marketplaceManifestChains[sourceAgent.name] = (manifest ?? []).map(
+        (entry) => (typeof entry === 'string' ? { id: entry } : { ...entry }),
       );
     }
     const marketplaceAgents = constructed.agents.map((sourceAgent) => {
@@ -1618,6 +1668,7 @@ export function buildResolvedAgentRegistry(
     identities: frozenIdentities,
     modelCandidates: frozenCandidates,
     marketplaceManifestChains: freeze(marketplaceManifestChains),
+    marketplaceInferenceBase: freeze(marketplaceInferenceBase),
     effectiveStartupModels: frozenEffective,
     tuiAgentModels: frozenTuiModels,
     tuiAgentVariants: frozenTuiVariants,

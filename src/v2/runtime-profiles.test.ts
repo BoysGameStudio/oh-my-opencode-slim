@@ -5,6 +5,11 @@ import {
   reconcileRuntimeProfileOptionKeys,
   resolveV2EventPayload,
 } from './runtime-profiles';
+import {
+  createSessionPresets,
+  type SessionTeamBundle,
+  wrapSessionPresetSubagent,
+} from './session-presets';
 import type { ModelRef, V2SessionContextEvent } from './types';
 
 const PROFILES = {
@@ -83,6 +88,523 @@ const GPT5_SWITCH = {
   sessionID: 'child-1',
   model: { providerID: 'openai', id: 'gpt-5-mini' },
 };
+
+describe('durable session team presets', () => {
+  function fixture() {
+    const bundle = (name: string): SessionTeamBundle => ({
+      presetName: name,
+      fallbackEnabled: true,
+      profiles: {
+        explorer: {
+          model: { providerID: 'test', id: name, variant: 'high' },
+          temperature: name === 'A' ? 0.1 : 0.8,
+          providerOptions: { reasoning: name },
+          sidebarModel: `test/${name}`,
+        },
+      },
+      chains: {
+        explorer: [
+          { id: `test/${name}`, variant: 'high' },
+          { id: `backup/${name}` },
+        ],
+      },
+      inheritance: { oracle: 'session' },
+    });
+    let current = bundle('A');
+    const values = new Map<string, unknown>();
+    const parents = new Map<string, string>();
+    const order: string[] = [];
+    const storage = {
+      get: async (key: string) => structuredClone(values.get(key)),
+      set: async (key: string, value: unknown) => {
+        order.push(`persist:${key.split('/').at(-1)}`);
+        values.set(key, structuredClone(value));
+      },
+      remove: async (key: string) => {
+        values.delete(key);
+      },
+      scan: async () => ({ entries: [] }),
+    };
+    const session = {
+      get: async ({ sessionID }: { sessionID: string }) => ({
+        id: sessionID,
+        directory: '/project',
+        ...(parents.has(sessionID) ? { parentID: parents.get(sessionID) } : {}),
+        agent: 'explorer',
+      }),
+    };
+    const create = () =>
+      createSessionPresets({
+        storage,
+        session: session as never,
+        directory: '/project',
+        current: () => current,
+        named: async (name) => bundle(name),
+      });
+    return {
+      create,
+      bundle,
+      values,
+      parents,
+      order,
+      storage,
+      setCurrent: (name: string) => {
+        current = bundle(name);
+      },
+    };
+  }
+
+  test('roots freeze at admission; switch, descendants and restart keep independent complete bundles', async () => {
+    const f = fixture();
+    let presets = f.create();
+    await presets.ensure('root-A');
+    f.setCurrent('B');
+    await presets.ensure('root-B');
+    // A never delegated before the global edit, but its new child still gets A.
+    f.parents.set('old-child', 'root-A');
+    await presets.bindChild(
+      'old-child',
+      'root-A',
+      (await presets.ensure('root-A')).bundle,
+    );
+    const capture = (await presets.ensure('root-A')).bundle;
+    await Promise.all([presets.apply('root-A', 'B'), presets.ensure('root-B')]);
+    f.parents.set('in-flight', 'root-A');
+    await presets.bindChild('in-flight', 'root-A', capture);
+    f.parents.set('new-child', 'root-A');
+    await presets.bindChild(
+      'new-child',
+      'root-A',
+      (await presets.ensure('root-A')).bundle,
+    );
+    f.parents.set('grandchild', 'old-child');
+    await presets.bindChild(
+      'grandchild',
+      'old-child',
+      (await presets.ensure('old-child')).bundle,
+    );
+    // Crash after native create but before progress bind. Parent has already
+    // moved to B; restart keeps the child unmanaged, never pretending B was
+    // its launch team and never blocking native compatibility admission.
+    f.parents.set('interrupted-child', 'root-A');
+    await presets.dispose();
+    presets = f.create();
+    f.setCurrent('C');
+    for (const [id, name] of [
+      ['old-child', 'A'],
+      ['in-flight', 'A'],
+      ['grandchild', 'A'],
+      ['new-child', 'B'],
+      ['root-B', 'B'],
+    ]) {
+      const record = await presets.ensure(id);
+      expect(record.bundle).toEqual(f.bundle(name));
+    }
+    // Another location may update KV while this instance still has an old
+    // peek. Reads must observe KV without mutating an admitted frozen bundle.
+    const priorRoot = presets.peek('root-B');
+    f.values.set('session-preset/v1/root-B', {
+      schemaVersion: 1,
+      bundle: f.bundle('D'),
+    });
+    expect((await presets.readState('root-B')).presetName).toBe('D');
+    expect((await presets.ensure('root-B')).bundle).toEqual(f.bundle('D'));
+    expect(priorRoot?.bundle).toEqual(f.bundle('B'));
+    // Apply must also read the remote execution policy, not its stale peek.
+    f.values.set('session-preset/v1/new-child', {
+      schemaVersion: 1,
+      parentID: 'root-A',
+      bundle: f.bundle('D'),
+      execution: f.bundle('B'),
+      preserveModel: true,
+      explicitModel: true,
+    });
+    await presets.apply('new-child', 'E');
+    expect(presets.peek('new-child')?.execution).toEqual(f.bundle('B'));
+    expect(presets.peek('new-child')?.explicitModel).toBe(true);
+    // An externally deleted child stays unmanaged; no parent-copy rebind.
+    f.values.delete('session-preset/v1/grandchild');
+    expect((await presets.readState('grandchild')).status).toBe('unbound');
+    expect(presets.peek('grandchild')).toBeUndefined();
+    expect(await presets.ensure('grandchild')).toBeUndefined();
+    f.values.set('session-preset/v1/root-B', { schemaVersion: 2 });
+    await expect(presets.ensure('root-B')).rejects.toThrow();
+    expect(presets.peek('root-B')).toBeUndefined();
+    expect(await presets.ensure('interrupted-child')).toBeUndefined();
+    expect(f.values.has('session-preset/v1/interrupted-child')).toBe(false);
+    expect((await presets.readState('interrupted-child')).status).toBe(
+      'unbound',
+    );
+    await expect(presets.apply('interrupted-child', 'B')).rejects.toThrow(
+      'unbound child',
+    );
+    const compat = wrapSessionPresetSubagent({
+      presets,
+      capture: async () => ({ bundle: null, explicitModel: false }),
+      execute: async (_input, raw) => {
+        f.parents.set('compat-child', 'interrupted-child');
+        await (
+          raw as { progress: (update: unknown) => Promise<void> }
+        ).progress({ sessionID: 'compat-child', status: 'running' });
+        expect(await presets.ensure('compat-child')).toBeUndefined();
+        return 'native-compat';
+      },
+    });
+    expect(
+      await compat(
+        {},
+        {
+          sessionID: 'interrupted-child',
+          id: 'compat-call',
+          signal: new AbortController().signal,
+          progress: async () => {},
+        },
+      ),
+    ).toBe('native-compat');
+    const resumeCompat = wrapSessionPresetSubagent({
+      presets,
+      capture: async () => ({ bundle: f.bundle('B'), explicitModel: false }),
+      execute: async (input, raw) => {
+        expect(input).toEqual({ sessionID: 'interrupted-child' });
+        await (
+          raw as { progress: (update: unknown) => Promise<void> }
+        ).progress({ sessionID: 'interrupted-child', status: 'running' });
+        return 'native-resume-compat';
+      },
+    });
+    expect(
+      await resumeCompat(
+        { sessionID: 'interrupted-child' },
+        {
+          sessionID: 'root-A',
+          id: 'resume-compat-call',
+          signal: new AbortController().signal,
+          progress: async () => {},
+        },
+      ),
+    ).toBe('native-resume-compat');
+    expect(f.values.has('session-preset/v1/interrupted-child')).toBe(false);
+    expect(f.values.has('session-preset/v1/compat-child')).toBe(false);
+    await presets.apply('old-child', 'B');
+    expect((await presets.ensure('old-child')).execution).toEqual(
+      f.bundle('A'),
+    );
+    await presets.remove('root-A');
+    expect((await presets.ensure('old-child')).execution).toEqual(
+      f.bundle('A'),
+    );
+    f.parents.set('orphan', 'missing-root');
+    expect(await presets.ensure('orphan')).toBeUndefined();
+    f.values.set('session-preset/v1/corrupt', { schemaVersion: 2 });
+    await expect(presets.ensure('corrupt')).rejects.toThrow();
+    f.parents.set('conflict', 'root-B');
+    f.values.set('session-preset/v1/conflict', {
+      schemaVersion: 1,
+      parentID: 'wrong-parent',
+      bundle: f.bundle('A'),
+    });
+    await expect(presets.ensure('conflict')).rejects.toThrow(
+      'parent identity mismatch',
+    );
+    f.storage.get = async () => {
+      throw new Error('get unavailable');
+    };
+    await expect(presets.ensure('new-child')).rejects.toThrow(
+      'get unavailable',
+    );
+    expect(presets.peek('new-child')).toBeUndefined();
+    await presets.dispose();
+    // Reduced hosts keep legacy prompts/delegation without pretending that
+    // session-only RPC or managed child persistence is available. Missing
+    // storage must not force an identity probe, nor vice versa.
+    for (const capability of [
+      {
+        storage: undefined,
+        session: {
+          get: async () => {
+            throw new Error('unexpected identity probe');
+          },
+        },
+      },
+      { storage: f.storage, session: {} },
+    ]) {
+      const reduced = createSessionPresets({
+        ...capability,
+        session: capability.session as never,
+        directory: '/project',
+        current: () => {
+          throw new Error('unexpected managed snapshot');
+        },
+        named: async () => f.bundle('A'),
+      });
+      expect(reduced.available).toBe(false);
+      expect(await reduced.ensure('legacy-root')).toBeUndefined();
+      await expect(reduced.readState('legacy-root')).rejects.toThrow(
+        'unavailable',
+      );
+      await expect(reduced.apply('legacy-root', 'A')).rejects.toThrow(
+        'unavailable',
+      );
+      await expect(
+        reduced.bindChild('legacy-child', 'legacy-root', f.bundle('A')),
+      ).rejects.toThrow('unavailable');
+      await reduced.remove('legacy-root');
+      await reduced.dispose();
+      expect(() => reduced.checkActive()).toThrow('retired');
+    }
+  });
+
+  test('native execute is called once; persist → original progress → prompt; resume preserves its own bundle and explicit selection', async () => {
+    const f = fixture();
+    const presets = f.create();
+    const captured = (await presets.ensure('root')).bundle;
+    let calls = 0;
+    const signal = new AbortController().signal;
+    const input = { agent: 'explorer', model: 'manual/chosen#low' };
+    const context = {
+      sessionID: 'root',
+      id: 'call',
+      signal,
+      progress: async () => {
+        f.order.push('progress');
+      },
+    };
+    const execute = wrapSessionPresetSubagent({
+      presets,
+      capture: async () => ({ bundle: captured, explicitModel: true }),
+      execute: async (args, raw) => {
+        calls++;
+        expect(args).toBe(input);
+        const ctx = raw as typeof context;
+        expect(ctx.signal).toBe(signal);
+        f.parents.set('child', 'root');
+        await presets.apply('root', 'B');
+        await ctx.progress({ sessionID: 'child', status: 'running' } as never);
+        await ctx.progress({ sessionID: 'child', status: 'running' } as never);
+        f.order.push('prompt');
+        return 'native-result';
+      },
+    });
+    expect(await execute(input, context)).toBe('native-result');
+    // Repeated progress and a structurally identical bundle with different
+    // JSON key order must not overwrite or conflict with the launch binding.
+    await presets.bindChild('child', 'root', {
+      inheritance: captured.inheritance,
+      chains: captured.chains,
+      profiles: captured.profiles,
+      fallbackEnabled: captured.fallbackEnabled,
+      presetName: captured.presetName,
+    });
+    expect(calls).toBe(1);
+    expect(f.order.slice(-4)).toEqual([
+      'persist:child',
+      'progress',
+      'progress',
+      'prompt',
+    ]);
+    const child = await presets.ensure('child');
+    expect(child.bundle).toEqual(f.bundle('A'));
+    expect(child.preserveModel).toBe(true);
+    expect(child.explicitModel).toBe(true);
+    const resumedInput = {
+      agent: 'explorer',
+      sessionID: 'child',
+      model: 'manual/changed#low',
+    };
+    const resumed = wrapSessionPresetSubagent({
+      presets,
+      capture: async () => ({ bundle: f.bundle('B'), explicitModel: true }),
+      execute: async (args, raw) => {
+        expect(args).toBe(resumedInput);
+        await (raw as { progress: (data: unknown) => Promise<void> }).progress({
+          sessionID: 'child',
+          status: 'running',
+        });
+        return 'resumed';
+      },
+    });
+    expect(await resumed(resumedInput, context)).toBe('resumed');
+    expect((await presets.ensure('child')).bundle).toEqual(f.bundle('A'));
+    const switches: unknown[] = [];
+    const bridge = createSessionProfileBridge({
+      profiles: () => f.bundle('B').profiles,
+      profilesForSession: async (id) =>
+        (await presets.ensure(id)).bundle.profiles,
+      preserveSessionModel: (id) => presets.peek(id)?.preserveModel === true,
+      pluginAgents: new Set(['explorer']),
+      registeredProfiles: f.bundle('B').profiles,
+      session: {
+        switchModel: async (args: unknown) => {
+          switches.push(args);
+        },
+      } as never,
+    });
+    await bridge.ensureSessionProfile('child', {
+      parentID: 'root',
+      agent: 'explorer',
+      model: f.bundle('B').profiles.explorer.model,
+    });
+    expect(switches).toEqual([]);
+    expect(bridge.profileForSession('child')?.temperature).toBe(0.1);
+    // Explicit cross-provider launches and cross-provider fallback requests
+    // keep generic temperature, but never carry test-vendor reasoning keys.
+    const profile = {
+      ...bridge.profileForSession('child'),
+      managedProviderOptionKeys: ['reasoning', 'registeredKey'],
+    };
+    for (const providerID of ['test', 'manual', 'backup']) {
+      const event = {
+        sessionID: 'child',
+        agent: 'explorer',
+        model: { providerID, id: 'selected' },
+        options: {
+          reasoning: 'stale-preset',
+          registeredKey: 'stale-baseline',
+          native: true,
+          temperature: 0.9,
+        },
+      } as unknown as V2SessionContextEvent;
+      applyRuntimeProfileOptions(event, profile, child);
+      expect(event.options).toEqual({
+        native: true,
+        temperature: 0.1,
+        ...(providerID === 'test' ? { reasoning: 'A' } : {}),
+      });
+    }
+    expect(profile.model?.providerID).toBe('test');
+    const genericTemperature = {
+      model: { providerID: 'test' },
+      options: {},
+    } as unknown as V2SessionContextEvent;
+    applyRuntimeProfileOptions(
+      genericTemperature,
+      {
+        ...profile,
+        providerOptions: { ...profile.providerOptions, temperature: 99 },
+        managedProviderOptionKeys: [
+          ...profile.managedProviderOptionKeys,
+          'temperature',
+        ],
+      },
+      child,
+    );
+    expect(genericTemperature.options?.temperature).toBe(0.1);
+    const { model: _model, ...inherited } = profile;
+    const inheritedEvent = {
+      model: { providerID: 'test' },
+      options: {},
+    } as unknown as V2SessionContextEvent;
+    applyRuntimeProfileOptions(inheritedEvent, inherited, {
+      inheritedProviderID: 'test',
+    });
+    expect(inheritedEvent.options).toEqual({
+      temperature: 0.1,
+      reasoning: 'A',
+    });
+    const legacyEvent = {
+      model: { providerID: 'manual' },
+      options: {},
+    } as unknown as V2SessionContextEvent;
+    applyRuntimeProfileOptions(legacyEvent, profile);
+    expect(legacyEvent.options).toEqual({ temperature: 0.1, reasoning: 'A' });
+    await presets.dispose();
+  });
+
+  test('storage failure, cancellation and retired generation cannot pass the native progress prompt barrier', async () => {
+    for (const failure of ['storage', 'cancel', 'retired']) {
+      const f = fixture();
+      const presets = f.create();
+      const bundle = (await presets.ensure('root')).bundle;
+      const abort = new AbortController();
+      let prompted = false;
+      let progressed = false;
+      const execute = wrapSessionPresetSubagent({
+        presets,
+        capture: async () => ({ bundle, explicitModel: false }),
+        execute: async (_args, raw) => {
+          f.parents.set('child', 'root');
+          if (failure === 'storage')
+            f.storage.set = async () => {
+              throw new Error('disk unavailable');
+            };
+          if (failure === 'cancel') abort.abort();
+          if (failure === 'retired') await presets.dispose();
+          await (
+            raw as { progress: (data: unknown) => Promise<void> }
+          ).progress({ sessionID: 'child', status: 'running' });
+          prompted = true;
+        },
+      });
+      await expect(
+        execute(
+          {},
+          {
+            sessionID: 'root',
+            id: 'call',
+            signal: abort.signal,
+            progress: async () => {
+              progressed = true;
+            },
+          },
+        ),
+      ).rejects.toThrow();
+      expect(prompted).toBe(false);
+      expect(progressed).toBe(false);
+      await presets.dispose();
+    }
+    // A KV write already underway must drain before the old generation's
+    // disposal resolves; its late completion may not open the prompt gate.
+    const f = fixture();
+    const presets = f.create();
+    const bundle = (await presets.ensure('root')).bundle;
+    f.parents.set('child', 'root');
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const originalSet = f.storage.set;
+    f.storage.set = async (key, value) => {
+      entered.resolve();
+      await release.promise;
+      await originalSet(key, value);
+    };
+    let progressed = false;
+    const execute = wrapSessionPresetSubagent({
+      presets,
+      capture: async () => ({ bundle, explicitModel: false }),
+      execute: async (_input, raw) => {
+        await (raw as { progress: (data: unknown) => Promise<void> }).progress({
+          sessionID: 'child',
+          status: 'running',
+        });
+        throw new Error('prompt barrier was bypassed');
+      },
+    });
+    const outcome = execute(
+      {},
+      {
+        sessionID: 'root',
+        id: 'call',
+        signal: new AbortController().signal,
+        progress: async () => {
+          progressed = true;
+        },
+      },
+    ).catch((error: Error) => error);
+    await entered.promise;
+    let drained = false;
+    const dispose = presets.dispose().then(() => {
+      drained = true;
+    });
+    expect(drained).toBe(false);
+    release.resolve();
+    expect(String(await outcome)).toContain('retired');
+    await dispose;
+    expect(progressed).toBe(false);
+    expect(presets.peek('child')).toBeUndefined();
+    const restarted = f.create();
+    expect((await restarted.ensure('child')).bundle).toEqual(f.bundle('A'));
+    await restarted.dispose();
+  });
+});
 
 describe('createSessionProfileBridge', () => {
   test('captures a newly seen plugin child and switches its model', async () => {

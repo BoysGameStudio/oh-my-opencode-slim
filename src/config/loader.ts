@@ -61,6 +61,9 @@ export interface ConfigLoadWarning {
   kind: ConfigLoadWarningKind;
   message: string;
   formatted?: unknown;
+  /** Only per-preset inheritance-resolution failures carry this scope.
+   * File/layer validation failures must remain unscoped. */
+  presetName?: string;
 }
 
 /**
@@ -87,6 +90,9 @@ export interface LoadPluginConfigOptions {
    * Unmarked hosts also use v1's worktree-bounded discovery.
    */
   hostFlavor?: string;
+  /** Select a preset for this read only, without creating a runtime agent
+   * override. Ancestors < child preset < root agents remains unchanged. */
+  presetName?: string;
 }
 
 const PROMPTS_DIR_NAME = 'oh-my-opencode-slim';
@@ -846,6 +852,9 @@ export function loadPluginConfig(
   if (envPreset) {
     config.preset = envPreset;
   }
+  if (options?.presetName !== undefined) {
+    config.preset = options.presetName;
+  }
 
   // Resolve presets independently. An invalid, unused preset must not prevent
   // valid presets from being selected. A failed chain is omitted completely,
@@ -884,6 +893,7 @@ export function loadPluginConfig(
             '',
           kind: 'invalid-schema',
           message,
+          presetName: name,
         });
         if (!options?.silent) {
           console.warn(`[oh-my-opencode-slim] ${message}`);

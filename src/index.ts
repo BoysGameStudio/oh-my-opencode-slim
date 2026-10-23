@@ -36,7 +36,7 @@ import {
   DEFAULT_MAX_SESSION_METADATA_ENTRIES,
   TOAST_DURATION_MS,
 } from './config/constants';
-import type { ConfigLoadWarningKind } from './config/loader';
+import type { ConfigLoadWarning, ConfigLoadWarningKind } from './config/loader';
 import { RuntimeConfig } from './config/runtime';
 import { getBuildInfo } from './generated/build-info';
 import { HEALTH_CHECK, minimumExpectedToolCount } from './health-check';
@@ -196,6 +196,7 @@ import {
   isInternalAdmission,
   recordInternalAdmission,
 } from './v2/internal-admissions';
+import type { SessionTeamBundle } from './v2/session-presets';
 
 /**
  * Best-effort log to opencode's app logger.
@@ -328,6 +329,7 @@ export type V2ProfileRefreshResult =
       ok: true;
       profiles: AgentRuntimeProfiles;
       projection: AgentModelProjection;
+      bundle: SessionTeamBundle;
     }
   | { ok: false; reason: string };
 
@@ -589,6 +591,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let chatHeadersHook: ReturnType<typeof createChatHeadersHook> | undefined;
   let foregroundFallback: ForegroundFallbackManager;
   let foregroundFallbackChains: Record<string, ModelChainEntry[]> = {};
+  let sessionTeamFor:
+    | ((sessionID: string) => SessionTeamBundle | undefined)
+    | undefined;
   let selectedMarketplacePackageIds: readonly string[] = [];
   let deepworkCommandHook: ReturnType<typeof createDeepworkCommandHook>;
   let deepworkGuardHook: ReturnType<typeof createDeepworkGuardHook>;
@@ -734,10 +739,19 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   const resolveDelegatedModelForParent = (
     agentType: string,
     parentSessionID?: string,
+    capturedBundle?: SessionTeamBundle | null,
   ): DelegatedModelSelection | undefined => {
     if (!parentSessionID) return undefined;
     const agentName = resolveRuntimeAgentName(runtime, agentType);
-    const inheritance = runtime.agent(agentName)?.inheritModelFrom;
+    const bundle =
+      capturedBundle === undefined
+        ? hostFlavor === 'v2'
+          ? sessionTeamFor?.(parentSessionID)
+          : undefined
+        : capturedBundle;
+    const inheritance = bundle
+      ? (bundle.inheritance[agentType] ?? bundle.inheritance[agentName])
+      : runtime.agent(agentName)?.inheritModelFrom;
     const followsParent =
       inheritance === 'orchestrator' || inheritance === 'session';
     return selectDelegatedModel({
@@ -746,7 +760,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // generation at launch (the same generation as its frozen profile),
       // while the parent's downProviders are provider names and carry over
       // across generations unchanged.
-      childChain: foregroundFallbackChains[agentName],
+      childChain: bundle
+        ? bundle.fallbackEnabled
+          ? (bundle.chains[agentType] ?? bundle.chains[agentName])
+          : undefined
+        : foregroundFallbackChains[agentName],
       followsParent,
       // External-selection metadata deliberately ignores internal fallback
       // replays (#1079). Delegation needs the opposite view: the model
@@ -755,6 +773,32 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       parentModel: liveSessionModel(parentSessionID),
       activeFallback: foregroundFallback?.getActiveFallback(parentSessionID),
     });
+  };
+
+  const getModelForAgent = (agentType: string, parentSessionID?: string) => {
+    const bundle =
+      hostFlavor === 'v2' && parentSessionID
+        ? sessionTeamFor?.(parentSessionID)
+        : undefined;
+    const delegated = resolveDelegatedModelForParent(
+      agentType,
+      parentSessionID,
+      bundle ?? null,
+    );
+    if (delegated) return delegated.entry.id;
+    // One admission view, after the host's agent layers have been finalized.
+    if (bundle && parentSessionID) {
+      const profile =
+        bundle.profiles[agentType] ??
+        bundle.profiles[resolveRuntimeAgentName(runtime, agentType)];
+      return profile?.model
+        ? `${profile.model.providerID}/${profile.model.id}`
+        : liveSessionModel(parentSessionID);
+    }
+    return (
+      resolvePrimaryModelFromFinalHostConfig(agentType) ??
+      (parentSessionID ? sessionMetadata.getModel(parentSessionID) : undefined)
+    );
   };
 
   const registerV1DelegatedIntent = (
@@ -1174,23 +1218,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           taskID,
           generation,
         ) === true,
-      getModelForAgent: (agentType: string, parentSessionID?: string) => {
-        const delegated = resolveDelegatedModelForParent(
-          agentType,
-          parentSessionID,
-        );
-        if (delegated) return delegated.entry.id;
-
-        // Admission must use the config after the host has merged all of its
-        // agent layers. The direct lookup preserves display-name keys; the
-        // resolved lookup handles canonical names and legacy aliases.
-        return (
-          resolvePrimaryModelFromFinalHostConfig(agentType) ??
-          (parentSessionID
-            ? sessionMetadata.getModel(parentSessionID)
-            : undefined)
-        );
-      },
+      getModelForAgent,
       sameProviderPolicy: runtime.backgroundJobs.sameProviderPolicy,
       getSessionModel: liveSessionModel,
       recoverRetainedSession,
@@ -1334,19 +1362,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         sessionMetadata.markTaskManaged(sessionID);
       },
       backgroundTaskConcurrency,
-      getModelForAgent: (agentType: string, parentSessionID?: string) => {
-        const delegated = resolveDelegatedModelForParent(
-          agentType,
-          parentSessionID,
-        );
-        if (delegated) return delegated.entry.id;
-        return (
-          resolvePrimaryModelFromFinalHostConfig(agentType) ??
-          (parentSessionID
-            ? sessionMetadata.getModel(parentSessionID)
-            : undefined)
-        );
-      },
+      getModelForAgent,
       onRecoveredTerminal: async (parentSessionID, taskID) => {
         const record = backgroundJobCoordinator.get(taskID);
         if (!record) return false;
@@ -2089,37 +2105,67 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     /** Startup has no last-good table yet; use the loader's normal fallback
      * config so malformed user input remains non-fatal for this generation. */
     allowInvalidFallback?: boolean;
+    presetName?: string;
+    detached?: boolean;
   }): Promise<V2ProfileRefreshResult> => {
     try {
       // Malformed config handling: collect warnings and abort BEFORE any
       // resolution or sidebar rewrite when the load is invalid. The loader
       // falls back to `{}` for invalid JSON/schema, which would otherwise
       // report a successful "refresh" that wipes every profile/model.
-      const hardWarnings: string[] = [];
+      const hardWarnings: ConfigLoadWarning[] = [];
       const freshConfig = loadPluginConfig(ctx.directory, {
         hostFlavor,
+        ...(options?.presetName ? { presetName: options.presetName } : {}),
         silent: true,
         onWarning: (warning) => {
           if (HARD_PROFILE_REFRESH_WARNING_KINDS.has(warning.kind)) {
-            hardWarnings.push(
-              `${warning.kind} (${warning.path}): ${warning.message}`,
-            );
+            hardWarnings.push(warning);
           }
         },
       });
-      if (hardWarnings.length > 0 && !options?.allowInvalidFallback) {
-        const reason = `config load failed: ${hardWarnings.join('; ')}`;
+      // The loader omits each broken inheritance chain independently. Only
+      // named, successfully resolved selections may ignore those unrelated
+      // diagnostics; layer/schema/image-routing failures remain fatal. Keep
+      // the normal watcher policy unchanged.
+      const selectedResolved =
+        options?.presetName &&
+        Object.hasOwn(freshConfig.presets ?? {}, options.presetName);
+      const blockingWarnings = hardWarnings.filter(
+        (warning) =>
+          !(
+            options?.detached &&
+            selectedResolved &&
+            warning.kind === 'invalid-schema' &&
+            warning.presetName !== undefined &&
+            warning.presetName !== options.presetName
+          ),
+      );
+      if (blockingWarnings.length > 0 && !options?.allowInvalidFallback) {
+        const reason = `config load failed: ${blockingWarnings.map((warning) => `${warning.kind} (${warning.path}): ${warning.message}`).join('; ')}`;
         log('[plugin] runtime profile refresh from disk failed', reason);
         return { ok: false, reason };
       }
-      const freshRuntime = RuntimeConfig.create(ctx.directory, freshConfig);
+      if (
+        options?.presetName &&
+        !Object.hasOwn(freshConfig.presets ?? {}, options.presetName)
+      ) {
+        return { ok: false, reason: `Unknown preset: ${options.presetName}` };
+      }
+      const freshRuntime = RuntimeConfig.createDetached(
+        ctx.directory,
+        freshConfig,
+        hostFlavor,
+      );
       const hostSnapshot = runtime.host();
       if (hostSnapshot) {
         freshRuntime.captureHostConfig(hostSnapshot);
       }
       // Mirror factory init: a persisted runtime preset (in-session switch)
       // survives the reload and wins over the config-file preset.
-      const runtimePresetName = runtime.getRuntimePreset();
+      const runtimePresetName = options?.presetName
+        ? undefined
+        : runtime.getRuntimePreset();
       let runtimePreset: Preset | undefined;
       if (runtimePresetName && freshConfig.presets?.[runtimePresetName]) {
         freshRuntime.setRuntimePreset(runtimePresetName);
@@ -2133,16 +2179,162 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         freshRuntime,
         freshAgentDefs,
       );
+      // Keep the finalized roster (including marketplace agents), but resolve
+      // only inference overrides. No package/resource activation occurs here.
+      const marketplaceInheritance: SessionTeamBundle['inheritance'] = {};
+      for (const [name, registered] of Object.entries(
+        resolvedAgentRegistry?.getSdkAgentProjection() ?? {},
+      )) {
+        const manifestBase =
+          resolvedAgentRegistry?.marketplaceInferenceBase[name];
+        if (Object.hasOwn(freshAgents, name) && !manifestBase) continue;
+        const base = (manifestBase ?? registered) as Record<string, unknown>;
+        const override = freshRuntime.agent(name);
+        const inference: Record<string, unknown> = {};
+        for (const field of [
+          'model',
+          'variant',
+          'temperature',
+          'options',
+        ] as const) {
+          const value =
+            field === 'options'
+              ? deepMerge(
+                  base.options as Record<string, unknown> | undefined,
+                  override?.options,
+                )
+              : (override?.[field] ?? base[field]);
+          if (value !== undefined) inference[field] = value;
+        }
+        if (Array.isArray(inference.model)) {
+          const head = inference.model[0];
+          inference.model = typeof head === 'string' ? head : head?.id;
+          if (
+            typeof head === 'object' &&
+            head?.variant &&
+            override?.variant === undefined
+          )
+            inference.variant = head.variant;
+        }
+        const source =
+          override?.inheritModelFrom ??
+          (override?.model === undefined
+            ? manifestBase?.inheritModelFrom
+            : undefined);
+        if (
+          source &&
+          (override?.model === undefined ||
+            Array.isArray(override.model) ||
+            freshRuntime.combinedModelInheritanceSource(name))
+        ) {
+          marketplaceInheritance[name] = source;
+          delete inference.model;
+          if (override?.variant === undefined) delete inference.variant;
+        }
+        (freshAgents as Record<string, unknown>)[name] = inference;
+      }
+      const hostInference = Object.fromEntries(
+        Object.entries(hostSnapshot?.agent ?? {}).map(([name, config]) => {
+          const host = config as Record<string, unknown>;
+          const request = host.request as
+            | { body?: Record<string, unknown> }
+            | undefined;
+          return [
+            name,
+            {
+              ...host,
+              ...(request?.body
+                ? {
+                    options: deepMerge(
+                      host.options as Record<string, unknown> | undefined,
+                      request.body,
+                    ),
+                  }
+                : {}),
+            },
+          ];
+        }),
+      );
       const mergedAgents = mergeHostAgentConfigs(
         freshAgents as Record<string, Record<string, unknown>>,
-        hostSnapshot?.agent,
+        hostInference,
       );
+      // Resolve builtin/orchestrator package sources only after the shared
+      // host/display-name merge, using that same authoritative inference view.
+      for (const [name, base] of Object.entries(
+        resolvedAgentRegistry?.marketplaceInferenceBase ?? {},
+      )) {
+        if (!base.modelFrom || marketplaceInheritance[name]) continue;
+        const target = mergedAgents[name];
+        const source = mergedAgents[base.modelFrom];
+        if (!target || !source) continue;
+        for (const field of ['model', 'variant'] as const) {
+          if (target[field] === undefined && source[field] !== undefined)
+            target[field] = source[field];
+        }
+      }
       const { profiles, projection } = projectAgentRuntimeState({
         runtime: freshRuntime,
         agentDefs: freshAgentDefs,
         agentConfigs: mergedAgents,
         runtimePreset,
       });
+      const freshCandidates = resolvedAgentRegistry
+        ? {
+            ...resolvedAgentRegistry.modelCandidates,
+            ...resolvedAgentRegistry.marketplaceManifestChains,
+          }
+        : undefined;
+      const chains = buildChainGeneration(
+        freshRuntime,
+        freshAgentDefs,
+        freshCandidates,
+      );
+      const inheritance: SessionTeamBundle['inheritance'] = {};
+      const registered = resolvedAgentRegistry?.getSdkAgentProjection();
+      for (const name of Object.keys(profiles)) {
+        // Runtime presets cannot register new agents or expand resource policy.
+        if (registered && !Object.hasOwn(registered, name)) {
+          delete profiles[name];
+          delete chains[name];
+          continue;
+        }
+        const effective = freshRuntime.agent(name);
+        const source =
+          marketplaceInheritance[name] ?? effective?.inheritModelFrom;
+        if (
+          source &&
+          (effective?.model === undefined ||
+            Array.isArray(effective.model) ||
+            freshRuntime.combinedModelInheritanceSource(name))
+        )
+          inheritance[name] = source;
+        if (marketplaceInheritance[name] && !profiles[name].model)
+          profiles[name].sidebarModel = 'default';
+        if (
+          !freshRuntime.combinedModelInheritanceSource(name) &&
+          runtime.hasModelSwitched(name)
+        ) {
+          chains[name] = [];
+        }
+      }
+      // Display-name session identities share the canonical inference policy.
+      for (const [identity, canonical] of Object.entries(
+        resolvedAgentRegistry?.identities ?? {},
+      )) {
+        if (profiles[canonical]) profiles[identity] = profiles[canonical];
+        if (chains[canonical]) chains[identity] = chains[canonical];
+        if (inheritance[canonical])
+          inheritance[identity] = inheritance[canonical];
+      }
+      const bundle: SessionTeamBundle = {
+        presetName: freshRuntime.preset ?? null,
+        fallbackEnabled: freshRuntime.fallback.enabled,
+        profiles,
+        chains,
+        inheritance,
+      };
+      if (options?.detached) return { ok: true, profiles, projection, bundle };
       // Sidebar projection must land before the profiles are reported as
       // refreshed (the caller swaps only on an ok result).
       //
@@ -2177,18 +2369,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // Manifest chains overlay the startup candidates: a user override
       // removed since startup must fall back to the package's own chain,
       // not the stale merged candidates.
-      const freshCandidates = resolvedAgentRegistry
-        ? {
-            ...resolvedAgentRegistry.modelCandidates,
-            ...resolvedAgentRegistry.marketplaceManifestChains,
-          }
-        : undefined;
-      publishChainGeneration(
-        buildChainGeneration(freshRuntime, freshAgentDefs, freshCandidates),
-        freshRuntime,
-        (name) => runtime.hasModelSwitched(name),
+      publishChainGeneration(chains, freshRuntime, (name) =>
+        runtime.hasModelSwitched(name),
       );
-      return { ok: true, profiles, projection };
+      return { ok: true, profiles, projection, bundle };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       log('[plugin] runtime profile refresh from disk failed', reason);
@@ -2200,14 +2384,47 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   const resolveV2DelegatedModel = ({
     agentType,
     parentSessionID,
+    bundle,
+    parentModel,
   }: {
     agentType: string;
     parentSessionID: string;
+    bundle?: SessionTeamBundle | null;
+    parentModel?: { providerID: string; id: string; variant?: string };
   }) => {
-    const entry = resolveDelegatedModelForParent(
-      agentType,
-      parentSessionID,
-    )?.entry;
+    const agentName = resolveRuntimeAgentName(runtime, agentType);
+    const profile = bundle?.profiles[agentType] ?? bundle?.profiles[agentName];
+    const inheritance =
+      bundle?.inheritance[agentType] ?? bundle?.inheritance[agentName];
+    const selected = bundle
+      ? selectDelegatedModel({
+          agentName,
+          childChain: bundle.fallbackEnabled
+            ? (bundle.chains[agentType] ?? bundle.chains[agentName])
+            : undefined,
+          followsParent:
+            inheritance === 'session' || inheritance === 'orchestrator',
+          parentModel: parentModel
+            ? `${parentModel.providerID}/${parentModel.id}`
+            : liveSessionModel(parentSessionID),
+          activeFallback: foregroundFallback.getActiveFallback(parentSessionID),
+        })
+      : resolveDelegatedModelForParent(agentType, parentSessionID);
+    let entry =
+      selected?.entry ??
+      (profile?.model
+        ? {
+            id: `${profile.model.providerID}/${profile.model.id}`,
+            ...(profile.model.variant
+              ? { variant: profile.model.variant }
+              : {}),
+          }
+        : undefined);
+    if (selected?.inherited && entry) {
+      const variant =
+        profile?.sidebarVariant ?? parentModel?.variant ?? entry.variant;
+      entry = { id: entry.id, ...(variant ? { variant } : {}) };
+    }
     return entry?.variant ? `${entry.id}#${entry.variant}` : entry?.id;
   };
 
@@ -2236,6 +2453,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     'v2.refreshProfiles': refreshProfilesFromDisk,
     'v2.foreignTaskEvent': observeForeignTaskEvent,
     'v2.resolveDelegatedModel': resolveV2DelegatedModel,
+    'v2.setSessionTeamResolver': (resolver: typeof sessionTeamFor) => {
+      sessionTeamFor = resolver;
+    },
     // Per-instance background-default flip handle: v2 setup arms it after
     // its description rewrite verifies and disarms it with its teardown.
     'v2.backgroundDefaultFlip': backgroundDefaultFlip,
@@ -2243,8 +2463,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       foregroundFallback.handleV2Retry.bind(foregroundFallback),
     // v2-only extension hook: pin the chain generation in effect when a
     // child session registers — the same generation as its frozen profile.
-    'v2.pinSessionChains': (sessionID: string) => {
-      foregroundFallback.pinSessionChains(sessionID);
+    'v2.pinSessionChains': (
+      sessionID: string,
+      chains?: SessionTeamBundle['chains'],
+      enabled?: boolean,
+    ) => {
+      foregroundFallback.pinSessionChains(sessionID, chains, enabled);
     },
     // v2-only extension hook: release the pin when the admission that
     // captured it fails, so the retry pins the generation current then.
@@ -3433,8 +3657,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     'v2.foreignTaskEvent': typeof observeForeignTaskEvent;
     'v2.refreshProfiles': typeof refreshProfilesFromDisk;
     'v2.resolveDelegatedModel': typeof resolveV2DelegatedModel;
+    'v2.setSessionTeamResolver': (resolver: typeof sessionTeamFor) => void;
     'v2.backgroundDefaultFlip': BackgroundDefaultFlipState;
-    'v2.pinSessionChains': (sessionID: string) => void;
+    'v2.pinSessionChains': (
+      sessionID: string,
+      chains?: SessionTeamBundle['chains'],
+      enabled?: boolean,
+    ) => void;
     'v2.releaseSessionChains': (sessionID: string) => void;
   };
 
