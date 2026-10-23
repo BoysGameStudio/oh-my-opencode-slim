@@ -1,16 +1,513 @@
 import { describe, expect, test } from 'bun:test';
 import type { PluginInput } from '@opencode-ai/plugin';
+import { buildPluginInput } from '../v2/client-shim';
+import type { V2Context } from '../v2/types';
 import {
   attributeHostRoundToTranscript,
   classifyAssistantTurnEvidence,
   classifyTerminalEvidence,
   classifyV2HistoricalRound,
+  diagnosticExcerptOf,
   fetchChildTranscript,
   latestInputAtOf,
   stringifyError,
   terminalTextOf,
 } from './child-transcript';
 import { composeHostRound, hostRoundStateOf } from './session-runtime-status';
+
+describe('diagnostic excerpts', () => {
+  test('a full text part followed by ignored tool output is not character-truncated', () => {
+    const text = 'x'.repeat(2000);
+    const result = diagnosticExcerptOf({
+      data: [
+        { info: { role: 'user' }, parts: [] },
+        {
+          info: { role: 'assistant' },
+          parts: [
+            { type: 'tool', state: { status: 'completed' } },
+            { type: 'text', text },
+          ],
+        },
+      ],
+    });
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toBe(text);
+    expect(result.truncated).toBe('none');
+  });
+
+  test.each(['tool', 'assistant'])(
+    'a %s error clipped to whitespace still reports truncation',
+    (kind) => {
+      const error = `permission denied${' '.repeat(480)}`;
+      const result = diagnosticExcerptOf({
+        data: [
+          { info: { role: 'user' }, parts: [] },
+          {
+            info: {
+              role: 'assistant',
+              ...(kind === 'assistant' ? { error } : {}),
+            },
+            parts:
+              kind === 'tool'
+                ? [{ type: 'tool', state: { status: 'error', error } }]
+                : [],
+          },
+        ],
+      });
+      if (!('text' in result)) throw new Error('expected excerpt');
+      expect(result.truncated).toBe('chars');
+      expect(result.text).toContain('error details truncated');
+    },
+  );
+
+  test.each(['v1', 'v2'] as const)(
+    'failed-tool diagnostic preserves %s host errors without inputs or outputs',
+    async (flavor) => {
+      const parts = [
+        {
+          type: 'tool',
+          state: {
+            status: 'error',
+            input: { command: 'SECRET INPUT' },
+            error:
+              flavor === 'v2'
+                ? { type: 'tool', message: 'permission denied' }
+                : 'permission denied',
+            content: [{ type: 'text', text: 'SECRET FAILED CONTENT' }],
+          },
+        },
+        {
+          type: 'tool',
+          state: {
+            status: 'completed',
+            input: { command: 'SECRET INPUT' },
+            output: 'SECRET OUTPUT',
+            content: [{ type: 'text', text: 'SECRET SUCCESS CONTENT' }],
+          },
+        },
+      ];
+      const client =
+        flavor === 'v2'
+          ? buildPluginInput({
+              session: {
+                context: async () => [
+                  { id: 'input', type: 'user', time: 100, content: [] },
+                  {
+                    id: 'answer',
+                    type: 'assistant',
+                    time: 110,
+                    content: parts,
+                  },
+                ],
+              },
+            } as unknown as V2Context).client
+          : ({
+              session: {
+                messages: async () => ({
+                  data: [
+                    {
+                      info: { role: 'user', time: { created: 100 } },
+                      parts: [],
+                    },
+                    {
+                      info: { role: 'assistant', time: { created: 110 } },
+                      parts,
+                    },
+                  ],
+                }),
+              },
+            } as unknown as PluginInput['client']);
+      const transcript = await fetchChildTranscript(
+        client,
+        'child',
+        '/test',
+        100,
+      );
+      const result = diagnosticExcerptOf(transcript, { runStartedAt: 100 });
+      if (!('text' in result)) throw new Error('expected excerpt');
+      expect(result.text).toContain('tool_error: permission denied');
+      expect(result.text).not.toContain('SECRET');
+      expect(result.truncated).toBe('none');
+    },
+  );
+
+  test.each([false, true])(
+    'budget stop counts only unvisited entries (earlier assistant=%s)',
+    (earlierAssistant) => {
+      const result = diagnosticExcerptOf(
+        {
+          data: [
+            { info: { role: 'user', time: { created: 0 } }, parts: [] },
+            ...(earlierAssistant
+              ? [
+                  {
+                    info: { role: 'assistant', time: { created: 1 } },
+                    parts: [{ type: 'text', text: 'earlier step' }],
+                  },
+                ]
+              : []),
+            {
+              info: { role: 'assistant', time: { created: 2 } },
+              parts: [{ type: 'text', text: '界'.repeat(2000) }],
+            },
+          ],
+        },
+        { runStartedAt: 0, maxBytes: 1000 },
+      );
+      if (!('text' in result)) throw new Error('expected excerpt');
+      expect(result.omittedMessages).toBe(earlierAssistant ? 1 : 0);
+      expect(result.truncated).toBe(
+        earlierAssistant ? 'messages,chars' : 'chars',
+      );
+      if (earlierAssistant)
+        expect(result.text).toContain('1 earlier messages omitted');
+      else expect(result.text).not.toContain('earlier messages omitted');
+      expect(
+        new TextEncoder().encode(result.text).byteLength,
+      ).toBeLessThanOrEqual(1000);
+    },
+  );
+
+  test('budget truncation counts a pre-start boundary input only once', () => {
+    const result = diagnosticExcerptOf(
+      {
+        data: [
+          { info: { role: 'user', time: { created: 99 } }, parts: [] },
+          {
+            info: { role: 'assistant', time: { created: 110 } },
+            parts: [{ type: 'text', text: 'x'.repeat(200) }],
+          },
+        ],
+      },
+      { runStartedAt: 100, maxBytes: 100 },
+    );
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.omittedMessages).toBe(1);
+    expect(result.text).toContain('1 earlier messages omitted');
+    expect(result.truncated).toBe('messages,chars');
+    expect(
+      new TextEncoder().encode(result.text).byteLength,
+    ).toBeLessThanOrEqual(100);
+  });
+
+  test('real v2 compacted context reports omitted maintenance messages', async () => {
+    const input = buildPluginInput({
+      session: {
+        context: async () => [
+          { id: 'input', type: 'user', time: 10, content: [] },
+          { id: 'compact', type: 'compaction', status: 'completed' },
+          {
+            id: 'answer',
+            type: 'assistant',
+            time: 11,
+            content: [{ type: 'text', text: 'partial work' }],
+          },
+        ],
+      },
+    } as unknown as V2Context);
+    const transcript = await fetchChildTranscript(
+      input.client,
+      'child',
+      '/test',
+      100,
+    );
+    expect(transcript).toMatchObject({ page: { complete: false } });
+    const result = diagnosticExcerptOf(transcript);
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toContain('partial work');
+    expect(result.text).toContain('1 compaction messages omitted');
+    expect(result.truncated).toBe('messages');
+    expect(result.omittedMessages).toBe(1);
+  });
+  test.each(['user', 'synthetic'])(
+    'excerpts fence earlier runs at the latest real %s input',
+    (role) => {
+      const result = diagnosticExcerptOf({
+        data: [
+          { info: { role: 'user' }, parts: [] },
+          {
+            info: { role: 'assistant' },
+            parts: [{ type: 'text', text: 'STALE SUCCESS' }],
+          },
+          { info: { id: 'new-input', role }, parts: [] },
+          {
+            info: { role: 'assistant' },
+            parts: [{ type: 'text', text: 'current step' }],
+          },
+          { info: { role: 'user' }, parts: [{ type: 'compaction' }] },
+          { info: { role: 'system' }, parts: [] },
+          { info: { role: 'assistant', error: 'current failure' }, parts: [] },
+        ],
+      });
+      if (!('text' in result)) throw new Error('expected excerpt');
+      expect(result.text).not.toContain('STALE SUCCESS');
+      expect(result.text).toContain('current step');
+      expect(result.text).toContain('current failure');
+      expect(result.text).toContain('2 earlier messages omitted');
+      expect(result.omittedMessages).toBe(3);
+    },
+  );
+
+  test('excerpts fail closed when the bounded window has no real input', () => {
+    const result = diagnosticExcerptOf({
+      data: Array.from({ length: 41 }, (_, i) => ({
+        info: { role: i === 0 ? 'user' : 'assistant' },
+        parts: [{ type: 'text', text: 'unattributable output' }],
+      })),
+    });
+    expect(result).toEqual({
+      unavailable: 'latest input is outside the diagnostic message window',
+    });
+  });
+
+  test('v2 compaction source cannot fence an excerpt', () => {
+    const transcript = {
+      data: [
+        {
+          info: { id: 'compact', role: 'user', sourceType: 'compaction' },
+          parts: [],
+        },
+        { info: { role: 'assistant', error: 'failure' }, parts: [] },
+      ],
+    };
+    expect(diagnosticExcerptOf(transcript)).toHaveProperty('unavailable');
+  });
+
+  test('compaction triggers cannot fence an excerpt', () => {
+    expect(
+      diagnosticExcerptOf({
+        data: [
+          { info: { role: 'assistant', error: 'older failure' }, parts: [] },
+          {
+            info: { role: 'user' },
+            parts: [{ type: 'compaction', auto: false }],
+          },
+        ],
+      }),
+    ).toEqual({
+      unavailable: 'latest input is outside the diagnostic message window',
+    });
+  });
+
+  test('excerpts omit and label compaction triggers and generated summaries', () => {
+    const result = diagnosticExcerptOf({
+      data: [
+        { info: { role: 'user' }, parts: [] },
+        {
+          info: { role: 'assistant' },
+          parts: [{ type: 'text', text: 'actual child findings' }],
+        },
+        {
+          info: { role: 'user' },
+          parts: [
+            { type: 'compaction', auto: false },
+            { type: 'text', text: 'compact request' },
+          ],
+        },
+        {
+          info: { role: 'assistant', summary: true },
+          parts: [{ type: 'text', text: 'generated host summary' }],
+        },
+      ],
+    });
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toContain('actual child findings');
+    expect(result.text).not.toContain('generated host summary');
+    expect(result.text).not.toContain('compact request');
+    expect(result.text).toContain('[... 2 compaction messages omitted ...]');
+    expect(result.truncated).toBe('messages');
+    expect(result.omittedMessages).toBe(2);
+    expect(
+      new TextEncoder().encode(result.text).byteLength,
+    ).toBeLessThanOrEqual(6144);
+  });
+  test('diagnostic excerpts cap errors without serializing arbitrary error data', () => {
+    const result = diagnosticExcerptOf({
+      data: [
+        { info: { role: 'user' }, parts: [] },
+        {
+          info: {
+            role: 'assistant',
+            error: {
+              message: 'x'.repeat(100_000),
+              toJSON() {
+                throw new Error('must not serialize');
+              },
+            },
+          },
+          parts: Array.from({ length: 100 }, () => ({
+            type: 'text',
+            text: 'x'.repeat(100_000),
+          })),
+        },
+      ],
+    });
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.assistantError?.length).toBeLessThanOrEqual(480);
+    expect(
+      new TextEncoder().encode(result.text).byteLength,
+    ).toBeLessThanOrEqual(6144);
+  });
+  test.each(['text', 'assistant error', 'tool error', 'structured tool error'])(
+    'preserves surrogate pairs at intermediate %s boundaries',
+    (kind) => {
+      const text = `😀${'x'.repeat(kind === 'text' ? 1999 : 479)}`;
+      const entry = {
+        info: {
+          role: 'assistant',
+          ...(kind === 'assistant error' ? { error: { message: text } } : {}),
+        },
+        parts:
+          kind === 'text'
+            ? [{ type: 'text', text }]
+            : kind.endsWith('tool error')
+              ? [
+                  {
+                    type: 'tool',
+                    state: {
+                      status: 'error',
+                      error:
+                        kind === 'structured tool error'
+                          ? { type: 'tool', message: text }
+                          : text,
+                    },
+                  },
+                ]
+              : [],
+      };
+      for (const maxBytes of [6144, 2048, 97]) {
+        const result = diagnosticExcerptOf(
+          { data: [{ info: { role: 'user' }, parts: [] }, entry] },
+          { maxBytes },
+        );
+        if (!('text' in result)) throw new Error('expected excerpt');
+        if (kind === 'structured tool error' && maxBytes === 6144) {
+          expect(result.text).toContain('tool_error:');
+          expect(result.truncated).toBe('chars');
+        }
+        expect(
+          Array.from(result.text).some((character) => {
+            const code = character.codePointAt(0) ?? 0;
+            return code >= 0xd800 && code <= 0xdfff;
+          }),
+        ).toBe(false);
+        expect(
+          new TextDecoder().decode(new TextEncoder().encode(result.text)),
+        ).not.toContain('\uFFFD');
+        expect(
+          new TextEncoder().encode(result.text).byteLength,
+        ).toBeLessThanOrEqual(maxBytes);
+      }
+    },
+  );
+  test.each([
+    undefined,
+    { error: 'deleted' },
+    { data: 'not-array' },
+    { data: [null] },
+  ])('unavailable input is explicit, not thrown: %j', (response) => {
+    expect(diagnosticExcerptOf(response)).toHaveProperty('unavailable');
+  });
+  test('tail scan bounds ignored limit responses and marks omitted messages and character cuts', () => {
+    const result = diagnosticExcerptOf({
+      data: Array.from({ length: 100 }, (_, index) => ({
+        info: { role: index === 61 ? 'user' : 'assistant' },
+        parts: [{ type: 'text', text: `${index}: ${'界'.repeat(10_000)}` }],
+      })),
+    });
+    expect('text' in result).toBe(true);
+    if ('text' in result) {
+      expect(
+        new TextEncoder().encode(result.text).byteLength,
+      ).toBeLessThanOrEqual(6144);
+      expect(result.truncated).toBe('messages,chars');
+      expect(result.omittedMessages).toBeGreaterThanOrEqual(60);
+      expect(result.text).toContain('earlier messages omitted');
+      expect(result.text).toContain('[... truncated ...]');
+    }
+  });
+  test('assistant and failed-tool errors are labelled and capped; inputs and successful output are excluded', () => {
+    const result = diagnosticExcerptOf({
+      data: [
+        { info: { role: 'user' }, parts: [] },
+        {
+          info: {
+            role: 'assistant',
+            error: { data: { message: 'provider broke' } },
+          },
+          parts: [
+            {
+              type: 'tool',
+              state: {
+                status: 'completed',
+                input: 'SECRET INPUT',
+                output: 'SECRET OUTPUT',
+              },
+            },
+            {
+              type: 'tool',
+              state: {
+                status: 'error',
+                input: 'SECRET INPUT',
+                error: `${'x'.repeat(3000)}failed command`,
+              },
+            },
+            { type: 'text', text: 'partial answer' },
+          ],
+        },
+      ],
+    });
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toContain('assistant_error: provider broke');
+    expect(result.text).toContain('tool_error:');
+    expect(result.text).toContain('failed command');
+    expect(result.text).toContain('partial answer');
+    expect(result.text).not.toContain('SECRET');
+    expect(result.text.length).toBeLessThan(1000);
+    expect(result.truncated).toBe('chars');
+  });
+  test('a small transcript is untruncated and user input is never excerpted', () => {
+    expect(
+      diagnosticExcerptOf({
+        data: [
+          {
+            info: { role: 'user' },
+            parts: [{ type: 'text', text: 'private prompt' }],
+          },
+          {
+            info: { role: 'assistant' },
+            parts: [{ type: 'text', text: 'partial answer' }],
+          },
+        ],
+      }),
+    ).toEqual({
+      text: 'partial answer',
+      truncated: 'none',
+      omittedMessages: 0,
+    });
+  });
+  test('caps per-message work even when a host returns thousands of parts', () => {
+    const result = diagnosticExcerptOf({
+      data: [
+        { info: { role: 'user' }, parts: [] },
+        {
+          info: { role: 'assistant' },
+          parts: [
+            ...Array.from({ length: 10_000 }, () => ({
+              type: 'text',
+              text: 'older',
+            })),
+            { type: 'text', text: 'tail evidence' },
+          ],
+        },
+      ],
+    });
+    if (!('text' in result)) throw new Error('expected excerpt');
+    expect(result.text).toContain('tail evidence');
+    expect(result.text.length).toBeLessThanOrEqual(2040);
+    expect(result.truncated).toContain('chars');
+  });
+});
 
 // #1642's host-attribution cases, expressed through #1635's parser/composer
 // rather than restoring the superseded historical-round classifier.

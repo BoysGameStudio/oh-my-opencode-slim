@@ -18,6 +18,52 @@ orchestrator plans → dispatches background specialists → monitors → reconc
 
 This is a clean rebuild, not a compatibility layer over the old blocking model.
 
+## Inspecting unsuccessful children
+
+`task_status` with `diagnostic: true` provides a read-only, bounded, non-final
+excerpt for tracked error, cancelled, or stopped children. Startup recovery
+normally re-adopts restarted children with their historical run start on both
+hosts. An owned untracked handle instead returns ordinary read-only status and
+a notice that diagnostics require a tracked record; it gets no excerpt or extra
+transcript read. Foreign-parent handles are rejected. Running children are
+refused; completed children use `result: true`. Unavailable or ambiguous evidence
+is reported, not invented.
+The tool's rendered diagnostic response is limited to 6,144 UTF-8 bytes,
+including headers, errors, and truncation markers; plugin warnings may be
+appended separately. The fetch requests a limit and our own scans are bounded.
+The v2 paged route honours it; without that route, the shim fetches full context
+but selects only the newest requested entries before conversion. It checks
+compaction over the full raw context and marks compaction or dropped entries
+incomplete. V1 hosts may ignore the limit, but the excerpt scan stays bounded.
+Missing attribution outside the scan window means uncertainty.
+Failed-tool and assistant errors may appear;
+tool inputs and successful tool outputs do not.
+Attribution is timestamp-based: most runs lack recorded message identities.
+Excerpts start after the latest real input and exclude assistant messages from
+before the recorded run start. A delivered same-run queued message moves the
+excerpt boundary, omitting earlier output without changing the recorded
+generation or run start.
+Missing completion times or legacy times predating the final message cause
+conservative refusals. A timing-dependent host-finish/plugin-publication gap can show
+new-run output under the old generation. See the
+[diagnostic attribution limits](tools.md#background-task-control), including the
+identity-recording follow-up. Host compaction is omitted and labelled. Terminal
+reasons use recorded host error/outcome reasons, attributable assistant errors,
+or the state name, never stored partial findings.
+
+Diagnostic reads are not consumption, acknowledgement, or parent acceptance
+and do not replace the completion/acknowledgement flow. Observed state is the
+evidence currently available; execution completion ends the child's run;
+parent acceptance decides whether its outcome satisfies the assignment.
+The fixed next-step line says to await or re-delegate, not mark the task accepted.
+
+`last_activity_source` explains the unchanged activity timestamp:
+`observed-activity` is a tracker event (which may lag); `host-busy` is a coarse
+host observation beyond run start, not proof of progress; `launch-time` means
+no activity evidence beyond the run start time, not that nothing happened;
+`unknown` means no activity evidence. A session-keyed tracker entry can predate
+a revive. These labels are evidence provenance, not completion guarantees.
+
 ---
 
 ## Runtime Requirement

@@ -24,7 +24,7 @@ import {
   switchPresetOnDisk,
 } from '../tools/preset-switch';
 import type { TuiRouteView } from '../tui';
-import omoTui, { resolveRouteSessionId } from '../tui';
+import omoTui, { renderUpdateBadge, resolveRouteSessionId } from '../tui';
 import {
   KILL_ALL_COMMAND_ID,
   KILL_ALL_KEYBIND,
@@ -42,6 +42,7 @@ import {
   type V2PresetManagerContext,
   type V2PresetUiSurface,
 } from './preset-manager';
+import { registerUpdateNotice } from './update-notice';
 
 /** A keymap command as accepted by the host's `keymap.layer` reducer. */
 export interface V2KeymapCommand {
@@ -371,6 +372,16 @@ const plugin = {
         );
       }
     }
+
+    // Update notice (issue #1655): the server-side checker detects updates
+    // but has no UI channel on V2 — `client.tui.showToast` is a no-op in the
+    // shim — so the TUI owns the message. Scheduled off the startup path and
+    // silent on every failure; see ./update-notice.
+    disposers.push(
+      registerUpdateNotice(ctx, {
+        renderBadge: (latest, color) => renderUpdateBadge(latest, color),
+      }),
+    );
 
     return () => {
       for (const dispose of disposers.reverse()) dispose();

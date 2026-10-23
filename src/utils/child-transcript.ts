@@ -145,6 +145,284 @@ interface LooseMessage {
 
 export type TranscriptMessage = LooseMessage;
 
+export const DIAGNOSTIC_MAX_BYTES = 6_144;
+const DIAGNOSTIC_MESSAGE_CHARS = 2_000;
+const DIAGNOSTIC_ITEM_CHARS = 500;
+const DIAGNOSTIC_MESSAGE_PARTS = 100;
+const DIAGNOSTIC_MESSAGES = 40;
+
+/** Slice UTF-16 without splitting a surrogate pair at either boundary. */
+function diagnosticSlice(text: string, start: number, end?: number): string {
+  let sliced = text.slice(start, end);
+  if (/^[\uDC00-\uDFFF]/u.test(sliced)) sliced = sliced.slice(1);
+  if (/[\uD800-\uDBFF]$/u.test(sliced)) sliced = sliced.slice(0, -1);
+  return sliced;
+}
+
+/** Read only known error-message fields; never serialize arbitrary error data. */
+function diagnosticErrorText(error: unknown) {
+  const candidates =
+    typeof error === 'string'
+      ? [error]
+      : isRecord(error)
+        ? [isRecord(error.data) ? error.data.message : undefined, error.message]
+        : [];
+  let truncated = false;
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const text = diagnosticSlice(candidate, -480);
+    truncated ||= candidate.length > text.length;
+    if (text.trim()) return { text, truncated };
+  }
+  return truncated
+    ? { text: '[error details truncated]', truncated: true }
+    : undefined;
+}
+
+/** UTF-8-safe tail trimming, without allocating a copy of an unbounded string. */
+export function diagnosticTail(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return '';
+  let tail = diagnosticSlice(text, -maxBytes);
+  while (new TextEncoder().encode(tail).byteLength > maxBytes) {
+    tail = diagnosticSlice(tail, 1);
+  }
+  return tail;
+}
+
+/** Select before validation: even malformed older entries must not cause an
+ * unbounded walk. Parts are bounded before the shared parser inspects them. */
+function diagnosticWindow(response: unknown):
+  | { unavailable: string }
+  | {
+      entries: TranscriptMessage[];
+      omittedMessages: number;
+      partsTruncated: boolean;
+    } {
+  if (response === undefined)
+    return { unavailable: 'transcript source not exposed by host' };
+  if (responseError(response) !== undefined)
+    return { unavailable: 'transcript read failed' };
+  if (!isRecord(response) || !Array.isArray(response.data))
+    return { unavailable: 'malformed transcript response' };
+  const omittedMessages = Math.max(
+    0,
+    response.data.length - DIAGNOSTIC_MESSAGES,
+  );
+  let partsTruncated = false;
+  const data = response.data.slice(omittedMessages).map((entry: unknown) => {
+    if (!isRecord(entry) || !Array.isArray(entry.parts)) return entry;
+    if (entry.parts.length > DIAGNOSTIC_MESSAGE_PARTS) partsTruncated = true;
+    return {
+      info: entry.info,
+      parts: entry.parts.slice(-DIAGNOSTIC_MESSAGE_PARTS),
+    };
+  });
+  const entries = transcriptEntries({ data });
+  if (!Array.isArray(entries)) return { unavailable: entries.reason };
+  return { entries, omittedMessages, partsTruncated };
+}
+
+/** Keep v2 maintenance recognition local: ordinary terminal readers retain
+ * their existing host-specific classification contracts. */
+function isDiagnosticCompactionRound(message: TranscriptMessage): boolean {
+  return sourceTypeOf(message) === 'compaction' || isCompactionRound(message);
+}
+
+function diagnosticInputIndex(entries: TranscriptMessage[]): number {
+  return entries.findLastIndex(
+    (entry) =>
+      !isDiagnosticCompactionRound(entry) &&
+      ['user', 'synthetic'].includes(sourceTypeOf(entry) ?? ''),
+  );
+}
+
+/** Bounded, non-final assistant evidence. Never includes tool inputs or
+ * successful tool output. Validation uses the shared rules on the tail only. */
+export function diagnosticExcerptOf(
+  response: unknown,
+  options: {
+    maxBytes?: number;
+    runStartedAt?: number;
+    completedAt?: number;
+  } = {},
+):
+  | { unavailable: string }
+  | {
+      text: string;
+      truncated: string;
+      omittedMessages: number;
+      assistantError?: string;
+    } {
+  const window = diagnosticWindow(response);
+  if ('unavailable' in window) return { unavailable: window.unavailable };
+  const { entries } = window;
+  const { runStartedAt, completedAt } = options;
+  // The tracked reader always supplies this field, even when the record lacks
+  // a usable terminal time; standalone excerpt-only callers may omit it.
+  if ('completedAt' in options) {
+    if (typeof completedAt !== 'number' || !Number.isFinite(completedAt))
+      return { unavailable: 'recorded terminal time is unavailable' };
+    // Like the lower fence, this relies on the production shared-Unix-ms
+    // clock contract. Ignore maintenance, but never borrow later execution
+    // activity merely because native registration has not updated the board.
+    if (
+      entries.some((entry) => {
+        if (entry.info?.role === 'system' || isDiagnosticCompactionRound(entry))
+          return false;
+        const source = sourceTypeOf(entry);
+        const created = entry.info?.time?.created;
+        return (
+          ['user', 'synthetic', 'assistant'].includes(source ?? '') &&
+          typeof created === 'number' &&
+          Number.isFinite(created) &&
+          created > completedAt
+        );
+      })
+    )
+      return { unavailable: 'activity after the recorded terminal outcome' };
+  }
+  const boundary = diagnosticInputIndex(entries);
+  if (boundary < 0 && entries.length > 0)
+    return {
+      unavailable: 'latest input is outside the diagnostic message window',
+    };
+  if (runStartedAt !== undefined) {
+    // Native registration can follow the prompt, whereas revive captures its
+    // start before admission. Do not require the input to postdate registration
+    // or guess a launch-time tolerance. Only assistant creation in this run's
+    // time range is safe to excerpt; completion alone could belong to old work.
+    const assistants = entries
+      .slice(boundary + 1)
+      .filter(
+        (entry) =>
+          entry.info?.role === 'assistant' &&
+          !isDiagnosticCompactionRound(entry),
+      );
+    if (
+      !Number.isFinite(runStartedAt) ||
+      assistants.some(
+        (entry) =>
+          typeof entry.info?.time?.created !== 'number' ||
+          !Number.isFinite(entry.info.time.created),
+      )
+    )
+      return {
+        unavailable:
+          'tracked run attribution requires assistant creation timestamps',
+      };
+    if (
+      !assistants.some(
+        (entry) => (entry.info?.time?.created as number) >= runStartedAt,
+      )
+    )
+      return {
+        unavailable: 'no assistant evidence at or after the tracked run start',
+      };
+  }
+  let charsCut = window.partsTruncated;
+  const budget = Math.max(
+    0,
+    Math.min(DIAGNOSTIC_MAX_BYTES, options.maxBytes ?? DIAGNOSTIC_MAX_BYTES),
+  );
+  const chunks: string[] = [];
+  let omittedMessages = window.omittedMessages + Math.max(0, boundary);
+  const boundaryCounted =
+    runStartedAt !== undefined &&
+    typeof entries[boundary]?.info?.time?.created === 'number' &&
+    (entries[boundary].info?.time?.created as number) < runStartedAt;
+  if (boundaryCounted) omittedMessages++;
+  let compactionMessages = 0;
+  let assistantError: string | undefined;
+  let bytes = 0;
+  for (let index = entries.length - 1; index > boundary; index--) {
+    const entry = entries[index];
+    if (isDiagnosticCompactionRound(entry)) {
+      compactionMessages++;
+      continue;
+    }
+    if (entry.info?.role !== 'assistant') continue;
+    if (
+      runStartedAt !== undefined &&
+      (entry.info?.time?.created as number) < runStartedAt
+    ) {
+      omittedMessages++;
+      continue;
+    }
+    const pieces: string[] = [];
+    let chars = 0;
+    const add = (text: string, cap: number) => {
+      const room = Math.max(0, DIAGNOSTIC_MESSAGE_CHARS - chars);
+      const clipped =
+        room > 0 ? diagnosticSlice(text, -Math.min(room, cap)) : '';
+      if (text.length > clipped.length) charsCut = true;
+      if (clipped) {
+        pieces.unshift(clipped);
+        chars += clipped.length + 1;
+      }
+    };
+    const error = entry.info?.error;
+    const detail = diagnosticErrorText(error);
+    if (detail) {
+      assistantError ??= detail.text;
+      if (detail.truncated) charsCut = true;
+      add(`assistant_error: ${detail.text}`, DIAGNOSTIC_ITEM_CHARS);
+    }
+    const parts = entry.parts ?? [];
+    for (let partIndex = parts.length - 1; partIndex >= 0; partIndex--) {
+      const part = parts[partIndex];
+      if (!isRecord(part)) continue;
+      if (part.type === 'text' && typeof part.text === 'string')
+        add(part.text, DIAGNOSTIC_MESSAGE_CHARS);
+      if (
+        part.type === 'tool' &&
+        isRecord(part.state) &&
+        part.state.status === 'error'
+      ) {
+        const toolError = diagnosticErrorText(part.state.error);
+        if (toolError) {
+          if (toolError.truncated) charsCut = true;
+          add(`tool_error: ${toolError.text}`, DIAGNOSTIC_ITEM_CHARS);
+        }
+      }
+    }
+    const text = diagnosticSlice(pieces.join('\n'), -DIAGNOSTIC_MESSAGE_CHARS);
+    chunks.unshift(text);
+    bytes += new TextEncoder().encode(text).byteLength + 1;
+    if (bytes >= budget) {
+      omittedMessages += index - boundary - 1;
+      charsCut = true;
+      break;
+    }
+  }
+  const omitted =
+    (omittedMessages
+      ? `[... ${omittedMessages} earlier messages omitted ...]\n`
+      : '') +
+    (compactionMessages
+      ? `[... ${compactionMessages} compaction messages omitted ...]\n`
+      : '');
+  let text = chunks.filter(Boolean).join('\n\n');
+  const encoder = new TextEncoder();
+  if (encoder.encode(omitted + text).byteLength > budget) charsCut = true;
+  const marker = charsCut ? '[... truncated ...]\n' : '';
+  text =
+    omitted +
+    marker +
+    diagnosticTail(text, budget - encoder.encode(omitted + marker).byteLength);
+  return {
+    text: diagnosticTail(text, budget),
+    truncated:
+      [
+        omittedMessages || compactionMessages ? 'messages' : '',
+        charsCut ? 'chars' : '',
+      ]
+        .filter(Boolean)
+        .join(',') || 'none',
+    omittedMessages: omittedMessages + compactionMessages,
+    ...(assistantError ? { assistantError } : {}),
+  };
+}
+
 /** A v1 compaction round (its `compaction` trigger and the `summary: true`
  * reply) is host maintenance, not the specialist's work. */
 function isCompactionRound(message: TranscriptMessage): boolean {

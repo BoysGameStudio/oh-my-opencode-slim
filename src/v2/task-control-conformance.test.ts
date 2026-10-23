@@ -12,6 +12,7 @@ import { createRevivedRunTracker } from '../hooks/task-session-manager/revived-r
 import { createV1InterviewSessionRuntime } from '../interview/runtime';
 import { createTaskMessageTool } from '../tools/task-message';
 import { createTaskReviveTool } from '../tools/task-revive';
+import { createTaskStatusTool } from '../tools/task-status';
 import { BackgroundJobBoard } from '../utils/background-job-board';
 import { boardFixture } from '../utils/background-job-fixture';
 import { createBackgroundJobTerminalGate } from '../utils/background-job-terminal-gate';
@@ -139,6 +140,433 @@ function harness(
 }
 
 describe('task controls through the real v2 client shim', () => {
+  test.each(
+    (['v1', 'v2'] as const).flatMap((flavor) =>
+      [
+        'new input',
+        'new input without assistant',
+        'new synthetic',
+        'new assistant',
+        'same run',
+        'same tick',
+        'host maintenance',
+        'missing terminal time',
+      ].map((scenario) => ({ flavor, scenario })),
+    ),
+  )(
+    'diagnostics refuse activity beyond the recorded terminal on %j',
+    async ({ flavor, scenario }) => {
+      const native: Array<Record<string, unknown>> = [
+        { id: 'input', type: 'user', time: 100, content: [] },
+        {
+          id: 'answer',
+          type: 'assistant',
+          time: scenario === 'same tick' ? 200 : 199,
+          content: [{ type: 'text', text: 'CURRENT PARTIAL' }],
+        },
+      ];
+      if (scenario.startsWith('new input') || scenario === 'new synthetic')
+        native.push({
+          id: 'new-input',
+          type: scenario === 'new synthetic' ? 'synthetic' : 'user',
+          time: 300,
+          content: [],
+        });
+      if (
+        scenario.startsWith('new ') &&
+        scenario !== 'new input without assistant'
+      )
+        native.push({
+          id: 'new-answer',
+          type: 'assistant',
+          time: 310,
+          content: [{ type: 'text', text: 'NEW RUN PARTIAL' }],
+        });
+      if (scenario === 'host maintenance')
+        native.push(
+          {
+            id: 'compact',
+            type: 'compaction',
+            status: 'completed',
+            time: 300,
+            content: [],
+          },
+          { id: 'idle', type: 'idle', time: 310, content: [] },
+        );
+      const input =
+        flavor === 'v2'
+          ? buildPluginInput({
+              session: { context: async () => native },
+            } as unknown as V2Context)
+          : ({
+              directory: '/test',
+              client: {
+                session: {
+                  messages: async () => ({
+                    data: native.map((message) => ({
+                      info: {
+                        id: message.id,
+                        role:
+                          message.type === 'idle'
+                            ? 'system'
+                            : ['compaction', 'synthetic'].includes(
+                                  String(message.type),
+                                )
+                              ? 'user'
+                              : message.type,
+                        ...(message.type === 'synthetic'
+                          ? { sourceType: 'synthetic' }
+                          : {}),
+                        time: { created: message.time },
+                      },
+                      parts:
+                        message.type === 'compaction'
+                          ? [{ type: 'compaction' }]
+                          : message.content,
+                    })),
+                  }),
+                },
+              },
+            } as unknown as PluginInput);
+      const board = new BackgroundJobBoard();
+      board.registerLaunch({
+        taskID: 'ses_child',
+        parentSessionID: 'parent',
+        agent: 'explorer',
+        now: 100,
+      });
+      boardFixture.updateStatus(board, {
+        taskID: 'ses_child',
+        state: 'error',
+        now: 200,
+      });
+      const job = board.get('ses_child');
+      if (!job) throw new Error('expected tracked record');
+      if (scenario === 'missing terminal time') job.completedAt = undefined;
+      const before = structuredClone(job);
+      const gate = createBackgroundJobTerminalGate({
+        input,
+        backgroundJobBoard: board,
+      });
+      dispose.push(() => gate.dispose());
+      const writes = [
+        spyOn(gate, 'capture'),
+        spyOn(gate, 'observe'),
+        spyOn(gate, 'reconcile'),
+        spyOn(board, 'markUsed'),
+      ];
+      const output = await createTaskStatusTool({
+        input,
+        backgroundJobBoard: board,
+        terminalGate: gate,
+      }).task_status.execute(
+        {
+          ...(flavor === 'v2'
+            ? { sessionID: 'ses_child' }
+            : { task_id: 'ses_child' }),
+          diagnostic: true,
+        },
+        context,
+      );
+      expect(output).toContain('generation: 1');
+      expect(output).not.toContain('NEW RUN PARTIAL');
+      if (scenario.startsWith('new '))
+        expect(output).toContain(
+          'evidence: unavailable (activity after the recorded terminal outcome)',
+        );
+      else if (scenario === 'missing terminal time')
+        expect(output).toContain(
+          'evidence: unavailable (recorded terminal time is unavailable)',
+        );
+      else {
+        expect(output).toContain('CURRENT PARTIAL');
+        expect(output).toContain('evidence: transcript');
+      }
+      for (const write of writes) expect(write).not.toHaveBeenCalled();
+      expect(board.get('ses_child')).toEqual(before);
+    },
+  );
+
+  test.each(
+    (['v1', 'v2'] as const).flatMap((flavor) =>
+      [
+        'textless failure',
+        'input before registration',
+        'missing time',
+        'only old evidence',
+      ].map((scenario) => ({ flavor, scenario })),
+    ),
+  )(
+    'tracked diagnostics bind the board run on %j',
+    async ({ flavor, scenario }) => {
+      const native = [
+        { id: 'old-input', type: 'user', time: 10, content: [] },
+        {
+          id: 'old-answer',
+          type: 'assistant',
+          time: 20,
+          content: [{ type: 'text', text: 'STALE SUCCESS' }],
+        },
+        ...(scenario === 'input before registration'
+          ? // Native after-hook registration can follow the input.
+            [{ id: 'new-input', type: 'user', time: 99, content: [] }]
+          : []),
+        ...(scenario === 'only old evidence'
+          ? []
+          : [
+              {
+                id: 'step',
+                type: 'assistant',
+                time: scenario === 'missing time' ? undefined : 110,
+                content: [
+                  { type: 'tool', state: { status: 'completed' } },
+                  ...(scenario === 'input before registration'
+                    ? [{ type: 'text', text: 'CURRENT PARTIAL' }]
+                    : []),
+                ],
+              },
+              {
+                id: 'error',
+                type: 'assistant',
+                time: 120,
+                error: 'current failure',
+                content: [],
+              },
+            ]),
+      ];
+      const input =
+        flavor === 'v2'
+          ? buildPluginInput({
+              session: { context: async () => native },
+            } as unknown as V2Context)
+          : ({
+              directory: '/test',
+              client: {
+                session: {
+                  messages: async () => ({
+                    data: native.map((message) => ({
+                      info: {
+                        id: message.id,
+                        role: message.type,
+                        time: { created: message.time },
+                        error: 'error' in message ? message.error : undefined,
+                      },
+                      parts: message.content,
+                    })),
+                  }),
+                },
+              },
+            } as unknown as PluginInput);
+      const board = new BackgroundJobBoard();
+      board.registerLaunch({
+        taskID: 'ses_child',
+        parentSessionID: 'parent',
+        agent: 'explorer',
+        now: 1,
+      });
+      boardFixture.updateStatus(board, {
+        taskID: 'ses_child',
+        state: 'error',
+        now: 30,
+      });
+      const previous = board.get('ses_child');
+      if (!previous) throw new Error('expected previous run');
+      const lease = board.acquireRelaunchLease(
+        'ses_child',
+        previous.generation,
+      );
+      if (!lease) throw new Error('expected relaunch lease');
+      board.registerLaunch({
+        taskID: 'ses_child',
+        parentSessionID: 'parent',
+        agent: 'explorer',
+        now: 100,
+        relaunchLease: lease,
+      });
+      board.releaseLease(lease);
+      boardFixture.updateStatus(board, {
+        taskID: 'ses_child',
+        state: 'error',
+        now: 130,
+      });
+      const before = structuredClone(board.get('ses_child'));
+      expect(before?.generation).toBe(2);
+      const gate = createBackgroundJobTerminalGate({
+        input,
+        backgroundJobBoard: board,
+      });
+      dispose.push(() => gate.dispose());
+      const output = await createTaskStatusTool({
+        input,
+        backgroundJobBoard: board,
+        terminalGate: gate,
+      }).task_status.execute(
+        {
+          ...(flavor === 'v2'
+            ? { sessionID: 'ses_child' }
+            : { task_id: 'ses_child' }),
+          diagnostic: true,
+        },
+        context,
+      );
+      expect(output).toContain(`generation: ${before?.generation}`);
+      expect(output).not.toContain('STALE SUCCESS');
+      if (scenario === 'missing time' || scenario === 'only old evidence') {
+        expect(output).toContain('excerpt: none (evidence unavailable)');
+        expect(output).toContain('tracked run');
+      } else {
+        expect(output).toContain('assistant_error: current failure');
+        expect(output).toContain('earlier messages omitted');
+        if (scenario === 'textless failure')
+          expect(output).toContain('2 earlier messages omitted');
+        if (scenario === 'input before registration')
+          expect(output).toContain('CURRENT PARTIAL');
+      }
+      expect(board.get('ses_child')).toEqual(before);
+    },
+  );
+
+  test.each(
+    (['v1', 'v2'] as const).flatMap((flavor) =>
+      [true, false].map((partial) => ({ flavor, partial })),
+    ),
+  )(
+    'read-only diagnostics fence runs on %j failed and interrupted children',
+    async ({ flavor, partial }) => {
+      for (const outcome of ['failed', 'interrupted']) {
+        const host = {
+          get: mock(async () => ({
+            id: 'ses_child',
+            parentID: 'parent',
+            outcome,
+            time: { idle: 20 },
+          })),
+          context: mock(async () => [
+            {
+              id: 'old-input',
+              type: 'user',
+              time: 1,
+              content: [],
+            },
+            {
+              id: 'old-answer',
+              type: 'assistant',
+              time: 2,
+              content: [{ type: 'text', text: 'STALE SUCCESS' }],
+            },
+            {
+              id: 'user',
+              type: 'user',
+              time: 10,
+              content: [{ type: 'text', text: 'private input' }],
+            },
+            {
+              id: 'answer',
+              type: 'assistant',
+              time: 11,
+              content: partial ? [{ type: 'text', text: 'partial work' }] : [],
+            },
+          ]),
+          prompt: mock(async () => ({})),
+          interrupt: mock(async () => ({})),
+          synthetic: mock(async () => ({})),
+          wait: mock(async () => {}),
+        };
+        const input =
+          flavor === 'v2'
+            ? buildPluginInput({ session: host } as unknown as V2Context)
+            : ({
+                directory: '/test',
+                client: {
+                  session: {
+                    prompt: host.prompt,
+                    abort: host.interrupt,
+                    synthetic: host.synthetic,
+                    wait: host.wait,
+                    get: mock(async () => ({ data: await host.get() })),
+                    status: mock(async () => ({ data: {} })),
+                    messages: mock(async () => ({
+                      data: [
+                        { info: { role: 'user' }, parts: [] },
+                        {
+                          info: { role: 'assistant' },
+                          parts: [{ type: 'text', text: 'STALE SUCCESS' }],
+                        },
+                        {
+                          info: { role: 'user', time: { created: 10 } },
+                          parts: [],
+                        },
+                        {
+                          info: {
+                            role: 'assistant',
+                            error: 'child failed',
+                            time: { created: 11 },
+                          },
+                          parts: partial
+                            ? [{ type: 'text', text: 'partial work' }]
+                            : [],
+                        },
+                      ],
+                    })),
+                  },
+                },
+              } as unknown as PluginInput);
+        const board = new BackgroundJobBoard();
+        board.registerLaunch({
+          taskID: 'ses_child',
+          parentSessionID: 'parent',
+          agent: 'explorer',
+          now: 10,
+        });
+        boardFixture.updateStatus(board, {
+          taskID: 'ses_child',
+          state: 'error',
+          now: 20,
+        });
+        const gate = createBackgroundJobTerminalGate({
+          input,
+          backgroundJobBoard: board,
+        });
+        dispose.push(() => gate.dispose());
+        const capture = spyOn(gate, 'capture');
+        const observe = spyOn(gate, 'observe');
+        const reconcile = spyOn(gate, 'reconcile');
+        const output = await createTaskStatusTool({
+          input,
+          backgroundJobBoard: board,
+          terminalGate: gate,
+        }).task_status.execute(
+          {
+            ...(flavor === 'v2'
+              ? { sessionID: 'ses_child' }
+              : { task_id: 'ses_child' }),
+            diagnostic: true,
+          },
+          context,
+        );
+        expect(output).toContain('generation: 1');
+        expect(output).toContain('state: error');
+        expect(output).toContain('partial_output: true');
+        if (partial) expect(output).toContain('partial work');
+        expect(output).not.toContain('STALE SUCCESS');
+        expect(output).toContain('2 earlier messages omitted');
+        expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(
+          6144,
+        );
+        for (const fn of [
+          host.prompt,
+          host.get,
+          host.interrupt,
+          host.synthetic,
+          host.wait,
+          capture,
+          observe,
+          reconcile,
+        ])
+          expect(fn).not.toHaveBeenCalled();
+      }
+    },
+  );
   test.each([
     'disposed',
     'lease released',

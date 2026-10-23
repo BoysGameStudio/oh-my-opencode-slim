@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { createAliasAuthority } from '../hooks/task-session-manager/session-recovery';
 import {
   createToolLoopGuardHook,
@@ -12,6 +12,7 @@ import {
 } from '../utils/background-job-terminal-gate';
 import { buildPluginInput } from '../v2/client-shim';
 import { createCancelTaskTool } from './cancel-task';
+import { TaskActivityTracker } from './task-activity';
 import { createTaskMessageTool } from './task-message';
 import { createTaskStatusTool } from './task-status';
 
@@ -23,6 +24,7 @@ afterEach(() => {
 
 function makeTool(options: {
   board: BackgroundJobBoard;
+  activityTracker?: TaskActivityTracker;
   now?: () => number;
   statusTimeoutMs?: number;
   readTimeoutMs?: number;
@@ -49,6 +51,7 @@ function makeTool(options: {
     backgroundJobBoard: options.board,
     terminalGate,
     now: options.now,
+    activityTracker: options.activityTracker,
     statusTimeoutMs: options.statusTimeoutMs,
     readTimeoutMs: options.readTimeoutMs,
     resolveCanonicalTaskRef: options.resolveCanonicalTaskRef,
@@ -93,6 +96,7 @@ function makeResultTool(
     backgroundJobBoard: board,
     input,
     graceMs: 0,
+    now: () => 20,
   });
   statusGates.push(gate);
   const { task_status } = createTaskStatusTool({
@@ -156,6 +160,542 @@ function makeResultTool(
 }
 
 describe('task_status', () => {
+  test.each(
+    (['v1', 'v2'] as const).flatMap((flavor) =>
+      (['error', 'cancelled', 'stopped'] as const).map((state) => ({
+        flavor,
+        state,
+      })),
+    ),
+  )(
+    'tracked terminal reasons never borrow partial findings: %j',
+    async ({ flavor, state }) => {
+      const h = makeResultTool(true, flavor);
+      await h.settle(state);
+      const job = h.board.get('ses_child1');
+      if (!job) throw new Error('expected tracked record');
+      job.resultSummary = 'PARTIAL FINDINGS';
+      job.lastStatusError = undefined;
+      const answer = {
+        info: {
+          role: 'assistant',
+          time: { created: 2 },
+          error: 'assistant failed' as string | undefined,
+        },
+        parts: [{ type: 'text', text: 'PARTIAL FINDINGS' }],
+      };
+      h.messages.mockResolvedValue({
+        data: [
+          { info: { role: 'user', time: { created: 1 } }, parts: [] },
+          answer,
+        ],
+      } as never);
+      const read = () =>
+        h.tool.execute({ task_id: 'ses_child1', diagnostic: true }, {
+          sessionID: 'parent-1',
+        } as never);
+      const output = await read();
+      expect(output).toContain('terminal_reason: assistant failed\n');
+      expect(output.slice(0, output.indexOf('excerpt_begin'))).not.toContain(
+        'PARTIAL FINDINGS',
+      );
+      expect(output.slice(output.indexOf('excerpt_begin'))).toContain(
+        'PARTIAL FINDINGS',
+      );
+      expect(output).toEndWith(
+        'next: treat this as non-final evidence; await or re-delegate, do not mark the task accepted',
+      );
+      answer.info.error = undefined;
+      expect(await read()).toContain(`terminal_reason: ${state}\n`);
+      job.lastStatusError = 'host error';
+      expect(await read()).toContain('terminal_reason: host error\n');
+      job.lastStatusError = undefined;
+      job.resultSummary = 'Host reported outcome: failed.';
+      answer.info.error = 'assistant failed';
+      expect(await read()).toContain(
+        'terminal_reason: Host reported outcome: failed.\n',
+      );
+    },
+  );
+
+  test('tool description stays status-focused and diagnostic parameter is concise', () => {
+    const h = makeResultTool();
+    expect(h.tool.description).not.toContain('diagnostic: true');
+    expect(h.tool.description).toContain(
+      'For an untracked session (e.g. after a restart), reports a read-only observed state.',
+    );
+    const description = h.tool.args.diagnostic.description ?? '';
+    expect(description).toContain('tracked');
+    expect(
+      new TextEncoder().encode(description).byteLength,
+    ).toBeLessThanOrEqual(135);
+  });
+
+  test.each([
+    'unknown',
+    'untracked status',
+    'foreign untracked',
+    'canonical refusal',
+    'resolver error',
+    'foreign tracked',
+    'running',
+    'completed',
+    'unavailable',
+    'race',
+  ])(
+    'bounds diagnostic errors and refusals with oversized references: %s',
+    async (kind) => {
+      const huge = `ses_${'a'.repeat(20_000)}`;
+      const detail = '💥'.repeat(20_000);
+      const board = new BackgroundJobBoard();
+      const tracked = [
+        'foreign tracked',
+        'running',
+        'completed',
+        'unavailable',
+        'race',
+      ].includes(kind);
+      if (tracked) {
+        board.registerLaunch({
+          taskID: huge,
+          parentSessionID: kind === 'foreign tracked' ? 'foreign' : 'parent-1',
+          agent: detail,
+          now: 0,
+        });
+        if (['completed', 'unavailable', 'race'].includes(kind))
+          boardFixture.updateStatus(board, {
+            taskID: huge,
+            state: kind === 'completed' ? 'completed' : 'error',
+            now: 10,
+          });
+      }
+      client = {
+        session: {
+          get: mock(async () => ({
+            data:
+              kind === 'foreign untracked'
+                ? { parentID: 'foreign' }
+                : kind === 'untracked status'
+                  ? { parentID: 'parent-1' }
+                  : {},
+          })),
+          messages: mock(async () => {
+            if (kind === 'race')
+              board.registerLaunch({
+                taskID: huge,
+                parentSessionID: 'parent-1',
+                agent: detail,
+                now: 20,
+              });
+            throw new Error(detail);
+          }),
+        },
+      };
+      const tool = makeTool({
+        board,
+        resolveCanonicalTaskRef: async () => {
+          if (kind === 'resolver error') throw new Error(detail);
+          return kind === 'canonical refusal'
+            ? { kind: 'refused', reason: detail }
+            : { kind: 'exact', taskID: huge };
+        },
+      }).task_status;
+      let rendered: string;
+      try {
+        rendered = await tool.execute({ task_id: huge, diagnostic: true }, {
+          sessionID: 'parent-1',
+        } as never);
+        expect([
+          'running',
+          'completed',
+          'unavailable',
+          'untracked status',
+        ]).toContain(kind);
+      } catch (error) {
+        rendered = String(error);
+        expect([
+          'unknown',
+          'foreign untracked',
+          'canonical refusal',
+          'resolver error',
+          'foreign tracked',
+          'race',
+        ]).toContain(kind);
+      }
+      expect(new TextEncoder().encode(rendered).byteLength).toBeLessThanOrEqual(
+        6144,
+      );
+      expect(rendered).toContain('[... truncated ...]');
+    },
+  );
+
+  test.each(['v1', 'v2'])(
+    'untracked diagnostic returns ordinary status with no excerpt read on %s',
+    async (flavor) => {
+      const h = makeResultTool(false, flavor);
+      const input = { info: { role: 'user', time: { created: 1 } }, parts: [] };
+      const answer = {
+        info: {
+          role: 'assistant',
+          time: { created: 2 },
+          error: 'child failed',
+        },
+        parts: [{ type: 'text', text: 'partial evidence' }],
+      };
+      h.get.mockResolvedValue({
+        data: { parentID: 'parent-1', outcome: 'failed', time: { idle: 3 } },
+      } as never);
+      h.messages.mockResolvedValue({
+        data: [input, answer],
+      } as never);
+      const args = { task_id: 'ses_child1' };
+      const context = { sessionID: 'parent-1' } as never;
+      const status = await h.tool.execute(args, context);
+      h.get.mockClear();
+      h.messages.mockClear();
+      const markUsed = spyOn(h.board, 'markUsed');
+      const output = await h.tool.execute(
+        { ...args, diagnostic: true },
+        context,
+      );
+      expect(output).toBe(
+        `${status}\nmessage: Diagnostics require a tracked task record.`,
+      );
+      expect(output).toContain(
+        `state: error (verified from ${flavor === 'v2' ? 'host state' : 'history'})`,
+      );
+      expect(output).not.toContain('partial evidence');
+      expect(output).not.toContain('excerpt_begin');
+      expect(h.get).toHaveBeenCalledTimes(1);
+      expect(h.messages).toHaveBeenCalledTimes(1);
+      expect(h.messages.mock.calls[0]?.[0]).toMatchObject({
+        query: { limit: undefined },
+      });
+      expect(markUsed).not.toHaveBeenCalled();
+      expect(h.board.get('ses_child1')).toBeUndefined();
+      markUsed.mockRestore();
+    },
+  );
+
+  test('ordinary untracked status and result preserve unlimited fetch defaults', async () => {
+    const h = makeResultTool(false);
+    const context = { sessionID: 'parent-1' } as never;
+    await h.tool.execute({ task_id: 'ses_child1' }, context);
+    await h.tool.execute({ task_id: 'ses_child1', result: true }, context);
+    expect(h.messages).toHaveBeenCalledTimes(2);
+    for (const [args] of h.messages.mock.calls)
+      expect(args).toMatchObject({ query: { limit: undefined } });
+  });
+  test.each(['observed-activity', 'host-busy', 'launch-time', 'unknown'])(
+    'activity provenance preserves timestamp: %s',
+    async (source) => {
+      const board = new BackgroundJobBoard();
+      const tracker = new TaskActivityTracker();
+      if (source !== 'unknown')
+        board.registerLaunch({
+          taskID: 'ses_child1',
+          parentSessionID: 'parent-1',
+          agent: 'explorer',
+          now: 100,
+        });
+      if (source === 'host-busy')
+        board.markRunningFromLiveSession('ses_child1', 150);
+      if (source === 'observed-activity') tracker.touch('ses_child1', 175);
+      client = {
+        session: {
+          get: mock(async () => ({ data: { parentID: 'parent-1' } })),
+          status: mock(async () => ({
+            data: { ses_child1: { type: 'busy' } },
+          })),
+        },
+      };
+      const tool = makeTool({
+        board,
+        activityTracker: tracker,
+        now: () => 200,
+      }).task_status;
+      const output = await tool.execute({ task_id: 'ses_child1' }, {
+        sessionID: 'parent-1',
+      } as never);
+      expect(output.match(/^last_activity_source: (.+)$/m)?.[1]).toBe(source);
+      if (source !== 'unknown')
+        expect(output).toContain(
+          `last_activity_at: ${new Date(source === 'observed-activity' ? 175 : source === 'host-busy' ? 150 : 100).toISOString()}`,
+        );
+      else expect(output).not.toContain('last_activity_at:');
+    },
+  );
+
+  test.each(['error', 'cancelled', 'stopped'] as const)(
+    'diagnostic serves %s without gate, board, or host writes',
+    async (state) => {
+      const h = makeResultTool();
+      await h.settle(state);
+      h.messages.mockResolvedValue({
+        data: [
+          { info: { role: 'user' }, parts: [] },
+          {
+            info: { role: 'assistant', time: { created: 10 } },
+            parts: [{ type: 'text', text: 'partial findings' }],
+          },
+        ],
+      } as never);
+      const captures = spyOn(h.gate, 'capture');
+      const observes = spyOn(h.gate, 'observe');
+      const reconciles = spyOn(h.gate, 'reconcile');
+      const markUsed = spyOn(h.board, 'markUsed');
+      const terminal = mock(() => {});
+      h.board.addTerminalStateListener(terminal);
+      const before = structuredClone(h.board.get('ses_child1'));
+      h.get.mockClear();
+      h.status.mockClear();
+      h.messages.mockClear();
+      const output = await h.tool.execute(
+        { task_id: 'exp-1', diagnostic: true },
+        { sessionID: 'parent-1' } as never,
+      );
+      for (const expected of [
+        `state: ${state}`,
+        'generation: 1',
+        'terminal_reason:',
+        'partial_output: true',
+        'excerpt_begin',
+        'partial findings',
+      ])
+        expect(output).toContain(expected);
+      expect(h.board.get('ses_child1')).toEqual(before);
+      for (const spy of [
+        captures,
+        observes,
+        reconciles,
+        markUsed,
+        terminal,
+        h.get,
+        h.status,
+      ])
+        expect(spy).not.toHaveBeenCalled();
+      expect(h.messages).toHaveBeenCalledTimes(1);
+      expect(h.messages.mock.calls[0]?.[0]).toMatchObject({
+        query: { limit: 100 },
+      });
+      captures.mockRestore();
+      observes.mockRestore();
+      reconciles.mockRestore();
+      markUsed.mockRestore();
+      h.board.removeTerminalStateListener(terminal);
+      if (state === 'error') {
+        const used = spyOn(h.board, 'markUsed');
+        await expect(h.execute()).rejects.toThrow('ended in error');
+        expect(used).toHaveBeenCalledTimes(1);
+        used.mockRestore();
+      }
+    },
+  );
+
+  test.each(['running', 'completed'] as const)(
+    'diagnostic refuses %s without reading transcript',
+    async (state) => {
+      const h = makeResultTool();
+      if (state === 'completed') await h.settle(state);
+      h.messages.mockClear();
+      const before = structuredClone(h.board.get('ses_child1'));
+      const output = await h.tool.execute(
+        { task_id: 'exp-1', diagnostic: true },
+        { sessionID: 'parent-1' } as never,
+      );
+      expect(output).toContain(`state: ${state}`);
+      expect(output).toContain(
+        state === 'completed' ? 'result: true' : 'finished-but-unsuccessful',
+      );
+      expect(h.messages).not.toHaveBeenCalled();
+      expect(h.board.get('ses_child1')).toEqual(before);
+    },
+  );
+
+  test('diagnostic mutual exclusion precedes all host I/O', async () => {
+    const h = makeResultTool();
+    await expect(
+      h.tool.execute({ task_id: 'exp-1', diagnostic: true, result: true }, {
+        sessionID: 'parent-1',
+      } as never),
+    ).rejects.toThrow('accepts either result or diagnostic, not both');
+    for (const fn of [h.get, h.status, h.messages])
+      expect(fn).not.toHaveBeenCalled();
+  });
+
+  test.each(['generation', 'publication', 'reopen', 'deleted'] as const)(
+    'diagnostic rejects a %s race during transcript read',
+    async (change) => {
+      const h = makeResultTool();
+      await h.settle('error');
+      h.messages.mockImplementation(async () => {
+        const job = h.board.get('ses_child1');
+        if (!job) throw new Error('expected tracked child');
+        if (change === 'generation') job.generation++;
+        if (change === 'publication') job.terminalRevision++;
+        if (change === 'reopen')
+          h.board.markRunningFromLiveSession(
+            job.taskID,
+            100,
+            job.generation,
+            job.terminalRevision,
+          );
+        if (change === 'deleted')
+          spyOn(h.board, 'get').mockReturnValue(undefined);
+        return { data: [] };
+      });
+      await expect(
+        h.tool.execute({ task_id: 'exp-1', diagnostic: true }, {
+          sessionID: 'parent-1',
+        } as never),
+      ).rejects.toThrow(
+        'changed generation while its diagnostic was being read',
+      );
+      if (change === 'deleted') (h.board.get as any).mockRestore();
+    },
+  );
+
+  test.each([true, false])(
+    'diagnostic rejects foreign ownership (tracked=%s)',
+    async (tracked) => {
+      const h = makeResultTool(tracked);
+      if (tracked) {
+        const job = h.board.get('ses_child1');
+        if (!job) throw new Error('expected tracked child');
+        job.parentSessionID = 'foreign';
+      } else h.get.mockResolvedValue({ data: { parentID: 'foreign' } });
+      await expect(
+        h.tool.execute({ task_id: 'ses_child1', diagnostic: true }, {
+          sessionID: 'parent-1',
+        } as never),
+      ).rejects.toThrow('does not belong to this session');
+      expect(h.messages).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([undefined, { data: 'not-array' }, { data: [] }])(
+    'diagnostic unavailable or empty evidence stays truthful: %j',
+    async (transcript) => {
+      const h = makeResultTool();
+      await h.settle('error');
+      h.messages.mockResolvedValue(transcript as never);
+      const output = await h.tool.execute(
+        { task_id: 'exp-1', diagnostic: true },
+        { sessionID: 'parent-1' } as never,
+      );
+      expect(output).toContain('state: error');
+      expect(output).toContain('evidence: unavailable');
+    },
+  );
+
+  test('whole rendered single-message diagnostic reports only character truncation within 6144 bytes', async () => {
+    const h = makeResultTool();
+    await h.settle('error');
+    h.messages.mockResolvedValue({
+      data: [
+        { info: { role: 'user', time: { created: 0 } }, parts: [] },
+        {
+          info: { role: 'assistant', time: { created: 1 } },
+          parts: [{ type: 'text', text: '界'.repeat(2000) }],
+        },
+      ],
+    } as never);
+    const output = await h.tool.execute(
+      { task_id: 'exp-1', diagnostic: true },
+      { sessionID: 'parent-1' } as never,
+    );
+    expect(output).toContain('excerpt_begin\n');
+    expect(output).toContain('truncated: chars\n');
+    expect(output).not.toContain('earlier messages omitted');
+    expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(
+      6144,
+    );
+  });
+
+  test('whole rendered diagnostic including huge reason and multibyte transcript fits 6144 bytes', async () => {
+    const h = makeResultTool();
+    await h.settle('error');
+    const job = h.board.get('ses_child1');
+    if (!job) throw new Error('expected tracked child');
+    job.lastStatusError = '💥'.repeat(100_000);
+    h.messages.mockResolvedValue({
+      data: Array.from({ length: 100 }, (_, index) => ({
+        info: {
+          role: index === 61 ? 'user' : 'assistant',
+          time: { created: index / 10 },
+        },
+        parts: [{ type: 'text', text: '💥'.repeat(100_000) }],
+      })),
+    } as never);
+    const read = () =>
+      h.tool.execute({ task_id: 'exp-1', diagnostic: true }, {
+        sessionID: 'parent-1',
+      } as never);
+    const output = await read();
+    expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(
+      6144,
+    );
+    expect(output).toContain('[... truncated ...]');
+    expect(output).toContain('truncated: messages,chars');
+    expect(await read()).toBe(output);
+  });
+
+  test.each(['child transcript read timed out', 'session deleted'])(
+    'diagnostic reports unavailable evidence on read failure: %s',
+    async (message) => {
+      const h = makeResultTool();
+      await h.settle('error');
+      h.messages.mockRejectedValue(new Error(message));
+      const output = await h.tool.execute(
+        { task_id: 'exp-1', diagnostic: true },
+        { sessionID: 'parent-1' } as never,
+      );
+      expect(output).toContain(`evidence: unavailable (${message})`);
+      expect(output).toContain('terminal_reason: error');
+      expect(output).not.toContain('excerpt_begin');
+      expect(new TextEncoder().encode(output).byteLength).toBeLessThanOrEqual(
+        6144,
+      );
+    },
+  );
+
+  test.each(['busy', 'unknown'])(
+    'untracked diagnostic keeps the ordinary live-status short circuit: %s',
+    async (kind) => {
+      const h = makeResultTool(false);
+      if (kind === 'busy')
+        h.status.mockResolvedValue({
+          data: { ses_child1: { type: 'busy' } },
+        } as never);
+      if (kind === 'unknown')
+        h.status.mockRejectedValue(new Error('status unreadable'));
+      const output = await h.tool.execute(
+        { task_id: 'ses_child1', diagnostic: true },
+        { sessionID: 'parent-1' } as never,
+      );
+      expect(output).not.toContain('partial_output: true');
+      expect(output).toContain(
+        kind === 'busy' ? 'state: busy (live)' : 'state: unknown (uncertain;',
+      );
+      expect(output).toContain('Diagnostics require a tracked task record.');
+      expect(h.messages).not.toHaveBeenCalled();
+      expect(h.board.get('ses_child1')).toBeUndefined();
+    },
+  );
+
+  test('diagnostic unavailable host endpoint retains terminal header', async () => {
+    const h = makeResultTool();
+    await h.settle('error');
+    (h.input as any).client.session.messages = undefined;
+    const output = await h.tool.execute(
+      { task_id: 'exp-1', diagnostic: true },
+      { sessionID: 'parent-1' } as never,
+    );
+    expect(output).toContain('state: error');
+    expect(output).toContain(
+      'evidence: unavailable (transcript source not exposed by host)',
+    );
+  });
   test('reads a child status without prompting it', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({

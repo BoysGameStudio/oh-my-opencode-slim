@@ -810,6 +810,45 @@ Do not interpret a restored task row as proof that execution resumed, and do
 not blindly resend continuation prompts after uncertain admission. This plugin
 does not add placeholder agents or automatically relaunch work to mask the race.
 
+### Read-only task diagnostics
+
+`task_status` accepts `diagnostic: true` for tracked failed, cancelled, or stopped
+children. Startup recovery normally re-adopts restarted children onto the board
+with their historical run start; v2 also re-delivers completions. An owned
+untracked handle returns ordinary read-only observed status plus a notice that
+diagnostics require a tracked record, with no excerpt or extra transcript read.
+Foreign-parent handles remain rejected.
+It never registers, prompts, or reconciles a child. Running children are
+refused; completed children use `result: true`. Missing or ambiguous evidence
+is explicit. Excerpts include assistant text and short assistant/failed-tool
+errors, not tool inputs or successful outputs. The tool's rendered diagnostic
+response fits 6,144 UTF-8 bytes, including headers, errors, and truncation
+markers; plugin warnings may be appended separately. The fetch requests a
+limit and our own scans are bounded. The paged messages route honours the limit.
+Without that route, the context fallback fetches full raw context, checks it for
+compaction, then selects only the newest requested entries before conversion.
+Dropped entries or compaction mark the page incomplete; fetching raw context
+itself is not bounded by the shim. No-limit and paged history-boundary reads are
+unchanged. Missing attribution outside the scan window
+is reported as uncertain or unavailable, never guessed.
+Excerpts start after the latest real input in the scan window and exclude
+assistant messages created before the tracked run start. Input may predate
+registration; missing creation times or only pre-start evidence makes the
+excerpt unavailable. Host compaction messages are excluded and labelled.
+Terminal reasons use recorded host error/outcome reasons, then attributable
+assistant error text, then the state name, not stored partial findings.
+
+Diagnostics are read-only and not consumption or acknowledgement. Observed
+state is evidence, execution completion ends a run, and parent acceptance is
+separate; diagnostics do not replace the completion/acceptance flow.
+The fixed next-step line advises awaiting or re-delegating, not marking the task
+accepted; it does not depend on a host-specific revival tool.
+`last_activity_source` reports `observed-activity` (tracker event, possibly
+lagging), `host-busy` (coarse host activity beyond run start, not progress),
+`launch-time` (no activity evidence beyond the run start time, not proof of
+inactivity), or `unknown`. Session-keyed tracker entries may predate a revive;
+the underlying activity timestamps are unchanged.
+
 ### Rehydrate existence probe (`session.get`)
 
 Rehydration re-registers persisted *running* task tool parts so a plugin
