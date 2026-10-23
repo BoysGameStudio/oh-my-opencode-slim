@@ -34,7 +34,9 @@ import {
   turnEndIndices,
   userTurn,
 } from './cache-safety-harness.test';
+import { COUNCIL_INJECT_METADATA_KEY } from './council-inject';
 import { GOAL_POINTER_METADATA_KEY } from './deepwork-goal';
+import { PHASE_REMINDER_METADATA_KEY } from './phase-reminder';
 import { BACKGROUND_JOB_BOARD_METADATA_KEY } from './task-session-manager';
 import type { MessageWithParts } from './types';
 
@@ -108,6 +110,51 @@ describe('cache-safety: turn-over-turn prefix stability', () => {
         expect(fingerprints.slice(0, previous.length)).toEqual(previous);
       }
       previous = fingerprints;
+    }
+  });
+
+  test('agent switch after history does not rewrite the shared prefix (issue #1640)', async () => {
+    const pipeline = createPipeline({ goalPointer: true });
+    const history = buildHistory();
+
+    const firstRun = await renderTurn(pipeline, history, history.length - 1);
+    const beforeSwitch = stablePrefixFingerprints(firstRun.messages).slice(
+      0,
+      history.length,
+    );
+
+    // The host rebuilds history, appends a turn from a different agent, and
+    // reruns the transforms. The reminder and council anchors live in the
+    // prefix; an agent-keyed gate would drop them and rewrite cached bytes.
+    const switchedRun = await renderTurn(
+      pipeline,
+      [...history, userTurn('m11', 'next phase', 'build')],
+      history.length,
+    );
+    const afterSwitch = stablePrefixFingerprints(switchedRun.messages).slice(
+      0,
+      history.length,
+    );
+
+    expect(beforeSwitch).toHaveLength(history.length);
+    expect(afterSwitch).toEqual(beforeSwitch);
+
+    // Both anchors are still in the shared prefix after the switch: the
+    // fingerprints above prove they were rebuilt, these prove they exist.
+    for (const run of [firstRun, switchedRun]) {
+      const prefixParts = run.messages
+        .slice(0, history.length)
+        .flatMap((message) => (message as MessageWithParts).parts);
+      expect(
+        prefixParts.some((part) =>
+          isTaggedPart(part, PHASE_REMINDER_METADATA_KEY),
+        ),
+      ).toBe(true);
+      expect(
+        prefixParts.some((part) =>
+          isTaggedPart(part, COUNCIL_INJECT_METADATA_KEY),
+        ),
+      ).toBe(true);
     }
   });
 });

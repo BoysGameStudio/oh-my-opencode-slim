@@ -6,9 +6,19 @@
  * (O(N) copies); a fixed anchor buys it with O(1). The anchor only moves when
  * the host rewrites the prefix (compaction / trim / fork), which already
  * invalidates the cache, so re-anchoring costs nothing (aside from the first
- * injection when the gate opens on an existing view, which appends into what
- * was previously the cached prefix — same as the pre-change behavior).
+ * injection into an already-anchored view after such a rewrite, which appends
+ * into what was previously the cached prefix — same as the pre-change
+ * behavior).
  * Supersedes #790's mechanism; preserves #790's invariant.
+ *
+ * Anchor eligibility is per-message and history-derived: agent switches never
+ * add or remove bytes already emitted. On v2 the context bridge reconstructs
+ * per-message agent per request from durable `agent-switched` markers
+ * (src/v2/setup.ts), so switches preserve anchor bytes there too. Residuals:
+ * v1-migrated sessions carry no per-message agent and track the session's
+ * current agent (status quo); the segment before a first in-window marker
+ * lacking `previous` (pre-2026-08-10 rows) falls back the same way, bounded
+ * by the compaction window.
  *
  * Do NOT make this tail-only: a reminder pinned to the newest message rewrites
  * the previous anchor's bytes every turn and pays full input price every turn,
@@ -35,16 +45,13 @@ export function hasPhaseReminder(part: MessagePart): boolean {
   return isTaggedPart(part, PHASE_REMINDER_METADATA_KEY);
 }
 
-interface PhaseReminderOptions {
-  shouldInject?: (sessionID: string) => boolean;
-}
-
 /**
  * Creates the experimental.chat.messages.transform hook for phase reminder injection.
  * This hook runs right before sending to API, so it doesn't affect UI display.
- * Only injects for the orchestrator agent.
+ * Injection eligibility is per-message (orchestrator-authored user turns only);
+ * see the module docblock for the history-stability contract.
  */
-export function createPhaseReminderHook(options: PhaseReminderOptions = {}) {
+export function createPhaseReminderHook() {
   return {
     'experimental.chat.messages.transform': async (
       _input: Record<string, never>,
@@ -57,14 +64,7 @@ export function createPhaseReminderHook(options: PhaseReminderOptions = {}) {
         return;
       }
 
-      const { agent, sessionID } = lastUserMessage.info;
-      if (
-        agent !== 'orchestrator' ||
-        !sessionID ||
-        (options.shouldInject && !options.shouldInject(sessionID))
-      ) {
-        return;
-      }
+      const { sessionID } = lastUserMessage.info;
 
       // Append as a separate part instead of mutating user-authored text;
       // the reminder stays out of the UI display and history (issue #448).

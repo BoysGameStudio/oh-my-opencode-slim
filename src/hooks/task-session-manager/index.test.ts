@@ -9306,7 +9306,7 @@ describe('task-session-manager hook', () => {
         agentMap.set(sessionID, 'orchestrator');
       },
     });
-    const phaseReminder = createPhaseReminderHook({ shouldInject });
+    const phaseReminder = createPhaseReminderHook();
     const messages = createMessages('orchestrator-1');
 
     await taskSessionManager['experimental.chat.messages.transform'](

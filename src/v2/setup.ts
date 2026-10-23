@@ -297,11 +297,14 @@ export interface V2SessionContextHandlerDeps {
    * (context fires before every `model.request` — see
    * createChatHeadersBridge). */
   observeChatHeaders?: (event: V2SessionContextEvent) => void;
-  /** Agent known for a session, from the agent-learned state the
-   * session-prompt bridge / context events maintain. Used to enrich
-   * transcript user messages the v1 injection gates key on when the
-   * context event itself carries no agent. */
-  knownAgentForSession?: (sessionID: string) => string | undefined;
+  /** Stored session history: the full `SessionMessage.Info` stream
+   * (markers included, compaction-bounded — the same window the request
+   * loader reads). Drives per-message agent attribution from durable
+   * `agent-switched` markers; a failed/absent read degrades attribution to
+   * the context event's current agent. */
+  sessionContext?: (
+    sessionID: string,
+  ) => Promise<Array<Record<string, unknown>> | undefined>;
   /** v1 `experimental.chat.system.transform` hook. */
   systemTransform?: (
     input: unknown,
@@ -318,6 +321,49 @@ export interface V2SessionContextHandlerDeps {
    * `options` record (temperature/provider options) for a captured child
    * session. Never touches system/messages/tools. */
   applyRuntimeProfile?: (event: V2SessionContextEvent) => void;
+}
+
+/**
+ * Map each stored user-message id to the agent that owned it at send time,
+ * walking the compaction-bounded history stream: durable `agent-switched`
+ * markers are the only source — a preceding marker is authoritative,
+ * `previous` seeds a window-start pre-segment, and a marker without one
+ * (pre-2026-08-10 rows) leaves its pre-segment unmapped. Callers apply
+ * `map.get(id) ?? event.agent`: misses degrade, never fabricate. Pure and
+ * stateless — rebuilt per request, restart-safe by construction.
+ */
+export function attributeAgentsByHistory(
+  history: ReadonlyArray<Record<string, unknown>> | undefined,
+): Map<string, string> {
+  const attribution = new Map<string, string>();
+  if (!Array.isArray(history)) return attribution;
+  let current: string | undefined;
+  let segment: string[] = [];
+  for (const entry of history) {
+    if (!isRecord(entry)) continue;
+    if (entry.type === 'agent-switched') {
+      const seed =
+        current ??
+        (typeof entry.previous === 'string' && entry.previous
+          ? entry.previous
+          : undefined);
+      if (seed !== undefined) {
+        for (const id of segment) attribution.set(id, seed);
+      }
+      segment = [];
+      if (typeof entry.agent === 'string' && entry.agent) {
+        current = entry.agent;
+      }
+      continue;
+    }
+    if (entry.type === 'user' && typeof entry.id === 'string') {
+      segment.push(entry.id);
+    }
+  }
+  if (current !== undefined) {
+    for (const id of segment) attribution.set(id, current);
+  }
+  return attribution;
 }
 
 /** Build the single `ctx.session.hook("context")` handler: interview marker
@@ -406,25 +452,38 @@ export function createSessionContextHandler(
     // injection does), so rebuild event.messages from the transformed
     // v1messages rather than index-based content copy-back.
     if (deps.messagesTransform && Array.isArray(event.messages)) {
-      // Transcript identity enrichment (v2-only): frozen board replay
-      // reads info.sessionID from the real-message tail, which may be an
-      // assistant or tool result. Stamp missing session IDs on every role;
-      // agent identity and internal-wake handling remain user-only.
-      // Identity is envelope-only and strictly absence-gated: host-provided
-      // values win. Synthetic wakes additionally need their first text part
-      // re-flagged because the host discards its internal part metadata.
-      // Both enrichments are idempotent across context events.
-      const knownAgent =
-        typeof event.agent === 'string' && event.agent
-          ? event.agent
-          : deps.knownAgentForSession?.(event.sessionID);
+      // Transcript identity enrichment (v2-only): stamp missing session IDs
+      // on every role (frozen board replay reads the real-message tail);
+      // reconstruct each user message's agent per request from durable
+      // `agent-switched` markers in stored history (same compaction window
+      // the request loader reads) so switches never re-write attribution.
+      // Envelope-only and absence-gated: host-provided values win; read
+      // failure or map miss degrades to the event's current agent. Synthetic
+      // wakes need their first text part re-flagged (host drops internal
+      // part metadata). Idempotent across context events.
+      let storedHistory: Array<Record<string, unknown>> | undefined;
+      try {
+        storedHistory = await deps.sessionContext?.(event.sessionID);
+      } catch (err) {
+        log('[v2] session.context attribution read failed', String(err));
+      }
+      const attribution = attributeAgentsByHistory(storedHistory);
       for (const message of event.messages) {
         if (message.sessionID === undefined) {
           message.sessionID = event.sessionID;
         }
         if (message.role !== 'user') continue;
-        if (message.agent === undefined && knownAgent) {
-          message.agent = knownAgent;
+        if (message.agent === undefined) {
+          const attributed =
+            message.id !== undefined ? attribution.get(message.id) : undefined;
+          const fallback =
+            typeof event.agent === 'string' && event.agent
+              ? event.agent
+              : undefined;
+          const agent = attributed ?? fallback;
+          if (agent !== undefined) {
+            message.agent = agent;
+          }
         }
         // session.synthetic bypasses session.prompt and the host turns its
         // text into a flagless user part. Restore the v1 internal marker by
@@ -2765,6 +2824,13 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
           log('[v2] native session prompt hook registered');
         }
 
+        // Per-message agent attribution: stored history (markers included)
+        // via the session domain read. Optional: hosts without a context
+        // read degrade attribution to the event's current agent.
+        const contextRead = ctx.session.context;
+        const sessionContextRead = contextRead
+          ? (sessionID: string) => contextRead({ sessionID })
+          : undefined;
         const handler = createSessionContextHandler({
           interviewHandleContext: (event) =>
             interviewBridge.handleContext(event),
@@ -2779,10 +2845,9 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                   observeChatHeaderState(chatHeaderStates, event),
               }
             : {}),
-          // Transcript user-message enrichment falls back to the agent the
-          // prompt bridge learned when the context event carries none.
-          knownAgentForSession: (sessionID) =>
-            promptBridge?.agentForSession(sessionID),
+          // Per-message agent attribution source: durable agent-switched
+          // markers in the stored, compaction-bounded history stream.
+          sessionContext: sessionContextRead,
           systemTransform,
           messagesTransform,
           // Captured child sessions get their frozen temperature/provider
