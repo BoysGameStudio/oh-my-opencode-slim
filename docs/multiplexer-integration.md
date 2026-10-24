@@ -186,13 +186,13 @@ integration can be installed separately:
 herdr integration install opencode
 ```
 
-After each spawn and each agent-pane close, the plugin re-equalizes only the
-agent panes through Herdr's socket API (`layout.export` /
+After each spawn and each agent-pane close, the plugin re-equalizes the agent
+panes through Herdr's socket API (`layout.export` /
 `layout.set_split_ratio`), so sibling agent panes keep equal sizes (heights in
 the `main-vertical` agent column, widths in the `main-horizontal` agent row).
-The split that bounds the main pane is never rewritten: `main_pane_size` still
-sets the main pane's share. Manual resizes persist until the next spawn or
-close, and a zoomed tab is left untouched. Equalization is best-effort —
+The split that bounds the main pane is reset separately to `main_pane_size`.
+Manual resizes persist until the next spawn or close, and a zoomed tab is left
+untouched. Equalization is best-effort —
 failures are logged and never affect pane creation or closure. Set
 `multiplexer.equalize_panes` to `false` to skip this step and keep manual pane
 sizes.
