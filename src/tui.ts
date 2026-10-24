@@ -1893,6 +1893,51 @@ interface SidebarRuntimeAdapter {
 }
 
 /**
+ * Resolve the live picker selection that may overlay the orchestrator row.
+ *
+ * Gate 1 — route: only a session route yields a sessionID; the home
+ * screen's selection belongs to a session that does not exist yet.
+ * Gate 2 — session shape: child sessions (parentID) own their own agent
+ * rows, and a root session under another primary agent is not the
+ * plugin's orchestrator row.
+ * Gate 3 — selection shape: the host's picker payload must carry usable
+ * providerID/modelID strings.
+ */
+export function resolveSelectedRootModel(input: {
+  route: { type?: string; sessionID?: string } | undefined;
+  sessionInfo?: { parentID?: unknown; agent?: unknown } | undefined;
+  selected?:
+    | { providerID?: unknown; modelID?: unknown; variant?: unknown }
+    | undefined;
+}): { model: string; variant?: string | undefined } | undefined {
+  const sessionID = input.route
+    ? resolveRouteSessionId(input.route)
+    : undefined;
+  if (!sessionID) return undefined;
+  const info = input.sessionInfo;
+  if (!info || info.parentID) return undefined;
+  if (typeof info.agent === 'string' && info.agent !== 'orchestrator') {
+    return undefined;
+  }
+  const selected = input.selected;
+  if (
+    !selected ||
+    typeof selected.providerID !== 'string' ||
+    !selected.providerID ||
+    typeof selected.modelID !== 'string' ||
+    !selected.modelID
+  ) {
+    return undefined;
+  }
+  return {
+    model: `${selected.providerID}/${selected.modelID}`,
+    ...(typeof selected.variant === 'string' && selected.variant
+      ? { variant: selected.variant }
+      : {}),
+  };
+}
+
+/**
  * Overlay the host picker's live selected model onto the orchestrator row.
  *
  * v2 defers `session.switchModel` until the next prompt commits it, so the
@@ -2261,28 +2306,15 @@ async function setup(ctx: V2TuiContext): Promise<undefined | (() => void)> {
     getDirectory: () => ctx.location?.directory ?? process.cwd(),
     getVisibleSession: () => resolveRouteSessionId(ctx.ui.router.current()),
     getSelectedRootModel: () => {
-      // Overlay only a root orchestrator session: child sessions own their
-      // own agent rows, and the home-screen selection belongs to a session
-      // that does not exist yet.
-      const sessionID = resolveRouteSessionId(ctx.ui.router.current());
-      if (!sessionID) return undefined;
-      const info = ctx.data?.session?.get?.(sessionID);
-      if (!info || info.parentID) return undefined;
-      if (typeof info.agent === 'string' && info.agent !== 'orchestrator') {
-        return undefined;
-      }
-      const selected = ctx.ui.model?.current?.();
-      if (
-        !selected ||
-        typeof selected.providerID !== 'string' ||
-        typeof selected.modelID !== 'string'
-      ) {
-        return undefined;
-      }
-      return {
-        model: `${selected.providerID}/${selected.modelID}`,
-        variant: selected.variant,
-      };
+      const route = ctx.ui.router.current();
+      const sessionID = resolveRouteSessionId(route);
+      return resolveSelectedRootModel({
+        route,
+        sessionInfo: sessionID
+          ? ctx.data?.session?.get?.(sessionID)
+          : undefined,
+        selected: ctx.ui.model?.current?.(),
+      });
     },
     client: ctx.client,
     renderer: ctx.renderer,

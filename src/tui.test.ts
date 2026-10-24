@@ -27,6 +27,7 @@ import {
   readConfigState,
   renderSidebar,
   resolveHoverBackground,
+  resolveSelectedRootModel,
   resolveSidebarSlotOrder,
   resolveTuiPaneDirectory,
   STATUS_DOT_GLYPH,
@@ -208,6 +209,84 @@ function createSnapshot(overrides: Partial<TuiSnapshot> = {}): TuiSnapshot {
     ...overrides,
   };
 }
+
+describe('resolveSelectedRootModel', () => {
+  const selection = {
+    providerID: 'opencode-go',
+    modelID: 'gemini-x',
+    variant: 'high',
+  };
+
+  test('root orchestrator session yields the picker model', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'root-a' },
+        sessionInfo: { agent: 'orchestrator' },
+        selected: selection,
+      }),
+    ).toEqual({ model: 'opencode-go/gemini-x', variant: 'high' });
+  });
+
+  test('agent-less root session (host default shape) still yields it', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'root-a' },
+        sessionInfo: {},
+        selected: { providerID: 'zai-coding-plan', modelID: 'glm-5.3' },
+      }),
+    ).toEqual({ model: 'zai-coding-plan/glm-5.3' });
+  });
+
+  test('child session (parentID) is not overlaid', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'child-1' },
+        sessionInfo: { parentID: 'root-a', agent: 'explorer' },
+        selected: selection,
+      }),
+    ).toBeUndefined();
+  });
+
+  test('home screen has no session to speak for', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'home' },
+        sessionInfo: { agent: 'orchestrator' },
+        selected: selection,
+      }),
+    ).toBeUndefined();
+  });
+
+  test('root session under another primary agent is not overlaid', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'root-b' },
+        sessionInfo: { agent: 'general' },
+        selected: selection,
+      }),
+    ).toBeUndefined();
+  });
+
+  test('missing optional host APIs degrade to no overlay', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'root-a' },
+        sessionInfo: undefined, // data.session.get absent
+        selected: undefined, // ui.model.current absent
+      }),
+    ).toBeUndefined();
+  });
+
+  test('malformed selection payload is rejected', () => {
+    expect(
+      resolveSelectedRootModel({
+        route: { type: 'session', sessionID: 'root-a' },
+        sessionInfo: { agent: 'orchestrator' },
+        selected: { providerID: 42, modelID: 'gemini-x' },
+      }),
+    ).toBeUndefined();
+  });
+});
 
 describe('overlaySelectedRootModel', () => {
   test('overlays the live selection onto the orchestrator row', () => {
