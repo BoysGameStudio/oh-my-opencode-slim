@@ -22,6 +22,7 @@ import {
   hydrateModelNames,
   isRefreshCurrent,
   makeRouteNavigator,
+  overlaySelectedRootModel,
   paneWiringOptions,
   readConfigState,
   renderSidebar,
@@ -207,6 +208,61 @@ function createSnapshot(overrides: Partial<TuiSnapshot> = {}): TuiSnapshot {
     ...overrides,
   };
 }
+
+describe('overlaySelectedRootModel', () => {
+  test('overlays the live selection onto the orchestrator row', () => {
+    const snapshot = createSnapshot({
+      agentModels: { orchestrator: 'zai-coding-plan/glm-5.3' },
+      agentVariants: { orchestrator: 'max' },
+    });
+    const overlay = overlaySelectedRootModel(snapshot, {
+      model: 'opencode-go/gemini-4-argon-contributor',
+      variant: 'high',
+    });
+    expect(overlay.agentModels.orchestrator).toBe(
+      'opencode-go/gemini-4-argon-contributor',
+    );
+    expect(overlay.agentVariants.orchestrator).toBe('high');
+    // Clone-on-write: the input snapshot stays untouched.
+    expect(snapshot.agentModels.orchestrator).toBe('zai-coding-plan/glm-5.3');
+    expect(snapshot.agentVariants.orchestrator).toBe('max');
+  });
+
+  test('clears the variant when the selection has none', () => {
+    const snapshot = createSnapshot({
+      agentModels: { orchestrator: 'zai-coding-plan/glm-5.3' },
+      agentVariants: { orchestrator: 'max' },
+    });
+    const overlay = overlaySelectedRootModel(snapshot, {
+      model: 'zai-coding-plan/glm-5.3',
+    });
+    expect(overlay.agentModels.orchestrator).toBe('zai-coding-plan/glm-5.3');
+    expect(overlay.agentVariants.orchestrator).toBeUndefined();
+  });
+
+  test('returns the same reference when nothing changes', () => {
+    const snapshot = createSnapshot({
+      agentModels: { orchestrator: 'openai/gpt-6' },
+      agentVariants: { orchestrator: 'high' },
+    });
+    expect(overlaySelectedRootModel(snapshot, undefined)).toBe(snapshot);
+    expect(
+      overlaySelectedRootModel(snapshot, {
+        model: 'openai/gpt-6',
+        variant: 'high',
+      }),
+    ).toBe(snapshot);
+  });
+
+  test('no overlay without an orchestrator row', () => {
+    const snapshot = createSnapshot({
+      agentModels: { explorer: 'openai/gpt-6' },
+    });
+    expect(overlaySelectedRootModel(snapshot, { model: 'openai/gpt-6' })).toBe(
+      snapshot,
+    );
+  });
+});
 
 describe('tui sidebar agents', () => {
   test('scopes active agents to the visible conversation (#1147)', () => {

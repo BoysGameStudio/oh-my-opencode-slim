@@ -467,6 +467,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   // observed status is kept so the flushed activation records the right
   // sidebar detail (busy vs retry).
   const pendingTuiBusySessions = new Map<string, 'busy' | 'retry'>();
+  // Live sidebar-model sync dedupe: last value written per `${directory}|${agent}`.
+  // chat.message fires on every turn, so the state file must only be
+  // rewritten when the projected model actually changed. Cleared whenever
+  // config() republishes the static projection.
+  const lastChatMessageModelSync = new Map<string, string>();
   const tuiActivityDirectory = (sessionID: string): string => {
     return sessionMetadata.getDirectory(sessionID) ?? ctx.directory;
   };
@@ -2611,6 +2616,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         },
         ctx.directory,
       );
+      // The static projection just replaced any live-synced values; drop the
+      // dedupe latch so the next chat.message re-syncs unconditionally.
+      lastChatMessageModelSync.clear();
 
       // This is the source of truth for admission. It is intentionally
       // captured only after every host/plugin merge, model pass and
@@ -3413,6 +3421,27 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             ...(liveVariant ? { variant: liveVariant } : {}),
             variantObserved: true,
           });
+          // Sidebar live-model projection. On v2 the prompt bridge
+          // (createSessionPromptBridge) is the only event-sourced carrier of
+          // agent+model+variant together — the usage-synthesized
+          // message.updated has none of them — so the projection rides this
+          // hook. A missing variant is the live choice too (model default):
+          // no policy fallback, or a variant-only re-selection could never
+          // clear the row. Deduped per directory+agent so the state file is
+          // only rewritten on an actual change.
+          if (agent) {
+            const directory = tuiActivityDirectory(input.sessionID);
+            const variant = liveVariant ?? null;
+            const dedupeKey = `${directory}|${agent}`;
+            const dedupeValue = `${model}\u0000${variant ?? ''}`;
+            if (lastChatMessageModelSync.get(dedupeKey) !== dedupeValue) {
+              lastChatMessageModelSync.set(dedupeKey, dedupeValue);
+              recordTuiAgentModel(
+                { agentName: agent, model, variant },
+                directory,
+              );
+            }
+          }
         }
         backgroundTaskConcurrency.migrateTask(input.sessionID, model);
       }
