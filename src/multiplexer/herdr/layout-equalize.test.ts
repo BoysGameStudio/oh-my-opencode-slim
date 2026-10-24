@@ -1,8 +1,16 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer, type Server } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
+  collectPaneIds,
+  equalizeAgentPanes,
   equalizeUpdates,
   type HerdrLayoutNode,
+  mainBoundaryUpdate,
   paneSpan,
+  ratioAtPath,
 } from './layout-equalize';
 
 function pane(id: string): HerdrLayoutNode {
@@ -109,5 +117,275 @@ describe('equalizeUpdates', () => {
 
   test('returns no updates for a single-pane tab', () => {
     expect(equalizeUpdates(pane('main'), 'main')).toEqual([]);
+  });
+});
+
+describe('mainBoundaryUpdate', () => {
+  test('pins the root split to the main share when main is the first child', () => {
+    const root = split('right', pane('main'), pane('agent'));
+    expect(mainBoundaryUpdate(root, 'main', 0.8)).toEqual({
+      path: [],
+      ratio: 0.8,
+    });
+  });
+
+  test('inverts the share when main is the second child', () => {
+    const root = split('right', pane('agent'), pane('main'));
+    expect(mainBoundaryUpdate(root, 'main', 0.8)).toEqual({
+      path: [],
+      ratio: 0.2,
+    });
+  });
+
+  test('finds a nested boundary rather than assuming the root', () => {
+    const root = split(
+      'down',
+      split('right', pane('side'), pane('main')),
+      pane('agent'),
+    );
+    expect(mainBoundaryUpdate(root, 'main', 0.75)).toEqual({
+      path: [false],
+      ratio: 0.25,
+    });
+  });
+
+  test('returns null when the main pane is absent', () => {
+    expect(mainBoundaryUpdate(pane('agent'), 'main', 0.8)).toBeNull();
+  });
+
+  test('clamps the share to the schema range', () => {
+    const root = split('right', pane('main'), pane('agent'));
+    expect(mainBoundaryUpdate(root, 'main', 0.95)?.ratio).toBe(0.8);
+    expect(mainBoundaryUpdate(root, 'main', 0.05)?.ratio).toBe(0.2);
+  });
+});
+
+describe('ratioAtPath / collectPaneIds', () => {
+  const root = split(
+    'right',
+    pane('main'),
+    split('down', pane('a'), pane('b')),
+  );
+
+  test('reads the ratio of the split at a path', () => {
+    expect(ratioAtPath(root, [])).toBe(0.5);
+    expect(ratioAtPath(root, [true])).toBe(0.5);
+    expect(ratioAtPath(root, [true, false])).toBeNull();
+  });
+
+  test('collects every pane id', () => {
+    expect([...collectPaneIds(root)].sort()).toEqual(['a', 'b', 'main']);
+  });
+});
+
+// --- socket layer -------------------------------------------------------
+// A fake herdr speaks the same one-request-per-connection protocol, so these
+// tests cover timeout, malformed JSON, error replies, zoomed tabs and the
+// epsilon skip without a real herdr.
+const unixOnly = process.platform === 'win32' ? test.skip : test;
+
+interface FakeHerdr {
+  socketPath: string;
+  received: Array<{ method: string; params: Record<string, unknown> }>;
+  close: () => Promise<void>;
+}
+
+async function startFakeHerdr(
+  reply: (request: {
+    method: string;
+    params: Record<string, unknown>;
+  }) => unknown,
+): Promise<FakeHerdr> {
+  const dir = mkdtempSync(join(tmpdir(), 'herdr-eq-'));
+  const socketPath = join(dir, 'herdr.sock');
+  const received: FakeHerdr['received'] = [];
+
+  const server: Server = createServer((socket) => {
+    let buffer = '';
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      const newline = buffer.indexOf('\n');
+      if (newline === -1) return;
+      const request = JSON.parse(buffer.slice(0, newline));
+      received.push(request);
+      const response = reply(request);
+      if (response === undefined) return; // never answer: timeout path
+      socket.end(`${JSON.stringify(response)}\n`);
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+
+  return {
+    socketPath,
+    received,
+    close: async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+const agentChain: HerdrLayoutNode = split('down', pane('a'), pane('b'));
+const layoutExport = (root: HerdrLayoutNode, zoomed = false) => ({
+  result: { layout: { root, zoomed } },
+});
+
+describe('equalizeAgentPanes (socket)', () => {
+  unixOnly(
+    'writes the main boundary and skips ratios already on target',
+    async () => {
+      const fake = await startFakeHerdr((request) =>
+        request.method === 'layout.export'
+          ? layoutExport(split('right', pane('main'), agentChain))
+          : { result: {} },
+      );
+      try {
+        const ok = await equalizeAgentPanes({
+          socketPath: fake.socketPath,
+          tabId: 't1',
+          mainPaneId: 'main',
+          mainPaneShare: 0.8,
+        });
+
+        expect(ok).toBe(true);
+        const writes = fake.received.filter(
+          (r) => r.method === 'layout.set_split_ratio',
+        );
+        // Root ratio 0.5 → 0.8 (boundary); the agent split is already 1/2.
+        expect(writes).toHaveLength(1);
+        expect(writes[0].params).toEqual({
+          tab_id: 't1',
+          path: [],
+          ratio: 0.8,
+        });
+      } finally {
+        await fake.close();
+      }
+    },
+  );
+
+  unixOnly('does nothing when every split is already equal', async () => {
+    const root = split('right', pane('main'), agentChain);
+    (root as { ratio: number }).ratio = 0.8;
+    const fake = await startFakeHerdr(() => layoutExport(root));
+    try {
+      const ok = await equalizeAgentPanes({
+        socketPath: fake.socketPath,
+        tabId: 't1',
+        mainPaneId: 'main',
+        mainPaneShare: 0.8,
+      });
+      expect(ok).toBe(true);
+      expect(fake.received).toHaveLength(1);
+      expect(fake.received[0].method).toBe('layout.export');
+    } finally {
+      await fake.close();
+    }
+  });
+
+  unixOnly('skips a zoomed tab without writing', async () => {
+    const fake = await startFakeHerdr(() =>
+      layoutExport(split('right', pane('main'), agentChain), true),
+    );
+    try {
+      const ok = await equalizeAgentPanes({
+        socketPath: fake.socketPath,
+        tabId: 't1',
+        mainPaneId: 'main',
+        mainPaneShare: 0.8,
+      });
+      expect(ok).toBe(true);
+      expect(fake.received).toHaveLength(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  unixOnly('reports pane ids for pruning', async () => {
+    const fake = await startFakeHerdr(() =>
+      layoutExport(split('right', pane('main'), agentChain)),
+    );
+    try {
+      const seen = new Set<string>();
+      await equalizeAgentPanes({
+        socketPath: fake.socketPath,
+        tabId: 't1',
+        mainPaneId: 'main',
+        onPanesSeen: (ids) => {
+          for (const id of ids) seen.add(id);
+        },
+      });
+      expect([...seen].sort()).toEqual(['a', 'b', 'main']);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  unixOnly('returns false when a ratio write is rejected', async () => {
+    const fake = await startFakeHerdr((request) =>
+      request.method === 'layout.export'
+        ? layoutExport(split('right', pane('main'), agentChain))
+        : { error: { code: 'nope', message: 'unsupported' } },
+    );
+    try {
+      const ok = await equalizeAgentPanes({
+        socketPath: fake.socketPath,
+        tabId: 't1',
+        mainPaneId: 'main',
+        mainPaneShare: 0.8,
+      });
+      expect(ok).toBe(false);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  unixOnly('returns false on malformed JSON', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'herdr-eq-'));
+    const socketPath = join(dir, 'herdr.sock');
+    const server = createServer((socket) => {
+      socket.on('data', () => socket.end('not json\n'));
+    });
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    try {
+      const ok = await equalizeAgentPanes({
+        socketPath,
+        tabId: 't1',
+        mainPaneId: 'main',
+      });
+      expect(ok).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  unixOnly('returns false when the socket is missing', async () => {
+    const ok = await equalizeAgentPanes({
+      socketPath: join(tmpdir(), 'definitely-not-a-herdr.sock'),
+      tabId: 't1',
+      mainPaneId: 'main',
+    });
+    expect(ok).toBe(false);
+  });
+
+  // Real timing on purpose: a timeout can only be observed by waiting for it.
+  // Kept to a 50 ms budget so the suite stays fast.
+  unixOnly('returns false when herdr never answers', async () => {
+    const fake = await startFakeHerdr(() => undefined);
+    try {
+      const ok = await equalizeAgentPanes({
+        socketPath: fake.socketPath,
+        tabId: 't1',
+        mainPaneId: 'main',
+        timeoutMs: 50,
+        budgetMs: 50,
+      });
+      expect(ok).toBe(false);
+    } finally {
+      await fake.close();
+    }
   });
 });

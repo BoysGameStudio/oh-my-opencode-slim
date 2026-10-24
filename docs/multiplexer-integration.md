@@ -279,7 +279,7 @@ inside that pane).
 | `type` | string | `"none"` | `"auto"`, `"tmux"`, `"zellij"`, `"herdr"`, `"cmux-tui"`, `"kitty"`, `"wezterm"`, or `"none"` |
 | `layout` | string | `"main-vertical"` | Layout preset: `main-vertical`, `main-horizontal`, `tiled`, `even-horizontal`, `even-vertical`. Each adapter maps it to its nearest native expression; cmux-tui has no layout expression and ignores it (see [Layouts](#layouts)). Herdr builds an agent area for both `main-*` layouts and re-equalizes only its agent panes after each spawn/close |
 | `main_pane_size` | number | `60` | Main pane size percentage (`20`–`80`). Applied by tmux for the `main-*` layouts, and by Herdr (first agent-area split of the `main-*` layouts; the agent panes in the resulting column or row are then re-equalized after each spawn/close while the main pane keeps this share) and WezTerm (first agent split); ignored by Zellij, kitty, and cmux-tui |
-| `equalize_panes` | boolean | `true` | Herdr only: re-equalize the `main-*` agent panes after each spawn and agent-pane close. Set `false` to keep manual pane sizes |
+| `equalize_panes` | boolean | `true` | Herdr only: after each spawn and agent-pane close, equalize the `main-*` agent panes and re-assert the main pane's `main_pane_size` share through Herdr's socket API. Set `false` to keep manual pane sizes |
 | `cmux_tui_binary` | string | omitted | Explicit path to the cmux-tui binary. When omitted, the client resolves `cmux-tui` first, then `cmux`, on `PATH` |
 | `viewer` | string | `"tui"` on v1, `"mini"` on v2 | Subagent pane surface: `"tui"` (full interface) or `"mini"` (lightweight interface). Explicit values override the host default. On v1, `"mini"` requires OpenCode >= 1.17.10 and runs `opencode attach <url> --session <id> --dir <dir> --mini`, without additional pane-cwd pinning. On v2 it runs `opencode mini` without a positional directory, so adapters pin the cwd (herdr/kitty/WezTerm natively, tmux `-c`, Zellij `--cwd`, cmux-tui `cd` for POSIX shells and fish). Changing the value takes effect on the next opencode start |
 
@@ -319,14 +319,17 @@ Adapter notes:
   `main-horizontal`), and later children stack inside that agent-area pane
   (below for `main-vertical`, to the right for `main-horizontal`); if it is
   closed, the next spawn recreates it from the parent. `even-*` and `tiled`
-  always split the parent, without a ratio. After every successful spawn and
-  agent-pane close, the agent area is re-equalized via `layout.export` /
+  always split the parent, without a ratio. Herdr builds that reject the
+  `pane split --ratio` flag are detected at runtime: the split is retried once
+  without it and the capability stays disabled for the process, so panes keep
+  working (the main pane then keeps Herdr's 50/50). After every successful
+  spawn and agent-pane close, the layout is corrected via `layout.export` /
   `layout.set_split_ratio`: each agent-only subtree is split evenly (a
-  perpendicular split keeps the larger side's span), while the split separating
-  the main pane from the agents is never rewritten, so `main_pane_size` still
-  bounds the main pane. Manual resizes persist until the next spawn or close;
-  zoomed tabs are skipped. Set `multiplexer.equalize_panes` to `false` to
-  disable the re-equalization entirely.
+  perpendicular split keeps the larger side's span), and the main/agent
+  boundary is re-asserted to `main_pane_size`, which also repairs a fallback
+  split that could not be sized. Manual resizes persist until the next spawn
+  or close; zoomed tabs are skipped. Set `multiplexer.equalize_panes` to
+  `false` to disable the socket-based correction entirely.
 - **kitty** — kitty has no per-window layout API. The mapped built-in layout
   (`tall` / `fat` / `grid` / `horizontal` / `vertical`) is applied to the tab
   containing the parent window via `goto-layout --match=window_id:<id>`, and

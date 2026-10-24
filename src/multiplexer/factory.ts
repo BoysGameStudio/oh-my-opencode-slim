@@ -6,7 +6,6 @@ import type { MultiplexerConfig, MultiplexerType } from '../config/schema';
 import { log } from '../utils/logger';
 import { CmuxMultiplexer } from './cmux';
 import { HerdrMultiplexer } from './herdr';
-import { equalizeAgentPanes } from './herdr/layout-equalize';
 import { KittyMultiplexer } from './kitty';
 import { TmuxMultiplexer } from './tmux';
 import type { Multiplexer } from './types';
@@ -45,12 +44,9 @@ export function getMultiplexer(config: MultiplexerConfig): Multiplexer | null {
       actualType = 'zellij';
       break;
     case 'herdr':
-      multiplexer = new HerdrMultiplexer(
-        config.layout,
-        config.main_pane_size,
-        equalizeAgentPanes,
-        config.equalize_panes,
-      );
+      multiplexer = new HerdrMultiplexer(config.layout, config.main_pane_size, {
+        equalizePanes: config.equalize_panes,
+      });
       actualType = 'herdr';
       break;
     case 'cmux-tui':
@@ -95,8 +91,7 @@ export function getMultiplexer(config: MultiplexerConfig): Multiplexer | null {
         multiplexer = new HerdrMultiplexer(
           config.layout,
           config.main_pane_size,
-          equalizeAgentPanes,
-          config.equalize_panes,
+          { equalizePanes: config.equalize_panes },
         );
         actualType = 'herdr';
       } else if (process.env.KITTY_WINDOW_ID) {

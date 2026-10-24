@@ -30,7 +30,16 @@ import {
 } from './layout-equalize';
 
 type HerdrPaneDirection = 'right' | 'down';
-type LayoutEqualizer = (opts: EqualizeAgentPanesOptions) => Promise<boolean>;
+export type LayoutEqualizer = (
+  opts: EqualizeAgentPanesOptions,
+) => Promise<boolean>;
+
+export interface HerdrMultiplexerOptions {
+  /** Injectable equalizer (tests). Defaults to the real socket client. */
+  equalizer?: LayoutEqualizer;
+  /** Gates equalization and the main-boundary re-assert. Defaults to true. */
+  equalizePanes?: boolean;
+}
 
 interface HerdrCliResponse {
   result?: {
@@ -54,21 +63,25 @@ export class HerdrMultiplexer implements Multiplexer {
   private agentPaneIds = new Set<string>();
   private equalize: LayoutEqualizer;
   private equalizePanes: boolean;
+  // Latch: herdr builds without `pane split --ratio` must keep creating panes.
+  private ratioSupported = true;
+  private loggedMissingEqualizeEnv = false;
   // ponytail: serialize spawnPane to prevent concurrent races on agentAreaPaneId
   private spawnMutex: Promise<unknown> = Promise.resolve();
+  // Serializes equalization passes so a close cannot race a spawn.
+  private equalizeMutex: Promise<unknown> = Promise.resolve();
 
   constructor(
     layout: MultiplexerLayout = 'main-vertical',
     mainPaneSize = 60,
-    equalizer: LayoutEqualizer = equalizeAgentPanes,
-    equalizePanes = true,
+    options: HerdrMultiplexerOptions = {},
   ) {
     this.layout = layout;
     this.paneDirection = getPaneDirection(layout);
     this.stackDirection = getStackDirection(layout);
     this.mainPaneSize = mainPaneSize;
-    this.equalize = equalizer;
-    this.equalizePanes = equalizePanes;
+    this.equalize = options.equalizer ?? equalizeAgentPanes;
+    this.equalizePanes = options.equalizePanes ?? true;
   }
 
   async isAvailable(): Promise<boolean> {
@@ -153,36 +166,70 @@ export class HerdrMultiplexer implements Multiplexer {
 
       let paneId: string | null = null;
       let lastRawOutput = '';
+      let fellBackToParent = false;
 
       if (this.isMainLayout() && this.agentAreaPaneId) {
-        const result = await this.runSplit(
+        let result = await this.runSplit(
           this.agentAreaPaneId,
           this.stackDirection,
           attachDir,
           false,
           viewerSecretArgs,
         );
+        if (!result.paneId) {
+          // One retry absorbs transient herdr failures before giving up on
+          // the agent area.
+          result = await this.runSplit(
+            this.agentAreaPaneId,
+            this.stackDirection,
+            attachDir,
+            false,
+            viewerSecretArgs,
+          );
+        }
         paneId = result.paneId;
         if (!paneId) {
           log('[herdr] agent area split failed, falling back to parent', {
             agentAreaPaneId: this.agentAreaPaneId,
           });
           this.agentAreaPaneId = null;
+          fellBackToParent = true;
         }
       }
 
       // A split from the parent creates the agent area, so only this split is
       // sized by main_pane_size; siblings inside the area keep herdr's 50/50
       // default. even-*/tiled never create an agent area, so they carry none.
-      const sized = this.isMainLayout() && this.agentAreaPaneId == null;
+      // The fallback path never sizes: the previous agent area still occupies
+      // space, so sizing again would shrink the main pane twice.
+      const sized =
+        this.isMainLayout() &&
+        this.agentAreaPaneId == null &&
+        !fellBackToParent;
       if (!paneId) {
-        const result = await this.runSplit(
+        let result = await this.runSplit(
           parentPaneId,
           this.paneDirection,
           attachDir,
           sized,
           viewerSecretArgs,
         );
+        // Herdr builds without `pane split --ratio` reject the unknown flag
+        // outright. Retry once unsized and latch, so pane creation keeps
+        // working (the main pane then keeps herdr's 50/50).
+        if (!result.paneId && sized && this.ratioSupported) {
+          this.ratioSupported = false;
+          log('[herdr] sized split failed; retrying without --ratio', {
+            mainPaneSize: this.mainPaneSize,
+          });
+          result = await this.runSplit(
+            parentPaneId,
+            this.paneDirection,
+            attachDir,
+            false,
+            viewerSecretArgs,
+          );
+        }
         paneId = result.paneId;
         lastRawOutput = result.rawOutput;
         if (paneId) {
@@ -342,6 +389,8 @@ export class HerdrMultiplexer implements Multiplexer {
     // main-vertical, to the right for main-horizontal).
     if (this.layout !== layout) {
       this.agentAreaPaneId = null;
+      this.mainPaneId = null;
+      this.agentPaneIds.clear();
     }
     this.layout = layout;
     this.paneDirection = getPaneDirection(layout);
@@ -373,7 +422,9 @@ export class HerdrMultiplexer implements Multiplexer {
       '--cwd',
       directory,
       '--no-focus',
-      ...(sized ? ['--ratio', String(agentPaneRatio(this.mainPaneSize))] : []),
+      ...(sized && this.ratioSupported
+        ? ['--ratio', String(agentPaneRatio(this.mainPaneSize))]
+        : []),
       ...viewerSecretArgs,
     ];
 
@@ -413,14 +464,44 @@ export class HerdrMultiplexer implements Multiplexer {
     const mainPaneId = this.mainPaneId;
     const tabId = process.env.HERDR_TAB_ID?.trim();
     const socketPath = process.env.HERDR_SOCKET_PATH?.trim();
-    if (!mainPaneId || !tabId || !socketPath) return;
+    if (!mainPaneId || !tabId || !socketPath) {
+      if (!this.loggedMissingEqualizeEnv) {
+        this.loggedMissingEqualizeEnv = true;
+        log('[herdr] equalization skipped: herdr pane environment missing', {
+          hasMainPaneId: mainPaneId !== null,
+          hasTabId: Boolean(tabId),
+          hasSocketPath: Boolean(socketPath),
+        });
+      }
+      return;
+    }
+
+    // A close-time pass must not interleave with a spawn-time pass: each
+    // computes paths from its own export, so a later write could apply stale
+    // ratios.
+    const prev = this.equalizeMutex;
+    let release!: () => void;
+    this.equalizeMutex = new Promise<void>((r) => (release = r));
+    await prev;
 
     try {
-      await this.equalize({ socketPath, tabId, mainPaneId });
+      await this.equalize({
+        socketPath,
+        tabId,
+        mainPaneId,
+        mainPaneShare: this.mainPaneSize / 100,
+        onPanesSeen: (paneIds) => {
+          for (const id of this.agentPaneIds) {
+            if (!paneIds.has(id)) this.agentPaneIds.delete(id);
+          }
+        },
+      });
     } catch (error) {
       log('[herdr] equalizeAgentPanes: unexpected failure', {
         error: String(error),
       });
+    } finally {
+      release();
     }
   }
 

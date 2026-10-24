@@ -10,8 +10,13 @@
  * `span(first) / (span(first) + span(second))`. `span` counts the panes a
  * subtree occupies ALONG the split's axis; a perpendicular split does not
  * divide that axis, so the larger side wins. Splits that contain the main
- * pane are never rewritten, which keeps the main pane at its
+ * pane are never rewritten by the equalizer, which keeps the main pane at its
  * `main_pane_size` share.
+ *
+ * When `mainPaneShare` is supplied, the split that bounds the main pane is
+ * additionally re-asserted to that share. This makes the sizing idempotent:
+ * it repairs drift and a fallback split that could not be sized, without
+ * touching any agent split.
  *
  * The socket protocol is one request per connection: write one
  * `{"id","method","params"}\n` line, read one line back, close.
@@ -48,10 +53,24 @@ export interface EqualizeAgentPanesOptions {
   socketPath: string;
   tabId: string;
   mainPaneId: string;
+  /**
+   * Main pane share (0..1). When set, the main/agent boundary is re-asserted
+   * to this share so sizing is self-healing.
+   */
+  mainPaneShare?: number;
+  /** Per-request socket timeout. */
   timeoutMs?: number;
+  /** Overall budget for one equalization pass (requests run in parallel). */
+  budgetMs?: number;
+  /** Receives every pane id seen in the exported layout (used for pruning). */
+  onPanesSeen?: (paneIds: Set<string>) => void;
 }
 
 const DEFAULT_TIMEOUT_MS = 2000;
+const DEFAULT_BUDGET_MS = 800;
+const RATIO_EPSILON = 0.005;
+const MIN_SHARE = 0.2;
+const MAX_SHARE = 0.8;
 
 /** Number of panes a subtree occupies along `axis`. */
 export function paneSpan(
@@ -97,6 +116,70 @@ export function equalizeUpdates(
 
   walk(root, []);
   return updates;
+}
+
+/**
+ * The split that directly parents the main pane, pinned to `mainPaneShare`.
+ * Working with the direct parent (rather than the shallowest split that merely
+ * separates main from the rest) means the ratio governs the main pane itself,
+ * not a subtree that happens to contain it. Returns null when the main pane is
+ * not in the tree (or the share is unusable).
+ */
+export function mainBoundaryUpdate(
+  root: HerdrLayoutNode,
+  mainPaneId: string,
+  mainPaneShare: number,
+): SplitRatioUpdate | null {
+  if (!Number.isFinite(mainPaneShare)) return null;
+  const share = Math.max(MIN_SHARE, Math.min(MAX_SHARE, mainPaneShare));
+
+  const walk = (
+    node: HerdrLayoutNode,
+    path: boolean[],
+  ): SplitRatioUpdate | null => {
+    if (node.type !== 'split') return null;
+    if (node.first.type === 'pane' && node.first.pane_id === mainPaneId) {
+      return { path, ratio: share };
+    }
+    if (node.second.type === 'pane' && node.second.pane_id === mainPaneId) {
+      // Round the complement so the socket payload carries a clean ratio
+      // (1 - 0.8 is 0.19999999999999996 in binary floating point).
+      return { path, ratio: Number((1 - share).toFixed(6)) };
+    }
+    return (
+      walk(node.first, [...path, false]) ?? walk(node.second, [...path, true])
+    );
+  };
+
+  return walk(root, []);
+}
+
+/** Current `ratio` of the split at `path`, or null when it is not a split. */
+export function ratioAtPath(
+  root: HerdrLayoutNode,
+  path: boolean[],
+): number | null {
+  let node: HerdrLayoutNode = root;
+  for (const second of path) {
+    if (node.type !== 'split') return null;
+    node = second ? node.second : node.first;
+  }
+  return node.type === 'split' ? node.ratio : null;
+}
+
+/** Every pane id in the tree, depth-first. */
+export function collectPaneIds(root: HerdrLayoutNode): Set<string> {
+  const ids = new Set<string>();
+  const walk = (node: HerdrLayoutNode): void => {
+    if (node.type === 'pane') {
+      ids.add(node.pane_id);
+      return;
+    }
+    walk(node.first);
+    walk(node.second);
+  };
+  walk(root);
+  return ids;
 }
 
 function isLayoutNode(value: unknown): value is HerdrLayoutNode {
@@ -180,14 +263,18 @@ function sendHerdrRequest(
 }
 
 /**
- * Equalize the agent panes of `tabId`, leaving the main pane's share alone.
- * Best-effort: every failure is logged and reported as `false`, never thrown.
+ * Equalize the agent panes of `tabId`, leaving the agent splits of the main
+ * pane alone and (when `mainPaneShare` is given) re-asserting the main/agent
+ * boundary. Best-effort: every failure is logged and reported as `false`,
+ * never thrown. Ratio writes are independent, so they run in parallel within
+ * one budget; splits already within rounding of their target are skipped.
  */
 export async function equalizeAgentPanes(
   opts: EqualizeAgentPanesOptions,
 ): Promise<boolean> {
   const { socketPath, tabId, mainPaneId } = opts;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const budgetMs = opts.budgetMs ?? DEFAULT_BUDGET_MS;
+  const timeoutMs = Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, budgetMs);
 
   try {
     const exported = await sendHerdrRequest(
@@ -197,7 +284,12 @@ export async function equalizeAgentPanes(
       timeoutMs,
     );
     const layout = isRecord(exported) ? exported.layout : undefined;
-    if (!isRecord(layout) || !isLayoutNode(layout.root)) {
+    if (!isRecord(layout)) {
+      log('[herdr] equalizeAgentPanes: unusable layout export', { tabId });
+      return false;
+    }
+    const root = layout.root;
+    if (!isLayoutNode(root)) {
       log('[herdr] equalizeAgentPanes: unusable layout export', { tabId });
       return false;
     }
@@ -207,22 +299,57 @@ export async function equalizeAgentPanes(
       return true;
     }
 
-    const updates = equalizeUpdates(layout.root, mainPaneId);
-    for (const update of updates) {
-      await sendHerdrRequest(
-        socketPath,
-        'layout.set_split_ratio',
-        { tab_id: tabId, path: update.path, ratio: update.ratio },
-        timeoutMs,
+    opts.onPanesSeen?.(collectPaneIds(root));
+
+    const boundary =
+      opts.mainPaneShare === undefined
+        ? null
+        : mainBoundaryUpdate(root, mainPaneId, opts.mainPaneShare);
+    const requested = [
+      ...(boundary ? [boundary] : []),
+      ...equalizeUpdates(root, mainPaneId),
+    ];
+
+    // Skip splits that already sit at their target: a steady-state spawn then
+    // costs one export instead of rewriting every split on the column.
+    const updates = requested.filter((update) => {
+      const current = ratioAtPath(root, update.path);
+      return (
+        current === null || Math.abs(current - update.ratio) > RATIO_EPSILON
       );
+    });
+
+    if (updates.length === 0) return true;
+
+    const results = await Promise.allSettled(
+      updates.map((update) =>
+        sendHerdrRequest(
+          socketPath,
+          'layout.set_split_ratio',
+          { tab_id: tabId, path: update.path, ratio: update.ratio },
+          timeoutMs,
+        ),
+      ),
+    );
+
+    const failures = results.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failures.length > 0) {
+      log('[herdr] equalizeAgentPanes: some ratio writes failed', {
+        tabId,
+        applied: updates.length - failures.length,
+        failed: failures.length,
+        error: describeHerdrError(failures[0]?.reason),
+      });
+      return false;
     }
 
-    if (updates.length > 0) {
-      log('[herdr] equalizeAgentPanes: applied', {
-        tabId,
-        splits: updates.length,
-      });
-    }
+    log('[herdr] equalizeAgentPanes: applied', {
+      tabId,
+      splits: updates.length,
+      boundary: boundary !== null,
+    });
     return true;
   } catch (error) {
     log('[herdr] equalizeAgentPanes: failed', {
