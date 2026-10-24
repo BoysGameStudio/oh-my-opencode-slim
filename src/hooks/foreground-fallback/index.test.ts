@@ -9055,5 +9055,37 @@ describe('ForegroundFallbackManager same-model retry hardening', () => {
       expect(mgr.isFallbackInProgress('hung-nc')).toBe(false);
       expect((mgr as any).sessionRetries.get('hung-nc') ?? 0).toBe(0);
     });
+
+    test('a stalled user-message read still sends the same-model replay', async () => {
+      const read = deferred<unknown>();
+      const { client, mocks } = createMockClient({
+        messagesImpl: async () => ({
+          data: [
+            { info: { id: 'a', role: 'assistant', parentID: 'u' }, parts: [] },
+          ],
+        }),
+      });
+      mocks.message.mockImplementation(() => read.promise as never);
+      const mgr = new ForegroundFallbackManager(makeChains(), true, {
+        client,
+        directory: '/test',
+      } as any);
+      await seed(mgr, 'deep-nc');
+      const pending = mgr.handleEvent(streamError('deep-nc', 'e1'));
+      await flush();
+      expect(mocks.message).toHaveBeenCalledTimes(1);
+      jest.advanceTimersByTime(2_000);
+      await flush();
+      read.resolve({
+        data: {
+          info: { id: 'u', role: 'user' },
+          parts: [{ type: 'text', text: 'hi' }],
+        },
+      });
+      await pending;
+      expect(mocks.message).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect((mgr as any).sessionRetries.get('deep-nc')).toBe(1);
+    });
   });
 });
