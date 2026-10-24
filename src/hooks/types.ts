@@ -60,7 +60,7 @@ export function findLatestUserMessage(
 }
 
 /**
- * A user message that can be replayed into a fallback prompt.
+ * A user turn that a fallback replay can follow up on.
  *
  * Accepts both the v1 transform shape (`{ info: { role: 'user' }, parts }`)
  * and the v2 `session.messages()` shape (`{ type: 'user', text }`) returned

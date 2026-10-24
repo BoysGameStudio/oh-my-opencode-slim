@@ -89,9 +89,9 @@ function textFromBody(args: Record<string, unknown>): string {
 }
 
 /** Map non-text v1 prompt parts (images, files) into v2 prompt `files`
- * entries. The fallback replay must not silently drop attachments: v1's
- * prompt API carries parts natively, so a text-only translation would
- * resend an attachment-dependent request without its content. Parts whose
+ * entries. A v1-style body must not silently drop attachments: v1's prompt
+ * API carries parts natively, so a text-only translation would resend an
+ * attachment-dependent request without its content. Parts whose
  * uri cannot be derived are logged and skipped (honest degradation). */
 function filesFromBody(
   args: Record<string, unknown>,
@@ -707,8 +707,8 @@ export function buildPluginInput(
         // snapshot that can be stale by delivery time (#1079). Purely
         // internal bodies WITHOUT the flag keep the pin semantics: the
         // interview runtime tracks its own model and must keep switching.
-        // Mixed bodies (foreground-fallback replay) still switch;
-        // `modelSwitch: 'required'` still switches.
+        // Mixed bodies still switch; `modelSwitch: 'required'` (the
+        // foreground-fallback replay) still switches.
         const inheritPersistedSelection =
           args?.modelSelection === 'inherit' &&
           args?.modelSwitch !== 'required';

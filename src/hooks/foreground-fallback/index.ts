@@ -8,9 +8,10 @@
  *   2. Aborts host retry or unknown-finish loops via client.session.abort();
  *      other session.error and message.updated paths re-prompt directly
  *      without abort.
- *   3. Re-queues the last user message via client.session.promptAsync()
- *      with the new model - promptAsync returns immediately so we never
- *      block the event handler waiting for a full LLM response.
+ *   3. Sends an internal reminder via client.session.promptAsync() with
+ *      the new model, which reads the user's request from history -
+ *      promptAsync returns immediately so we never block the event handler
+ *      waiting for a full LLM response.
  *
  * Spent-allowance errors (issue #966) mark the failing provider exhausted
  * for the descent: failover skips that provider's remaining chain entries,
@@ -3003,7 +3004,7 @@ export class ForegroundFallbackManager {
         (await this.ensureSessionAgent(sessionID));
       if (!agentName || !this.isCurrentTurn(sessionID, expectedEpoch)) return;
 
-      // Retrieve the last user message to re-submit with the fallback model.
+      // Confirm there is a user turn before sending the replay reminder.
       // Fence captured BEFORE any await in the preparation: a board
       // relaunch during the transcript read or the admission await must
       // not enroll the new generation under this (stale) attempt's

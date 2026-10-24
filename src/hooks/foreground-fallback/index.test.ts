@@ -3646,7 +3646,7 @@ describe('ForegroundFallbackManager session.error', () => {
     expect(call[0].body.model.modelID).toBe('gpt-4o');
   });
 
-  test('marks the replayed user prompt as an internal initiator', async () => {
+  test('marks the replay prompt as an internal initiator', async () => {
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -3673,8 +3673,8 @@ describe('ForegroundFallbackManager session.error', () => {
 
   test('skips malformed messages without info when locating the last user message', async () => {
     // OpenCode may return partial/streaming messages whose `info` is undefined;
-    // the fallback must ignore those rather than crash, and still re-submit the
-    // real last user message.
+    // the fallback must ignore those rather than crash, and still find the
+    // real last user turn before replaying.
     ({ mocks } = createMockClient({
       messagesData: [
         {},
@@ -4023,7 +4023,7 @@ describe('ForegroundFallbackManager session.error', () => {
     expect(calls.reject).toEqual([]);
   });
 
-  test('a turn longer than the tail replays its parent user message without a full read', async () => {
+  test('a turn longer than the tail finds its parent user message without a full read', async () => {
     const { calls, handoff } = handoffMock();
     const mocks = await runFallbackScenario({
       handoff,
