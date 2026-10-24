@@ -106,32 +106,14 @@ export const CouncilPresetSchema = z
     return councillors;
   });
 
-const KNOWN_COUNCIL_KEYS = new Set([
+/** Declared council keys; anything else is reported and dropped. */
+export const COUNCIL_CONFIG_KEYS: readonly string[] = [
   'presets',
   'default_preset',
   'master',
   'master_timeout',
   'master_fallback',
-]);
-
-/** Keys already reported, so a config read twice warns once per key. */
-const reportedCouncilKeys = new Set<string>();
-
-/** Test seam: bun shares one process, so the dedup set needs clearing. */
-export function resetCouncilDiagnostics(): void {
-  reportedCouncilKeys.clear();
-}
-
-function warnUnknownCouncilKeys(keys: readonly string[]): void {
-  const unknown = keys.filter(
-    (key) => !KNOWN_COUNCIL_KEYS.has(key) && !reportedCouncilKeys.has(key),
-  );
-  if (unknown.length === 0) return;
-  for (const key of unknown) reportedCouncilKeys.add(key);
-  console.warn(
-    `[oh-my-opencode-slim] Ignoring unknown council config keys: ${unknown.join(', ')}`,
-  );
-}
+];
 
 /**
  * Top-level council configuration.
@@ -163,13 +145,11 @@ export const CouncilConfigSchema = z
       .never({ error: 'council.master_fallback was removed' })
       .optional(),
   })
-  // Unknown keys pass validation on purpose: a typo here must not invalidate
-  // the whole config layer. The transform drops them, so surface the drop —
-  // otherwise a renamed or misspelled key disappears without a word.
+  // Keep a typo non-fatal; the silence-aware loader reports dropped keys.
   .passthrough()
-  .transform((data) => {
-    warnUnknownCouncilKeys(Object.keys(data));
-    return { presets: data.presets, default_preset: data.default_preset };
-  });
+  .transform((data) => ({
+    presets: data.presets,
+    default_preset: data.default_preset,
+  }));
 
 export type CouncilConfig = z.infer<typeof CouncilConfigSchema>;
