@@ -16,22 +16,25 @@ import {
   buildOrchestratorWakeFingerprint,
   CHILD_INPUT_WAKE_SETTLE_MS,
   CHILD_STALENESS_INTERVALS,
+  COMPLETED_JOB_OVERFLOW_TEXT,
+  COMPLETED_JOB_QUEUE_CAP,
+  COMPLETED_JOB_WAKE_CHUNK,
   childUpdateEvidenceMs,
   createOrchestratorWakeScheduler,
   formatChildInputWaitDelta,
+  formatCompletedJobDelta,
   formatStoppedJobDelta,
   isGenuineOperatorMessage,
   isWakeChildActive,
   mapWakeChild,
   ORCHESTRATOR_CHILD_INPUT_WAKE_TEXT,
   ORCHESTRATOR_CHILDREN_WAKE_TEXT,
+  ORCHESTRATOR_PUBLICATION_WAKE_TEXT,
   ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT,
-  ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD,
   ORCHESTRATOR_WAKE_TEXT,
   ORCHESTRATOR_WAKE_UNCHANGED_CAP,
   resolveWakeMode,
   STOPPED_RECOVERY_OVERFLOW_TEXT,
-  STOPPED_RECOVERY_OVERFLOW_TEXT_NO_BOARD,
   STOPPED_RECOVERY_QUEUE_CAP,
   STOPPED_RECOVERY_WAKE_CHUNK,
   WAKE_ANTI_FORGERY_TEXT,
@@ -156,7 +159,6 @@ function createScheduler(options?: {
   intervalMs?: number;
   mode?: 'auto' | 'todo' | 'children';
   periodicWakeEnabled?: boolean;
-  boardInjectionEnabled?: boolean;
   hostFlavor?: string;
   sessionClient?: SessionClient | null;
   shouldManageSession?: (id: string) => boolean;
@@ -164,6 +166,7 @@ function createScheduler(options?: {
   isFallbackInProgress?: (id: string) => boolean;
   isStoppedJobRecoveryCurrent?: (taskID: string, generation: number) => boolean;
   isChildInputWaitCurrent?: (taskID: string, requestID: string) => boolean;
+  isCompletedJobCurrent?: (taskID: string, generation: number) => boolean;
   isWriterLaneTask?: (taskID: string) => boolean;
   hasPendingDelegatedWork?: (id: string) => boolean;
   resolveSelection?: (sessionID: string) => Promise<{
@@ -193,12 +196,12 @@ function createScheduler(options?: {
         : {}),
     },
     intervalMs: options?.intervalMs ?? 60_000,
-    boardInjectionEnabled: options?.boardInjectionEnabled,
     shouldManageSession: options?.shouldManageSession ?? (() => true),
     hasInputWait: options?.hasInputWait ?? (() => false),
     isFallbackInProgress: options?.isFallbackInProgress,
     isStoppedJobRecoveryCurrent: options?.isStoppedJobRecoveryCurrent,
     isChildInputWaitCurrent: options?.isChildInputWaitCurrent,
+    isCompletedJobCurrent: options?.isCompletedJobCurrent,
     isWriterLaneTask: options?.isWriterLaneTask,
     hasPendingDelegatedWork: options?.hasPendingDelegatedWork,
     resolveSelection: options?.resolveSelection,
@@ -396,7 +399,6 @@ describe('overflow input requests across host versions', () => {
       const { scheduler } = createScheduler({
         hostFlavor,
         periodicWakeEnabled: false,
-        boardInjectionEnabled: false,
         sessionClient:
           hostFlavor === 'v2'
             ? makeV2Client({ promptAsync })
@@ -916,6 +918,169 @@ describe('orchestrator wake scheduler', () => {
     expect(promptAsync).toHaveBeenCalledTimes(1);
   });
 
+  test('a completed-job push carries its result once with the bare resume pointer', async () => {
+    const promptAsync = mock(async () => ({}));
+    const { scheduler } = createScheduler({
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+
+    const delta = formatCompletedJobDelta({
+      alias: 'exp-1',
+      taskID: 'ses_done',
+      state: 'completed',
+      resultSummary: 'the answer',
+    });
+    const fence = {
+      taskID: 'ses_done',
+      generation: 2,
+      terminalRevision: 3,
+      state: 'completed' as const,
+    };
+    scheduler.triggerCompletedJobPublication('p1', delta, 'ses_done:2', fence);
+    // Same execution re-queued: deduplicated, never duplicated in the prompt.
+    scheduler.triggerCompletedJobPublication('p1', delta, 'ses_done:2', fence);
+    await clock.advance(0);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const call = (
+      promptAsync.mock.calls as unknown as Array<
+        [
+          {
+            body: {
+              parts: Array<{
+                text: string;
+                metadata?: Record<string, unknown>;
+              }>;
+            };
+          },
+        ]
+      >
+    )[0]?.[0];
+    const text = call?.body.parts[0]?.text ?? '';
+    expect(text.match(/<completed-job>/g)?.length).toBe(1);
+    expect(text).toContain('result: the answer');
+    expect(text).toContain(ORCHESTRATOR_PUBLICATION_WAKE_TEXT);
+    expect(text).not.toContain('<stopped-job>');
+    expect(text).not.toContain('Background Job Board');
+    expect(
+      call?.body.parts[0]?.metadata?.['oh-my-opencode-slim.terminalDelta'],
+    ).toEqual([fence]);
+  });
+
+  test('a reopened completed result does not strand a queued child question', async () => {
+    const promptAsync = mock(async () => ({}));
+    let reopened = false;
+    const { scheduler } = createScheduler({
+      isCompletedJobCurrent: () => !reopened,
+      isChildInputWaitCurrent: () => true,
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+    scheduler.triggerChildInputWaitWake(
+      'p1',
+      formatChildInputWaitDelta({
+        alias: 'fix-1',
+        taskID: 'ses_q',
+        kind: 'permission',
+        requestID: 'r1',
+        detail: 'permission: external_directory\npatterns: /approved/*',
+      }),
+      'ses_q:r1',
+    );
+    scheduler.triggerCompletedJobPublication(
+      'p1',
+      formatCompletedJobDelta({
+        alias: 'exp-1',
+        taskID: 'ses_done',
+        state: 'completed',
+        resultSummary: 'the answer',
+      }),
+      'ses_done:2',
+      {
+        taskID: 'ses_done',
+        generation: 2,
+        terminalRevision: 3,
+        state: 'completed' as const,
+      },
+    );
+    // The completed task reopens before the parent goes idle: its queued
+    // result is stale, but the still-open question must still be delivered —
+    // the settle timer was the last non-periodic timer (Greptile P1
+    // 4344705554).
+    reopened = true;
+    await clock.advance(CHILD_INPUT_WAKE_SETTLE_MS);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const call = (
+      promptAsync.mock.calls as unknown as Array<
+        [{ body: { parts: Array<{ text: string }> } }]
+      >
+    )[0]?.[0];
+    expect(call?.body.parts[0]?.text).toContain(
+      'permission: external_directory',
+    );
+    expect(call?.body.parts[0]?.text).not.toContain('<completed-job>');
+  });
+
+  test('completed-job overflow keeps a bounded batch and a task_status pointer', async () => {
+    const promptAsync = mock(async () => ({}));
+    let waiting = true;
+    const { scheduler } = createScheduler({
+      hasInputWait: () => waiting,
+      sessionClient: makeClient({
+        todos: [],
+        promptAsync,
+        childrenData: [{ id: 'child-2' }],
+        statusData: { 'child-2': { type: 'busy' } },
+      }),
+    });
+
+    for (let i = 0; i < COMPLETED_JOB_QUEUE_CAP + 1; i++) {
+      scheduler.triggerCompletedJobPublication(
+        'p1',
+        formatCompletedJobDelta({
+          alias: `a${i}`,
+          taskID: `ses_${i}`,
+          state: 'completed',
+          resultSummary: `r${i}`,
+        }),
+        `ses_${i}:1`,
+        {
+          taskID: `ses_${i}`,
+          generation: 1,
+          terminalRevision: 2,
+          state: 'completed',
+        },
+      );
+    }
+    waiting = false;
+    await scheduler.event({
+      event: { type: 'session.idle', properties: { sessionID: 'p1' } },
+    });
+    await clock.advance(0);
+
+    const text =
+      (
+        promptAsync.mock.calls as unknown as Array<
+          [{ body: { parts: Array<{ text: string }> } }]
+        >
+      )[0]?.[0]?.body.parts[0]?.text ?? '';
+    expect(text.match(/<completed-job>/g)?.length).toBe(
+      COMPLETED_JOB_WAKE_CHUNK,
+    );
+    expect(text).toContain(COMPLETED_JOB_OVERFLOW_TEXT);
+    expect(text).toContain('<completed-job-overflow-ids>');
+    expect(text).toContain('task_status');
+  });
+
   test('caps queued stop deltas without losing the overflow recovery signal', async () => {
     const promptAsync = mock(async () => ({}));
     let waiting = true;
@@ -966,11 +1131,10 @@ describe('orchestrator wake scheduler', () => {
     );
   });
 
-  test('overflow recovery facts use the board-free text when board injection is off', async () => {
+  test('overflow recovery facts carry the retained task IDs and the task_status pointer', async () => {
     const promptAsync = mock(async () => ({}));
     let waiting = true;
     const { scheduler } = createScheduler({
-      boardInjectionEnabled: false,
       hasInputWait: () => waiting,
       sessionClient: makeClient({
         todos: [],
@@ -1005,16 +1169,15 @@ describe('orchestrator wake scheduler', () => {
           [{ body: { parts: Array<{ text: string }> } }]
         >
       )[0]?.[0]?.body.parts[0]?.text ?? '';
-    expect(text).toContain(STOPPED_RECOVERY_OVERFLOW_TEXT_NO_BOARD);
-    expect(text).not.toContain(STOPPED_RECOVERY_OVERFLOW_TEXT);
-    expect(text).toContain(ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD);
+    expect(text).toContain(STOPPED_RECOVERY_OVERFLOW_TEXT);
+    expect(text).toContain(ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT);
+    expect(text).not.toContain('Background Job Board');
   });
 
   test('board-free overflow reports evictions beyond the retained ID cap honestly', async () => {
     const promptAsync = mock(async () => ({}));
     let waiting = true;
     const { scheduler } = createScheduler({
-      boardInjectionEnabled: false,
       hasInputWait: () => waiting,
       sessionClient: makeClient({
         todos: [],
@@ -1234,7 +1397,6 @@ describe('orchestrator wake scheduler', () => {
     const promptAsync = mock(async () => ({}));
     const { scheduler } = createScheduler({
       periodicWakeEnabled: false,
-      boardInjectionEnabled: false,
       sessionClient: makeClient({
         todos: [{ id: 't1', status: 'pending' }],
         promptAsync,
@@ -1248,8 +1410,8 @@ describe('orchestrator wake scheduler', () => {
     await clock.advance(180_000);
     expect(promptAsync).not.toHaveBeenCalled();
 
-    // ...while the stopped-recovery event wake still delivers, with the
-    // board-free text variant.
+    // ...while the stopped-recovery event wake still delivers with the
+    // pull-channel text.
     scheduler.triggerStoppedJobRecovery(
       'p1',
       formatStoppedJobDelta({
@@ -1269,7 +1431,7 @@ describe('orchestrator wake scheduler', () => {
       >
     )[0]?.[0];
     expect(call?.body.parts[0]?.text).toContain(
-      ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT_NO_BOARD,
+      ORCHESTRATOR_STOPPED_JOB_WAKE_TEXT,
     );
     expect(call?.body.parts[0]?.text).not.toContain('Background Job Board');
   });

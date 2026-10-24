@@ -601,6 +601,10 @@ export class ForegroundFallbackManager {
       this.pinnedChains(sessionID)[agentName]?.length === 0
     );
   }
+  private readonly sessionRetryEnabled = new Map<string, boolean>();
+  private retryEnabledFor(sessionID: string): boolean {
+    return this.sessionRetryEnabled.get(sessionID) ?? this.v2RetryEnabled;
+  }
   /** child sessionID → parent sessionID (from session.created info).
    *  Lets the fallback abort path promote a foreground task() waiter to
    *  background first, so the waiting tool resolves via backgroundResult
@@ -756,7 +760,7 @@ export class ForegroundFallbackManager {
    * persistent 401/410 errors until recovery is actually impossible.
    */
   willAttemptFallback(sessionID: string): boolean {
-    if (!this.enabled && !this.v2RetryEnabled) return false;
+    if (!this.enabled && !this.retryEnabledFor(sessionID)) return false;
     if (this.inProgress.has(sessionID)) return true;
     if ((this.chainExhaustion.get(sessionID) ?? 0) >= 2) return false;
     if (this.deterministicTerminal.has(sessionID)) return false;
@@ -781,7 +785,7 @@ export class ForegroundFallbackManager {
   }
 
   fallbackFailureReason(sessionID: string): string {
-    if (!this.enabled && !this.v2RetryEnabled)
+    if (!this.enabled && !this.retryEnabledFor(sessionID))
       return 'Model fallback is disabled.';
     if (!this.hasFallbackChain(sessionID))
       return `No model fallback chain for ${this.sessionAgent.get(sessionID) ?? 'this agent'}.`;
@@ -818,7 +822,26 @@ export class ForegroundFallbackManager {
    *  in-flight fallback sequence finishes against its own generation even if
    *  a hot refresh publishes a new chain table mid-descent. First call wins;
    *  chain resolution pins lazily as a safety net. */
-  pinSessionChains(sessionID: string): void {
+  pinSessionChains(
+    sessionID: string,
+    chains?: Record<string, ReadonlyArray<ForegroundFallbackModel>>,
+    enabled?: boolean,
+  ): void {
+    if (enabled !== undefined) this.sessionRetryEnabled.set(sessionID, enabled);
+    if (chains) {
+      this.sessionChains.set(
+        sessionID,
+        Object.fromEntries(
+          Object.entries(chains).map(([name, entries]) => [
+            name,
+            entries.map((entry) =>
+              typeof entry === 'string' ? entry : { ...entry },
+            ),
+          ]),
+        ),
+      );
+      return;
+    }
     this.pinnedChains(sessionID);
   }
 
@@ -828,6 +851,7 @@ export class ForegroundFallbackManager {
    *  admission, so no descent can be mid-flight. */
   releaseSessionChains(sessionID: string): void {
     this.sessionChains.delete(sessionID);
+    this.sessionRetryEnabled.delete(sessionID);
   }
 
   async preflightEvent(rawEvent: unknown): Promise<void> {
@@ -1190,6 +1214,7 @@ export class ForegroundFallbackManager {
     this.sessionAgent.delete(id);
     this.sessionTried.delete(id);
     this.sessionChains.delete(id);
+    this.sessionRetryEnabled.delete(id);
     this.unknownFinishStreak.delete(id);
     this.v2RetryNotices.delete(id);
     // NOTE: inProgress is intentionally NOT cleared here —
@@ -1295,7 +1320,12 @@ export class ForegroundFallbackManager {
     // tried/retry/exhaustion state and skips fallbacks that are
     // available again. Intervention branches are gated on `enabled`
     // individually.
-    if (!this.enabled && !this.v2RetryEnabled) return;
+    if (
+      !this.enabled &&
+      !this.v2RetryEnabled &&
+      this.sessionRetryEnabled.size === 0
+    )
+      return;
     const event = rawEvent as {
       type: string;
       properties?: unknown;
@@ -1763,11 +1793,11 @@ export class ForegroundFallbackManager {
           agent: event.agent,
           from,
           failover,
-          steering: this.v2RetryEnabled,
+          steering: this.retryEnabledFor(sessionID),
         });
       }
       if (
-        !this.v2RetryEnabled ||
+        !this.retryEnabledFor(sessionID) ||
         this.disposed ||
         this.inProgress.has(sessionID)
       )

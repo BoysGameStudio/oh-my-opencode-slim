@@ -2,10 +2,15 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { testRender } from '@opentui/solid';
+import { createSignal } from 'solid-js';
 import type { PluginConfig } from '../config';
 import baseTui from '../tui';
 import { recordTuiAgentActivity, recordTuiSessionParent } from '../tui-state';
-import { registerConfigChangeListener } from './config-change-coordinator';
+import {
+  notifyConfigChanged,
+  registerConfigChangeListener,
+} from './config-change-coordinator';
 import tui2Plugin, {
   applyPresetByName,
   runPresetFlow,
@@ -236,7 +241,10 @@ describe('v2 tui preset plugin', () => {
           cheap: { orchestrator: { model: 'openai/gpt-5-mini' } },
         },
       });
-      const stub = makeStubCtx({ selects: ['cheap', 'apply'] });
+      const stub = makeStubCtx({
+        selects: ['cheap', 'apply', 'global'],
+        confirms: [true],
+      });
       const unregister = registerConfigChangeListener(projectDir, () => ({
         ok: true,
       }));
@@ -261,7 +269,7 @@ describe('v2 tui preset plugin', () => {
         'cheap',
         '__omo_new_preset__',
       ]);
-      expect(listArgs.options?.[0]?.title).toContain('(active)');
+      expect(listArgs.options?.[0]?.title).toContain('(default)');
       expect(stub.selectTitles()[1]).toBe('Preset: cheap');
     });
 
@@ -285,6 +293,11 @@ describe('v2 tui preset plugin', () => {
         expect(stub.toasts).toHaveLength(1);
         expect(stub.toasts[0]).toContain('Saved preset "cheap"');
         expect(stub.toasts[0]).toContain('Live refresh requested');
+        expect(stub.toasts[0]).toStartWith(
+          'Saved preset "cheap" to user config.',
+        );
+        expect(stub.toasts[0]).not.toContain('Global default saved');
+        expect(stub.toasts[0]).toContain('bound sessions unchanged');
         expect(stub.toasts[0]).not.toContain('Reload OpenCode');
         expect(readUserConfig().preset).toBe('cheap');
       } finally {
@@ -302,8 +315,14 @@ describe('v2 tui preset plugin', () => {
 
       expect(readUserConfig().preset).toBe('cheap');
       expect(stub.toasts).toHaveLength(1);
+      expect(stub.toasts[0]).toStartWith(
+        'Saved preset "cheap" to user config,',
+      );
+      expect(stub.toasts[0]).not.toContain('Global default saved');
       expect(stub.toasts[0]).toContain('live refresh request failed');
-      expect(stub.toasts[0]).toContain('Reload OpenCode to apply');
+      expect(stub.toasts[0]).toContain(
+        'Reload OpenCode to refresh the default',
+      );
       expect(stub.toasts[0]).not.toContain('Live refresh requested');
     });
 
@@ -354,6 +373,81 @@ describe('v2 tui preset plugin', () => {
 
       expect(stub.toasts).toEqual([]);
       expect(readUserConfig().preset).toBeUndefined();
+    });
+
+    test('bare /preset reads the current route and applies only its session through RPC', async () => {
+      writeUserConfig(makeConfig() as unknown as Record<string, unknown>);
+      const before = fs.readFileSync(userConfigPath(), 'utf-8');
+      const stub = makeStubCtx({
+        selects: ['cheap', 'apply', 'session'],
+        confirms: [true],
+      });
+      const reads: unknown[] = [];
+      const applies: unknown[] = [];
+      Object.assign(stub.ctx.ui, {
+        router: {
+          current: () => ({ type: 'session', sessionID: 'visible-root' }),
+        },
+      });
+      Object.assign(stub.ctx, {
+        client: {
+          rpc: (contract: { id: string }) => {
+            expect(contract.id).toBe('oh-my-opencode-slim.session-preset.v1');
+            return {
+              read: async (input: unknown, options: unknown) => {
+                reads.push({ input, options });
+                return {
+                  sessionID: 'visible-root',
+                  status: 'unbound',
+                  presetName: null,
+                  affects: 'future-children-only',
+                };
+              },
+              apply: async (input: unknown, options: unknown) => {
+                applies.push({ input, options });
+                return {
+                  sessionID: 'visible-root',
+                  status: 'bound',
+                  presetName: 'cheap',
+                  affects: 'future-children-only',
+                };
+              },
+            };
+          },
+        },
+      });
+      await runPresetFlow(stub.ctx);
+      expect(reads).toEqual([
+        {
+          input: { sessionID: 'visible-root' },
+          options: {
+            location: { directory: projectDir },
+            signal: expect.any(AbortSignal),
+          },
+        },
+      ]);
+      expect(applies).toEqual([
+        {
+          input: { sessionID: 'visible-root', presetName: 'cheap' },
+          options: { location: { directory: projectDir } },
+        },
+      ]);
+      expect(stub.toasts[0]).toContain('Session team snapshot: "cheap"');
+      expect(fs.readFileSync(userConfigPath(), 'utf-8')).toBe(before);
+      expect(stub.reloadCalls()).toBe(0);
+    });
+
+    test('bare /preset on home rejects Current session without RPC or a global write', async () => {
+      writeUserConfig(makeConfig() as unknown as Record<string, unknown>);
+      const before = readUserConfig();
+      const stub = makeStubCtx({ selects: ['cheap', 'apply', 'session'] });
+      Object.assign(stub.ctx.ui, {
+        router: { current: () => ({ type: 'home' }) },
+      });
+      await runPresetFlow(stub.ctx);
+      expect(stub.toasts).toHaveLength(1);
+      expect(stub.toasts[0]).toContain('No session is displayed');
+      expect(readUserConfig()).toEqual(before);
     });
 
     test('opens the create prompt when no presets are configured', async () => {
@@ -414,7 +508,10 @@ describe('v2 tui preset plugin', () => {
         },
       });
 
-      const stub = makeStubCtx({ selects: ['cheap', 'apply'] });
+      const stub = makeStubCtx({
+        selects: ['cheap', 'apply', 'global'],
+        confirms: [true],
+      });
       await runPresetFlow(stub.ctx);
 
       expect(stub.toasts).toHaveLength(1);
@@ -498,6 +595,122 @@ describe('v2 tui preset plugin', () => {
       expect(tui2Plugin.id).toBe(baseTui.id);
       expect(tui2Plugin.tui).toBe(baseTui.tui);
       expect(typeof tui2Plugin.setup).toBe('function');
+    });
+
+    test('sidebar separates default from session snapshot and rejects stale route/workspace responses', async () => {
+      writeUserConfig(makeConfig() as unknown as Record<string, unknown>);
+      process.env.XDG_DATA_HOME = path.join(configHome, 'sidebar-data');
+      process.env.OPENCODE_LOG_DIR = path.join(configHome, 'logs');
+      process.env.OH_MY_OPENCODE_SLIM_TUI_REFRESH_MS = '60000';
+      const [route, setRoute] = createSignal({
+        type: 'session',
+        sessionID: 'root-a',
+      });
+      const [directory, setDirectory] = createSignal(projectDir);
+      const stub = makeSetupCtx();
+      const ui = stub.ctx.ui as { router: { current: () => unknown } };
+      ui.router.current = route;
+      Object.defineProperty(stub.ctx, 'location', {
+        get: () => ({ directory: directory() }),
+      });
+      let notifyRendered = () => {};
+      const rendered = new Promise<void>((resolve) => {
+        notifyRendered = resolve;
+      });
+      stub.ctx.renderer = { requestRender: () => notifyRendered() };
+      let notifySecondRead = () => {};
+      const secondRead = new Promise<void>((resolve) => {
+        notifySecondRead = resolve;
+      });
+      let finishSecondRead: (value: unknown) => void = () => {};
+      const pending = new Promise((resolve) => {
+        finishSecondRead = resolve;
+      });
+      const requests: unknown[] = [];
+      stub.ctx.client = {
+        rpc: () => ({
+          read: async (input: { sessionID: string }, options: unknown) => {
+            requests.push({ input, options });
+            if (input.sessionID === 'root-b') {
+              notifySecondRead();
+              return pending;
+            }
+            return {
+              sessionID: input.sessionID,
+              status: 'bound',
+              presetName: 'server-alpha',
+              affects: 'future-children-only',
+            };
+          },
+        }),
+      };
+      let cleanup: (() => void) | undefined;
+      let screen: Awaited<ReturnType<typeof testRender>> | undefined;
+      try {
+        cleanup = await tui2Plugin.setup(
+          stub.ctx as unknown as V2TuiPluginContext,
+        );
+        await rendered;
+        const sidebar = stub.slotClaims.find(
+          (slot) => slot.append === 'sidebar.content',
+        );
+        if (!sidebar?.render) throw new Error('Sidebar slot missing');
+        screen = await testRender(() => sidebar.render?.() as never, {
+          width: 80,
+          height: 32,
+        });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).toContain('Default');
+        expect(screen.captureCharFrame()).toContain('balanced');
+        expect(screen.captureCharFrame()).toContain(
+          'Session team snapshot: server-alpha',
+        );
+
+        setRoute({ type: 'session', sessionID: 'root-b' });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).not.toContain('server-alpha');
+        expect(screen.captureCharFrame()).toContain(
+          'Session team snapshot: Loading',
+        );
+        writeUserConfig({
+          ...makeConfig(),
+          preset: 'cheap',
+        } as unknown as Record<string, unknown>);
+        await notifyConfigChanged(projectDir, 'test-route-refresh');
+        await secondRead;
+        setRoute({ type: 'session', sessionID: 'root-c' });
+        setDirectory(configHome);
+        finishSecondRead({
+          sessionID: 'root-b',
+          status: 'bound',
+          presetName: 'late-beta',
+          affects: 'future-children-only',
+        });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).not.toContain('late-beta');
+        expect(screen.captureCharFrame()).not.toContain('server-alpha');
+        expect(requests[1]).toEqual({
+          input: { sessionID: 'root-b' },
+          options: {
+            location: { directory: projectDir },
+            signal: expect.any(AbortSignal),
+          },
+        });
+        setRoute({ type: 'home', sessionID: '' });
+        await screen.renderOnce();
+        expect(screen.captureCharFrame()).toContain(
+          'Session team snapshot: No session displayed',
+        );
+      } finally {
+        finishSecondRead({
+          sessionID: 'root-b',
+          status: 'unbound',
+          presetName: null,
+          affects: 'future-children-only',
+        });
+        cleanup?.();
+        screen?.renderer.destroy();
+      }
     });
 
     test('setup registers the sidebar slot and the /preset layer in the app slot render', async () => {

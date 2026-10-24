@@ -39,12 +39,10 @@ import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
   BACKGROUND_JOB_BOARD_METADATA_KEY,
-  type InjectedTerminalJobs,
   type InjectionState,
   injectBackgroundJobBoard,
   observeSyntheticTerminalPart,
   pruneReopenCorrectionState,
-  reconcileInjectedTerminalJobs,
   stabilizeRunningTaskParts,
   updateFromInjectedCompletion,
 } from './board-injection';
@@ -330,6 +328,14 @@ export function createTaskSessionManagerHook(
     hostOutcomeClock?: 'shared-unix-ms';
     backgroundJobSupervisor?: BackgroundJobSupervisor;
     backgroundTaskConcurrency?: BackgroundTaskConcurrency;
+    /** Whether a completed-job push for this exact run is still queued and
+     *  undelivered in the wake scheduler; consulted by the stale-timestamp
+     *  retirement fallback so an undelivered answer is never acked first. */
+    hasUndeliveredTerminalPush?: (
+      parentSessionID: string,
+      taskID: string,
+      generation: number,
+    ) => boolean;
     /** Shared by plugin generations for one admission runtime. */
     pendingCallTracker?: PendingCallTracker;
     getModelForAgent?: (
@@ -345,10 +351,6 @@ export function createTaskSessionManagerHook(
     /** Host flavor marker ('v2' on OpenCode v2 hosts); selects the native
      *  delegation vocabulary in model-visible tool guidance. Defaults v1. */
     hostFlavor?: string;
-    /** v1-only honoured switch (runtime.backgroundJobs.boardInjection;
-     *  forced false on v2 at the RuntimeConfig layer). false on v1 =
-     *  boardless. */
-    boardInjection?: boolean;
     /** Per-instance pairing flag for the background-default flip (v2 only);
      *  see BackgroundDefaultFlipState in v2/delegation. */
     isBackgroundDefaultFlipArmed?: () => boolean;
@@ -617,11 +619,6 @@ export function createTaskSessionManagerHook(
     });
   const taskContextTracker = createTaskContextTracker();
 
-  const terminalJobsInjectedByParent = new Map<string, InjectedTerminalJobs>();
-  const pendingInjectedTerminalJobsByParent = new Map<
-    string,
-    Map<string, BackgroundJobExecution>
-  >();
   /** Sessions with a deferred failover error awaiting the fallback
    *  outcome (managed inline 401/410, or a background child's
    *  failover-worthy error with an armed fallback chain), mapped to the
@@ -646,8 +643,6 @@ export function createTaskSessionManagerHook(
 
   const idleReconciler = createIdleReconciler({
     terminalGate,
-    reconcileInjectedTerminalJobs: (parentSessionID: string) =>
-      reconcileInjectedTerminalJobs(injectionState, parentSessionID),
     idleReconcileDelayMs:
       options.idleReconcileDelayMs ?? IDLE_RECONCILE_DELAY_MS,
     isFallbackInProgress: options.isFallbackInProgress,
@@ -733,10 +728,7 @@ export function createTaskSessionManagerHook(
         backgroundJobBoard.clearParent(sessionId);
         if (!hardTimedOut) options.backgroundJobSupervisor?.drop(sessionId);
       }
-      terminalJobsInjectedByParent.delete(sessionId);
-      pendingInjectedTerminalJobsByParent.delete(sessionId);
       historyBoundaries.delete(sessionId);
-      injectionState.retainedTailBoards.delete(sessionId);
       // Orphaned reopen corrections must never surface in a recreated
       // session; the board entries they referenced are being dropped too.
       pruneReopenCorrectionState(injectionState, sessionId);
@@ -751,7 +743,6 @@ export function createTaskSessionManagerHook(
     backgroundJobBoard,
     terminalGate,
     hostFlavor: options.hostFlavor,
-    boardInjection: options.boardInjection !== false,
     lifecycleLedger: rehydrateState,
     processedInjectedCompletions: rehydrateState.processedInjectedCompletions,
     processedInjectedCompletionOrder:
@@ -762,13 +753,10 @@ export function createTaskSessionManagerHook(
       rehydrateState.syntheticTerminalOccurrenceOrder,
     getLifecycleEpoch: () => rehydrateState.nextEpoch,
     getDeletionEpoch: (taskID) => rehydrateState.deletionEpochs.get(taskID),
-    terminalJobsInjectedByParent,
-    pendingInjectedTerminalJobsByParent,
+    hasUndeliveredTerminalPush: options.hasUndeliveredTerminalPush,
     metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
     shouldManageSession: options.shouldManageSession,
     taskContextTracker,
-    lastInjectedBoardTextByParent: new Map(),
-    retainedTailBoards: new Map(),
   };
 
   // Early session.created registrations belong to the pending native call,
@@ -970,6 +958,11 @@ export function createTaskSessionManagerHook(
         }
 
         for (const [partIndex, part] of message.parts.entries()) {
+          // The host's native completion commits the terminal state. Its
+          // retirement is NOT observed here: on v1 the native delivery is
+          // untagged (the plugin cannot see it as one of its own deltas), so
+          // the run retires through the tagged-delta observation or the
+          // stale-terminal fallback (issue #1647).
           await updateFromInjectedCompletion(
             injectionState,
             part,
@@ -1034,8 +1027,6 @@ export function createTaskSessionManagerHook(
         terminalGate,
         pendingCallTracker,
         taskContextTracker,
-        terminalJobsInjectedByParent,
-        pendingInjectedTerminalJobsByParent,
         backgroundJobSupervisor: options.backgroundJobSupervisor,
         bindConcurrencyTicket: (taskID, pending) =>
           pending.concurrencyTicket?.bind(taskID),

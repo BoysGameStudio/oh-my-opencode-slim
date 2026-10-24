@@ -16,21 +16,15 @@
  * backed (older/reduced hosts); when neither yields models the flow toasts
  * guidance instead of failing.
  *
- * Mutation semantics are identical to v1, deliberately: preset edits and the
- * selected preset name are persisted to the user config file. After a
- * successful write the manager runs the shared live-refresh seam
- * (`onConfigChanged`): the request asks the server-side watcher to refresh
- * the runtime profiles used by NEW child dispatches and the TUI sidebar
- * re-reads its config-backed rows, while running sessions keep their captured
- * profiles. The TUI process CANNOT observe the server watcher's outcome
- * (separate process; the supported host exposes no safe plugin RPC bridge
- * between the server and TUI entries), so a successful toast says the refresh
- * was requested — never that it was applied — and a failed/missing request
- * path degrades to the actionable reload fallback. The manager never reloads
- * the host registry itself.
+ * Apply explicitly chooses a scope. Global defaults and definition edits
+ * persist to user config and request a refresh for future unbound roots.
+ * Current-session inference bindings are owned by the server RPC, never local
+ * config. Neither operation changes the root model or existing children.
+ * A requested config refresh is not a confirmed watcher outcome; session
+ * apply succeeds only when the RPC confirms its binding.
  *
- * Host types are hand-mirrored and capability-guarded — the v2 plugin package
- * is not a build-time dependency (same convention as `src/v2/tui.ts`).
+ * UI capabilities are mirrored locally and guarded at runtime. The shared
+ * RPC contract uses the official v2 plugin package; request options are mirrored.
  */
 import type { AgentOverrideConfig, Preset, PresetDefinition } from '../config';
 import { resolvePreset } from '../config';
@@ -74,6 +68,7 @@ import {
   writePreset,
 } from '../tools/preset-switch';
 import { log } from '../utils/logger';
+import { type SessionPresetState, sessionPresetRpc } from './preset-rpc';
 
 // --- v2 host mirror types (subset consumed here, capability-guarded) ---
 
@@ -162,6 +157,8 @@ export interface V2PresetManagerContext {
     };
   };
   client?: unknown;
+  /** Live route accessor; no session on the home screen. */
+  getSessionID?: () => string | undefined;
   /** Runs after a successful config write (Save / Save & Apply / Apply).
    * This is a REQUEST seam: on the supported host it asks the server-side
    * watcher to refresh the runtime profiles and re-reads the TUI sidebar
@@ -203,6 +200,131 @@ interface ManagerRun {
   ctx: V2PresetManagerContext;
   directory: string;
   dialog: RequiredDialog;
+}
+
+type ApplyTarget =
+  | { scope: 'global' }
+  | { scope: 'session'; sessionID: string };
+
+const SESSION_PRESET_READ_TIMEOUT_MS = 2_000;
+
+/** The consumed subset of v2 RpcCallOptions; no dev-only client dependency. */
+export interface V2PresetRpcCallOptions {
+  readonly location?: { readonly directory?: string };
+  readonly signal?: AbortSignal;
+}
+
+/** Only the server owns session bindings. Never infer them from local config. */
+function sessionPresetClient(ctx: V2PresetManagerContext) {
+  const client = ctx.client as
+    | {
+        rpc?: (contract: typeof sessionPresetRpc) => {
+          read: (
+            input: { sessionID: string },
+            options: V2PresetRpcCallOptions,
+          ) => Promise<SessionPresetState>;
+          apply: (
+            input: { sessionID: string; presetName: string },
+            options: V2PresetRpcCallOptions,
+          ) => Promise<SessionPresetState>;
+        };
+      }
+    | undefined;
+  if (typeof client?.rpc !== 'function') {
+    throw new Error('Session preset RPC unavailable. Nothing was applied.');
+  }
+  return client.rpc(sessionPresetRpc);
+}
+
+export async function readSessionPreset(
+  ctx: V2PresetManagerContext,
+  sessionID: string,
+  directory: string,
+): Promise<SessionPresetState> {
+  const state = await sessionPresetClient(ctx).read(
+    { sessionID },
+    {
+      location: { ...ctx.location, directory },
+      // Bound the host request so an unavailable server cannot stall sidebar refresh.
+      signal: AbortSignal.timeout(SESSION_PRESET_READ_TIMEOUT_MS),
+    },
+  );
+  if (state.sessionID !== sessionID)
+    throw new Error('Session response mismatch.');
+  return state;
+}
+
+function assertApplyTarget(run: ManagerRun, target: ApplyTarget): void {
+  if (
+    (run.ctx.location?.directory ?? run.directory) !== run.directory ||
+    (target.scope === 'session' &&
+      run.ctx.getSessionID?.() !== target.sessionID)
+  ) {
+    throw new Error(
+      'The displayed session or workspace changed. Nothing was applied; try again.',
+    );
+  }
+}
+
+async function chooseApplyTarget(
+  run: ManagerRun,
+  presetName: string,
+  save: boolean,
+): Promise<ApplyTarget | undefined> {
+  const sessionID = run.ctx.getSessionID?.();
+  const scope = await run.dialog.select<'session' | 'global'>({
+    title: `${save ? 'Save & apply' : 'Apply'}: ${presetName}`,
+    placeholder: 'Choose where to apply — no change until confirmed',
+    options: [
+      {
+        title: 'Current session',
+        value: 'session',
+        description: sessionID
+          ? 'Inference only for future children; root and existing children unchanged'
+          : 'Unavailable: open a session first',
+      },
+      {
+        title: 'Global default',
+        value: 'global',
+        description: 'Write the user default; already-bound sessions unchanged',
+      },
+    ],
+  });
+  if (scope === undefined) return undefined;
+  if (scope !== 'session' && scope !== 'global') return undefined;
+  if (scope === 'session' && !sessionID) {
+    toast(
+      run.ctx,
+      'warning',
+      'Preset not applied',
+      'No session is displayed. Open a session first. Global default unchanged.',
+    );
+    return undefined;
+  }
+  const target: ApplyTarget =
+    scope === 'session' ? { scope, sessionID: sessionID as string } : { scope };
+  const message =
+    scope === 'session'
+      ? `Apply "${presetName}" to this session's future child team? Inference only: model, variant, temperature, options and fallback. Root model, existing children, prompts, skills and MCPs stay unchanged. Global default unchanged.`
+      : `Set "${presetName}" as the global default? This writes user config for future unbound roots; project overrides still apply. Live refresh is inference only, not a hot-swap of prompts, skills or MCPs. Already-bound sessions and their future children stay unchanged.`;
+  if (
+    !(await run.dialog.confirm({
+      title:
+        scope === 'session'
+          ? 'Apply to current session?'
+          : 'Change global default?',
+      message: `${save ? 'First save this preset definition to user config. Saving alone does not change any bound session. ' : ''}${message}`,
+    }))
+  )
+    return undefined;
+  try {
+    assertApplyTarget(run, target);
+    if (scope === 'session') sessionPresetClient(run.ctx);
+    return target;
+  } catch (err) {
+    toast(run.ctx, 'warning', 'Preset not applied', String(err));
+    return undefined;
+  }
 }
 
 interface ModelOption {
@@ -308,14 +430,14 @@ export function liveRefreshSuccessMessage(
   summary: string[] = [],
 ): string {
   const suffix = summary.length > 0 ? ` ${summary.join('; ')}` : '';
-  return `Saved preset "${presetName}". Live refresh requested — new child dispatches pick the change up once the config watcher refreshes; running sessions keep their current model.${suffix}`;
+  return `Saved preset "${presetName}" to user config. Live refresh requested, not confirmed — changes affect future unbound roots only; bound sessions unchanged, including their future children.${suffix}`;
 }
 
 export function liveRefreshFailureMessage(
   presetName: string,
   reason: string,
 ): string {
-  return `Saved preset "${presetName}", but the live refresh request failed: ${reason}. Reload OpenCode to apply.`;
+  return `Saved preset "${presetName}" to user config, but the live refresh request failed: ${reason}. Reload OpenCode to refresh the default for future unbound roots. Bound sessions unchanged.`;
 }
 
 /** Run the live-refresh seam after a successful config write and report the
@@ -378,6 +500,25 @@ async function runPresetList(run: ManagerRun): Promise<void> {
       ]),
     );
     const activePreset = config.preset ?? null;
+    const sessionID = run.ctx.getSessionID?.();
+    let sessionLabel = 'No session displayed';
+    if (sessionID) {
+      try {
+        const state = await readSessionPreset(
+          run.ctx,
+          sessionID,
+          run.directory,
+        );
+        sessionLabel =
+          state.status === 'bound'
+            ? (state.presetName ?? '(no named preset)')
+            : 'Not bound';
+        if (run.ctx.getSessionID?.() !== sessionID)
+          sessionLabel = 'Session changed — reopen manager';
+      } catch {
+        sessionLabel = 'Unavailable';
+      }
+    }
 
     // No presets at all: jump straight to "create" (same as v1). A cancelled
     // create closes the manager — there is nothing else to do.
@@ -392,7 +533,7 @@ async function runPresetList(run: ManagerRun): Promise<void> {
       const tag = isProject ? ' [project - read-only]' : '';
       return {
         title:
-          name === activePreset ? `${name} (active)${tag}` : `${name}${tag}`,
+          name === activePreset ? `${name} (default)${tag}` : `${name}${tag}`,
         value: wrapUserChoice(name),
         description: describePreset(name, allPresets),
       };
@@ -401,7 +542,7 @@ async function runPresetList(run: ManagerRun): Promise<void> {
 
     const choice = await run.dialog.select<PresetChoice>({
       title: 'Presets',
-      placeholder: 'Select a preset to apply or edit',
+      placeholder: `Session team snapshot: ${sessionLabel}. Same name does not imply the same definition; reapply to update.`,
       options,
       // Only pass `current` when it matches an option: a stale config preset
       // name must not break the host dialog.
@@ -461,7 +602,11 @@ async function showPresetActions(
 
     switch (choice) {
       case 'apply':
-        await applyPresetWithMessage(run, presetName, 'Preset saved');
+        {
+          const target = await chooseApplyTarget(run, presetName, false);
+          if (!target) return 'exit';
+          await applyPresetWithMessage(run, presetName, target);
+        }
         return 'exit';
       case 'edit':
         return (await editPreset(run, presetName)) === 'dismiss'
@@ -481,26 +626,67 @@ async function showPresetActions(
   }
 }
 
-/** Apply a preset and report ONE combined toast: persistence is immediate,
- * the live refresh is requested, and a failed request degrades to the reload
- * fallback. `title` lets Save & Apply show one distinct message. */
+/** Apply the confirmed scope; keep a committed Save distinct from an apply failure. */
 async function applyPresetWithMessage(
   run: ManagerRun,
   presetName: string,
-  title: string,
+  target: ApplyTarget,
+  saved = false,
 ): Promise<void> {
-  const config = loadPluginConfig(run.directory, {
-    silent: true,
-    hostFlavor: 'v2',
-  });
-  const result = switchPresetOnDisk(run.directory, presetName, config, {
-    hostFlavor: 'v2',
-  });
-  if (!result.ok) {
-    toast(run.ctx, 'warning', 'Preset switch failed', result.message);
-    return;
+  try {
+    assertApplyTarget(run, target);
+    if (target.scope === 'session') {
+      const state = await sessionPresetClient(run.ctx).apply(
+        { sessionID: target.sessionID, presetName },
+        { location: { ...run.ctx.location, directory: run.directory } },
+      );
+      if (
+        state.sessionID !== target.sessionID ||
+        state.status !== 'bound' ||
+        state.presetName !== presetName
+      ) {
+        throw new Error(
+          'Server did not confirm the requested session binding.',
+        );
+      }
+      toast(
+        run.ctx,
+        'success',
+        saved ? 'Preset saved & session team updated' : 'Session team updated',
+        `Session team snapshot: "${state.presetName ?? presetName}". Inference only for future children. Root model, existing children and global default unchanged.`,
+      );
+      return;
+    }
+    const config = loadPluginConfig(run.directory, {
+      silent: true,
+      hostFlavor: 'v2',
+    });
+    const result = switchPresetOnDisk(run.directory, presetName, config, {
+      hostFlavor: 'v2',
+    });
+    if (!result.ok) {
+      toast(
+        run.ctx,
+        'warning',
+        saved ? 'Preset saved — not applied' : 'Preset not applied',
+        `${saved ? 'Definition saved, but global default was not changed. ' : ''}${result.message}`,
+      );
+      return;
+    }
+    await reportConfigWrite(
+      run,
+      presetName,
+      'Global default saved',
+      result.summary,
+    );
+  } catch (err) {
+    toast(
+      run.ctx,
+      'warning',
+      saved ? 'Preset saved — not applied' : 'Preset not applied',
+      `${saved ? 'Definition saved, but apply was not confirmed. ' : 'Apply was not confirmed. '}${target.scope === 'session' ? 'Global default unchanged. ' : ''}${String(err)}`,
+    );
   }
-  await reportConfigWrite(run, presetName, title, result.summary);
 }
 
 type DeleteResult = 'deleted' | 'cancelled' | 'dismiss';
@@ -731,6 +917,14 @@ async function editPresetWorkingCopy(
         continue;
       }
       if (choice === ACTION_SAVE_APPLY) {
+        const target = await chooseApplyTarget(run, presetName, true);
+        if (!target) continue;
+        try {
+          assertApplyTarget(run, target);
+        } catch (err) {
+          toast(run.ctx, 'warning', 'Preset not applied', String(err));
+          continue;
+        }
         const saved = await savePreset(
           run,
           presetName,
@@ -739,11 +933,8 @@ async function editPresetWorkingCopy(
           baseline,
         );
         if (saved.ok) {
-          await applyPresetWithMessage(
-            run,
-            presetName,
-            'Preset saved & applied',
-          );
+          baseline = saved.baseline;
+          await applyPresetWithMessage(run, presetName, target, true);
           return 'back';
         }
         toast(

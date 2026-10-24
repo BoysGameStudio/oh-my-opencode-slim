@@ -72,7 +72,7 @@ function waitKey(taskID: string, requestID: string): string {
  * Escape child-supplied text for prompt-visible rendering. Stored records
  * feed both the `<child-input-wait>` wake delta and task_status output, so
  * escaping at the sanitize choke point covers every render path. Same
- * `&`/`<`/`>` precedent as the Background Job Board's promptSafe.
+ * `&`/`<`/`>` precedent as the board render's promptSafe had.
  */
 function sanitizeText(value: unknown, maxLength: number): string {
   const text = typeof value === 'string' ? value : '';

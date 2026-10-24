@@ -61,6 +61,9 @@ export interface ConfigLoadWarning {
   kind: ConfigLoadWarningKind;
   message: string;
   formatted?: unknown;
+  /** Only per-preset inheritance-resolution failures carry this scope.
+   * File/layer validation failures must remain unscoped. */
+  presetName?: string;
 }
 
 /**
@@ -87,6 +90,9 @@ export interface LoadPluginConfigOptions {
    * Unmarked hosts also use v1's worktree-bounded discovery.
    */
   hostFlavor?: string;
+  /** Select a preset for this read only, without creating a runtime agent
+   * override. Ancestors < child preset < root agents remains unchanged. */
+  presetName?: string;
 }
 
 const PROMPTS_DIR_NAME = 'oh-my-opencode-slim';
@@ -802,36 +808,23 @@ export function loadPluginConfig(
     }
   }
 
-  // boardInjection is v1-only: force-disabled at the RuntimeConfig layer on
-  // v2 (native notifier + inbox delivery replace the passive board). An
-  // explicit true warns here — pre-parse, on the merged explicit-only
-  // config — because the loader is the layer that sees user intent, and
-  // Object.hasOwn distinguishes an explicit key from an applied default.
-  // periodicWakeEnabled needs no derivation here: v2 disables the periodic
-  // evaluation structurally where the wake scheduler is wired (src/index.ts).
-  // An explicit true warns the same way, so the override is never silent.
+  // v2 hosts have no plugin wake machinery at all (council 2026-10-23):
+  // the native background notifier owns terminal delivery and the whole
+  // backgroundJobs.orchestratorWake section is v1-only. Warn so the
+  // override is never silent.
   if (options?.hostFlavor === 'v2' && !options?.silent) {
     const backgroundJobs = (config.backgroundJobs ?? {}) as Record<
       string,
       unknown
     >;
-    if (
-      Object.hasOwn(backgroundJobs, 'boardInjection') &&
-      backgroundJobs.boardInjection === true
-    ) {
-      console.warn(
-        '[oh-my-opencode-slim] backgroundJobs.boardInjection is ignored on OpenCode v2 hosts: the native background notifier and inbox delivery replace the passive board. Run oh-my-opencode-slim doctor for details.',
-      );
-    }
     const orchestratorWake = backgroundJobs.orchestratorWake;
     if (
       orchestratorWake !== null &&
       typeof orchestratorWake === 'object' &&
-      Object.hasOwn(orchestratorWake, 'periodicWakeEnabled') &&
-      (orchestratorWake as Record<string, unknown>).periodicWakeEnabled === true
+      Object.keys(orchestratorWake as Record<string, unknown>).length > 0
     ) {
       console.warn(
-        '[oh-my-opencode-slim] backgroundJobs.orchestratorWake.periodicWakeEnabled is ignored on OpenCode v2 hosts: the native background notifier delivers terminal publications to an idle parent, so the periodic idle evaluation is off. Run oh-my-opencode-slim doctor for details.',
+        '[oh-my-opencode-slim] backgroundJobs.orchestratorWake is v1-only and ignored on OpenCode v2 hosts: the native background notifier owns terminal delivery. Run oh-my-opencode-slim doctor for details.',
       );
     }
   }
@@ -858,6 +851,9 @@ export function loadPluginConfig(
   const envPreset = process.env.OH_MY_OPENCODE_SLIM_PRESET;
   if (envPreset) {
     config.preset = envPreset;
+  }
+  if (options?.presetName !== undefined) {
+    config.preset = options.presetName;
   }
 
   // Resolve presets independently. An invalid, unused preset must not prevent
@@ -897,6 +893,7 @@ export function loadPluginConfig(
             '',
           kind: 'invalid-schema',
           message,
+          presetName: name,
         });
         if (!options?.silent) {
           console.warn(`[oh-my-opencode-slim] ${message}`);

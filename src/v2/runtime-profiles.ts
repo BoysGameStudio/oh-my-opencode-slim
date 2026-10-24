@@ -95,6 +95,10 @@ export function resolveV2EventPayload(
 export interface SessionProfileBridgeOptions {
   /** Current profile table (read on every newly seen child). */
   profiles: () => V2AgentRuntimeProfiles;
+  /** Durable per-session team; never consult the global table for a child
+   * when the session preset service is installed. */
+  profilesForSession?: (sessionID: string) => Promise<V2AgentRuntimeProfiles>;
+  preserveSessionModel?: (sessionID: string) => boolean;
   /** Startup profiles, matching the host-registered agent defaults. */
   registeredProfiles?: V2AgentRuntimeProfiles;
   /** Plugin-defined agent ids; foreign children are never profiled. */
@@ -300,7 +304,10 @@ export function createSessionProfileBridge(
         return;
       }
 
-      const profile = options.profiles()[resolved.agent];
+      const profiles = options.profilesForSession
+        ? await options.profilesForSession(sessionID)
+        : options.profiles();
+      const profile = profiles[resolved.agent];
       if (!profile) {
         // Plugin-managed but absent from the profile table (e.g. a
         // marketplace-agent child: the registry registers it yet the table
@@ -319,6 +326,7 @@ export function createSessionProfileBridge(
       const registered = options.registeredProfiles?.[resolved.agent]?.model;
       if (
         !profile.model ||
+        options.preserveSessionModel?.(sessionID) ||
         (options.registeredProfiles &&
           resolved.model &&
           !sameModel(resolved.model, registered))
@@ -470,6 +478,7 @@ export function reconcileRuntimeProfileOptionKeys(
 export function applyRuntimeProfileOptions(
   event: V2SessionContextEvent,
   profile: V2AgentRuntimeProfile | undefined,
+  binding?: { inheritedProviderID?: string },
 ): void {
   if (!profile) return;
   const options = (event as { options?: Record<string, unknown> }).options;
@@ -478,11 +487,20 @@ export function applyRuntimeProfileOptions(
   if (typeof profile.temperature === 'number') {
     options.temperature = profile.temperature;
   }
-  for (const key of profile.managedProviderOptionKeys ?? []) {
+  for (const key of new Set([
+    ...(profile.managedProviderOptionKeys ?? []),
+    ...(binding ? Object.keys(profile.providerOptions ?? {}) : []),
+  ])) {
+    if (binding && key === 'temperature') continue;
     delete options[key];
+  }
+  if (binding) {
+    const origin = profile.model?.providerID ?? binding.inheritedProviderID;
+    if (!origin || origin !== event.model.providerID) return;
   }
   if (profile.providerOptions) {
     for (const [key, value] of Object.entries(profile.providerOptions)) {
+      if (binding && key === 'temperature') continue;
       options[key] = value;
     }
   }

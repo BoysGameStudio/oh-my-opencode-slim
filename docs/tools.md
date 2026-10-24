@@ -45,6 +45,16 @@ Fast, structural code search and refactoring - more powerful than plain text gre
 
 `ast_grep` understands code structure, so it can find patterns like "all arrow functions that return a JSX element" rather than relying on exact text matching.
 
+If the ast-grep CLI is missing or cannot execute, the tools attempt automatic
+recovery once, then return an error rather than retrying indefinitely.
+Concurrent calls share recovery work. Missing paths are rediscovered locally
+before downloading, so an installed CLI can be used offline. Only an unusable
+plugin-cached binary is removed; package and system binaries are never deleted.
+Downloaded Linux binaries require glibc.
+On Alpine/musl, build a compatible binary locally
+(`cargo install ast-grep --locked`), copy it to the plugin cache path shown in
+the error, and restart OpenCode.
+
 `ast_grep_replace` previews changes by default. Set `dryRun: false` to write
 the replacements. Report-size limits do not limit which matching rewrites
 are applied. Write failures and timeouts return errors instead of a successful
@@ -70,14 +80,16 @@ conservatively passes the path through. Disable with
 | Tool | Description |
 |------|-------------|
 | `task` | Start a specialist task and return its task ID |
-| `task_status` | Check the status of a task; `result: true` retrieves its result |
+| `task_status` | Check task status; `result: true` retrieves a completed result; `diagnostic: true` reads an unsuccessful child's partial excerpt |
 | `task_message` | Send a non-interrupting message and return `queued` (queue-only: no wake, no steer channel) |
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction (v1 only; on v2 continue with `subagent(sessionID, prompt)`) |
 | `wait_for_user` | Pause automatic orchestrator wake prompts until the next distinct external user message (v1 only; not registered on v2 — use the native `question` tool there) |
 
-The task controls use the task ID or Background Job Board alias for the task being
-managed. `task_message` does not interrupt the current generation. `task_cancel`
+The task controls use the task ID or its parent-scoped alias for the task being
+managed. `task_status` with an unknown or placeholder ID enumerates the
+session's recent task handles, including recently finished sessions, so a
+handle lost to compaction is recoverable from the error itself. `task_message` does not interrupt the current generation. `task_cancel`
 stops the generation but retains its session; it does not roll back partial edits.
 After cancelling a write-capable task, inspect and reconcile file changes before
 launching replacement work.
@@ -86,7 +98,7 @@ launching replacement work.
 and custom primary agents that have delegated work. Host tool permissions still
 apply, and a parent can only control its own children. Switching primary agents
 does not transfer child ownership. Completed results are surfaced and
-acknowledged for reuse in both board modes regardless of the parent's agent name.
+acknowledged for reuse regardless of the parent's agent name.
 History recovery and injected completion handling use the same managed-session
 admission; an unmanaged Build turn is not promoted to Orchestrator.
 This does not add the Orchestrator prompt to Build or make it delegate automatically.
@@ -229,9 +241,70 @@ and only when it matches that result's session ID and original agent argument.
 A numbered alias is issued only to children of a parent created while the
 plugin instance runs (see [Background Orchestration](background-orchestration.md));
 any other new task is still created and is referred to by its exact session ID.
+
+`task_status` reports `last_activity_source` alongside tracked activity time:
+`observed-activity` means a tracker event (completed assistant/step or host
+busy/retry), which may lag the host; `host-busy` is a coarse busy observation
+beyond the run start, not proof of useful work; `launch-time` means no activity
+evidence beyond the run start time, not proof the child did nothing; `unknown`
+means no activity evidence is available. Tracker entries are session-keyed, so
+a pre-revive entry can supply an older timestamp; timestamps are unchanged.
+
+Use `diagnostic: true` only for tracked, finished-but-unsuccessful children:
+error, cancelled, or stopped. It returns a labelled, non-final tail excerpt,
+including short assistant errors and failed-tool error text, never tool inputs or
+successful tool outputs. Host compaction triggers and summaries are excluded
+and counted as omitted messages. The terminal reason uses a recorded host
+error/outcome reason, then attributable assistant error text, then the state
+name—not partial findings from the stored result summary.
+The tool's rendered diagnostic response is capped at 6,144 UTF-8 bytes,
+including headers, errors, and truncation markers; plugin
+warnings may be appended separately. The fetch requests the newest 100 messages.
+Our own scanning is bounded to 40 trailing messages, 100 trailing parts per
+message, and 2,000 excerpt characters per message. On v2 the paged messages route
+honours the limit. Without that route the shim fetches full context, checks it
+for compaction, then selects the newest requested entries before conversion;
+dropped context or compaction is marked incomplete. A v1 host may ignore the
+limit; the excerpt scan still stays bounded. Attribution outside the scan window
+is reported as uncertain or unavailable, not guessed. Truncation and unavailable
+evidence are explicit.
+Running children are refused; completed
+children point to `result: true`. The two modes are mutually exclusive.
+Most runs lack recorded message identities, so attribution is timestamp-based.
+Excerpts start after the latest real input in the window and exclude assistant
+messages created before the recorded run start. Input may predate registration;
+late registration can omit genuine early output. A missing input boundary,
+missing assistant creation times, or only pre-start evidence makes the excerpt
+unavailable.
+A delivered same-run queued `task_message` also moves the excerpt start:
+earlier output is omitted and labelled, without changing the recorded generation.
+Without an attributable assistant after that input, the excerpt is unavailable.
+
+Real input or assistant activity created after the recorded completion time
+returns `evidence: unavailable`. So do records without a completion time and
+legacy records whose recorded time predates their final assistant message.
+Compaction and system maintenance do not count as new run activity.
+A timing-dependent publication gap remains: a new run whose input reaches the
+child after the host finishes but before the plugin publishes the old outcome
+can still appear under the old generation. This can occur if the parent or
+another actor re-prompts the child during that gap.
+Run-identity fencing would require launch-time recording of run anchors and
+queued-input identities; that is a possible follow-up.
+
+An owned untracked handle returns the ordinary read-only status plus a short
+notice that diagnostics require a tracked task record, not an excerpt or an
+extra transcript read. Startup recovery normally re-adopts restarted children
+onto the board with their historical run start. Foreign-parent handles are
+still rejected.
+Diagnostics are read-only, not consumption or acknowledgement: observed state
+is evidence, execution completion ends a run, and parent acceptance is a
+separate decision. Diagnostic reads do not reconcile or resume a child.
+The fixed next-step line reminds callers to treat the excerpt as non-final
+evidence and await or re-delegate, not mark the task accepted.
+
 `task_status`, `task_message`, `task_reply`, `task_cancel`,
 `task_revive`, and an explicit resume ID resolve a non-exact alias from the
-board first, else from the markers in one read of the parent's readable history,
+tracked job records first, else from the markers in one read of the parent's readable history,
 before reading or sending anything. On v1, the read covers the 1,000 most recent
 messages; a longer history counts as cut. Multiple saved targets, no marked
 target, or a cut or unreadable history produce no action: use the exact session

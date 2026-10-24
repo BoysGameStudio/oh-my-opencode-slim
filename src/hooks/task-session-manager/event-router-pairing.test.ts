@@ -38,8 +38,6 @@ function createDeps(board: BackgroundJobBoard) {
       clearSession: mock(() => {}),
       prune: mock(() => {}),
     },
-    terminalJobsInjectedByParent: new Map(),
-    pendingInjectedTerminalJobsByParent: new Map(),
   };
 }
 
@@ -128,7 +126,9 @@ describe('session.created pairing', () => {
     expect(record?.provisional).toBe(true);
     expect(board.resolve(PARENT, 'child-9')).toEqual(record);
     expect(board.resolve(PARENT, record?.alias ?? '')).toEqual(record);
-    expect(board.formatForPromptWithMetadata(PARENT)).toBeUndefined();
+    // The board is never rendered (issue #1647): a placeholder registration
+    // stays invisible to every prompt surface.
+    expect(board.list(PARENT)).toHaveLength(1);
   });
 
   test.each(['fixer', undefined])(

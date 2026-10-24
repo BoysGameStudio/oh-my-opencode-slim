@@ -39,7 +39,7 @@ export function idParamFor(input: unknown): string {
 export function taskRefArgs(param: string): TaskRefArgs {
   const native = z
     .string()
-    .describe('Tracked task ID or Background Job Board alias');
+    .describe('Tracked task ID or its parent-scoped alias');
   if (param === 'task_id') return { task_id: native };
   return {
     sessionID: native.optional(),

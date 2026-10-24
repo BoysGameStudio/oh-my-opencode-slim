@@ -13,7 +13,10 @@ import {
   stringifyError,
 } from '../../utils/child-transcript';
 import { isRecord } from '../../utils/guards';
-import { createInternalAgentTextPart } from '../../utils/internal-initiator';
+import {
+  createInternalAgentTextPart,
+  TERMINAL_DELTA_METADATA_KEY,
+} from '../../utils/internal-initiator';
 import { log } from '../../utils/logger';
 import { getClient } from '../../utils/opencode-client';
 import type { SessionSelection } from '../../utils/session-selection';
@@ -336,6 +339,7 @@ export function createRevivedRunTracker(options: {
     parentSessionID: string,
     selection: SessionSelection | undefined,
     text: string,
+    extraMetadata?: Record<string, unknown>,
   ): Promise<unknown> {
     const session = getClient(options.input).session;
     const promptAsync =
@@ -359,7 +363,7 @@ export function createRevivedRunTracker(options: {
           ...(selection?.model && selection.variant
             ? { variant: selection.variant }
             : {}),
-          parts: [createInternalAgentTextPart(text)],
+          parts: [createInternalAgentTextPart(text, extraMetadata)],
         },
       },
     );
@@ -487,7 +491,16 @@ export function createRevivedRunTracker(options: {
           ) {
             throw new Error('Terminal notification is no longer current');
           }
-          return promptParent(run.parentSessionID, selection, text);
+          return promptParent(run.parentSessionID, selection, text, {
+            [TERMINAL_DELTA_METADATA_KEY]: [
+              {
+                taskID: run.taskID,
+                generation: run.generation,
+                terminalRevision: record.terminalRevision,
+                state,
+              },
+            ],
+          });
         },
         // Acceptance belongs to the publication, even if an older attempt
         // settles after its local timeout or while another attempt sends.

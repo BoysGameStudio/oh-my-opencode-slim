@@ -297,9 +297,20 @@ async function assembly(
 
 type Assembly = Awaited<ReturnType<typeof assembly>>;
 
+async function pullTaskStatus(
+  h: Assembly,
+  taskID: string,
+  parentSessionID = 'parent',
+): Promise<string> {
+  const status = await h.hooks.tool?.task_status.execute({ task_id: taskID }, {
+    sessionID: parentSessionID,
+  } as never);
+  return String(status);
+}
+
 for (const state of ['completed', 'error'] as const) {
   for (const provisional of [true, false]) {
-    test(`publication wake ownership: ${state}, provisional=${provisional}`, async () => {
+    test(`v2 publication injects nothing, pull-only: ${state}, provisional=${provisional}`, async () => {
       resetOrchestratorWakeGateForTests();
       const promptAsync = mock(async () => ({}));
       const probe = v2ShimClient({
@@ -346,11 +357,15 @@ for (const state of ['completed', 'error'] as const) {
       expect(h.board.get('child')?.state).toBe(state);
       expect(h.board.get('child')?.provisional === true).toBe(provisional);
       expect(h.board.get('child')?.terminalRevision).toBeGreaterThan(1);
-      expect(promptAsync).toHaveBeenCalledTimes(provisional ? 0 : 1);
+      // v2 has no wake machinery (council 2026-10-23): neither a later
+      // publication nor provisional promotion injects a prompt. The parent
+      // can still inspect the terminal through task_status.
+      expect(promptAsync).not.toHaveBeenCalled();
+      expect(await pullTaskStatus(h, 'child')).toContain(`state: ${state}`);
       if (provisional) {
         h.board.promoteProvisional('child', 'parent');
         await flush();
-        expect(promptAsync).toHaveBeenCalledTimes(1);
+        expect(promptAsync).not.toHaveBeenCalled();
       }
     });
   }
@@ -1836,9 +1851,9 @@ test.skip('probe: late-attributable outcome after exhaustion terminalizes the st
 // carries the host envelope `created` timestamp, so the gate's
 // ambiguous-event demotion cannot pass vacuously), the parent's real
 // request cycle (`experimental.chat.messages.transform`) performing the
-// injection-time reconcile and the Task 6 reopen corrective notice, and
-// the second publication firing the Task 6 terminal-publication wake
-// for the idle parent through the production listener wiring.
+// injection-time reconcile and the Task 6 reopen corrective notice. On v2
+// the parent pulls a later terminal result via task_status; council
+// 2026-10-23 removed plugin wake machinery from that host path.
 
 /** Interactive v2 driver: the SAME production pump order as
  * `driveV2Lifecycle` (host outcome committed before terminal execution
@@ -1973,13 +1988,18 @@ test('v2 hosts are structurally boardless and still retire consumed terminal job
 
     // The parent consumes the natively delivered report: two real
     // request cycles, and no board part ever appears in the payload.
+    // Message times strictly after the terminal publication: retirement
+    // requires an assistant turn newer than completedAt, and a same-ms
+    // Date.now() tie made this test flaky.
+    let clock = Date.now() + 60_000;
+    const afterTerminal = () => clock++;
     const userMsg = (id: string, text: string) => ({
       info: {
         id,
         sessionID: 'parent',
         role: 'user',
         agent: 'orchestrator',
-        time: { created: Date.now() },
+        time: { created: afterTerminal() },
       },
       parts: [{ type: 'text', text }],
     });
@@ -1988,7 +2008,7 @@ test('v2 hosts are structurally boardless and still retire consumed terminal job
         id,
         sessionID: 'parent',
         role: 'assistant',
-        time: { completed: Date.now() },
+        time: { completed: afterTerminal() },
       },
       parts: [{ type: 'text', text }],
     });
@@ -2029,7 +2049,7 @@ test('v2 hosts are structurally boardless and still retire consumed terminal job
   }
 });
 
-test('reopen-after-reconcile: child self-continuation republishes, wakes the idle parent, and corrects the parent', async () => {
+test('reopen-after-reconcile: child self-continuation republishes without a plugin wake and corrects the parent', async () => {
   resetOrchestratorWakeGateForTests();
   const capture = captureGateLogs();
   try {
@@ -2050,11 +2070,6 @@ test('reopen-after-reconcile: child self-continuation republishes, wakes the idl
     });
     const { h, pump, awaitPublication } = await openV2Lifecycle(probe, {
       hostFlavor: 'v2',
-      // Schema floor (1s) instead of the 30s default so the SECOND
-      // publication wake is observable without a half-minute sleep.
-      configOverrides: {
-        orchestratorWake: { publicationWakeMinIntervalMs: 1_000 },
-      },
     });
 
     // Run 1: launch → execution → terminal → publication #1.
@@ -2099,24 +2114,29 @@ test('reopen-after-reconcile: child self-continuation republishes, wakes the idl
             'first-publication-native-owned',
         );
 
-    // Wake #1 is the NATIVE notifier's: the first publication of the
-    // original launch lineage is natively delivered even to an idle
-    // parent, so the plugin wake must NOT fire for it (I1).
+    // Council 2026-10-23 removed the v2 publication-wake path. The host
+    // native notifier owns terminal delivery; no plugin wake (or skip-log)
+    // is emitted, and task_status remains the pull path if needed.
     await flush();
-    await Bun.sleep(30);
     expect(wakingPublicationWakes()).toHaveLength(0);
-    expect(firstPublicationSkips()).toHaveLength(1);
+    expect(firstPublicationSkips()).toHaveLength(0);
     expect(promptAsync).not.toHaveBeenCalled();
+    expect(await pullTaskStatus(h, 'child')).toContain('state: completed');
 
     // The parent consumes the report: two real request cycles (deliver,
     // then reconcile once the prompt shape advanced past the delivery).
+    // Message times strictly after the terminal publication: retirement
+    // requires an assistant turn newer than completedAt, and a same-ms
+    // Date.now() tie made this test flaky.
+    let clock = Date.now() + 60_000;
+    const afterTerminal = () => clock++;
     const userMsg = (id: string, text: string) => ({
       info: {
         id,
         sessionID: 'parent',
         role: 'user',
         agent: 'orchestrator',
-        time: { created: Date.now() },
+        time: { created: afterTerminal() },
       },
       parts: [{ type: 'text', text }],
     });
@@ -2125,7 +2145,7 @@ test('reopen-after-reconcile: child self-continuation republishes, wakes the idl
         id,
         sessionID: 'parent',
         role: 'assistant',
-        time: { completed: Date.now() },
+        time: { completed: afterTerminal() },
       },
       parts: [{ type: 'text', text }],
     });
@@ -2144,11 +2164,8 @@ test('reopen-after-reconcile: child self-continuation republishes, wakes the idl
     ]);
     expect(h.board.getState('child')).toBe('reconciled');
 
-    // Past the publication-wake throttle window (and strictly past every
-    // host timestamp so far — the resume busy must be unambiguous).
-    await Bun.sleep(1_100);
-
-    // Run 2: the child's own background-shell notification resumes it.
+    // Run 2: the child's own background-shell notification resumes it; the
+    // pump stamps this busy strictly after the prior host events.
     // The busy event rides the RAW v2 envelope (created = host time),
     // which mapV2EventToV1 preserves as activityAt — without it the
     // gate's ambiguous-event demotion would make this pass vacuously.
@@ -2194,7 +2211,8 @@ test('reopen-after-reconcile: child self-continuation republishes, wakes the idl
     ).toHaveLength(0);
 
     // Run 2 completes again: a second terminal publication for the SAME
-    // generation (new attempt, advanced terminalRevision).
+    // generation (new attempt, advanced terminalRevision). The parent can
+    // pull this result from task_status; no plugin prompt is injected.
     hostChildren = [
       {
         id: 'child',
@@ -2216,39 +2234,24 @@ test('reopen-after-reconcile: child self-continuation republishes, wakes the idl
       capture.of('[terminal-gate] terminal published', 'child'),
     ).toHaveLength(2);
 
-    // Wake #2: the second publication re-fires the Task 6 wake for the
-    // idle parent — the queue delivery the CameraFTP loop depends on.
+    // v2 injects no wake for later publications either (council
+    // 2026-10-23). The terminal remains on the task_status pull surface.
     await flush();
-    await Bun.sleep(30);
-    expect(wakingPublicationWakes()).toHaveLength(1);
-    expect(promptAsync).toHaveBeenCalledTimes(1);
-    const lastWakeCall = promptAsync.mock.calls.at(-1)?.[0] as {
-      path?: { id?: string };
-      delivery?: string;
-      modelSelection?: string;
-      body?: { agent?: string };
-    };
-    expect(lastWakeCall).toMatchObject({
-      path: { id: 'parent' },
-      delivery: 'queue',
-      modelSelection: 'inherit',
-    });
-    expect(lastWakeCall?.body?.agent).toBe('orchestrator');
+    expect(wakingPublicationWakes()).toHaveLength(0);
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(await pullTaskStatus(h, 'child')).toContain('state: completed');
   } finally {
     capture.restore();
   }
 });
 
-// ── Final-review pin: exactly-once queued admission for a revived run ──
+// ── Tracker delivery pin: exactly-once queued admission for a revived run ──
 //
 // A revived run (task_revive) is owned by the revived-run tracker: its
 // completion is delivered to the parent by the tracker's notifyParent
-// (a queued `<task>` notification via promptAsync). The publication-wake
-// listener in src/index.ts fires for the SAME terminal publication — on
-// an idle parent that wake passes its busy/throttle gates and would queue
-// a SECOND admission. The wake must be suppressed when the tracker will
-// deliver for that exact (taskID, generation); non-revived publications
-// keep waking exactly once (regression pin below).
+// (a queued `<task>` notification via promptAsync). On v2 the plugin has
+// no wake machinery (council 2026-10-23), so the tracker delivery remains
+// the sole plugin prompt for a revived completion.
 
 async function verifyRevivedDelivery(moved: boolean) {
   resetOrchestratorWakeGateForTests();
@@ -2267,12 +2270,6 @@ async function verifyRevivedDelivery(moved: boolean) {
     });
     const { h, pump, awaitPublication } = await openV2Lifecycle(probe, {
       hostFlavor: 'v2',
-      // Schema floor (1s) instead of the 30s default so the revived
-      // publication sits past the throttle window without a
-      // half-minute sleep (same shape as the reopen-chain probe above).
-      configOverrides: {
-        orchestratorWake: { publicationWakeMinIntervalMs: 1_000 },
-      },
     });
     const tracker = h.revivedTracker;
     if (!tracker) {
@@ -2325,10 +2322,9 @@ async function verifyRevivedDelivery(moved: boolean) {
     await childEvent('session.execution.succeeded');
     const first = await awaitPublication('child', 0);
     expect(first).toMatchObject({ state: 'completed' });
-    // Run 1 (non-revived): publication #1 is the lineage's first —
-    // natively delivered, so the plugin wake stays suppressed (I1).
+    // Run 1 (non-revived): v2 has no plugin wake machinery (council
+    // 2026-10-23), so no native-ownership skip log or prompt is emitted.
     await flush();
-    await Bun.sleep(30);
     expect(
       capture
         .of('[orchestrator-wake] terminal publication wake skipped', 'child')
@@ -2337,14 +2333,13 @@ async function verifyRevivedDelivery(moved: boolean) {
             (entry.data as { reason?: string } | undefined)?.reason ===
             'first-publication-native-owned',
         ),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
     expect(promptAsync).not.toHaveBeenCalled();
 
-    // Past the publication-wake throttle window, revive the child: the
-    // exact post-admission state task_revive leaves behind
+    // Keep the original and revived run observations distinct, then
+    // recreate the exact post-admission state task_revive leaves behind
     // (task-revive.ts registerLaunch + tracker.register) — the board
     // runs a NEW generation and the tracker owns observing it.
-    await Bun.sleep(1_100);
     const lease = h.board.acquireRelaunchLease('child', first.generation);
     if (!lease) throw new Error('missing relaunch lease');
     const relaunched = h.board.registerLaunch({
@@ -2404,12 +2399,10 @@ async function verifyRevivedDelivery(moved: boolean) {
 
     // Exactly ONE queued admission across the whole assembly for the
     // revived completion: the tracker's `<task>` delivery (the only
-    // promptAsync call — run 1's first publication was natively owned
-    // and never woke). The publication wake must NOT have fired for the
-    // revived publication — wake + tracker delivery double-notifying is
-    // a failure.
+    // promptAsync call). v2 injects no publication wake beside it
+    // (council 2026-10-23) — wake + tracker delivery double-notifying
+    // was the failure the deletion removed.
     await flush();
-    await Bun.sleep(30);
     expect(
       capture
         .of('[orchestrator-wake] terminal publication wake', 'child')
@@ -2441,20 +2434,14 @@ test.each([false, true])(
   verifyRevivedDelivery,
 );
 
-// ── Exhausted revived-run tracker: the suppressed publication is
-// re-emitted exactly once as the degraded fallback ──
+// ── Exhausted revived-run tracker: retry exhaustion stays pull-only ──
 //
-// When EVERY tracker notification attempt fails, ownership is released
-// at the organic retry-exhaustion give-up point — but the publication
-// the listener already suppressed (revived-tracker-owns-delivery) must
-// not stay swallowed: the idle parent would get neither the <task>
-// notification nor a wake. The release hook re-emits the publication
-// wake DIRECTLY through the scheduler, bypassing the listener's
-// suppression chain (a revived lineage has no native notifier, so the
-// first-publication-native-owned skip must not apply) while the
-// scheduler's own guards (canSchedule, one-flight, throttle) still do.
+// When EVERY tracker notification attempt fails, ownership is released at
+// the organic retry-exhaustion give-up point. On v2 the plugin has no wake
+// machinery to re-emit the result (council 2026-10-23), so after the retry
+// budget is spent the parent discovers it through task_status pull.
 
-test('revived-run tracker exhaustion re-emits exactly one publication wake to the idle parent', async () => {
+test('revived-run tracker exhaustion sends no further prompt; result is pull-only', async () => {
   resetOrchestratorWakeGateForTests();
   const capture = captureGateLogs();
   try {
@@ -2467,8 +2454,7 @@ test('revived-run tracker exhaustion re-emits exactly one publication wake to th
       );
     };
     // The tracker's <task> transport fails for its whole retry budget
-    // (default 3 attempts); any other promptAsync consumer (the wake)
-    // succeeds.
+    // (default 3 attempts); v2 has no scheduler for a fallback wake.
     let notificationFailures = 3;
     const promptAsync = mock(async (args: unknown) => {
       if (isTrackerNotification(args) && notificationFailures > 0) {
@@ -2489,9 +2475,6 @@ test('revived-run tracker exhaustion re-emits exactly one publication wake to th
     });
     const { h, pump, awaitPublication } = await openV2Lifecycle(probe, {
       hostFlavor: 'v2',
-      configOverrides: {
-        orchestratorWake: { publicationWakeMinIntervalMs: 1_000 },
-      },
     });
     const tracker = h.revivedTracker;
     if (!tracker) {
@@ -2524,12 +2507,9 @@ test('revived-run tracker exhaustion re-emits exactly one publication wake to th
     const first = await awaitPublication('child', 0);
     expect(first).toMatchObject({ state: 'completed' });
     await flush();
-    await Bun.sleep(30);
     expect(promptAsync).not.toHaveBeenCalled();
 
-    // Past the throttle window, revive the child (the exact
-    // post-admission state task_revive leaves behind).
-    await Bun.sleep(1_100);
+    // Revive the child in task_revive's exact post-admission shape.
     const lease = h.board.acquireRelaunchLease('child', first.generation);
     if (!lease) throw new Error('missing relaunch lease');
     const relaunched = h.board.registerLaunch({
@@ -2550,7 +2530,7 @@ test('revived-run tracker exhaustion re-emits exactly one publication wake to th
     const sinceRevision = h.board.get('child')?.terminalRevision ?? 0;
 
     // The revived run executes and completes; the tracker owns the
-    // delivery, so the publication listener suppresses the wake.
+    // delivery, spinning up its <task> transport retries.
     hostChildren = [
       { id: 'child', parentID: 'parent', time: { updated: Date.now() } },
     ];
@@ -2597,25 +2577,23 @@ test('revived-run tracker exhaustion re-emits exactly one publication wake to th
             (entry.data as { reason?: string } | undefined)?.reason ===
             'revived-tracker-owns-delivery',
         ),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
 
-    // The tracker burns its whole retry budget (3 attempts, 1s retry
-    // delay), gives up, and the release hook must deliver EXACTLY ONE
-    // publication wake to the idle parent — poll rather than sleep a
-    // fixed window so the assertion is timing-tolerant.
-    const wakeCalls = () =>
-      promptAsync.mock.calls.filter((call) => !isTrackerNotification(call[0]));
-    for (let i = 0; i < 600 && wakeCalls().length === 0; i += 1) {
+    // Let the tracker spend its three attempts (two 1s retry delays).
+    // Ownership release does not re-emit a wake on v2 (council
+    // 2026-10-23), so the failed result stays discoverable by pull.
+    const notificationCalls = () =>
+      promptAsync.mock.calls.filter((call) => isTrackerNotification(call[0]));
+    for (let i = 0; i < 400 && notificationCalls().length < 3; i += 1) {
       await Bun.sleep(10);
     }
     await flush();
 
-    const notificationCalls = promptAsync.mock.calls.filter((call) =>
-      isTrackerNotification(call[0]),
-    );
-    expect(notificationCalls).toHaveLength(3);
-    expect(wakeCalls()).toHaveLength(1);
-    expect(promptAsync).toHaveBeenCalledTimes(4);
+    const wakeCalls = () =>
+      promptAsync.mock.calls.filter((call) => !isTrackerNotification(call[0]));
+    expect(notificationCalls()).toHaveLength(3);
+    expect(wakeCalls()).toHaveLength(0);
+    expect(promptAsync).toHaveBeenCalledTimes(3);
     expect(
       capture
         .of('[orchestrator-wake] terminal publication wake', 'child')
@@ -2624,26 +2602,14 @@ test('revived-run tracker exhaustion re-emits exactly one publication wake to th
             (entry.data as { verdict?: string } | undefined)?.verdict ===
             'waking',
         ),
-    ).toHaveLength(1);
-    const wakeCall = wakeCalls()[0]?.[0] as {
-      path?: { id?: string };
-      delivery?: string;
-      modelSelection?: string;
-      body?: { agent?: string; parts?: Array<{ text?: string }> };
-    };
-    expect(wakeCall).toMatchObject({
-      path: { id: 'parent' },
-      delivery: 'queue',
-      modelSelection: 'inherit',
-    });
-    expect(wakeCall?.body?.agent).toBe('orchestrator');
-    expect(wakeCall?.body?.parts?.[0]?.text).not.toContain('<task ');
+    ).toHaveLength(0);
+    expect(await pullTaskStatus(h, 'child')).toContain('state: completed');
   } finally {
     capture.restore();
   }
 });
 
-test('regression: first publication is native-owned; a later publication of the same lineage still wakes exactly once', async () => {
+test('regression: publications of the same v2 lineage inject nothing; results are pull-only', async () => {
   resetOrchestratorWakeGateForTests();
   const capture = captureGateLogs();
   try {
@@ -2660,14 +2626,10 @@ test('regression: first publication is native-owned; a later publication of the 
     });
     const { h, pump, awaitPublication } = await openV2Lifecycle(probe, {
       hostFlavor: 'v2',
-      configOverrides: {
-        orchestratorWake: { publicationWakeMinIntervalMs: 1_000 },
-      },
     });
 
-    // A plain (never-revived) background task: the FIRST completion is
-    // the native notifier's (suppressed plugin wake); a LATER
-    // completion of the same lineage must wake exactly once.
+    // A plain background task completes, resumes, and completes again.
+    // Neither publication injects a plugin wake on v2 (council 2026-10-23).
     await h.requestTask('native', 'v2 publication-wake regression probe');
     await pump({
       type: 'session.created',
@@ -2701,10 +2663,9 @@ test('regression: first publication is native-owned; a later publication of the 
             'waking',
         );
 
-    // Publication #1 is the launch lineage's FIRST: natively delivered
-    // to the idle parent, so the plugin wake stays suppressed (I1).
+    // v2 has no publication-wake path at all (council 2026-10-23): no
+    // native-ownership skip log and no prompt on the first publication.
     await flush();
-    await Bun.sleep(30);
     expect(waking()).toHaveLength(0);
     expect(promptAsync).not.toHaveBeenCalled();
     expect(
@@ -2715,12 +2676,11 @@ test('regression: first publication is native-owned; a later publication of the 
             (entry.data as { reason?: string } | undefined)?.reason ===
             'first-publication-native-owned',
         ),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
+    expect(await pullTaskStatus(h, 'child')).toContain('state: completed');
 
-    // A LATER publication of the same lineage (the child resumes and
-    // finishes again) has no native notifier: the publication wake must
-    // fire EXACTLY once and queue exactly one admission (the wake).
-    await Bun.sleep(1_100);
+    // The child resumes and finishes again; its later publication is
+    // also pull-only on v2, with no throttle wait or plugin prompt.
     hostChildren = [
       { id: 'child', parentID: 'parent', time: { updated: Date.now() } },
     ];
@@ -2741,21 +2701,12 @@ test('regression: first publication is native-owned; a later publication of the 
       type: 'session.execution.succeeded',
       data: { sessionID: 'child' },
     });
-    await awaitPublication('child', first.terminalRevision);
+    const second = await awaitPublication('child', first.terminalRevision);
     await flush();
-    await Bun.sleep(30);
-    expect(waking()).toHaveLength(1);
-    expect(promptAsync).toHaveBeenCalledTimes(1);
-    const wakeCall = promptAsync.mock.calls[0]?.[0] as {
-      path?: { id?: string };
-      delivery?: string;
-      modelSelection?: string;
-    };
-    expect(wakeCall).toMatchObject({
-      path: { id: 'parent' },
-      delivery: 'queue',
-      modelSelection: 'inherit',
-    });
+    expect(second).toMatchObject({ state: 'completed' });
+    expect(waking()).toHaveLength(0);
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(await pullTaskStatus(h, 'child')).toContain('state: completed');
   } finally {
     capture.restore();
   }
@@ -2770,11 +2721,10 @@ test('regression: first publication is native-owned; a later publication of the 
 // host `subagent` tool call that arms the native background notifier — a
 // relaunch re-arms it with a fresh `started_at`, defeating the notify
 // dedupe — so even an UNOWNED second generation's first publication is
-// natively delivered. Only later revisions of the same generation (rev>1:
-// child self-continuation, a direct prompt to the child session) have no
-// native notifier and keep the plugin wake as their only notifier.
+// natively delivered. On v2 the plugin injects NO wake for any of them:
+// all of these terminals are pull-only (council 2026-10-23).
 
-test('first publication of an unowned second generation is native-owned: skipped, zero plugin wakes', async () => {
+test('first publication of an unowned second generation delivers nothing (pull-only)', async () => {
   resetOrchestratorWakeGateForTests();
   const capture = captureGateLogs();
   try {
@@ -2791,9 +2741,6 @@ test('first publication of an unowned second generation is native-owned: skipped
     });
     const { h, pump, awaitPublication } = await openV2Lifecycle(probe, {
       hostFlavor: 'v2',
-      configOverrides: {
-        orchestratorWake: { publicationWakeMinIntervalMs: 1_000 },
-      },
     });
 
     // Run 1: original lineage — first publication natively owned.
@@ -2821,15 +2768,12 @@ test('first publication of an unowned second generation is native-owned: skipped
     const first = await awaitPublication('child', 0);
     expect(first).toMatchObject({ state: 'completed' });
 
-    // Past the throttle window, relaunch WITHOUT tracker registration —
-    // the exact ownership shape of a tracker that exhausted its retry
-    // budget (willNotifyParent false). Under the native-contract
-    // correction this is STILL a natively-notified publication: on v2
-    // the relaunch is itself a host `subagent` tool call that re-arms
-    // the native background notifier with a fresh `started_at` (defeating
-    // the notify dedupe), so the plugin wake must NOT fire beside the
-    // native delivery (F1).
-    await Bun.sleep(1_100);
+    // Relaunch WITHOUT tracker registration — the exact ownership shape
+    // of a tracker that exhausted its retry budget (willNotifyParent
+    // false). The relaunch is itself a host `subagent` tool call that
+    // re-arms the native background notifier with a fresh `started_at`.
+    // On v2 the plugin has no wake to fire beside it at all (council
+    // 2026-10-23): the publication is natively delivered or pulled.
     const lease = h.board.acquireRelaunchLease('child', first.generation);
     if (!lease) throw new Error('missing relaunch lease');
     const relaunched = h.board.registerLaunch({
@@ -2878,14 +2822,10 @@ test('first publication of an unowned second generation is native-owned: skipped
 
     // The second generation's FIRST publication (fresh generation,
     // terminalRevision 1) is delivered by the host's native notifier —
-    // the `subagent` tool call that relaunched the child armed it — and
-    // the plugin wake beside it would double-notify: exactly the skip
-    // with `first-publication-native-owned`, zero plugin wakes. If that
-    // native delivery is ever lost host-side, the fallback is board
-    // injection on the parent's next activity (pre-branch parity), never
-    // a speculative plugin wake.
+    // the `subagent` tool call that relaunched the child armed it. v2
+    // has no plugin wake or skip-log path for it (council 2026-10-23):
+    // zero plugin prompts, and the terminal stays pullable.
     await flush();
-    await Bun.sleep(30);
     const waking = capture
       .of('[orchestrator-wake] terminal publication wake', 'child')
       .filter(
@@ -2901,33 +2841,23 @@ test('first publication of an unowned second generation is native-owned: skipped
             ?.reason === 'first-publication-native-owned',
       );
     expect(waking).toHaveLength(0);
-    // One native-owned skip per generation's first publication: run 1's
-    // rev-1 (the original launch) AND the relaunched generation's rev-1
-    // — each armed its own host `subagent` notifier call.
-    expect(nativeOwnedSkips).toHaveLength(2);
-    expect(
-      nativeOwnedSkips.filter(
-        (entry) =>
-          (entry.data as { generation?: number } | undefined)?.generation ===
-          relaunched.generation,
-      ),
-    ).toHaveLength(1);
+    expect(nativeOwnedSkips).toHaveLength(0);
     expect(promptAsync).not.toHaveBeenCalled();
+    expect(await pullTaskStatus(h, 'child')).toContain('state: completed');
   } finally {
     capture.restore();
   }
 });
 
-// ── M4+M1 pin: symmetric tracker suppression + honest stop reason ────────
+// ── M4+M1 pin: honest stop reason + pull-only stops ─────────────────────
 //
-// A revived run that STOPS must produce exactly one notification. When the
-// tracker owns this generation's delivery (it already delivered the run's
-// terminal <task>), the stopped-job recovery wake stays suppressed beside
-// it; when nothing else delivers (a fresh revived generation whose first
-// terminal publication IS the stop), the recovery wake is the one delivery
-// and its delta must tell the truth about a host-attributed interruption.
+// A revived run that STOPS no longer triggers a recovery wake on v2
+// (council 2026-10-23): the plugin has no wake machinery, so neither the
+// tracker-owned nor the tracker-less stop is pushed. The board record
+// still carries the truthful host-attributed reason for a task_status
+// pull.
 
-test('revived stop with no prior tracker delivery wakes once and carries the attributed reason', async () => {
+test('revived stop with no prior tracker delivery injects nothing; the attributed reason stays on the record', async () => {
   resetOrchestratorWakeGateForTests();
   const capture = captureGateLogs();
   try {
@@ -2959,9 +2889,6 @@ test('revived stop with no prior tracker delivery wakes once and carries the att
     }));
     const { h, pump, awaitPublication } = await openV2Lifecycle(probe, {
       hostFlavor: 'v2',
-      configOverrides: {
-        orchestratorWake: { publicationWakeMinIntervalMs: 1_000 },
-      },
     });
     const tracker = h.revivedTracker;
     if (!tracker) {
@@ -3003,7 +2930,6 @@ test('revived stop with no prior tracker delivery wakes once and carries the att
 
     // Revive (task_revive's post-admission shape), then the host
     // interrupts the revived run before it ever completes.
-    await Bun.sleep(1_100);
     const lease = h.board.acquireRelaunchLease('child', first.generation);
     if (!lease) throw new Error('missing relaunch lease');
     const relaunched = h.board.registerLaunch({
@@ -3056,33 +2982,20 @@ test('revived stop with no prior tracker delivery wakes once and carries the att
     if (!stopped) throw new Error('revived stop never published');
     expect(stopped.resultSummary).toBe('Host reported outcome: interrupted.');
 
-    // Exactly ONE queued admission for the revived stop — the recovery
-    // wake (the tracker delivers nothing for stops) — and its delta
-    // must carry the attributed-interruption reason, not the missing-
-    // result slander.
+    // v2 has no recovery wake for a revived stop (council 2026-10-23):
+    // nothing is queued, and the parent reads the stop (state + the
+    // truthful reason kept on the board record above) through
+    // task_status pull. Status mode reports state/activity, not the
+    // result summary, so only the state is asserted here.
     await flush();
-    await Bun.sleep(30);
-    expect(promptAsync).toHaveBeenCalledTimes(1);
-    const wakeCall = promptAsync.mock.calls[0]?.[0] as {
-      path?: { id?: string };
-      delivery?: string;
-      body?: { parts?: Array<{ text?: string }> };
-    };
-    expect(wakeCall).toMatchObject({
-      path: { id: 'parent' },
-      delivery: 'queue',
-    });
-    const wakeText = wakeCall?.body?.parts?.[0]?.text ?? '';
-    const deltaText = wakeText.slice(wakeText.indexOf('<stopped-job>'));
-    expect(deltaText).toContain('<stopped-job>');
-    expect(deltaText).toContain('host-attributed interruption');
-    expect(deltaText).not.toContain('stopped without a terminal result');
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(await pullTaskStatus(h, 'child')).toContain('state: stopped');
   } finally {
     capture.restore();
   }
 });
 
-test('recovery wake stays suppressed beside a tracker-delivered terminal for the same generation', async () => {
+test('revived generation stays silent after a tracker-delivered terminal and a later stop', async () => {
   resetOrchestratorWakeGateForTests();
   const capture = captureGateLogs();
   try {
@@ -3111,9 +3024,6 @@ test('recovery wake stays suppressed beside a tracker-delivered terminal for the
     }));
     const { h, pump, awaitPublication } = await openV2Lifecycle(probe, {
       hostFlavor: 'v2',
-      configOverrides: {
-        orchestratorWake: { publicationWakeMinIntervalMs: 1_000 },
-      },
     });
     const tracker = h.revivedTracker;
     if (!tracker) {
@@ -3151,7 +3061,6 @@ test('recovery wake stays suppressed beside a tracker-delivered terminal for the
 
     // Revive; the revived generation completes and the tracker delivers
     // its <task> notification (the generation's one admission).
-    await Bun.sleep(1_100);
     const lease = h.board.acquireRelaunchLease('child', first.generation);
     if (!lease) throw new Error('missing relaunch lease');
     const relaunched = h.board.registerLaunch({
@@ -3213,10 +3122,9 @@ test('recovery wake stays suppressed beside a tracker-delivered terminal for the
 
     // The delivered generation resumes and is then interrupted: the
     // stop is a LATER revision of a lineage the parent already heard
-    // from. The recovery wake must stay suppressed beside the tracker's
-    // delivered terminal (M4) — exactly one admission for the
-    // generation, no second wake for the stop.
-    await Bun.sleep(1_100);
+    // from. v2 injects nothing for the stop (council 2026-10-23) — the
+    // tracker's one <task> delivery stays the generation's only prompt,
+    // and there is no recovery-wake skip log either.
     hostOutcome = 'interrupted';
     hostIdleAt = undefined;
     hostChildren = [
@@ -3251,14 +3159,13 @@ test('recovery wake stays suppressed beside a tracker-delivered terminal for the
     if (!stopped) throw new Error('post-completion stop never published');
 
     await flush();
-    await Bun.sleep(30);
     expect(promptAsync).toHaveBeenCalledTimes(1);
     expect(
       capture.of(
         '[orchestrator-wake] stopped-job recovery wake skipped',
         'child',
       ),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
   } finally {
     capture.restore();
   }
@@ -3268,12 +3175,12 @@ test('recovery wake stays suppressed beside a tracker-delivered terminal for the
 //
 // The deleted v2-wake runbook's §3-D checked, live, that a full revival
 // window produces exactly one queued admission (the revived-run
-// tracker's `<task>` notification) with the publication wake suppressed
-// beside it — and ZERO [cache-monitor] warnings across the whole window:
-// the wake, tracker notification, and corrective surfaces ride the
+// tracker's `<task>` notification) with no publication wake beside it —
+// and ZERO [cache-monitor] warnings across the whole window:
+// the tracker notification and corrective surfaces ride the
 // cache-safe trailing zone, so a revival turn that busts the provider
 // prefix is a regression. This pin automates the automatable core: the
-// REAL plugin factory (cache-monitor, wake listeners, tracker all wired
+// REAL plugin factory (cache-monitor, tracker all wired
 // by src/index.ts), the REAL v2 event mapping (session.usage.updated →
 // message.updated through mapV2EventToV1, production pump order), and
 // realistic per-turn usage telemetry for the parent (turn 1 cold
@@ -3304,9 +3211,6 @@ test('runbook §3-D: zero cache-monitor warnings across a full revival/notificat
     });
     const { h, pump, awaitPublication } = await openV2Lifecycle(probe, {
       hostFlavor: 'v2',
-      configOverrides: {
-        orchestratorWake: { publicationWakeMinIntervalMs: 1_000 },
-      },
     });
     const tracker = h.revivedTracker;
     if (!tracker) {
@@ -3340,8 +3244,7 @@ test('runbook §3-D: zero cache-monitor warnings across a full revival/notificat
     await parentTurn({ input: 9_000, read: 0, write: 8_200 });
 
     // Run 1: launch → execution → terminal → publication #1 (gen 1,
-    // rev 1 — natively owned per the corrected contract; zero plugin
-    // wakes beside the native delivery).
+    // rev 1 — natively owned; zero plugin prompts on v2).
     await pump({
       type: 'session.created',
       data: { sessionID: 'child', parentID: 'parent', agent: 'explorer' },
@@ -3365,7 +3268,6 @@ test('runbook §3-D: zero cache-monitor warnings across a full revival/notificat
     const first = await awaitPublication('child', 0);
     expect(first).toMatchObject({ state: 'completed' });
     await flush();
-    await Bun.sleep(30);
     expect(
       capture
         .of('[orchestrator-wake] terminal publication wake skipped', 'child')
@@ -3374,16 +3276,15 @@ test('runbook §3-D: zero cache-monitor warnings across a full revival/notificat
             (entry.data as { reason?: string } | undefined)?.reason ===
             'first-publication-native-owned',
         ),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
     expect(promptAsync).not.toHaveBeenCalled();
 
     // Turn 2 — the parent consumes the natively delivered report: warm,
     // the prefix is read and grows.
     await parentTurn({ input: 3_000, read: 8_500, write: 1_200 });
 
-    // Revival past the throttle window: tracker-owned relaunch
-    // (task_revive's exact post-admission shape).
-    await Bun.sleep(1_100);
+    // Revival: tracker-owned relaunch (task_revive's exact post-admission
+    // shape).
     const lease = h.board.acquireRelaunchLease('child', first.generation);
     if (!lease) throw new Error('missing relaunch lease');
     const relaunched = h.board.registerLaunch({
@@ -3438,9 +3339,9 @@ test('runbook §3-D: zero cache-monitor warnings across a full revival/notificat
 
     // §3-D's exactly-one-admission contract: the tracker's `<task>`
     // notification is the ONE queued admission for the revived
-    // completion; the publication wake stays suppressed beside it.
+    // completion; there is no publication wake beside it on v2 (council
+    // 2026-10-23), so no skip log or wake is emitted.
     await flush();
-    await Bun.sleep(30);
     expect(promptAsync).toHaveBeenCalledTimes(1);
     const trackerCall = promptAsync.mock.calls.at(-1)?.[0] as {
       path?: { id?: string };
@@ -3460,7 +3361,7 @@ test('runbook §3-D: zero cache-monitor warnings across a full revival/notificat
             (entry.data as { reason?: string } | undefined)?.reason ===
             'revived-tracker-owns-delivery',
         ),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
     expect(
       capture
         .of('[orchestrator-wake] terminal publication wake', 'child')
@@ -3471,7 +3372,7 @@ test('runbook §3-D: zero cache-monitor warnings across a full revival/notificat
         ),
     ).toHaveLength(0);
 
-    // Turn 3 — the woken turn (consuming the tracker notification) and
+    // Turn 3 — the turn consuming the tracker notification and
     // turn 4 — the post-notification reconcile: both warm, the read
     // prefix keeps growing, never zero again.
     await parentTurn({ input: 3_600, read: 9_700, write: 300 });
@@ -3854,7 +3755,7 @@ driftTest(
   },
 );
 
-test('startup recovers a running native child and wakes the idle parent on completion', async () => {
+test('startup recovers a running native child and injects nothing on completion (pull-only)', async () => {
   resetOrchestratorWakeGateForTests();
   const promptAsync = mock(async () => ({}));
   const runningChildHistory = {
@@ -3951,8 +3852,12 @@ test('startup recovers a running native child and wakes the idle parent on compl
   });
   await awaitPublication('ses_child', 0);
   await flush();
-  await Bun.sleep(30);
-  expect(promptAsync).toHaveBeenCalledTimes(1);
+  // v2 has no publication wake (council 2026-10-23): the recovered
+  // child's completion is natively delivered or pulled, never pushed.
+  expect(promptAsync).not.toHaveBeenCalled();
+  expect(await pullTaskStatus(h, 'ses_child', 'ses_parent')).toContain(
+    'state: completed',
+  );
 
   // A duplicate completion observation must not send a second publication
   // for a terminal execution that was already acknowledged.
@@ -3961,6 +3866,5 @@ test('startup recovers a running native child and wakes the idle parent on compl
     data: { sessionID: 'ses_child' },
   });
   await flush();
-  await Bun.sleep(30);
-  expect(promptAsync).toHaveBeenCalledTimes(1);
+  expect(promptAsync).not.toHaveBeenCalled();
 });

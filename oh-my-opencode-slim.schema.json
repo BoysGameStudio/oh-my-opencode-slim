@@ -1394,6 +1394,9 @@
         "maxRetainedSnapshots": {
           "not": {}
         },
+        "boardInjection": {
+          "not": {}
+        },
         "orchestratorWake": {
           "default": {
             "enabled": true,
@@ -1403,7 +1406,7 @@
             "wakeOnTerminalPublication": true,
             "publicationWakeMinIntervalMs": 30000
           },
-          "description": "Periodic orchestrator wake scheduler for idle sessions. v1: requires host session APIs (session.get, todo, children, status, promptAsync) and wakes while incomplete todos remain. v2: runs in children-driven degraded mode (requires session.list + promptAsync) and wakes while un-finished child sessions remain. Default enabled at a 5-minute interval.",
+          "description": "Periodic orchestrator wake scheduler for idle sessions (v1 hosts only; ignored on OpenCode v2 hosts, where the native background notifier owns terminal delivery). Requires host session APIs (session.get, todo, children, status, promptAsync) and wakes while incomplete todos remain. Default enabled at a 5-minute interval.",
           "type": "object",
           "properties": {
             "enabled": {
@@ -1420,7 +1423,7 @@
             },
             "mode": {
               "default": "auto",
-              "description": "Wake-condition source. \"auto\" uses todo-gating on v1 hosts and children-driven degraded mode on v2 hosts (no todo surface there); \"todo\" or \"children\" pin one mode, degrading to children when the host lacks the todo API. Default \"auto\".",
+              "description": "Wake-condition source (v1 hosts only). \"auto\" uses todo-gating; \"todo\" or \"children\" pin one mode, degrading to children when the host lacks the todo API. On OpenCode v2 hosts the whole section is ignored: the native background notifier owns terminal delivery. Default \"auto\".",
               "type": "string",
               "enum": [
                 "auto",
@@ -1430,17 +1433,17 @@
             },
             "periodicWakeEnabled": {
               "default": true,
-              "description": "When false, the periodic idle evaluation never runs; only event-driven wakes (stopped-job recovery, terminal-publication rev>1, child-input) still deliver. Failed event wakes keep their timer-based retry path. Default enabled on v1 hosts; v2 hosts never run the periodic evaluation (the native background notifier delivers first terminal publications).",
+              "description": "When false, the periodic idle evaluation never runs; only event-driven wakes (stopped-job recovery, terminal-publication rev>1, child-input) still deliver. Failed event wakes keep their timer-based retry path. v1 hosts only; v2 hosts run no plugin wake machinery at all. Default enabled.",
               "type": "boolean"
             },
             "wakeOnTerminalPublication": {
               "default": true,
-              "description": "When true, a terminal completed/error publication wakes an idle parent orchestrator immediately (bounded by publicationWakeMinIntervalMs) instead of waiting for the next periodic evaluation. Busy parents are skipped: the native steer already delivered the completion. Default enabled.",
+              "description": "When true, a terminal completed/error publication wakes an idle parent orchestrator immediately (bounded by publicationWakeMinIntervalMs) instead of waiting for the next periodic evaluation. v1 hosts only. Default enabled.",
               "type": "boolean"
             },
             "publicationWakeMinIntervalMs": {
               "default": 30000,
-              "description": "Per-parent minimum spacing between terminal-publication wakes (1,000–2,147,483,647ms; 0 is invalid at the config layer). Default 30,000 (30 seconds). A burst of publications collapses into one wake.",
+              "description": "Per-parent minimum spacing between terminal-publication wakes (1,000–2,147,483,647ms; 0 is invalid at the config layer). Default 30,000 (30 seconds). A burst of publications collapses into one wake. Later-result (<completed-job>) pushes honor the same spacing: inside the window they stay queued and are delivered together when it elapses.",
               "type": "integer",
               "minimum": 1000,
               "maximum": 2147483647
@@ -1538,11 +1541,6 @@
         "waitForUserGuard": {
           "default": true,
           "description": "When true, intercept wait_for_user calls made while background tasks are still running and the orchestrator wake scheduler is enabled, returning guidance to end the turn instead of blocking on manual input. Default enabled.",
-          "type": "boolean"
-        },
-        "boardInjection": {
-          "default": true,
-          "description": "When false on v1 hosts, the Background Job Board is never injected into prompts — tracking, wake, and task_status keep working, and terminal retirement runs through prompt-shape consumption (covering cancelled, which has no native delivery). Default enabled. On v2 hosts the key is ignored with a warning: the native background notifier and inbox delivery replace the passive board.",
           "type": "boolean"
         },
         "childInputWake": {

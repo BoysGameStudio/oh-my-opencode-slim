@@ -48,7 +48,7 @@ Once every councillor has responded (or the orchestrator's bounded wait on
 a silent seat expires — see [Failure behavior](#failure-behavior)), the
 orchestrator calls the council agent with the question plus a final
 `Seats: <id, id>` line listing the session IDs the seat dispatches returned;
-the harness resolves those IDs from its Background Job Board and attaches the
+the harness resolves those IDs from its tracked job records and attaches the
 full stored responses before the call runs, so the orchestrator never
 re-types the seat text itself. The
 council agent itself waits for no one: it has no tools and starts from

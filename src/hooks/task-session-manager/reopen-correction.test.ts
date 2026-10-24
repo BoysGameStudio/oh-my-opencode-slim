@@ -21,8 +21,7 @@ import {
   type InjectionState,
   injectBackgroundJobBoard,
   pruneReopenCorrectionState,
-  reconcileInjectedTerminalJobs,
-  rememberInjectedTerminalJobs,
+  reconcileObservedTerminalRun,
 } from './board-injection';
 
 const SESSION = 'ses_parent_1';
@@ -52,8 +51,6 @@ function createInjectionState(
     hostFlavor,
     processedInjectedCompletions: new Set(),
     processedInjectedCompletionOrder: [],
-    terminalJobsInjectedByParent: new Map(),
-    pendingInjectedTerminalJobsByParent: new Map(),
     metadataKey: BACKGROUND_JOB_BOARD_METADATA_KEY,
     shouldManageSession: () => true,
     taskContextTracker: {
@@ -61,8 +58,6 @@ function createInjectionState(
       contextFilesForPrompt: () => [],
       prune: () => {},
     },
-    lastInjectedBoardTextByParent: new Map(),
-    retainedTailBoards: new Map(),
   } as unknown as InjectionState;
 }
 
@@ -85,13 +80,13 @@ function reconciledAndRelaunched() {
     description: 'first run',
   });
   board.updateStatus({ taskID: 'child-1', state: 'completed' });
-  rememberInjectedTerminalJobs(
-    state,
-    SESSION,
-    [{ taskID: 'child-1', generation: first.generation, terminalRevision: 1 }],
-    'shape-1',
-  );
-  reconcileInjectedTerminalJobs(state, SESSION);
+  // The parent observed the terminal run (host delivery or push delta):
+  // that observation is what retires it and arms the reopen correction.
+  reconcileObservedTerminalRun(state, SESSION, {
+    taskID: 'child-1',
+    generation: first.generation,
+    terminalRevision: 1,
+  });
   const second = board.registerLaunch({
     taskID: 'child-1',
     parentSessionID: SESSION,
@@ -119,19 +114,11 @@ describe('reopen corrective notice', () => {
     });
 
     // The parent consumed the completion report...
-    rememberInjectedTerminalJobs(
-      state,
-      SESSION,
-      [
-        {
-          taskID: 'child-1',
-          generation: 1,
-          terminalRevision: 1,
-        },
-      ],
-      'shape-1',
-    );
-    reconcileInjectedTerminalJobs(state, SESSION);
+    reconcileObservedTerminalRun(state, SESSION, {
+      taskID: 'child-1',
+      generation: 1,
+      terminalRevision: 1,
+    });
     expect(board.getState('child-1')).toBe('reconciled');
 
     // ...then the child session became busy again (board reopens running).
@@ -222,19 +209,11 @@ describe('reopen corrective notice', () => {
     await injectBackgroundJobBoard(state, {}, initial as never);
 
     board.updateStatus({ taskID: 'child-1', state: 'completed' });
-    rememberInjectedTerminalJobs(
-      state,
-      SESSION,
-      [
-        {
-          taskID: 'child-1',
-          generation: second.generation,
-          terminalRevision: 1,
-        },
-      ],
-      'shape-2',
-    );
-    reconcileInjectedTerminalJobs(state, SESSION);
+    reconcileObservedTerminalRun(state, SESSION, {
+      taskID: 'child-1',
+      generation: second.generation,
+      terminalRevision: 1,
+    });
     // A request while gen2 is still reconciled must keep its live entry.
     await injectBackgroundJobBoard(state, {}, {
       messages: [structuredClone(userMsg('msg_u2', 'continue', BASE_TIME + 1))],
@@ -295,13 +274,11 @@ describe('reopen corrective notice', () => {
       state: 'error',
       resultSummary: 'boom',
     });
-    rememberInjectedTerminalJobs(
-      state,
-      SESSION,
-      [{ taskID: 'child-1', generation: 1, terminalRevision: 1 }],
-      'shape-1',
-    );
-    reconcileInjectedTerminalJobs(state, SESSION);
+    reconcileObservedTerminalRun(state, SESSION, {
+      taskID: 'child-1',
+      generation: 1,
+      terminalRevision: 1,
+    });
     board.markRunningFromLiveSession('child-1', Date.now() + 60_000);
     expect(board.getState('child-1')).toBe('running');
     expect(state.reportedTerminalRunsByParent?.get(SESSION)?.size).toBe(1);
@@ -334,13 +311,11 @@ describe('reopen corrective notice', () => {
       state: 'completed',
       resultSummary: 'mapped hooks',
     });
-    rememberInjectedTerminalJobs(
-      state,
-      SESSION,
-      [{ taskID: 'child-1', generation: 1, terminalRevision: 1 }],
-      'shape-1',
-    );
-    reconcileInjectedTerminalJobs(state, SESSION);
+    reconcileObservedTerminalRun(state, SESSION, {
+      taskID: 'child-1',
+      generation: 1,
+      terminalRevision: 1,
+    });
     board.markRunningFromLiveSession('child-1', Date.now() + 60_000);
 
     const request = {
@@ -359,8 +334,8 @@ describe('reopen corrective notice', () => {
   });
 });
 
-describe('structural flavor split (v2 boardless)', () => {
-  test('v2: the reopen correction delivers in the board-free variant (#1443 review)', async () => {
+describe('boardless hosts (v1 and v2)', () => {
+  test('the reopen correction delivers in the board-free variant (#1443 review)', async () => {
     const board = new BackgroundJobBoard();
     const state = createInjectionState(board, 'v2');
 
@@ -375,19 +350,11 @@ describe('structural flavor split (v2 boardless)', () => {
       state: 'completed',
       resultSummary: 'mapped hooks',
     });
-    rememberInjectedTerminalJobs(
-      state,
-      SESSION,
-      [
-        {
-          taskID: 'child-1',
-          generation: 1,
-          terminalRevision: 1,
-        },
-      ],
-      'shape-1',
-    );
-    reconcileInjectedTerminalJobs(state, SESSION);
+    reconcileObservedTerminalRun(state, SESSION, {
+      taskID: 'child-1',
+      generation: 1,
+      terminalRevision: 1,
+    });
     expect(board.getState('child-1')).toBe('reconciled');
     board.markRunningFromLiveSession('child-1', Date.now() + 60_000);
     expect(board.getState('child-1')).toBe('running');
@@ -417,15 +384,11 @@ describe('structural flavor split (v2 boardless)', () => {
     expect((request.messages as unknown[]).at(-1)).toBe(corrections[0]);
   });
 
-  test('v1 boardless: the reopen correction uses the board-free wording too', async () => {
-    // Regression (council B1, fac9a90): the wording gate must key on the
-    // honoured boardInjection switch, not host flavor alone — a v1 parent
-    // with boardInjection: false never sees a board, so a correction that
-    // says "consult the Background Job Board" points at a panel the model
-    // cannot see.
+  test('every host delivers the correction without any board reference', async () => {
+    // The board no longer exists on any host (issue #1647), so the
+    // correction always uses the pull-channel wording.
     const board = new BackgroundJobBoard();
     const state = createInjectionState(board);
-    state.boardInjection = false;
 
     board.registerLaunch({
       taskID: 'child-1',
@@ -438,20 +401,11 @@ describe('structural flavor split (v2 boardless)', () => {
       state: 'completed',
       resultSummary: 'mapped hooks',
     });
-    rememberInjectedTerminalJobs(
-      state,
-      SESSION,
-      [
-        {
-          taskID: 'child-1',
-          generation: 1,
-          terminalRevision: 1,
-        },
-      ],
-      'shape-1',
-    );
-    reconcileInjectedTerminalJobs(state, SESSION);
-    expect(board.getState('child-1')).toBe('reconciled');
+    reconcileObservedTerminalRun(state, SESSION, {
+      taskID: 'child-1',
+      generation: 1,
+      terminalRevision: 1,
+    });
     board.markRunningFromLiveSession('child-1', Date.now() + 60_000);
     expect(board.getState('child-1')).toBe('running');
 
@@ -472,6 +426,7 @@ describe('structural flavor split (v2 boardless)', () => {
     const correctionText = (
       corrections[0] as { parts: Array<{ text: string }> }
     ).parts[0].text;
+    expect(correctionText).toContain('superseded');
     expect(correctionText).toContain('`task_status`');
     expect((request.messages as unknown[]).at(-1)).toBe(corrections[0]);
   });

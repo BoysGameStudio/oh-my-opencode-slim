@@ -1380,30 +1380,25 @@ test('integration: late acknowledgement and transport success for A cannot consu
     expect(transport.mock.calls[1][0].body.parts[0].text).toContain(
       '<task_result>\nB\n</task_result>',
     );
+    // The revived-run tracker delivered B's terminal notification to the
+    // parent. Retirement rides the OBSERVED delivery (issue #1647): the
+    // notification part in the parent history is the acknowledgement.
     messages.push({
       info: {
         id: 'consume-B',
         sessionID: 'parent',
         role: 'user',
         agent: 'orchestrator',
+        time: { created: Date.now() + 1_000 },
       },
-      parts: [{ type: 'text', text: 'received B' }],
-    });
-    await hook['experimental.chat.messages.transform']({}, { messages });
-    await hook.injectBackgroundJobBoard({}, { messages });
-    // Change-only: the completion surfaces on the next user-side tail
-    // (assistant tails neither place nor register), so consumption needs
-    // one more shape advance. The stale step-1 entry (revision of A) is
-    // dropped without acknowledging.
-    expect(acknowledge).not.toHaveBeenCalled();
-    messages.push({
-      info: {
-        id: 'consume-B-2',
-        sessionID: 'parent',
-        role: 'assistant',
-        agent: 'orchestrator',
-      },
-      parts: [{ type: 'text', text: 'acknowledged B' }],
+      parts: [
+        {
+          type: 'text',
+          text: transport.mock.calls[1]?.[0]?.body.parts[0]?.text ?? '',
+          synthetic: true,
+          metadata: { 'oh-my-opencode-slim.internalInitiator': true },
+        },
+      ],
     });
     await hook['experimental.chat.messages.transform']({}, { messages });
     await hook.injectBackgroundJobBoard({}, { messages });

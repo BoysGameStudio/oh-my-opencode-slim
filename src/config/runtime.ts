@@ -99,7 +99,6 @@ const DEFAULT_BACKGROUND_JOBS: BackgroundJobsConfig = {
   waitForUserGuard: true,
   childInputWake: true,
   childInputWakeKinds: { ...DEFAULT_CHILD_INPUT_WAKE_KINDS },
-  boardInjection: true,
   pruneEvictedSessions: false,
 };
 
@@ -376,16 +375,9 @@ export class RuntimeConfig {
   }
 
   get backgroundJobs(): BackgroundJobsConfig {
-    const config = this.resolveChildInputWake(
+    return this.resolveChildInputWake(
       this.pluginConfig?.backgroundJobs ?? DEFAULT_BACKGROUND_JOBS,
     );
-    if (this.hostFlavor === 'v2') {
-      // v2 hosts deliver terminal results natively (notifier + inbox);
-      // passive board injection is a v1-only channel. An explicitly
-      // configured true was already warned about at load time (loader).
-      return { ...config, boardInjection: false };
-    }
-    return config;
   }
 
   private resolveChildInputWake(

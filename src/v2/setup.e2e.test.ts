@@ -28,6 +28,7 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import type { BundledSkillInfo } from '../cli/custom-skills';
 import { stateFilePath } from '../companion/manager';
+import { RuntimeConfig } from '../config/runtime';
 import { MarketplaceStore } from '../marketplace/store';
 import { createEventDirectoryScope } from '../utils/event-directory-scope';
 import { flushLoggerForTesting } from '../utils/logger';
@@ -136,6 +137,11 @@ function makeMockV2Context(
   events: ReturnType<typeof createEventQueue>;
 } {
   const skillCallbacks = new Set<(draft: unknown) => void>();
+  const stored = new Map<string, unknown>();
+  const nativeSubagent = {
+    description: 'Native subagent',
+    execute: async (_input: unknown, _context: unknown) => ({}),
+  };
   const calls: MockCalls = {
     agentUpdates: [],
     agentRemoves: [],
@@ -180,6 +186,16 @@ function makeMockV2Context(
   const ctx = {
     app: { name: 'opencode', version: 'v2-e2e' },
     options: {},
+    storage: {
+      get: async (key: string) => structuredClone(stored.get(key)),
+      set: async (key: string, value: unknown) => {
+        stored.set(key, structuredClone(value));
+      },
+      remove: async (key: string) => {
+        stored.delete(key);
+      },
+      scan: async () => ({ entries: [] }),
+    },
     location: {
       directory: projectDir,
       project: {
@@ -213,6 +229,10 @@ function makeMockV2Context(
     tool: {
       transform: async (cb: (draft: unknown) => void) => {
         cb({
+          update: (id: string, update: (tool: unknown) => void) => {
+            if (id === 'subagent') update(nativeSubagent);
+          },
+          get: (id: string) => (id === 'subagent' ? nativeSubagent : undefined),
           add: (toolDef: Record<string, unknown>) => {
             calls.toolAdds.push(toolDef as unknown as CapturedTool);
           },
@@ -259,9 +279,14 @@ function makeMockV2Context(
       list: async () => [],
       reload: async () => {},
     },
-    // Runtime session methods deliberately ABSENT: the shim must degrade
-    // honestly without them (no fake success shapes).
+    // The supported host supplies durable KV and location-qualified identity.
+    // Other runtime methods stay absent unless a test needs them.
     session: {
+      get: async ({ sessionID }: { sessionID: string }) => ({
+        id: sessionID,
+        directory: projectDir,
+        agent: 'orchestrator',
+      }),
       hook: async (
         name: 'context' | 'prompt',
         cb: (event: never) => Promise<void>,
@@ -415,6 +440,817 @@ describe('createV2Setup e2e', () => {
     expect(calls.disposed.length).toBeGreaterThan(0);
   }, 20_000);
 
+  test('session preset RPC and native execute bind one captured team before progress and first prompt', async () => {
+    for (const [agentName, model, builtin] of [
+      [
+        'market-static',
+        {
+          source: 'explicit',
+          candidates: [
+            { id: 'manifest/model', variant: 'manifest-v' },
+            'manifest-backup/model',
+          ],
+        },
+        undefined,
+      ],
+      ['market-session', { source: 'session' }, undefined],
+      ['market-builtin', { source: 'builtin' }, 'oracle'],
+      ['market-orchestrator', { source: 'orchestrator' }, undefined],
+    ] as const) {
+      new MarketplaceStore({ pluginVersion: '3.2.0' }).install({
+        manifest: {
+          schemaVersion: 2,
+          id: `team/${agentName}`,
+          version: '1.0.0',
+          displayName: agentName,
+          description: 'Inference snapshot fixture',
+          agentName,
+          prompt: 'Keep resources frozen.',
+          skills: [],
+          mcps: [],
+          tools: ['read'],
+          author: { name: 'Test' },
+          tags: [],
+          license: 'MIT',
+          compatibility: { plugin: '>=1.0.0' },
+          temperature: 0.25,
+          model,
+          ...(builtin ? { extends: { builtin, promptMode: 'append' } } : {}),
+          routing: {
+            description: 'Snapshot fixture',
+            when: 'Testing inference.',
+            keywords: ['snapshot'],
+          },
+        } as never,
+      });
+    }
+    const configPath = path.join(
+      projectDir,
+      '.opencode',
+      'oh-my-opencode-slim.json',
+    );
+    const config = JSON.stringify({
+      companion: { enabled: false },
+      preset: 'A',
+      agents: {
+        orchestrator: { displayName: 'lead-team' },
+        'market-session': { options: { nativeReasoning: true } },
+        explorer: {
+          temperature: 0.35,
+          options: { shared: 'root', root: true },
+        },
+        oracle: {
+          displayName: 'research-team',
+          temperature: 0.4,
+          variant: 'root-variant',
+          options: { shared: 'root', root: true },
+        },
+      },
+      presets: {
+        Parent: {
+          oracle: {
+            model: 'ancestor/model',
+            options: { ancestor: true, order: 'ancestor', shared: 'ancestor' },
+          },
+          explorer: {
+            options: { ancestor: true, order: 'ancestor', shared: 'ancestor' },
+          },
+        },
+        A: {
+          marketplace: {
+            agents: [
+              'team/market-static',
+              'team/market-session',
+              'team/market-builtin',
+              'team/market-orchestrator',
+            ],
+          },
+          'market-static': {
+            model: [
+              { id: 'override/model', variant: 'chain-v' },
+              'override-backup/model',
+            ],
+            variant: 'override-v',
+            temperature: 0.75,
+            options: { stalePreset: true },
+          },
+          fixer: { inheritModelFrom: 'session', variant: 'medium' },
+          explorer: {
+            model: ['test/a', 'backup/a'],
+            variant: 'high',
+            temperature: 0.1,
+            options: { reasoning: 'A' },
+          },
+        },
+        B: {
+          extends: 'Parent',
+          agents: {
+            oracle: {
+              model: 'child/model',
+              temperature: 0.8,
+              variant: 'child-variant',
+              options: { order: 'child', child: true, shared: 'child' },
+            },
+            fixer: {
+              model: 'test/fixed',
+              inheritModelFrom: 'session',
+              variant: 'low',
+            },
+            explorer: {
+              model: ['test/b', 'backup/b'],
+              variant: 'low',
+              temperature: 0.8,
+              options: { reasoning: 'B', order: 'child', shared: 'child' },
+            },
+          },
+        },
+        C: { 'market-session': { model: 'override/static' } },
+        bad: { extends: 'missing', agents: { explorer: { temperature: 0.2 } } },
+        cycleA: {
+          extends: 'cycleB',
+          agents: { explorer: { temperature: 0.2 } },
+        },
+        cycleB: {
+          extends: 'cycleA',
+          agents: { explorer: { temperature: 0.2 } },
+        },
+      },
+    });
+    await Bun.write(configPath, config);
+    const { ctx, calls } = makeMockV2Context(projectDir);
+    const originalAgentTransform = ctx.agent.transform;
+    const hostOracle = {
+      id: 'research-team',
+      model: {
+        providerID: 'host',
+        id: 'oracle-model',
+        variant: 'host-variant',
+      },
+      request: { body: { shared: 'host', host: true } },
+    };
+    const hostLead = {
+      id: 'lead-team',
+      model: { providerID: 'host', id: 'lead-model', variant: 'medium' },
+    };
+    ctx.agent.transform = (callback) =>
+      originalAgentTransform((draft) =>
+        callback({
+          ...draft,
+          list: () => [hostOracle, hostLead],
+          get: (id) =>
+            id === hostOracle.id
+              ? hostOracle
+              : id === hostLead.id
+                ? hostLead
+                : draft.get(id),
+        }),
+      );
+    const stored = new Map<string, any>();
+    const identities = new Map<string, any>([
+      [
+        'root',
+        {
+          id: 'root',
+          directory: projectDir,
+          agent: 'orchestrator',
+          model: { providerID: 'native', id: 'root-model' },
+        },
+      ],
+    ]);
+    const order: string[] = [];
+    let rpc: any;
+    (ctx as any).rpc = {
+      register: async (_contract: unknown, handlers: unknown) => {
+        rpc = handlers;
+        return { dispose() {} };
+      },
+    };
+    (ctx as any).storage = {
+      get: async (key: string) => structuredClone(stored.get(key)),
+      set: async (key: string, value: unknown) => {
+        stored.set(key, structuredClone(value));
+        order.push(`persist:${key.split('/').at(-1)}`);
+      },
+      remove: async (key: string) => {
+        stored.delete(key);
+      },
+      scan: async () => ({ entries: [] }),
+    };
+    ctx.session.get = async ({ sessionID }) => {
+      const info = identities.get(sessionID);
+      if (!info) return info;
+      // Match native 2.1.2 session/info.fromRow, not the raw SQLite model:
+      // an absent stored variant is projected as the default sentinel.
+      return {
+        ...info,
+        location: { directory: info.directory },
+        ...(info.model
+          ? {
+              model: {
+                ...info.model,
+                variant: info.model.variant ?? 'default',
+              },
+            }
+          : {}),
+      };
+    };
+    ctx.session.update = async () => ({});
+    (ctx.session as any).context = async ({
+      sessionID,
+    }: {
+      sessionID: string;
+    }) =>
+      sessionID === 'ses_child-1'
+        ? [
+            {
+              id: 'msg_delivered_user',
+              type: 'user',
+              text: 'work',
+              time: { created: 1 },
+            },
+            {
+              id: 'msg_completed_assistant',
+              type: 'assistant',
+              content: [{ type: 'text', text: 'done' }],
+              finish: 'stop',
+              time: { created: 2, completed: 3 },
+            },
+            {
+              id: 'msg_idle',
+              type: 'idle',
+              outcome: 'succeeded',
+              time: { created: 4 },
+            },
+          ]
+        : [];
+    let retryHook: ((event: any) => Promise<void>) | undefined;
+    const originalSessionHook = (ctx.session as any).hook;
+    (ctx.session as any).hook = (name: string, callback: any) => {
+      if (name === 'retry') retryHook = callback;
+      return originalSessionHook.call(ctx.session, name, callback);
+    };
+    const switches: unknown[] = [];
+    ctx.session.switchModel = async (input) => {
+      switches.push(input);
+    };
+    let nativeCalls = 0;
+    const nativeInputs: Array<Record<string, unknown>> = [];
+    const native = {
+      description: 'native',
+      execute: async (input: any, context: any) => {
+        nativeCalls++;
+        nativeInputs.push({ ...input });
+        const id = input.sessionID ?? `ses_child-${nativeCalls}`;
+        const [selection, variant] = String(input.model ?? 'test/a#high').split(
+          '#',
+        );
+        const [providerID, ...modelID] = selection.split('/');
+        const model = {
+          providerID,
+          id: modelID.join('/'),
+          ...(variant ? { variant } : {}),
+        };
+        if (!input.sessionID) {
+          identities.set(id, {
+            id,
+            directory: projectDir,
+            parentID: context.sessionID,
+            agent: input.agent ?? 'explorer',
+            model,
+          });
+          order.push(`create:${id}`);
+        } else if (input.model) {
+          identities.get(id).model = model;
+        }
+        await context.progress({ sessionID: id, status: 'running' });
+        await calls.promptHookCb?.({
+          sessionID: id,
+          messageID: `message-${nativeCalls}`,
+          prompt: { text: 'work' },
+        });
+        order.push(`prompt:${id}`);
+        return { content: 'native-result', metadata: { sessionID: id } };
+      },
+    };
+    let replay: (() => void) | undefined;
+    ctx.tool.transform = async (cb) => {
+      const run = () =>
+        cb({
+          add: (tool) => calls.toolAdds.push(tool),
+          update: (id, update) => {
+            if (id === 'subagent') update(native);
+          },
+          get: (id) => (id === 'subagent' ? native : undefined),
+        });
+      run();
+      replay = run;
+      return { dispose() {} };
+    };
+    const nativeExecute = native.execute;
+    let cleanup = await createV2Setup()(ctx);
+    try {
+      await calls.promptHookCb?.({
+        sessionID: 'root',
+        messageID: 'root-first',
+        prompt: { text: 'start' },
+      });
+      const event = {
+        tool: 'subagent',
+        sessionID: 'root',
+        id: 'call-1',
+        input: { agent: 'explorer', prompt: 'work', background: false },
+      };
+      await calls.toolBeforeCb?.(event);
+      expect((event.input as any).model).toBe('test/a#high');
+      // Tool call ids need only identify a call within its parent session.
+      // A second root using the same id cannot overwrite root A's capture.
+      identities.set('second-root', {
+        id: 'second-root',
+        directory: projectDir,
+        agent: 'orchestrator',
+      });
+      await rpc.apply(
+        { sessionID: 'second-root', presetName: 'B' },
+        { signal: new AbortController().signal },
+      );
+      const overlapping = {
+        ...event,
+        sessionID: 'second-root',
+        input: {
+          agent: 'explorer',
+          prompt: 'other root work',
+          background: false,
+        },
+      };
+      await calls.toolBeforeCb?.(overlapping);
+      expect((overlapping.input as any).model).toBe('test/b#low');
+      expect(
+        (
+          await rpc.apply(
+            { sessionID: 'root', presetName: 'B' },
+            { signal: new AbortController().signal },
+          )
+        ).presetName,
+      ).toBe('B');
+      const execute = native.execute;
+      replay?.();
+      expect(native.execute).toBe(execute); // replay never nests wrappers
+      await native.execute(event.input, {
+        sessionID: 'root',
+        id: 'call-1',
+        signal: new AbortController().signal,
+        progress: async () => {
+          order.push('progress');
+        },
+      });
+      expect(nativeCalls).toBe(1);
+      // No execute.after was delivered. The wrapper itself consumed the
+      // handoff, so replaying the same call cannot create another child.
+      await expect(
+        native.execute(event.input, {
+          sessionID: 'root',
+          id: 'call-1',
+          signal: new AbortController().signal,
+          progress: async () => {},
+        }),
+      ).rejects.toThrow('admission capture missing');
+      expect(nativeCalls).toBe(1);
+      expect(order.slice(-4)).toEqual([
+        'create:ses_child-1',
+        'persist:ses_child-1',
+        'progress',
+        'prompt:ses_child-1',
+      ]);
+      expect(
+        stored.get('session-preset/v1/ses_child-1').bundle.presetName,
+      ).toBe('A');
+      expect(stored.get('session-preset/v1/ses_child-1').preserveModel).toBe(
+        true,
+      );
+      expect(stored.get('session-preset/v1/ses_child-1').explicitModel).toBe(
+        false,
+      );
+      const inherited = {
+        tool: 'subagent',
+        sessionID: 'ses_child-1',
+        id: 'inherited-call',
+        input: {
+          agent: 'fixer',
+          prompt: 'nested inherited work',
+          background: false,
+        },
+      };
+      await calls.toolBeforeCb?.(inherited);
+      expect((inherited.input as any).model).toBe('test/a#medium');
+      const next = {
+        tool: 'subagent',
+        sessionID: 'root',
+        id: 'call-2',
+        input: { agent: 'explorer', prompt: 'next', background: false },
+      };
+      await calls.toolBeforeCb?.(next);
+      expect((next.input as any).model).toBe('test/b#low');
+      await native.execute(next.input, {
+        sessionID: 'root',
+        id: 'call-2',
+        signal: new AbortController().signal,
+        progress: async () => {},
+      });
+      expect(
+        stored.get('session-preset/v1/ses_child-2').bundle.presetName,
+      ).toBe('B');
+      const selectedProfiles = stored.get('session-preset/v1/ses_child-2')
+        .bundle.profiles;
+      expect(
+        stored
+          .get('session-preset/v1/ses_child-2')
+          .bundle.chains.explorer.map((entry: any) => entry.id),
+      ).toEqual(['test/b', 'backup/b']);
+      expect(selectedProfiles.explorer.temperature).toBe(0.35);
+      expect(selectedProfiles.explorer.providerOptions).toEqual({
+        ancestor: true,
+        order: 'child',
+        shared: 'root',
+        root: true,
+        reasoning: 'B',
+      });
+      expect(selectedProfiles.oracle).toMatchObject({
+        model: {
+          providerID: 'host',
+          id: 'oracle-model',
+          variant: 'host-variant',
+        },
+        temperature: 0.4,
+        providerOptions: { host: true, shared: 'host' },
+      });
+      const scalar = {
+        tool: 'subagent',
+        sessionID: 'root',
+        id: 'scalar-call',
+        input: {
+          agent: 'fixer',
+          prompt: 'scalar takes precedence',
+          background: false,
+        },
+      };
+      await calls.toolBeforeCb?.(scalar);
+      expect((scalar.input as any).model).toBe('test/fixed#low');
+      expect(switches).toEqual([]); // native root and explicit child model untouched
+      expect(await Bun.file(configPath).text()).toBe(config);
+      identities.set('other-root', {
+        id: 'other-root',
+        directory: projectDir,
+        agent: 'orchestrator',
+      });
+      await calls.promptHookCb?.({
+        sessionID: 'other-root',
+        messageID: 'other-first',
+        prompt: { text: 'start' },
+      });
+      expect((await rpc.read({ sessionID: 'other-root' })).presetName).toBe(
+        'A',
+      ); // detached named build never changes global
+      identities.set('foreign', {
+        id: 'foreign',
+        directory: '/other-location',
+        agent: 'orchestrator',
+      });
+      await expect(
+        rpc.apply(
+          { sessionID: 'foreign', presetName: 'B' },
+          { signal: new AbortController().signal },
+        ),
+      ).rejects.toThrow('location mismatch');
+      expect(retryHook).toBeFunction();
+      const retry = async (sessionID: string, providerID: string, id: string) =>
+        retryHook?.({
+          sessionID,
+          agent: 'explorer',
+          model: { providerID, id },
+          error: { message: 'quota exceeded' },
+          decision: { retry: true },
+        });
+      const launch = async (
+        callID: string,
+        parentID: string,
+        input: Record<string, unknown>,
+      ) => {
+        const call = {
+          tool: 'subagent',
+          sessionID: parentID,
+          id: callID,
+          input: {
+            agent: 'explorer',
+            prompt: callID,
+            background: false,
+            ...input,
+          },
+        };
+        await calls.toolBeforeCb?.(call);
+        const result = await native.execute(call.input, {
+          sessionID: parentID,
+          id: callID,
+          signal: new AbortController().signal,
+          progress: async () => {},
+        });
+        return result.metadata.sessionID as string;
+      };
+      // Automatic before injection is not a user override: preset fallback
+      // still runs, but a cross-vendor retry must not reuse preset options.
+      await retry('ses_child-2', 'test', 'b');
+      expect(switches.at(-1)).toMatchObject({
+        sessionID: 'ses_child-2',
+        model: { providerID: 'backup', id: 'b' },
+      });
+      const crossProviderContext = {
+        sessionID: 'ses_child-2',
+        agent: 'explorer',
+        model: { providerID: 'backup', id: 'b' },
+        options: {
+          reasoning: 'stale',
+          shared: 'stale',
+          ancestor: true,
+          root: true,
+          order: 'child',
+          native: true,
+        },
+        system: [],
+        messages: [],
+        tools: {},
+      };
+      await calls.contextHookCb?.(crossProviderContext);
+      expect(crossProviderContext.options).toEqual({
+        temperature: 0.35,
+        native: true,
+      });
+      const explicitChild = await launch('explicit-call', 'root', {
+        model: 'manual/chosen#low',
+      });
+      const explicitRecord = stored.get(`session-preset/v1/${explicitChild}`);
+      expect(explicitRecord.explicitModel).toBe(true);
+      expect(explicitRecord.bundle.presetName).toBe('B');
+      const beforeExplicitRetry = switches.length;
+      await retry(explicitChild, 'manual', 'chosen');
+      expect(switches).toHaveLength(beforeExplicitRetry);
+      const explicitContext = {
+        ...crossProviderContext,
+        sessionID: explicitChild,
+        model: { providerID: 'manual', id: 'chosen' },
+        options: { reasoning: 'stale', shared: 'stale', native: true },
+      };
+      await calls.contextHookCb?.(explicitContext);
+      expect(explicitContext.options).toEqual({
+        temperature: 0.35,
+        native: true,
+      });
+      // The override protects only this child's execution, not descendants.
+      const grandchild = await launch(
+        'explicit-grandchild-call',
+        explicitChild,
+        {},
+      );
+      expect(
+        stored.get(`session-preset/v1/${grandchild}`).bundle.presetName,
+      ).toBe('B');
+      expect(stored.get(`session-preset/v1/${grandchild}`).explicitModel).toBe(
+        false,
+      );
+      await retry(grandchild, 'test', 'b');
+      expect(switches.at(-1)).toMatchObject({
+        sessionID: grandchild,
+        model: { providerID: 'backup', id: 'b' },
+      });
+      // A cached, already-profiled child gets the same protection on resume.
+      await launch('explicit-resume-call', 'root', {
+        sessionID: 'ses_child-1',
+        model: 'manual/resumed#low',
+      });
+      expect(
+        stored.get('session-preset/v1/ses_child-1').bundle.presetName,
+      ).toBe('A');
+      const beforeResumeRetry = switches.length;
+      await retry('ses_child-1', 'manual', 'resumed');
+      expect(switches).toHaveLength(beforeResumeRetry);
+      const cancelled = {
+        tool: 'subagent',
+        sessionID: 'root',
+        id: 'cancelled-call',
+        input: {
+          agent: 'explorer',
+          prompt: 'cancel before execute',
+          background: false,
+        },
+      };
+      await calls.toolBeforeCb?.(cancelled);
+      const abort = new AbortController();
+      abort.abort();
+      const callsBeforeCancel = nativeCalls;
+      await expect(
+        native.execute(cancelled.input, {
+          sessionID: 'root',
+          id: 'cancelled-call',
+          signal: abort.signal,
+          progress: async () => {},
+        }),
+      ).rejects.toThrow();
+      await expect(
+        native.execute(cancelled.input, {
+          sessionID: 'root',
+          id: 'cancelled-call',
+          signal: new AbortController().signal,
+          progress: async () => {},
+        }),
+      ).rejects.toThrow('admission capture missing');
+      expect(nativeCalls).toBe(callsBeforeCancel);
+      // Historical/host-command children stay honestly unmanaged. Their
+      // native workflow and descendants work, but acquire no guessed team.
+      identities.set('host-created', {
+        id: 'host-created',
+        parentID: 'root',
+        directory: projectDir,
+        agent: 'explorer',
+        model: { providerID: 'native', id: 'historical' },
+      });
+      await calls.promptHookCb?.({
+        sessionID: 'host-created',
+        messageID: 'host-created-first',
+        prompt: { text: 'legacy work' },
+      });
+      const compatChild = await launch('compat-child-call', 'host-created', {});
+      for (const sessionID of ['host-created', compatChild]) {
+        expect(stored.has(`session-preset/v1/${sessionID}`)).toBe(false);
+        expect((await rpc.read({ sessionID })).status).toBe('unbound');
+      }
+      await expect(
+        rpc.apply(
+          { sessionID: 'host-created', presetName: 'B' },
+          { signal: new AbortController().signal },
+        ),
+      ).rejects.toThrow('unbound child');
+      await expect(
+        rpc.apply(
+          { sessionID: 'root', presetName: 'bad' },
+          { signal: new AbortController().signal },
+        ),
+      ).rejects.toThrow('missing');
+      await expect(
+        rpc.apply(
+          { sessionID: 'root', presetName: 'cycleA' },
+          { signal: new AbortController().signal },
+        ),
+      ).rejects.toThrow('cycle');
+      expect((await rpc.read({ sessionID: 'root' })).presetName).toBe('B');
+      identities.set('market-root', {
+        id: 'market-root',
+        directory: projectDir,
+        agent: 'orchestrator',
+        model: { providerID: 'native', id: 'root-model' },
+      });
+      await calls.promptHookCb?.({
+        sessionID: 'market-root',
+        messageID: 'market-first',
+        prompt: { text: 'start' },
+      });
+      const overriddenMarket = await launch('market-A', 'market-root', {
+        agent: 'market-static',
+      });
+      expect(
+        stored.get(`session-preset/v1/${overriddenMarket}`).bundle.profiles[
+          'market-static'
+        ],
+      ).toMatchObject({
+        model: { providerID: 'override', id: 'model', variant: 'override-v' },
+        temperature: 0.75,
+        providerOptions: { stalePreset: true },
+      });
+      await rpc.apply(
+        { sessionID: 'market-root', presetName: 'B' },
+        { signal: new AbortController().signal },
+      );
+      const restoredMarket = await launch('market-B', 'market-root', {
+        agent: 'market-static',
+      });
+      const manifestProfile = stored.get(`session-preset/v1/${restoredMarket}`)
+        .bundle.profiles['market-static'];
+      expect(manifestProfile).toMatchObject({
+        model: { providerID: 'manifest', id: 'model', variant: 'manifest-v' },
+        temperature: 0.25,
+      });
+      expect(manifestProfile.providerOptions).toBeUndefined();
+      expect(
+        stored.get(`session-preset/v1/${restoredMarket}`).bundle.chains[
+          'market-static'
+        ],
+      ).toEqual([
+        { id: 'manifest/model', variant: 'manifest-v' },
+        { id: 'manifest-backup/model' },
+      ]);
+      const inheritedMarket = await launch('market-session', 'market-root', {
+        agent: 'market-session',
+      });
+      const inheritedRecord = stored.get(
+        `session-preset/v1/${inheritedMarket}`,
+      );
+      expect(nativeInputs.at(-1)?.model).toBe('native/root-model');
+      expect(inheritedRecord.bundle.inheritance['market-session']).toBe(
+        'session',
+      );
+      expect(inheritedRecord.inheritedProviderID).toBe('native');
+      for (const providerID of ['native', 'other']) {
+        const event = {
+          sessionID: inheritedMarket,
+          agent: 'market-session',
+          model: { providerID, id: 'chosen' },
+          options: { nativeReasoning: 'stale', nativeSafe: true },
+          system: [],
+          messages: [],
+          tools: {},
+        };
+        await calls.contextHookCb?.(event);
+        expect(event.options).toEqual({
+          temperature: 0.25,
+          nativeSafe: true,
+          ...(providerID === 'native' ? { nativeReasoning: true } : {}),
+        });
+      }
+      identities.get('market-root').model.variant = 'high';
+      await launch('market-inherited-named-variant', 'market-root', {
+        agent: 'market-session',
+      });
+      expect(nativeInputs.at(-1)?.model).toBe('native/root-model#high');
+      delete identities.get('market-root').model.variant;
+      // Explicit input is not an observed API sentinel, even when its named
+      // variant is literally "default". Let native availability validate it.
+      await launch('market-explicit-default-variant', 'market-root', {
+        agent: 'market-session',
+        model: 'manual/with-default#default',
+      });
+      expect(nativeInputs.at(-1)?.model).toBe('manual/with-default#default');
+      for (const [agent, model, variant] of [
+        ['market-builtin', 'oracle-model', 'host-variant'],
+        ['market-orchestrator', 'lead-model', 'medium'],
+      ]) {
+        const sourceChild = await launch(`source-${agent}`, 'market-root', {
+          agent,
+        });
+        expect(
+          stored.get(`session-preset/v1/${sourceChild}`).bundle.profiles[agent]
+            .model,
+        ).toEqual({ providerID: 'host', id: model, variant });
+        expect(nativeInputs.at(-1)?.model).toBe(`host/${model}#${variant}`);
+      }
+      await rpc.apply(
+        { sessionID: 'market-root', presetName: 'C' },
+        { signal: new AbortController().signal },
+      );
+      const staticOverride = await launch(
+        'market-cancel-inheritance',
+        'market-root',
+        { agent: 'market-session' },
+      );
+      expect(
+        stored.get(`session-preset/v1/${staticOverride}`).bundle.inheritance[
+          'market-session'
+        ],
+      ).toBeUndefined();
+      expect(
+        stored.get(`session-preset/v1/${staticOverride}`).inheritedProviderID,
+      ).toBeUndefined();
+      // A malformed project layer must still fail even if a lower layer has
+      // the requested valid selection (unlike an unrelated extends failure).
+      await Bun.write(path.join(configDir, 'oh-my-opencode-slim.json'), config);
+      await Bun.write(
+        configPath,
+        JSON.stringify({ agents: { explorer: { temperature: 'invalid' } } }),
+      );
+      await expect(
+        rpc.apply(
+          { sessionID: 'market-root', presetName: 'B' },
+          { signal: new AbortController().signal },
+        ),
+      ).rejects.toThrow('config load failed');
+      await Bun.write(configPath, config);
+      await cleanup();
+      native.execute = nativeExecute;
+      cleanup = await createV2Setup()(ctx);
+      await calls.promptHookCb?.({
+        sessionID: restoredMarket,
+        messageID: 'restored-market',
+        prompt: { text: 'resume' },
+      });
+      expect(
+        stored.get(`session-preset/v1/${restoredMarket}`).bundle.profiles[
+          'market-static'
+        ],
+      ).toEqual(manifestProfile);
+      expect((await rpc.read({ sessionID: restoredMarket })).presetName).toBe(
+        'B',
+      );
+    } finally {
+      await cleanup();
+    }
+  }, 20_000);
+
   test('returns cleanly without registering when disabled by env', async () => {
     process.env.OH_MY_OPENCODE_SLIM_DISABLE = '1';
     const { ctx, calls } = makeMockV2Context(projectDir);
@@ -494,7 +1330,10 @@ describe('createV2Setup e2e', () => {
       replay = callback;
       return { dispose: () => {} };
     };
-    const nativeTool = { description: 'Foreground (default) native wording' };
+    const nativeTool = {
+      description: 'Foreground (default) native wording',
+      execute: async () => ({}),
+    };
     let toolPresent = true;
     const draft = () => ({
       update: (_id: string, fn: (tool: typeof nativeTool) => void) => {
@@ -526,10 +1365,10 @@ describe('createV2Setup e2e', () => {
 
     const cleanup = await createV2Setup()(ctx);
     try {
-      // (1) Setup settled, registry not replayed yet: an omitted
-      // background stays omitted (native foreground default).
+      // No native editor has replayed yet: admission fails closed rather
+      // than launching an unwrapped child without its durable snapshot.
       expect(replay).toBeDefined();
-      expect(await sendLaunch()).not.toHaveProperty('background');
+      await expect(sendLaunch()).rejects.toThrow('wrapper unavailable');
       await flushLoggerForTesting();
       expect(readPluginLog()).not.toContain('v2 background default applied');
 
@@ -552,7 +1391,7 @@ describe('createV2Setup e2e', () => {
       // subsequent replay with it re-arms (replays are idempotent).
       toolPresent = false;
       replay?.(draft());
-      expect(await sendLaunch()).not.toHaveProperty('background');
+      await expect(sendLaunch()).rejects.toThrow('wrapper unavailable');
       await flushLoggerForTesting();
       expect(readPluginLog()).toContain(
         '[v2] subagent description flip missed (tool absent)',
@@ -568,7 +1407,7 @@ describe('createV2Setup e2e', () => {
         },
         get: () => undefined,
       });
-      expect(await sendLaunch()).not.toHaveProperty('background');
+      await expect(sendLaunch()).rejects.toThrow('wrapper unavailable');
       await flushLoggerForTesting();
       expect(readPluginLog()).toContain(
         '[v2] subagent description flip failed',
@@ -592,7 +1431,10 @@ describe('createV2Setup e2e', () => {
       replay = callback;
       return { dispose: () => {} };
     };
-    const nativeTool = { description: 'Foreground (default) native wording' };
+    const nativeTool = {
+      description: 'Foreground (default) native wording',
+      execute: async () => ({}),
+    };
     const launch = () => ({
       tool: 'subagent',
       sessionID: 'ses_flip_dispose',
@@ -636,7 +1478,7 @@ describe('createV2Setup e2e', () => {
     expect(readPluginLog()).toContain('[v2] background-default flip disarmed');
 
     const rejected = launch();
-    await expect(hook(rejected)).rejects.toThrow(/disposed/);
+    await expect(hook(rejected)).rejects.toThrow(/disposed|retired/);
     expect(rejected.input).not.toHaveProperty('background');
   }, 20_000);
 
@@ -1781,6 +2623,7 @@ describe('createV2Setup e2e', () => {
     );
 
     const { ctx, calls, events } = makeMockV2Context(projectDir);
+    delete ctx.session.get; // This test explicitly exercises unknown identity.
     const setupCtx = ctx as unknown as {
       mcp: {
         transform: (callback: (draft: unknown) => void) => Promise<{
@@ -2053,6 +2896,9 @@ describe('createV2Setup e2e', () => {
 
   test('batch-deferred MCP and agent transforms finalize before managed prompts', async () => {
     const { ctx, calls, events } = makeMockV2Context(projectDir);
+    // Permission readiness still protects reduced hosts, but their legacy
+    // created prewarm must not hold the shared event pump behind the roster.
+    delete (ctx as any).storage;
     const mcp = ctx.mcp as unknown as {
       transform: (callback: (draft: unknown) => void) => Promise<{
         dispose: () => void;
@@ -2087,15 +2933,21 @@ describe('createV2Setup e2e', () => {
     };
 
     const cleanup = await createV2Setup()(ctx);
+    const detached = spyOn(RuntimeConfig, 'createDetached');
     try {
       expect(deferredMcpTransform).toBeFunction();
       expect(deferredAgentTransform).toBeFunction();
       expect(calls.hooks).toContain('session:prompt');
-      const earlyPrompt = calls.promptHookCb?.({
-        sessionID: 'ses_deferred_mcp_child',
-        messageID: 'msg_early',
-        prompt: { text: 'early child prompt' },
-      });
+      const earlyPrompt = calls
+        .promptHookCb?.({
+          sessionID: 'ses_deferred_mcp_child',
+          messageID: 'msg_early',
+          prompt: { text: 'early child prompt' },
+        })
+        .then(
+          () => undefined,
+          (error) => error,
+        );
       events.push({
         type: 'session.created',
         data: {
@@ -2104,9 +2956,14 @@ describe('createV2Setup e2e', () => {
           agent: 'explorer',
         },
       });
+      events.push({
+        type: 'session.deleted',
+        data: { sessionID: 'unrelated-deleted' },
+      });
       // Let the event pump cache the child while its initial plugin roster is
       // still empty; finalization must reclassify it rather than lose it.
       await Bun.sleep(25);
+      expect(events.pulled()).toBeGreaterThanOrEqual(2);
 
       const agentDraft = {
         list: () => [],
@@ -2127,6 +2984,9 @@ describe('createV2Setup e2e', () => {
         remove: () => {},
       };
       expect(() => deferredAgentTransform?.(agentDraft)).not.toThrow();
+      detached.mockImplementationOnce(() => {
+        throw new Error('transient inference refresh');
+      });
       expect(() =>
         deferredMcpTransform?.({
           list: () => [['host-only', { type: 'local' }]],
@@ -2146,7 +3006,10 @@ describe('createV2Setup e2e', () => {
       );
       await flushLoggerForTesting();
       expect(readPluginLog()).toContain('[v2] agents registered {"count":5}');
-      await expect(earlyPrompt).resolves.toBeUndefined();
+      expect(await earlyPrompt).toMatchObject({
+        message: 'transient inference refresh',
+      });
+      detached.mockRestore();
       await calls.promptHookCb?.({
         sessionID: 'ses_deferred_mcp_child',
         messageID: 'msg_deferred_child',
@@ -2166,6 +3029,7 @@ describe('createV2Setup e2e', () => {
         expect.objectContaining({ action: 'host-only_*', effect: 'deny' }),
       );
     } finally {
+      detached.mockRestore();
       await cleanup();
     }
   }, 20_000);
@@ -2542,6 +3406,7 @@ describe('createV2Setup e2e', () => {
     };
     session.get = async ({ sessionID }: { sessionID: string }) => ({
       id: sessionID,
+      directory: projectDir,
       agent: sessionID === childID ? 'fixer' : 'orchestrator',
       ...(sessionID === childID ? { parentID: 'ses_parent' } : {}),
       ...(completedAt ? { outcome: 'succeeded' } : {}),
@@ -2957,6 +3822,13 @@ describe('createV2Setup e2e', () => {
     const prompts: unknown[] = [];
     const session = ctx.session as Record<string, unknown>;
     session.get = async (args: { sessionID?: string }) => {
+      if (args.sessionID === 'ses_parent') {
+        return {
+          id: 'ses_parent',
+          directory: projectDir,
+          agent: 'orchestrator',
+        };
+      }
       if (args.sessionID !== 'ses_child') {
         return { error: { message: 'NotFound' } };
       }

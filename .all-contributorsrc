@@ -1262,6 +1262,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "monsterlag",
+      "name": "monsterlag",
+      "avatar_url": "https://avatars.githubusercontent.com/u/64719697?v=4",
+      "profile": "https://github.com/monsterlag",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"

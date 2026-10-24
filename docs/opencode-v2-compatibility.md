@@ -131,11 +131,9 @@ nothing.
 
 Verified live on OpenCode v2 (all bridges green — health check
 `bridges:11`, +1 on hosts that accept the `session.model.request` hook
-name for the chat.headers bridge; the event stream, bridges, and
-orchestrator-wake children-driven degraded mode are exercised end-to-end
-on the stable host — live mock-driven re-verification on 2026-09-09
-included a queued wake firing after 60 s of parent idle with a stalled
-background child). v2 conformance is compile-time-pinned by the
+name for the chat.headers bridge; the event stream and bridges are exercised end-to-end on the stable host;
+since the council 2026-10-23 removal the plugin creates no wake scheduler on
+v2 — terminal delivery is the host's native background notifier). v2 conformance is compile-time-pinned by the
 mirror-conformance guard against the `@opencode/plugin` 2.1.2
 devDependency and exercised by the mock-driven bridge tests. Every v2
 API the adapter touches is
@@ -444,11 +442,11 @@ side cannot be observed.
 | Built-in MCPs (context7, gh_grep) auto-registered | ✅ | ✅ `ctx.mcp.transform` | `ctx.mcp.transform` is present in all v2.0.x stable hosts; the runtime capability probe is belt-and-suspenders |
 | Background-job state persistence (tombstones, deletion epochs) | ➖ process-local | ✅ via `ctx.storage` | optional domain; absent → pure in-memory fallback, zero behavior change (see [Background job state](#background-job-state-rehydrate-probe-and-persistence)) |
 | Foreground model fallback (rate-limit failover) | ✅ | ❌ disabled pending an atomic turn-conditional host switch | v2's non-atomic `session.switchModel` + steer replay could alter/replay a newer turn |
-| `/preset` (preset manager) | ✅ | ✅ TUI plugin entry (`./tui` → `dist/tui2.js`): sidebar (incl. clickable active-preset row) + the same three-level manager as v1 on bare `/preset`, or `/preset <name>` fast path | The layer registers from an `append: "app"` slot render because the host's `keymap.layer` is provider-scoped (calling it from plugin `setup` throws `Keymap.Provider is missing`); the command carries an `id` and `slash.arguments`; host needs `ui.slot` + `keymap.layer`; the manager needs `ui.dialog.select` + `prompt` + `confirm` (without them the sidebar preset row is informational-only, but `/preset <name>` still applies); feedback uses `ui.toast.show`; config-file `preset` still applies at load. Config edits (manual, manager saves, `/preset`) are watched over `.json` + `.jsonc` candidates (user + project, including files/directories created later, arbitrary `OPENCODE_CONFIG_DIR` names, and nested missing ancestors; ~300 ms debounce) and hot-applied **only** as inference profiles: `model`/`variant` via `session.switchModel` and `temperature`/`options` on the captured child session's request options, plus the sidebar's tui-state model entries. Capture is awaited on the `session.prompt` request path (the `session.created` event consumer is only a prewarm) so a first child request cannot race the event pump. Agent definitions, prompts, tools, permissions, skills, and MCPs stay frozen for the session lifetime; the host registry is never reloaded. The TUI **requests** this refresh and reports `Saved … Live refresh requested`; it cannot observe the server-side watcher (separate process, no safe plugin RPC bridge on the supported host), which logs its own failure cause. A malformed config (`invalid-json`/`invalid-schema`/`read-error`) is rejected before any swap — the last-known-good profiles/sidebar stay — and the fix-and-reload fallback applies |
+| `/preset` (preset manager) | ✅ configuration writes; reload to apply | ✅ TUI entry (`./tui` → `dist/tui2.js`), with **Current session** / **Global default** selection; `/preset <name>` writes the global default | The command layer registers from an `append: "app"` slot render because `keymap.layer` is provider-scoped; commands carry an `id` and `slash.arguments`. The manager needs `ui.dialog.select` + `prompt` + `confirm`; feedback uses `ui.toast.show`. Session scope additionally requires server `ctx.storage`, session identity lookup and `ctx.rpc.register`, plus TUI `client.rpc`. It changes future subagent inference for the selected session, not its main model or existing children. User/project `.json` and `.jsonc` edits are watched (~300 ms debounce), including newly created candidates; they refresh defaults for future bindings, not saved snapshots. Global-write feedback acknowledges the refresh request, while session-apply feedback requires RPC confirmation. With persistence available, native subagent `progress` saves the child binding before the first prompt; `session.created` is not used to capture its profile. Reduced hosts retain legacy execution behavior. See [Preset switching](preset-switching.md) for inheritance, reapplication and compatibility limits |
 | Default primary agent | ✅ finalized visible orchestrator identity | ✅ `draft.default(<visible orchestrator identity>)`; the canonical `orchestrator` entry remains a hidden alias when `displayName` is configured | v1 `default_agent` and v2 draft default target the same visible entry |
 | TUI default agent | ✅ orchestrator | ✅ host follows the default primary agent and hoists it to the head of the agent list | — |
 | Multiplexer (tmux/zellij/herdr/cmux-tui panes) | ✅ | ✅ TUI plugin entry wires the client-owned pane lifecycle through a v2 host adapter: shared background service and `--server` hosts are supported, `--standalone` is fail-closed (one diagnostic per process, `/subagent` fallback — opens a tab without moving focus) | Defaults are host-specific: `"tui"` on v1 (`opencode attach <url> --session <id> --dir <dir>`); `"mini"` on v2 shared (`opencode mini --session <id>`) and remote (`opencode mini --server <url> --session <id>`), with the pane cwd pinned by the adapter. Explicit `viewer: "tui"` retains the v2 full-TUI commands with a positional directory; v1 `viewer: "mini"` appends `--mini` to attach (OpenCode >= 1.17.10), without extra cwd pinning. The `OPENCODE_PASSWORD` secret is injected through the multiplexer's spawn-time environment (or a Linux + POSIX-shell `/proc` bridge on zellij/cmux-tui), never through the viewer's command line — see [Secret handling](multiplexer-integration.md#known-limitations). Events are projected from `session.created` / `session.execution.*` / `session.idle` / `session.deleted`; directory attribution is recorded at `session.created` because execution events carry none |
-| Orchestrator-wake scheduler | ✅ todo-gated (host `todo`/`children`/`status` APIs) | ✅ children-driven degraded mode (`backgroundJobs.orchestratorWake.mode`) | v2 wake enumerates children via `session.list({parentID})` with an event-tracked fallback, gates on children without a terminal `outcome` (staleness-bounded), and delivers with `queue`; v2's native subagent completion nudges still cover the happy path — the port adds a periodic watchdog for stuck children and unreconciled jobs |
+| Orchestrator-wake scheduler | ✅ todo-gated (host `todo`/`children`/`status` APIs) | ❌ not created (council 2026-10-23) | v2 runs no plugin wake machinery: the native background notifier owns terminal delivery and `task_status` is the pull channel; the whole `backgroundJobs.orchestratorWake` section is v1-only |
 | `chat.headers` (Copilot `x-initiator` routing) | ✅ | ✅ via `session.hook("model.request")` | transport-level only; auxiliary kinds are covered by v2's built-in Copilot provider hook |
 | Companion app | ✅ | ⚠️ unverified | independent desktop app; test separately against v2 |
 
@@ -812,6 +810,45 @@ Do not interpret a restored task row as proof that execution resumed, and do
 not blindly resend continuation prompts after uncertain admission. This plugin
 does not add placeholder agents or automatically relaunch work to mask the race.
 
+### Read-only task diagnostics
+
+`task_status` accepts `diagnostic: true` for tracked failed, cancelled, or stopped
+children. Startup recovery normally re-adopts restarted children onto the board
+with their historical run start; v2 also re-delivers completions. An owned
+untracked handle returns ordinary read-only observed status plus a notice that
+diagnostics require a tracked record, with no excerpt or extra transcript read.
+Foreign-parent handles remain rejected.
+It never registers, prompts, or reconciles a child. Running children are
+refused; completed children use `result: true`. Missing or ambiguous evidence
+is explicit. Excerpts include assistant text and short assistant/failed-tool
+errors, not tool inputs or successful outputs. The tool's rendered diagnostic
+response fits 6,144 UTF-8 bytes, including headers, errors, and truncation
+markers; plugin warnings may be appended separately. The fetch requests a
+limit and our own scans are bounded. The paged messages route honours the limit.
+Without that route, the context fallback fetches full raw context, checks it for
+compaction, then selects only the newest requested entries before conversion.
+Dropped entries or compaction mark the page incomplete; fetching raw context
+itself is not bounded by the shim. No-limit and paged history-boundary reads are
+unchanged. Missing attribution outside the scan window
+is reported as uncertain or unavailable, never guessed.
+Excerpts start after the latest real input in the scan window and exclude
+assistant messages created before the tracked run start. Input may predate
+registration; missing creation times or only pre-start evidence makes the
+excerpt unavailable. Host compaction messages are excluded and labelled.
+Terminal reasons use recorded host error/outcome reasons, then attributable
+assistant error text, then the state name, not stored partial findings.
+
+Diagnostics are read-only and not consumption or acknowledgement. Observed
+state is evidence, execution completion ends a run, and parent acceptance is
+separate; diagnostics do not replace the completion/acceptance flow.
+The fixed next-step line advises awaiting or re-delegating, not marking the task
+accepted; it does not depend on a host-specific revival tool.
+`last_activity_source` reports `observed-activity` (tracker event, possibly
+lagging), `host-busy` (coarse host activity beyond run start, not progress),
+`launch-time` (no activity evidence beyond the run start time, not proof of
+inactivity), or `unknown`. Session-keyed tracker entries may predate a revive;
+the underlying activity timestamps are unchanged.
+
 ### Rehydrate existence probe (`session.get`)
 
 Rehydration re-registers persisted *running* task tool parts so a plugin
@@ -1042,64 +1079,18 @@ The guards are module-level booleans with fixed text — no timestamps,
 session ids, or per-call payloads — so repeated wake polls and cleanup
 calls do not flood the log.
 
-### Orchestrator-wake on v2 (children-driven degraded mode)
+### No orchestrator-wake on v2
 
-The wake scheduler is **active on v2** in a degraded mode, configured with
-`backgroundJobs.orchestratorWake.mode` (`"auto"` | `"todo"` | `"children"`,
-default `"auto"`: todo-gating on v1, children-driven on v2; an explicit
-`"todo"` degrades to children because v2 has no todo surface exposed to
-plugins — logged once).
-
-How it differs from the v1 path:
-
-- **Gate:** v2 requires only the shim's `session.list` + `promptAsync`
-  (`session.get` is optional model enrichment). v1 keeps its exact
-  historical probe set (`get`/`todo`/`children`/`status`/`promptAsync`).
-- **Children enumeration:** `session.list({ parentID })` through the shim
-  (v2 `Session.Info` → v1 envelope; `outcome` and `time.updated` mapped).
-  When the listing is unavailable (missing/erroring/empty), an event-tracked
-  fallback uses the adapter-synthesized `session.created` parentID links plus
-  tracked busy/idle statuses — refreshed on every evaluation with the host's
-  authoritative `outcome`/`time.updated` via `session.get` (fail-soft per
-  child). A finished child is therefore terminal immediately instead of
-  reading active for the whole staleness window, and a live child stays
-  visible on its host evidence rather than dropping out on stale local
-  evidence. `session.list` is not exposed to plugins on any stable
-  host
-  (see
-  [Not exposed to plugins](#not-exposed-to-plugins-sessionlist-sessionremove)),
-  so the event-tracked fallback is the operative path. Results are scoped
-  to the session's directory when the host reports one.
-- **Wake condition:** children with `outcome === undefined` (v2 records an
-  outcome only on terminal transition: succeeded|failed|interrupted) that
-  still have fresh update evidence — host `time.updated` or a tracked status
-  change newer than 3× the wake interval (staleness bound for children that
-  crash mid-run without recording an outcome). Stopped-job recovery wakes
-  bypass the condition, as on v1.
-- **Wake delivery:** `delivery: "queue"` — v1 `prompt_async` queued, and a
-  v2 `steer` would hijack an in-flight run. The shim's `promptAsync` keeps
-  `steer` as the default for callers that request steering.
-  The wake model pin carries the session model's variant as the v2-only
-  `modelVariant` argument, so `switchModel` preserves the reasoning-effort
-  setting instead of resetting it to the host default.
-- **Variant-preserving skip (shim-level guard):** a variant-less model pin
-  that already matches the session's current model (same provider + id,
-  read via `session.get` at delivery time) is treated as "continue on this
-  model": the shim skips `switchModel` entirely instead of resetting the
-  variant to default. This covers every internal caller that pins the
-  current model without a variant opinion (wake pins and task-message)
-  even when the pin's source lost the variant.
-  Explicit variants (including `default` via `modelVariant`) and
-  cross-model pins still switch. Hosts without `session.get`, or a failing
-  `get`, keep the legacy variant-free switch.
-- **Fingerprint:** children-only (id + outcome + tracked status + update
-  evidence); the two-wake no-progress cap still bounds cost.
-
-v2's built-in `subagent` tool still posts completion notifications to the
-parent natively — that covers the happy path. What the port adds is a
-periodic watchdog: an idle parent with a stuck or unreconciled child (or a
-job that stopped without a terminal result) gets woken to assess, cancel, or
-respawn, bounded by the same no-progress cap as v1.
+The wake scheduler is **not created on v2** (council 2026-10-23). The host's
+native background notifier owns terminal delivery: a busy parent is reached
+by steer at its next step boundary, an idle parent gets a successor turn,
+restart recovery re-delivers from the durable KV job marker, and the durable
+inbox dedupes by message ID. A rev>1 continuation relaunched through the
+`subagent` tool re-arms the native notifier. Child permission/question asks
+are a host-UI boundary the host does not route to the parent agent; the
+parent discovers open asks via `task_status` pull. The whole
+`backgroundJobs.orchestratorWake` config section is v1-only and warns as
+ignored on v2.
 
 ### Terminal-publication wake
 
@@ -1112,7 +1103,8 @@ revision of the same generation (a child that self-continues via its own
 background-shell notification and finishes again, or a completion after a
 direct prompt to the child session) would otherwise wait for the periodic
 idle evaluation (up to `orchestratorWake.intervalMs`, default 5 minutes).
-The **terminal-publication wake** closes that gap on both host flavors:
+The **terminal-publication wake** closes that gap on v1 (on v2 no plugin wake
+exists — the native notifier and `task_status` pull are the only channels):
 
 - **Trigger:** the terminal gate publishes a `completed` or `error` host
   outcome (state-disjoint from the stopped-job recovery listener, which
@@ -1127,8 +1119,8 @@ The **terminal-publication wake** closes that gap on both host flavors:
   (`terminalRevision` 1) is suppressed with `reason:
   "first-publication-native-owned"` — the native notifier armed by that
   generation's `subagent` tool call already delivers it to an idle
-  parent; if that native delivery is ever lost host-side, the job falls
-  back to board injection on the parent's next activity. Exception: a
+  parent; if that native delivery is ever lost host-side, the job stays
+  pullable with `task_status` on the parent's next activity. Exception: a
   revived run whose tracker-owned `<task>` notification exhausts its
   whole retry budget releases ownership and re-emits the publication
   wake directly through the scheduler (a revived lineage has no native
@@ -1148,16 +1140,25 @@ The **terminal-publication wake** closes that gap on both host flavors:
   fingerprint keeps the cap tripped.
 
 Config knobs (see the `backgroundJobs.orchestratorWake` rows in the
-[configuration reference](configuration.md#background-job-management)):
-`wakeOnTerminalPublication` (boolean, default `true` — the feature flag)
-and `publicationWakeMinIntervalMs` (integer ms, default `30_000` — the
+[configuration reference](configuration.md#background-job-management); v1
+only): `wakeOnTerminalPublication` (boolean, default `true` — the feature
+flag) and `publicationWakeMinIntervalMs` (integer ms, default `30_000` — the
 per-parent throttle window; a burst of publications collapses into one
 wake).
 
 Related: when a job whose terminal report the parent already consumed
-(reconciled) reopens to running, the board injection appends exactly one
-corrective trailing notice ("previously reported terminal, now running
-again; the earlier report is superseded") in the cache-safe tail zone.
+(reconciled) reopens to running, the plugin appends exactly one corrective
+trailing notice ("previously reported terminal, now running again; the earlier
+report is superseded") in the cache-safe tail zone, pointing at `task_status`.
+
+On v1 hosts the same first-publication rule holds (the native task-tool
+notifier delivers it), and a LATER publication of the same run — which has no
+native notifier on either host — is delivered by the plugin itself on v1 only,
+as one self-contained `<completed-job>` delta through the bounded delta queue
+(it survives a busy parent, and inside the per-parent publication spacing it
+stays queued until the window elapses). On v2 the plugin sends no wake: a
+relaunch through the `subagent` tool re-arms the native notifier, and any
+other later result is pulled through `task_status`.
 
 ### Host outcome quirks the terminal gate defends against
 

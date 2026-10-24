@@ -7679,10 +7679,11 @@ describe('ForegroundFallbackManager chain generation pins', () => {
       string,
       ReadonlyArray<string | { id: string; variant?: string }>
     >,
+    startupEnabled = true,
   ) =>
     new ForegroundFallbackManager(
       chains,
-      true,
+      startupEnabled,
       { directory: '/test', hostFlavor: 'v2' } as never,
       0,
       undefined,
@@ -7692,8 +7693,77 @@ describe('ForegroundFallbackManager chain generation pins', () => {
       undefined,
       undefined,
       undefined,
-      true,
+      startupEnabled,
     );
+
+  test('durable team chains override an early event pin and isolate new A/B children from global refresh', async () => {
+    createMockClient();
+    const chains = {
+      orchestrator: [{ id: 'test/global' }, { id: 'test/new-global' }],
+    };
+    const manager = makeGenerationManager(chains);
+    const switchModel = mock(async () => {});
+    try {
+      for (const name of ['A', 'B']) {
+        const id = `new-child-${name}`;
+        // The async created event can reach the old global pin first.
+        manager.registerSessionAgent(id, 'orchestrator');
+        const snapshot = {
+          orchestrator: [
+            { id: `test/${name}` },
+            { id: `backup/${name}`, variant: 'high' },
+          ],
+        };
+        manager.pinSessionChains(id, snapshot);
+        snapshot.orchestrator[1].id = 'mutated/not-a-snapshot';
+        chains.orchestrator = [{ id: 'global/edited-again' }];
+        await manager.handleV2Retry(
+          {
+            sessionID: id,
+            agent: 'orchestrator',
+            model: { providerID: 'test', id: name },
+            error: { message: 'Rate limit exceeded' },
+            decision: { retry: true },
+          },
+          switchModel,
+        );
+        expect(switchModel).toHaveBeenLastCalledWith(id, {
+          providerID: 'backup',
+          id: name,
+          variant: 'high',
+        });
+      }
+    } finally {
+      manager.dispose();
+    }
+    // Restart under globally disabled fallback: a recovered enabled bundle
+    // still steers, while a disabled bundle never follows the new global flag.
+    const restored = makeGenerationManager(chains, false);
+    try {
+      const snapshot = {
+        orchestrator: [{ id: 'test/old' }, { id: 'backup/old' }],
+      };
+      for (const enabled of [true, false]) {
+        const sessionID = `restored-${enabled}`;
+        restored.pinSessionChains(sessionID, snapshot, enabled);
+        const decision = { retry: true };
+        const switched = mock(async () => {});
+        await restored.handleV2Retry(
+          {
+            sessionID,
+            agent: 'orchestrator',
+            model: { providerID: 'test', id: 'old' },
+            error: { message: 'Rate limit exceeded' },
+            decision,
+          },
+          switched,
+        );
+        expect(switched).toHaveBeenCalledTimes(enabled ? 1 : 0);
+      }
+    } finally {
+      restored.dispose();
+    }
+  });
 
   test('registered child finishes its descent on its original chain across a swap', async () => {
     createMockClient();

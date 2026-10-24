@@ -5,7 +5,6 @@
  * session.idle, session.error, session.status, session.deleted) to
  * the appropriate subsystems.
  */
-import type { BackgroundJobExecution } from '../../utils/background-job-board';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
 import { structuredErrorMessage } from '../../utils/child-transcript';
@@ -15,7 +14,6 @@ import {
   isFailoverError,
   isInlineFailoverError,
 } from '../foreground-fallback/index';
-import type { InjectedTerminalJobs } from './board-injection';
 import {
   type ChildInputWaitKind,
   type ChildInputWaitNotification,
@@ -257,7 +255,6 @@ export async function handleEvent(
       now?: () => number;
     };
     idleReconciler: {
-      scheduleIdleReconciliation(sessionID: string): void;
       scheduleChildIdleReconciliation(
         sessionID: string,
         idleObservedAt: number,
@@ -296,11 +293,6 @@ export async function handleEvent(
       clearSession(sessionID: string): void;
       prune(board: { taskIDs(): Set<string> }): void;
     };
-    terminalJobsInjectedByParent: Map<string, InjectedTerminalJobs>;
-    pendingInjectedTerminalJobsByParent: Map<
-      string,
-      Map<string, BackgroundJobExecution>
-    >;
     backgroundJobSupervisor?: BackgroundJobSupervisor;
     bindConcurrencyTicket?: (taskID: string, pending: PendingTaskCall) => void;
     releaseConcurrencyTask?: (taskID: string) => void;
@@ -515,22 +507,9 @@ export async function handleEvent(
         managesSession: sessionId
           ? deps.options.shouldManageSession(sessionId)
           : false,
-        terminalJobsPending: sessionId
-          ? (deps.terminalJobsInjectedByParent.get(sessionId)?.executions
-              .size ?? 0) +
-            (deps.pendingInjectedTerminalJobsByParent.get(sessionId)?.size ?? 0)
-          : 0,
         runningJobForSession,
       },
     );
-    if (
-      sessionId &&
-      deps.options.shouldManageSession(sessionId) &&
-      !(runningJobForSession && deps.deferredInlineErrors.has(sessionId))
-    ) {
-      deps.idleReconciler.scheduleIdleReconciliation(sessionId);
-    }
-
     // Fallback: for background child sessions that go idle without
     // an injected completion, reconcile the board entry since the
     // session being idle is itself the completion signal.
@@ -605,8 +584,6 @@ export async function handleEvent(
           !deps.options.willAttemptFallback?.(sessionId))
       ) {
         deps.deferredInlineErrors.delete(sessionId);
-        deps.terminalJobsInjectedByParent.delete(sessionId);
-        deps.pendingInjectedTerminalJobsByParent.delete(sessionId);
         // Record non-retryable errors on the job board so the
         // orchestrator sees the failure instead of a false completion.
         if (job && job.state === 'running') {
