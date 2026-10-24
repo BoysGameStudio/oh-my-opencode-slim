@@ -361,7 +361,12 @@ describe('foreground fallback redo harness', () => {
   test('a replay read answering after a host stall still replays', async () => {
     const { manager, mocks } = makeManager();
     const read = deferred<unknown>();
-    mocks.messages.mockImplementation(() => read.promise);
+    mocks.messages.mockImplementation(async () => ({
+      data: [
+        { info: { id: 'a', role: 'assistant', parentID: 'u' }, parts: [] },
+      ],
+    }));
+    mocks.message.mockImplementation(() => read.promise as never);
     manager.registerSessionAgent('stall', 'orchestrator');
     await manager.handleEvent(redoEvents.assistant('stall'));
     const pending = manager.handleEvent(redoEvents.error('stall'));
@@ -369,15 +374,13 @@ describe('foreground fallback redo harness', () => {
     jest.advanceTimersByTime(2_000);
     await flush();
     read.resolve({
-      data: [
-        {
-          info: { id: 'u', role: 'user' },
-          parts: [{ type: 'text', text: 'hi' }],
-        },
-      ],
+      data: {
+        info: { id: 'u', role: 'user' },
+        parts: [{ type: 'text', text: 'hi' }],
+      },
     });
     await pending;
-    expect(mocks.messages).toHaveBeenCalledTimes(1);
+    expect(mocks.message).toHaveBeenCalledTimes(1);
     expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
       body: { model: { providerID: 'test', modelID: 'b' } },
     });
@@ -9043,6 +9046,9 @@ describe('ForegroundFallbackManager same-model retry hardening', () => {
       await seed(mgr, 'hung-nc');
       const pending = mgr.handleEvent(streamError('hung-nc', 'e1'));
       await flush();
+      jest.advanceTimersByTime(2_000);
+      await flush();
+      expect(mgr.isFallbackInProgress('hung-nc')).toBe(true);
       jest.advanceTimersByTime(2_000);
       await pending;
       expect(mocks.promptAsync).not.toHaveBeenCalled();
