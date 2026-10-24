@@ -191,6 +191,8 @@ panes through Herdr's socket API (`layout.export` /
 `layout.set_split_ratio`), so sibling agent panes keep equal sizes (heights in
 the `main-vertical` agent column, widths in the `main-horizontal` agent row).
 The split that bounds the main pane is reset separately to `main_pane_size`.
+Only panes this client spawned are equalized, so an unrelated pane that shares
+the tab keeps its own ratio.
 Manual resizes persist until the next spawn or close, and a zoomed tab is left
 untouched. Equalization is best-effort —
 failures are logged and never affect pane creation or closure. Set

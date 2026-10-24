@@ -1526,4 +1526,66 @@ describe('HerdrMultiplexer', () => {
     // @ts-expect-error - accessing private for test
     expect(herdr.agentPaneIds.has('w1:p2')).toBe(false);
   });
+
+  test('does not equalize or size even-*/tiled layouts', async () => {
+    process.env.HERDR_TAB_ID = 'w1:t1';
+    process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+    for (const layout of [
+      'even-horizontal',
+      'even-vertical',
+      'tiled',
+    ] as const) {
+      crossSpawnMock.mockReset();
+      crossSpawnMock.mockImplementation((command: string[]) => {
+        if (command[0] === 'which') {
+          return createSpawnResult(0, '/usr/bin/herdr\n');
+        }
+        if (command.includes('split')) {
+          return createSpawnResult(0, `${createSplitResponse('w1:p2')}\n`);
+        }
+        return createSpawnResult();
+      });
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer(layout, 80, {
+        equalizer: equalize,
+      });
+
+      await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+
+      // No correction pass and no ratio: these layouts keep their even split.
+      expect(equalize.mock.calls).toHaveLength(0);
+      const splits = commands().filter((command) => command.includes('split'));
+      expect(splits).toHaveLength(1);
+      expect(splits[0]).not.toContain('--ratio');
+    }
+  });
+
+  test('does not latch ratio support on an unrelated split failure', async () => {
+    let sizedAttempts = 0;
+    crossSpawnMock.mockImplementation((command: string[]) => {
+      if (command[0] === 'which') {
+        return createSpawnResult(0, '/usr/bin/herdr\n');
+      }
+      if (command.includes('split')) {
+        if (command.includes('--ratio')) {
+          sizedAttempts += 1;
+          return createSpawnResult(1, '', 'error: pane would be too small');
+        }
+        return createSpawnResult(0, `${createSplitResponse('w1:p2')}\n`);
+      }
+      return createSpawnResult();
+    });
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-vertical', 60);
+
+    await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+    await herdr.closePane('w1:p2');
+    await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
+
+    // A transient failure retried unsized, but sizing stays enabled: the
+    // second parent split tries --ratio again.
+    expect(sizedAttempts).toBe(2);
+  });
 });

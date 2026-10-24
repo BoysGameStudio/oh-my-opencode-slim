@@ -218,10 +218,24 @@ export class HerdrMultiplexer implements Multiplexer {
         // outright. Retry once unsized and latch, so pane creation keeps
         // working (the main pane then keeps herdr's 50/50).
         if (!result.paneId && sized && this.ratioSupported) {
-          this.ratioSupported = false;
-          log('[herdr] sized split failed; retrying without --ratio', {
-            mainPaneSize: this.mainPaneSize,
-          });
+          // Only a genuine flag rejection means this herdr lacks support;
+          // an unrelated failure (transient, pane too small) must not disable
+          // sizing for the rest of the process.
+          const rejectsRatioFlag =
+            result.stderr.includes('--ratio') &&
+            /unexpected|unknown|unrecogni[sz]ed|invalid/i.test(result.stderr);
+          if (rejectsRatioFlag) {
+            this.ratioSupported = false;
+            log('[herdr] herdr rejects pane split --ratio; sizing disabled', {
+              mainPaneSize: this.mainPaneSize,
+              stderr: result.stderr,
+            });
+          } else {
+            log('[herdr] sized split failed; retrying without --ratio', {
+              mainPaneSize: this.mainPaneSize,
+              stderr: result.stderr,
+            });
+          }
           result = await this.runSplit(
             parentPaneId,
             this.paneDirection,
@@ -279,7 +293,8 @@ export class HerdrMultiplexer implements Multiplexer {
         // so it does not linger in the agent area. Session manager gets no
         // paneId on failure, so we must clean it up here.
         try {
-          await this.closePane(paneId);
+          // Already inside the spawn mutex: use the unlocked variant.
+          await this.closePaneInner(paneId);
         } catch (closeErr) {
           log('[herdr] spawnPane: failed to close orphaned pane', {
             paneId,
@@ -358,6 +373,20 @@ export class HerdrMultiplexer implements Multiplexer {
   }
 
   async closePane(paneId: string): Promise<boolean> {
+    // Serialize with spawn: a close must not collapse a branch between another
+    // pass's export and its path-based ratio writes.
+    const prev = this.spawnMutex;
+    let release!: () => void;
+    this.spawnMutex = new Promise<void>((r) => (release = r));
+    await prev;
+    try {
+      return await this.closePaneInner(paneId);
+    } finally {
+      release();
+    }
+  }
+
+  private async closePaneInner(paneId: string): Promise<boolean> {
     const herdr = await this.getBinary();
     const closed = await gracefulClosePane(herdr, paneId, {
       ctrlC: ['pane', 'send-keys', paneId, 'ctrl+c'],
@@ -408,9 +437,9 @@ export class HerdrMultiplexer implements Multiplexer {
     directory: string,
     sized: boolean,
     viewerSecretArgs: string[] = [],
-  ): Promise<{ paneId: string | null; rawOutput: string }> {
+  ): Promise<{ paneId: string | null; rawOutput: string; stderr: string }> {
     const herdr = await this.getBinary();
-    if (!herdr) return { paneId: null, rawOutput: '' };
+    if (!herdr) return { paneId: null, rawOutput: '', stderr: '' };
 
     const splitArgs = [
       herdr,
@@ -446,10 +475,18 @@ export class HerdrMultiplexer implements Multiplexer {
         exitCode: splitExitCode,
         stderr: splitStderr.trim(),
       });
-      return { paneId: null, rawOutput: splitStdout.trim() };
+      return {
+        paneId: null,
+        rawOutput: splitStdout.trim(),
+        stderr: splitStderr.trim(),
+      };
     }
 
-    return { paneId: parsePaneId(splitStdout), rawOutput: splitStdout.trim() };
+    return {
+      paneId: parsePaneId(splitStdout),
+      rawOutput: splitStdout.trim(),
+      stderr: '',
+    };
   }
 
   /**
@@ -459,7 +496,9 @@ export class HerdrMultiplexer implements Multiplexer {
    * before any environment or socket access.
    */
   private async equalizeAgentArea(): Promise<void> {
-    if (!this.equalizePanes) return;
+    // even-*/tiled have no agent area and no main_pane_size share, so
+    // correcting them would turn their even split into an 80/20 one.
+    if (!this.equalizePanes || !this.isMainLayout()) return;
 
     const mainPaneId = this.mainPaneId;
     const tabId = process.env.HERDR_TAB_ID?.trim();
@@ -490,6 +529,7 @@ export class HerdrMultiplexer implements Multiplexer {
         tabId,
         mainPaneId,
         mainPaneShare: this.mainPaneSize / 100,
+        agentPaneIds: this.agentPaneIds,
         onPanesSeen: (paneIds) => {
           for (const id of this.agentPaneIds) {
             if (!paneIds.has(id)) this.agentPaneIds.delete(id);

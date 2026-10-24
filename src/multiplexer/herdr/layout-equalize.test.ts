@@ -118,6 +118,24 @@ describe('equalizeUpdates', () => {
   test('returns no updates for a single-pane tab', () => {
     expect(equalizeUpdates(pane('main'), 'main')).toEqual([]);
   });
+
+  test('skips subtrees holding panes this client did not spawn', () => {
+    const agents = split('down', pane('a'), pane('b'));
+    const agentSide = split('down', agents, pane('user'));
+    const root = split('right', pane('main'), agentSide);
+
+    // Without the tracked set, both the mixed subtree and the agent branch
+    // are rewritten.
+    expect(equalizeUpdates(root, 'main').map((u) => u.path)).toEqual([
+      [true],
+      [true, false],
+    ]);
+
+    // With it, only the all-agent branch inside the mixed subtree is touched.
+    expect(equalizeUpdates(root, 'main', new Set(['a', 'b']))).toEqual([
+      { path: [true, false], ratio: 0.5 },
+    ]);
+  });
 });
 
 describe('mainBoundaryUpdate', () => {

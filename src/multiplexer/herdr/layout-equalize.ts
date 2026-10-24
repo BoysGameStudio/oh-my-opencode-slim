@@ -58,6 +58,11 @@ export interface EqualizeAgentPanesOptions {
    * to this share so sizing is self-healing.
    */
   mainPaneShare?: number;
+  /**
+   * Panes this client spawned. When set, only subtrees made up entirely of
+   * these panes are equalized, so unrelated user panes keep their sizes.
+   */
+  agentPaneIds?: ReadonlySet<string>;
   /** Per-request socket timeout. */
   timeoutMs?: number;
   /** Overall budget for one equalization pass (requests run in parallel). */
@@ -91,25 +96,36 @@ function containsPane(node: HerdrLayoutNode, paneId: string): boolean {
 /**
  * Split-ratio updates that equalize every agent-only subtree. The split that
  * bounds the main pane is skipped (recursed into, never rewritten).
+ *
+ * When `agentPaneIds` is given, a subtree is equalized only if every pane in
+ * it was spawned by this client. A user pane that happens to live in the same
+ * tab is left at its own ratio.
  */
 export function equalizeUpdates(
   root: HerdrLayoutNode,
   mainPaneId: string,
+  agentPaneIds?: ReadonlySet<string>,
 ): SplitRatioUpdate[] {
   const updates: SplitRatioUpdate[] = [];
+
+  const isAgentOnly = (node: HerdrLayoutNode): boolean => {
+    if (!agentPaneIds) return true;
+    for (const id of collectPaneIds(node)) {
+      if (!agentPaneIds.has(id)) return false;
+    }
+    return true;
+  };
 
   const walk = (node: HerdrLayoutNode, path: boolean[]): void => {
     if (node.type !== 'split') return;
 
-    if (!containsPane(node, mainPaneId)) {
+    if (!containsPane(node, mainPaneId) && isAgentOnly(node)) {
       const first = paneSpan(node.first, node.direction);
       const second = paneSpan(node.second, node.direction);
       updates.push({ path, ratio: first / (first + second) });
-      walk(node.first, [...path, false]);
-      walk(node.second, [...path, true]);
-      return;
     }
 
+    // Keep descending: a mixed subtree can still contain a pure agent branch.
     walk(node.first, [...path, false]);
     walk(node.second, [...path, true]);
   };
@@ -274,14 +290,23 @@ export async function equalizeAgentPanes(
 ): Promise<boolean> {
   const { socketPath, tabId, mainPaneId } = opts;
   const budgetMs = opts.budgetMs ?? DEFAULT_BUDGET_MS;
-  const timeoutMs = Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, budgetMs);
+  const perRequestCap = Math.min(
+    opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    budgetMs,
+  );
+  // One deadline for the whole pass: the export and the writes share it, so a
+  // slow export cannot be followed by a full-length write phase.
+  const deadline = Date.now() + budgetMs;
+  const remaining = (): number => Math.max(0, deadline - Date.now());
+  const requestTimeout = (): number =>
+    Math.max(1, Math.min(perRequestCap, remaining()));
 
   try {
     const exported = await sendHerdrRequest(
       socketPath,
       'layout.export',
       { tab_id: tabId },
-      timeoutMs,
+      requestTimeout(),
     );
     const layout = isRecord(exported) ? exported.layout : undefined;
     if (!isRecord(layout)) {
@@ -307,7 +332,7 @@ export async function equalizeAgentPanes(
         : mainBoundaryUpdate(root, mainPaneId, opts.mainPaneShare);
     const requested = [
       ...(boundary ? [boundary] : []),
-      ...equalizeUpdates(root, mainPaneId),
+      ...equalizeUpdates(root, mainPaneId, opts.agentPaneIds),
     ];
 
     // Skip splits that already sit at their target: a steady-state spawn then
@@ -321,13 +346,21 @@ export async function equalizeAgentPanes(
 
     if (updates.length === 0) return true;
 
+    if (remaining() <= 0) {
+      log('[herdr] equalizeAgentPanes: budget exhausted before ratio writes', {
+        tabId,
+      });
+      return false;
+    }
+    const writeTimeout = requestTimeout();
+
     const results = await Promise.allSettled(
       updates.map((update) =>
         sendHerdrRequest(
           socketPath,
           'layout.set_split_ratio',
           { tab_id: tabId, path: update.path, ratio: update.ratio },
-          timeoutMs,
+          writeTimeout,
         ),
       ),
     );
