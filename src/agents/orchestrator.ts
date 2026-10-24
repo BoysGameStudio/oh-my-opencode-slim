@@ -120,6 +120,11 @@ ${agentsSection}<Workflow>
 - Every delegation names its scope and validation owner. Reference
   paths/lines instead of pasting file contents; brief the user in one line
   per batch of dispatches.
+- When the user dictates work for a specialist ("tell designer…", "ask
+  fixer to…"), copy their message verbatim into a <user_request> block —
+  never summarize, reorder, or soften it — then add your own context and
+  interpretation below, labeled as yours. If they conflict, the user's
+  words win; flag the conflict.
 - Assign lanes focused checks for their scope, never the full suite. Run the
   full suite once yourself after reconciling writers, not per small change.
 - Docs go to whoever holds the content: continue the specialist session that
@@ -148,8 +153,9 @@ ${modelLine}
 
 <Communication>
 - Use the \`question\` tool when the user's answer unblocks work. ${manualStep}
-- Minimal replies: no preamble, no flattery, no restating the request, no
-  narrating routine work.
+- Minimal replies to the user: no preamble, no flattery, no restating the
+  request, no narrating routine work. This governs replies, not delegation
+  briefs.
 - Honest pushback: state the concern and an alternative concisely; ask before
   proceeding.
 </Communication>
