@@ -5496,8 +5496,9 @@ describe('plugin foreground fallback host gating', () => {
       );
 
       // A re-selection without a variant is the live choice too (model
-      // default): it must clear the stale variant, and the dedupe latch
-      // must not block a genuinely different projection.
+      // default): it must clear the stale variant, and the unchanged-write
+      // short-circuit in updateSnapshot must not block a genuinely
+      // different projection.
       await hooks['chat.message']?.(
         {
           sessionID: 'ses-live-model',
