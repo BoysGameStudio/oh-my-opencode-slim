@@ -8,6 +8,7 @@ import {
   spyOn,
 } from 'bun:test';
 import { z } from 'zod';
+import { resetCouncilDiagnostics } from './council-schema';
 import {
   DISABLED_COMMANDS_VALUES,
   DISABLED_HOOKS_VALUES,
@@ -646,6 +647,59 @@ describe('InterviewConfigSchema printState', () => {
     if (interviewResult.success) {
       expect(interviewResult.data.printState).toBe(true);
     }
+  });
+});
+
+describe('PluginConfigSchema council', () => {
+  let warnSpy: Mock<typeof console.warn>;
+
+  beforeEach(() => {
+    resetCouncilDiagnostics();
+    warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
+    // Spies on console.warn can be shared across test files in one process;
+    // clear call history so each test counts only its own warnings.
+    warnSpy.mockClear();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('warns about an unknown key instead of swallowing it', () => {
+    // `defaultPreset` is a typo for `default_preset`. Unknown council keys
+    // must not invalidate the config layer, but they also must not vanish
+    // silently — the old transform dropped them without a word.
+    const result = PluginConfigSchema.safeParse({
+      council: {
+        presets: { review: { a: { model: 'openai/gpt-6-luna' } } },
+        defaultPreset: 'review',
+      },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.council?.presets?.review).toBeDefined();
+      expect(result.data.council?.default_preset).toBe('default');
+    }
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const message = warnSpy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('council');
+    expect(message).toContain('defaultPreset');
+  });
+
+  it('stays quiet for a valid council block', () => {
+    const result = PluginConfigSchema.safeParse({
+      council: {
+        presets: { review: { a: { model: 'openai/gpt-6-luna' } } },
+        default_preset: 'review',
+      },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.council?.default_preset).toBe('review');
+    }
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 });
 
