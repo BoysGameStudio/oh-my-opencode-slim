@@ -354,6 +354,52 @@ describe('foreground fallback redo harness', () => {
     expect(mocks.abort).not.toHaveBeenCalled();
   });
 
+  const flush = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+
+  test('a replay read answering after a host stall still replays', async () => {
+    const { manager, mocks } = makeManager();
+    const read = deferred<unknown>();
+    mocks.messages.mockImplementation(() => read.promise);
+    manager.registerSessionAgent('stall', 'orchestrator');
+    await manager.handleEvent(redoEvents.assistant('stall'));
+    const pending = manager.handleEvent(redoEvents.error('stall'));
+    await flush();
+    jest.advanceTimersByTime(2_000);
+    await flush();
+    read.resolve({
+      data: [
+        {
+          info: { id: 'u', role: 'user' },
+          parts: [{ type: 'text', text: 'hi' }],
+        },
+      ],
+    });
+    await pending;
+    expect(mocks.messages).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'b' } },
+    });
+  });
+
+  test('a replay read that never answers releases the fence after two windows', async () => {
+    const { manager, mocks } = makeManager();
+    mocks.messages.mockImplementation(() => new Promise(() => {}));
+    manager.registerSessionAgent('hung', 'orchestrator');
+    await manager.handleEvent(redoEvents.assistant('hung'));
+    const pending = manager.handleEvent(redoEvents.error('hung'));
+    await flush();
+    jest.advanceTimersByTime(2_000);
+    await flush();
+    expect(manager.isFallbackInProgress('hung')).toBe(true);
+    jest.advanceTimersByTime(2_000);
+    await flush();
+    expect(manager.isFallbackInProgress('hung')).toBe(false);
+    await pending;
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+  });
+
   test('T1: content-filter chain walk starts at the head and stays exhausted after the sticky retry', async () => {
     const chain = [
       'anthropic/claude-opus-5-5',
