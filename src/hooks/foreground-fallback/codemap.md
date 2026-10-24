@@ -123,7 +123,7 @@ Resolve fallback chain for session
     ↓
 Abort current rate-limited prompt (session.status retry path only, with timeout)
     ↓
-Retrieve last user message from session history (replayed via isReplayableUserMessage/partsFromReplayMessage)
+Confirm a user turn in session history (isReplayableUserMessage); the replay carries only an internal reminder
     ↓
 Re-prompt session with next model via promptAsync()
     ↓
@@ -162,7 +162,7 @@ Log fallback event
   - `log()`: Structured logging for observability
 - **SessionLifecycle** (`src/hooks/session-lifecycle.ts`): registers `session.deleted` cleanup
 - **Background job board** (`src/index.ts`): supplies a synchronous `hasRunning(sessionID)` child check for the optional v1 abort guard; the failing background job itself is not counted as its own child
-- **Message types** (`src/hooks/types.ts`): `isReplayableUserMessage` / `partsFromReplayMessage` for safe replay
+- **Message types** (`src/hooks/types.ts`): `isReplayableUserMessage` to locate the user turn before a replay
 - **Configuration**: Fallback chains provided at construction from agent configurations
 
 ### Configuration Schema

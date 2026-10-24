@@ -85,16 +85,3 @@ export function isReplayableUserMessage(
   const candidate = message as { type?: unknown };
   return candidate.type === 'user';
 }
-
-export function partsFromReplayMessage(
-  message: ReplayableUserMessage,
-): MessagePart[] {
-  const parts = (message as Partial<MessageWithParts>).parts;
-  if (Array.isArray(parts)) {
-    return parts;
-  }
-  const text = (message as { text?: string }).text;
-  return typeof text === 'string' && text.length > 0
-    ? [{ type: 'text', text }]
-    : [];
-}

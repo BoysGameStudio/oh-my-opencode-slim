@@ -3,10 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import {
-  isReplayableUserMessage,
-  partsFromReplayMessage,
-} from '../hooks/types';
+import { isReplayableUserMessage } from '../hooks/types';
 import { createInternalAgentTextPart } from '../utils/internal-initiator';
 import { buildPluginInput } from './client-shim';
 import type { V2Context } from './types';
@@ -1758,10 +1755,9 @@ describe('v2 client shim foreground-fallback integration', () => {
       .find(isReplayableUserMessage);
     expect(lastUser).toBeDefined();
     if (!lastUser) throw new Error('expected a replayable user message');
-    const replayParts = partsFromReplayMessage(lastUser) as Array<{
-      type: 'text';
-      text: string;
-    }>;
+    const replayParts = (
+      lastUser as { parts: Array<{ type: 'text'; text: string }> }
+    ).parts;
     expect(replayParts).toEqual([
       { type: 'text', text: 'Fix the failing build' },
     ]);
@@ -1853,10 +1849,6 @@ describe('v2 client shim foreground-fallback integration', () => {
     ]);
     const message = result.data[0];
     expect(isReplayableUserMessage(message)).toBe(true);
-    expect(partsFromReplayMessage(message as never)).toEqual([
-      { type: 'text', text: 'hello' },
-      { type: 'reasoning', text: 'inner' },
-    ]);
   });
 
   // ── Task 4 live gap: terminal metadata must survive the mapping ──

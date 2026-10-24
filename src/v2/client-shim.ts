@@ -252,10 +252,9 @@ function internalInitiatorMetadataFromBody(
 
 /**
  * Pure-internal routing gate: ONLY bodies whose every part is an internal
- * initiator may take the session.synthetic admission. Mixed bodies —
- * notably foreground-fallback's replay of the user's real parts with an
- * appended internal reminder — must stay on session.prompt so they remain
- * persisted user input and keep their file attachments (the synthetic
+ * initiator may take the session.synthetic admission. Mixed bodies (user
+ * parts with an appended internal part) must stay on session.prompt so they
+ * remain persisted user input and keep their file attachments (the synthetic
  * branch forwards text only). See the mixed-replay regression test and
  * the greptile P1 review on #1158.
  */
@@ -683,9 +682,9 @@ export function buildPluginInput(
         // dedicated session.synthetic admission keeps the text model-visible
         // while skipping user-message persistence, and its default `resume`
         // preserves the wake semantics. ONLY purely-internal bodies take
-        // this route — mixed bodies (foreground-fallback's user-parts +
-        // internal reminder replay) must stay on session.prompt to preserve
-        // user-input persistence and file attachments. Hosts without
+        // this route — mixed bodies (user parts + an internal part) must
+        // stay on session.prompt to preserve user-input persistence and
+        // file attachments. Hosts without
         // session.synthetic keep the pre-fix prompt path (visible wake,
         // metadata intact).
         const internalViaSynthetic =
