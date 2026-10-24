@@ -626,11 +626,11 @@ describe('v2 client shim delegation', () => {
     // (foreground-fallback depends on steering an in-flight run).
     await promptAsync({
       path: { id: 'ses_1' },
-      body: { parts: [{ type: 'text', text: 'fallback replay' }] },
+      body: { parts: [{ type: 'text', text: 'user prompt' }] },
     });
     expect(seq[2]).toMatchObject({
       m: 'prompt',
-      i: { sessionID: 'ses_1', delivery: 'steer', text: 'fallback replay' },
+      i: { sessionID: 'ses_1', delivery: 'steer', text: 'user prompt' },
     });
   });
 
@@ -806,7 +806,7 @@ describe('v2 client shim delegation', () => {
       }
     ).session.promptAsync({
       path: { id: 'ses_1' },
-      body: { parts: [{ type: 'text', text: 'fallback replay' }] },
+      body: { parts: [{ type: 'text', text: 'user prompt' }] },
       modelSwitch: 'required',
     });
     expect(seq).toHaveLength(1);
@@ -814,7 +814,7 @@ describe('v2 client shim delegation', () => {
     expect(seq[0].i).toMatchObject({
       sessionID: 'ses_1',
       delivery: 'steer',
-      text: 'fallback replay',
+      text: 'user prompt',
     });
   });
 
@@ -1533,7 +1533,7 @@ describe('v2 client shim promptAsync model-switch hardening (#1125)', () => {
       path: { id: 'ses_1' },
       body: {
         model: { providerID: 'test', modelID: 'model-a' },
-        parts: [{ type: 'text', text: 'fallback replay' }],
+        parts: [{ type: 'text', text: 'user prompt' }],
       },
       modelVariant: 'default',
     });
@@ -1564,7 +1564,7 @@ describe('v2 client shim promptAsync model-switch hardening (#1125)', () => {
       path: { id: 'ses_1' },
       body: {
         model: { providerID: 'test', modelID: 'model-a' },
-        parts: [{ type: 'text', text: 'fallback replay' }],
+        parts: [{ type: 'text', text: 'user prompt' }],
       },
     });
     expect(seq.map((c) => c.m)).toEqual(['switchModel', 'prompt']);
@@ -1980,7 +1980,7 @@ describe('v2 client shim foreground-fallback integration', () => {
   });
 });
 
-describe('v2 client shim replay attachment preservation', () => {
+describe('v2 client shim v1 prompt attachment translation', () => {
   test('promptAsync maps image/file parts into v2 prompt files', async () => {
     const prompts: Array<Record<string, unknown>> = [];
     const input = buildPluginInput(
