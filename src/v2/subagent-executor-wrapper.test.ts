@@ -78,10 +78,12 @@ describe('createSubagentExecutorWrapper', () => {
     const returned = await wrapped({}, ctx);
 
     expect((returned as { content: string }).content).toBe(content);
+    // Only the text INSIDE the block reaches the structured launch: the
+    // block is the host's rendering, not the child's public answer.
     expect(rec.launches[0]).toMatchObject({
       childTaskID: 'ses_done',
       state: 'completed',
-      result: content,
+      result: 'ok',
     });
   });
 
@@ -89,7 +91,7 @@ describe('createSubagentExecutorWrapper', () => {
     const rec = recorder();
     const wrapper = createSubagentExecutorWrapper({ register: rec.register });
     // Host-authored prose with intentional spacing/quotes: the wrapper must
-    // carry the string byte-for-byte, never reformat it.
+    // carry the extracted inner text byte-for-byte, never reformat it.
     const content =
       '<subagent sessionID="ses_done" state="completed">\n  <result>  done &amp; dusted  </result>\n</subagent>';
     const wrapped = wrapper.wrap(async () => ({
@@ -101,7 +103,86 @@ describe('createSubagentExecutorWrapper', () => {
     await wrapped({}, ctx);
 
     expect(rec.launches).toHaveLength(1);
-    expect(rec.launches[0].result).toBe(content);
+    expect(rec.launches[0].result).toBe(
+      '<result>  done &amp; dusted  </result>',
+    );
+  });
+
+  test('an empty subagent block omits the result field so the gate sees no answer', async () => {
+    const rec = recorder();
+    const wrapper = createSubagentExecutorWrapper({ register: rec.register });
+    // The whole block used to be counted as the answer text: the terminal
+    // gate saw a nonempty result and recorded a success for a child that
+    // returned nothing. Only the block's inner text reaches the gate.
+    const content =
+      '<subagent sessionID="ses_done" state="completed"></subagent>';
+    const wrapped = wrapper.wrap(async () => ({
+      output: { sessionID: 'ses_done', status: 'completed' },
+      content,
+      metadata: { sessionID: 'ses_done', status: 'completed' },
+    }));
+
+    const returned = await wrapped({}, ctx);
+
+    // The host's returned content stays exactly as authored.
+    expect((returned as { content: string }).content).toBe(content);
+    expect(rec.launches).toHaveLength(1);
+    expect(rec.launches[0]).toEqual({
+      callID: 'call_1',
+      parentSessionID: 'parent_1',
+      childTaskID: 'ses_done',
+      state: 'completed',
+      background: false,
+    });
+    expect('result' in rec.launches[0]).toBe(false);
+  });
+
+  test('a whitespace-only subagent block omits the result field', async () => {
+    const rec = recorder();
+    const wrapper = createSubagentExecutorWrapper({ register: rec.register });
+    const wrapped = wrapper.wrap(async () => ({
+      output: { sessionID: 'ses_done', status: 'completed' },
+      content:
+        '<subagent sessionID="ses_done" state="completed">\n\n</subagent>',
+      metadata: { sessionID: 'ses_done', status: 'completed' },
+    }));
+
+    await wrapped({}, ctx);
+
+    expect(rec.launches).toHaveLength(1);
+    expect('result' in rec.launches[0]).toBe(false);
+  });
+
+  test('an unterminated subagent block omits the result field', async () => {
+    const rec = recorder();
+    const wrapper = createSubagentExecutorWrapper({ register: rec.register });
+    const content = '<subagent sessionID="ses_done" state="completed">partial';
+    const wrapped = wrapper.wrap(async () => ({
+      output: { sessionID: 'ses_done', status: 'completed' },
+      content,
+      metadata: { sessionID: 'ses_done', status: 'completed' },
+    }));
+
+    const returned = await wrapped({}, ctx);
+
+    expect((returned as { content: string }).content).toBe(content);
+    expect(rec.launches[0]).not.toHaveProperty('result');
+  });
+
+  test('a quoted attribute cannot leak into the extracted answer text', async () => {
+    const rec = recorder();
+    const wrapper = createSubagentExecutorWrapper({ register: rec.register });
+    const content =
+      '<subagent sessionID="ses_done" state="completed" description="Check a > b">done</subagent>';
+    const wrapped = wrapper.wrap(async () => ({
+      output: { sessionID: 'ses_done', status: 'completed' },
+      content,
+      metadata: { sessionID: 'ses_done', status: 'completed' },
+    }));
+
+    await wrapped({}, ctx);
+
+    expect(rec.launches[0].result).toBe('done');
   });
 
   test('a result with no text omits the result field (fail-open)', async () => {
@@ -119,16 +200,36 @@ describe('createSubagentExecutorWrapper', () => {
     expect('result' in rec.launches[0]).toBe(false);
   });
 
-  test('falls back to output.result when content is absent', async () => {
+  test('carries plain-text content that is not a subagent block', async () => {
     const rec = recorder();
     const wrapper = createSubagentExecutorWrapper({ register: rec.register });
     const wrapped = wrapper.wrap(async () => ({
-      output: { sessionID: 'ses_done', status: 'completed', result: 'plain' },
+      output: { sessionID: 'ses_child', status: 'running' },
+      content:
+        'The subagent is working in the background (sessionID: ses_child).',
+      metadata: { sessionID: 'ses_child', status: 'running' },
     }));
 
     await wrapped({}, ctx);
 
-    expect(rec.launches[0].result).toBe('plain');
+    expect(rec.launches[0].result).toBe(
+      'The subagent is working in the background (sessionID: ses_child).',
+    );
+  });
+
+  test('carries plain text that mentions the subagent tag name', async () => {
+    const rec = recorder();
+    const wrapper = createSubagentExecutorWrapper({ register: rec.register });
+    const content = 'Use <subagent> as the tool name in this example.';
+    const wrapped = wrapper.wrap(async () => ({
+      output: { sessionID: 'ses_child', status: 'completed' },
+      content,
+      metadata: { sessionID: 'ses_child', status: 'completed' },
+    }));
+
+    await wrapped({}, ctx);
+
+    expect(rec.launches[0].result).toBe(content);
   });
 
   test('fails open when the result carries no structured session ID', async () => {

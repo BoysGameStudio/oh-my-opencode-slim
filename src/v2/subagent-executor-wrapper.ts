@@ -16,6 +16,7 @@
  */
 
 import { log } from '../utils/logger';
+import { parseTaskResultFromOutput } from '../utils/task';
 
 export type SubagentStructuredState =
   | 'running'
@@ -34,11 +35,12 @@ export interface SubagentStructuredLaunch {
   /** Host-confirmed background promotion from structured metadata. */
   background: boolean;
   /**
-   * The child's final text, passed VERBATIM (never reformatted): the
-   * native v2 foreground completion carries the full host-authored
-   * `<subagent …>` block in `content`. Omitted when the result carries
-   * no text (fail-open). The terminal gate's textless-completion policy
-   * needs it so a valid answer is not recorded as an error.
+   * The child's final text, passed VERBATIM (never reformatted). Omitted
+   * when the result carries no public answer text (fail-open): the
+   * terminal gate's textless-completion policy needs a nonempty answer so
+   * a valid answer is not recorded as an error, and an EMPTY host-authored
+   * `<subagent …></subagent>` block is not an answer either — counting the
+   * block itself as text would record a textless completion as success.
    */
   result?: string;
 }
@@ -64,7 +66,7 @@ const WRAPPED_MARKER = Symbol.for(
 );
 
 interface ExecutorResultLike {
-  output?: { sessionID?: unknown; status?: unknown; result?: unknown };
+  output?: { sessionID?: unknown; status?: unknown };
   metadata?: {
     sessionID?: unknown;
     status?: unknown;
@@ -76,6 +78,22 @@ interface ExecutorResultLike {
 
 function readString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+/**
+ * Extract the public answer text from a host-authored `<subagent …>` block,
+ * reusing the shared parser so the structured lane and the prose lane agree
+ * on what the child actually said. Non-block content passes through
+ * unchanged.
+ *
+ * An empty or unterminated block yields no text: the host rendered no
+ * answer, so the launch must not carry a nonempty `result` that would let
+ * the terminal gate record a success.
+ */
+function publicResultText(text: string | undefined): string | undefined {
+  if (text === undefined) return undefined;
+  if (!/^\s*<subagent\b/i.test(text)) return text;
+  return parseTaskResultFromOutput(text) ?? undefined;
 }
 
 function structuredLaunch(
@@ -95,12 +113,14 @@ function structuredLaunch(
     rawState === 'completed' || rawState === 'error' || rawState === 'cancelled'
       ? rawState
       : 'running';
-  // The child's final text, verbatim: the native v2 foreground completion
-  // carries the full host-authored `<subagent …>` block in `content`.
-  // Never reformat it — the terminal gate's textless-completion policy
-  // reads this as the run's public answer text.
-  const resultText =
-    readString(shaped.content) ?? readString(shaped.output?.result);
+  // The child's final text. The native v2 foreground completion carries
+  // the host-authored `<subagent …>` block in `content`; that block is
+  // the HOST's rendering, not the child's answer, so its inner text is
+  // extracted with the same parser the prose lane uses. An empty block
+  // yields no text, so `result` is omitted and the terminal gate's
+  // textless-completion policy decides (incident: empty answers looked
+  // successful). Non-block content is carried through unchanged.
+  const resultText = publicResultText(readString(shaped.content));
   return {
     callID,
     parentSessionID,
