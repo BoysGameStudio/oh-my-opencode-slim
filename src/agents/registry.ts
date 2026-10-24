@@ -245,6 +245,26 @@ function projectMarketplacePermission(
       projected[tool] = clone(existingRule);
     }
   }
+  // `external_directory` is a native safety guard, not a manifest tool
+  // capability: it is never in `tools`, never inferred from a tool grant or
+  // the wildcard fallback, and never synthesized. Only an explicit owner
+  // declaration — a whole-tool effect or a resource map — carries through,
+  // verbatim. The `'*': 'deny'` base keeps an absent declaration denied.
+  const declaredExternal = existing.external_directory;
+  if (typeof declaredExternal === 'string') {
+    projected.external_directory =
+      declaredExternal === 'allow' || declaredExternal === 'ask'
+        ? declaredExternal
+        : 'deny';
+  } else if (
+    declaredExternal &&
+    typeof declaredExternal === 'object' &&
+    !Array.isArray(declaredExternal)
+  ) {
+    projected.external_directory = clone(
+      declaredExternal as Record<string, unknown>,
+    );
+  }
   const existingSkills = existing.skill;
   const grants = getSkillPermissionsForAgent('__marketplace__', skills);
   const wildcard = grants['*'] === 'allow';
@@ -284,12 +304,35 @@ function projectMarketplacePermission(
   return projected;
 }
 
+/**
+ * Conservative deny floor for the `external_directory` native safety guard.
+ * Emitted as the FIRST baseline rule of every Marketplace policy — ahead of
+ * the source and host rules but after the compiler's admission defaults — so
+ * the ceiling's `defaultEffect: 'allow'` can never synthesize a grant for an
+ * empty policy. Explicit owner declarations and finalized host rules follow
+ * in their original order, so last-match-wins still lets a declared allow or
+ * a resource map open (and re-restrict) the guard; nothing is ever granted
+ * when nothing was declared. It is a policy default, not a declared denial:
+ * it never enters the registered `baselineRules` and so never replays in the
+ * child-payload deny ceiling behind authoritative host rules.
+ */
+const EXTERNAL_DIRECTORY_GUARD_FLOOR: readonly V2PermissionRule[] = [
+  { action: 'external_directory', resource: '*', effect: 'deny' },
+];
+
 function marketplacePermissionCeilings(
   tools: readonly string[],
   skills: readonly string[],
   mcps: readonly string[],
 ): PermissionCeilings {
-  const actions: Record<string, 'allow' | 'deny'> = {};
+  const actions: Record<string, 'allow' | 'deny'> = {
+    // The native safety guard is admitted so explicit owner declarations and
+    // finalized host rules can reach the policy; the conservative guard floor
+    // in `finalizeAgentPolicy` / `compileChildPermissions` keeps it denied
+    // until something declares it. It is deliberately not a manifest tool:
+    // a package's `tools` list can never open it.
+    external_directory: 'allow',
+  };
   for (const tool of tools) {
     if (tool === 'bash') {
       for (const { action } of v1PermKeyToV2(tool)) actions[action] = 'allow';
@@ -765,6 +808,10 @@ function finalizeAgentPolicy(input: {
     ceilings,
     policy: compilePermissionPolicy({
       baselineRules: [
+        // Marketplace policies open with the conservative external_directory
+        // guard floor; the returned `baselineRules` (deny-ceiling source)
+        // deliberately omits it.
+        ...(ceilings ? EXTERNAL_DIRECTORY_GUARD_FLOOR : []),
         ...baselineBeforeReadSafeguards,
         ...marketplaceReadSafeguards(tools),
         ...ownerReadRule,
@@ -1687,7 +1734,12 @@ export function buildResolvedAgentRegistry(
         );
       }
       const policy = compilePermissionPolicy({
-        baselineRules: [],
+        // Marketplace child payloads open with the same conservative
+        // external_directory guard floor as the registered policy, so the
+        // ceiling's default-effect allow can never synthesize a grant for a
+        // child payload that never declared the guard. Non-marketplace agents
+        // have no ceilings and keep the untouched host-rule pass-through.
+        baselineRules: constraints ? EXTERNAL_DIRECTORY_GUARD_FLOOR : [],
         hostRules: rules,
         ...(constraints ? { ceilings: constraints } : {}),
       });

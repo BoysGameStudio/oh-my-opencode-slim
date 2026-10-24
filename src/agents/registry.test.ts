@@ -3511,4 +3511,221 @@ describe('marketplace agent customization', () => {
     const prompt = registry.finalAgentConfig['market-agent'].prompt as string;
     expect(prompt).toContain('Package prompt');
   });
+
+  // external_directory is a native safety guard, distinct from manifest tool
+  // capabilities: only an explicit owner permission declaration opens or
+  // narrows it — never a manifest tool grant or the projection's wildcard —
+  // and an absent declaration stays denied on both the registered policy and
+  // every compiled child payload.
+  const externalGrid = [
+    '/approved/report.txt',
+    '/approved/private/secret.txt',
+    '/elsewhere/x.txt',
+  ];
+
+  const decideOfRules = (rules: readonly V2PermissionRule[]) =>
+    compilePermissionPolicy({ baselineRules: [], hostRules: rules }).decide;
+
+  // Host-agent overrides must be owned by a config entry (reserved-identity
+  // guard); re-state the package defaults so nothing else changes.
+  const ownedConfig = (agents: Record<string, unknown> = {}) => ({
+    agents: {
+      'market-agent': { skills: ['skill-a'], mcps: ['host-mcp'], ...agents },
+    },
+  });
+
+  test('external_directory: explicit owner allow survives registered and child policies', () => {
+    const registry = configured(ownedConfig(), {
+      hostAgent: {
+        'market-agent': { permission: { external_directory: 'allow' } },
+      },
+      hostFlavor: 'v2',
+    });
+    expect(
+      (
+        registry.finalAgentConfig['market-agent'] as {
+          permission: Record<string, unknown>;
+        }
+      ).permission.external_directory,
+    ).toBe('allow');
+    const policy = registry.nativePolicies['market-agent'];
+    for (const resource of externalGrid) {
+      expect(policy.decide('external_directory', resource)).toBe('allow');
+    }
+    const compiled = registry.compileChildPermissions('market-agent', [
+      { action: 'external_directory', resource: '*', effect: 'allow' },
+    ]);
+    expect(
+      decideOfRules(compiled)('external_directory', '/approved/report.txt'),
+    ).toBe('allow');
+  });
+
+  test('external_directory: ask and deny declarations are preserved verbatim', () => {
+    for (const effect of ['ask', 'deny'] as const) {
+      const registry = configured(ownedConfig(), {
+        hostAgent: {
+          'market-agent': { permission: { external_directory: effect } },
+        },
+        hostFlavor: 'v2',
+      });
+      const policy = registry.nativePolicies['market-agent'];
+      expect(policy.decide('external_directory', '/approved/report.txt')).toBe(
+        effect,
+      );
+      const compiled = registry.compileChildPermissions('market-agent', [
+        { action: 'external_directory', resource: '*', effect },
+      ]);
+      expect(
+        decideOfRules(compiled)('external_directory', '/approved/report.txt'),
+      ).toBe(effect);
+    }
+  });
+
+  test('external_directory: resource map scopes the grant; private subpath and outside paths stay denied', () => {
+    const registry = configured(ownedConfig(), {
+      hostAgent: {
+        'market-agent': {
+          permission: {
+            external_directory: {
+              '/approved/*': 'allow',
+              '/approved/private/*': 'deny',
+            },
+          },
+        },
+      },
+      hostFlavor: 'v2',
+    });
+    const policy = registry.nativePolicies['market-agent'];
+    expect(policy.decide('external_directory', '/approved/report.txt')).toBe(
+      'allow',
+    );
+    expect(
+      policy.decide('external_directory', '/approved/private/secret.txt'),
+    ).toBe('deny');
+    expect(policy.decide('external_directory', '/elsewhere/x.txt')).toBe(
+      'deny',
+    );
+    const compiled = registry.compileChildPermissions('market-agent', [
+      ...policy.rules,
+    ]);
+    const decide = decideOfRules(compiled);
+    expect(decide('external_directory', '/approved/report.txt')).toBe('allow');
+    expect(decide('external_directory', '/approved/private/secret.txt')).toBe(
+      'deny',
+    );
+    expect(decide('external_directory', '/elsewhere/x.txt')).toBe('deny');
+  });
+
+  test('external_directory: finalized host rules bind the owner allow', () => {
+    const registry = configured(ownedConfig(), {
+      hostAgent: {
+        'market-agent': { permission: { external_directory: 'allow' } },
+      },
+      nativePermissionsByAgent: {
+        'market-agent': [
+          {
+            action: 'external_directory',
+            resource: '/approved/denied/*',
+            effect: 'deny',
+          },
+          {
+            action: 'external_directory',
+            resource: '/approved/asked/*',
+            effect: 'ask',
+          },
+        ],
+      },
+      hostFlavor: 'v2',
+    });
+    const policy = registry.nativePolicies['market-agent'];
+    expect(policy.decide('external_directory', '/approved/report.txt')).toBe(
+      'allow',
+    );
+    expect(policy.decide('external_directory', '/approved/denied/x.txt')).toBe(
+      'deny',
+    );
+    expect(policy.decide('external_directory', '/approved/asked/y.txt')).toBe(
+      'ask',
+    );
+  });
+
+  test('external_directory: absent declaration and empty child payload deny; admitting the guard widens nothing else', () => {
+    const registry = configured({}, { hostFlavor: 'v2' });
+    const policy = registry.nativePolicies['market-agent'];
+    for (const resource of externalGrid) {
+      expect(policy.decide('external_directory', resource)).toBe('deny');
+    }
+    const empty = registry.compileChildPermissions('market-agent', []);
+    expect(
+      decideOfRules(empty)('external_directory', '/approved/report.txt'),
+    ).toBe('deny');
+    // No other capability rides in with the admitted guard action: the
+    // compiled child payload itself keeps undeclared tools denied, and a
+    // host wildcard allow passed through the ceiling cannot admit them.
+    expect(decideOfRules(empty)('subagent', 'explorer')).toBe('deny');
+    expect(decideOfRules(empty)('write', 'src/index.ts')).toBe('deny');
+    const withGlobal = registry.compileChildPermissions('market-agent', [
+      { action: '*', resource: '*', effect: 'allow' },
+    ]);
+    expect(decideOfRules(withGlobal)('subagent', 'explorer')).toBe('deny');
+    expect(decideOfRules(withGlobal)('write', 'src/index.ts')).toBe('deny');
+  });
+
+  test('external_directory: repeated child projection is decision-idempotent', () => {
+    const registry = configured(ownedConfig(), {
+      hostAgent: {
+        'market-agent': { permission: { external_directory: 'allow' } },
+      },
+      hostFlavor: 'v2',
+    });
+    const once = registry.compileChildPermissions('market-agent', [
+      ...registry.nativePolicies['market-agent'].rules,
+    ]);
+    const twice = registry.compileChildPermissions('market-agent', once);
+    const first = decideOfRules(once);
+    const second = decideOfRules(twice);
+    for (const resource of externalGrid) {
+      for (const action of [
+        'external_directory',
+        'read',
+        'write',
+        'subagent',
+        'skill',
+      ]) {
+        expect(`${action} ${resource} ${second(action, resource)}`).toBe(
+          `${action} ${resource} ${first(action, resource)}`,
+        );
+      }
+    }
+  });
+
+  test('external_directory: visible alias identity shares the guard, bare alias stays denied', () => {
+    const allowed = configured(
+      { agents: { 'market-agent': { displayName: 'MarketVisible' } } },
+      {
+        hostAgent: {
+          'market-agent': { permission: { external_directory: 'allow' } },
+        },
+        hostFlavor: 'v2',
+      },
+    );
+    for (const name of ['market-agent', 'MarketVisible']) {
+      expect(
+        allowed.nativePolicies[name].decide(
+          'external_directory',
+          '/approved/report.txt',
+        ),
+      ).toBe('allow');
+    }
+    const bare = configured(
+      { agents: { 'market-agent': { displayName: 'MarketVisible' } } },
+      { hostFlavor: 'v2' },
+    );
+    expect(
+      bare.nativePolicies.MarketVisible.decide(
+        'external_directory',
+        '/approved/report.txt',
+      ),
+    ).toBe('deny');
+  });
 });
