@@ -3116,6 +3116,9 @@ describe('marketplace agent customization', () => {
       packageOverrides?: Record<string, unknown>;
       mcps?: string[];
       hostAgent?: Record<string, unknown>;
+      nativePermissionsByAgent?: Readonly<
+        Record<string, readonly V2PermissionRule[]>
+      >;
       projectDirectory?: string;
       hostFlavor?: 'v2';
     } = {},
@@ -3647,6 +3650,12 @@ describe('marketplace agent customization', () => {
     expect(policy.decide('external_directory', '/approved/asked/y.txt')).toBe(
       'ask',
     );
+    const child = decideOfRules(
+      registry.compileChildPermissions('market-agent', policy.rules),
+    );
+    expect(child('external_directory', '/approved/report.txt')).toBe('allow');
+    expect(child('external_directory', '/approved/denied/x.txt')).toBe('deny');
+    expect(child('external_directory', '/approved/asked/y.txt')).toBe('ask');
   });
 
   test('external_directory: absent declaration and empty child payload deny; admitting the guard widens nothing else', () => {
