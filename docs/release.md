@@ -16,33 +16,43 @@ format are unchanged by the extraction.
 ## Companion manifest handoff
 
 The [Companion Manifest Sync](../.github/workflows/companion-manifest-sync.yml)
-workflow runs every six hours or on manual dispatch. It reads the public native
+workflow runs every six hours or on manual dispatch. It reads the native
 repository's latest published release, requires all five supported archives,
-downloads each archive, calculates SHA-256 from the actual bytes, and proposes
-an update to:
+hashes their actual bytes, and proposes an update to
+`src/companion/companion-manifest.json` and the matching `COMPANION_MANIFEST`
+fallback in `src/companion/updater.ts`. When aligned it writes nothing; API
+errors, incomplete releases, invalid release identities, truncated downloads,
+downgrades, and same-tag checksum changes fail closed, and it never builds
+native code or rewrites an existing release.
 
-- `src/companion/companion-manifest.json`
-- The matching `COMPANION_MANIFEST` fallback in `src/companion/updater.ts`
-
-It runs focused release/helper, installer/updater tests, changed-file Biome
-checks, offline manifest validation, and remote release verification before
-opening or updating its plugin-local PR. When aligned, it writes nothing and
-opens no PR. API errors, missing/incomplete releases, invalid release identities,
-truncated downloads, downgrades, and same-tag checksum changes fail closed; the
-plugin workflow never attempts a native build or rewrites an existing release.
-
-The workflow needs only public read access to the native repository. Its own
-`GITHUB_TOKEN` creates the branch/PR **in the plugin repository**, not in the
-native repository. Enable **Allow GitHub Actions to create and approve pull
-requests** in the plugin repository's Actions settings. No cross-repository
-write token or repository-dispatch setup is required. Bot PRs require normal
-review and merge; their focused checks run in the sync workflow itself because
-PRs created with `GITHUB_TOKEN` do not trigger ordinary PR workflows.
+It only needs public read access to the native repository: its own
+`GITHUB_TOKEN` creates the PR in this repository, so no cross-repository write
+token or repository-dispatch setup is required. Bot PRs need normal review and
+merge, and their focused checks run inside the sync workflow because PRs
+created with `GITHUB_TOKEN` do not trigger ordinary PR workflows.
 
 Merge the generated manifest PR before shipping a plugin that requires the new
 native release. Managed installs follow the version pinned in the installed
 plugin, not whatever happens to be latest upstream.
 
+### Companion release strategy
+
+- Binaries ship as `companion-vX.Y.Z` GitHub Release assets in
+  [oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion/releases);
+  GitHub Releases are the source of truth (R2 can mirror later).
+- The companion is versioned separately from the plugin, so plugin betas do not
+  require native rebuilds. `companion install` selects the archive for the
+  current OS/arch, and the plugin ships the release plus SHA-256 in its manifest.
+- Asset names are
+  `oh-my-opencode-slim-companion-vX.Y.Z-<target>.tar.gz` (`.zip` for Windows),
+  for `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+  `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and
+  `x86_64-pc-windows-msvc`.
+- Native CI and the autonomous release workflow live in the companion
+  repository. Sync metadata by hand with
+  `gh workflow run companion-manifest-sync.yml --repo alvinunreal/oh-my-opencode-slim`;
+  for local recovery run `bun run sync:companion-manifest`, then
+  `bun run verify:companion-manifest` and `bun run verify:companion-release`.
 ### Local synchronization / recovery
 
 ```bash

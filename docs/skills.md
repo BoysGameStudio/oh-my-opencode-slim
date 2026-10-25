@@ -378,6 +378,7 @@ Control which skills each agent can use in `~/.config/opencode/oh-my-opencode-sl
 |-------|------|---------|
 | `skills_add` | string[] | Skill names appended to the effective list (after `skills`) |
 | `skills_remove` | string[] | Skill names removed from the effective list; removal wins over addition |
+| `skills_include_local` | boolean | Adds valid skills from the project's and ancestors' `.opencode/skills/**/SKILL.md` and `.agents/skills/**/SKILL.md` trees before `skills_remove` applies |
 
 ```json
 {

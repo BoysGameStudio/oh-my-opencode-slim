@@ -176,98 +176,39 @@ Inside the interview page:
 
 ## Modes
 
-The interview module has two modes: **per-session** (default) and **dashboard** (opt-in).
+The interview module has two modes: **per-session** (default) and **dashboard**
+(opt-in).
 
 ### Per-session mode (default)
 
-When `port` is `0` (or unset) and `dashboard` is `false` (or unset), each OpenCode process runs its own interview server on a random port. This is the original behavior - no configuration needed.
-
-```jsonc
-{
-  "oh-my-opencode-slim": {
-    "interview": {}
-    // or explicitly:
-    // "interview": { "port": 0 }
-  }
-}
-```
-
-- one interview server per OpenCode process
-- server starts lazily on first `/interview` command
-- random port assigned by the OS
-- all state is local to the session
+With `port: 0` (or unset) and `dashboard: false` (or unset), each OpenCode
+process runs its own interview server on an OS-assigned random port. It starts
+lazily on the first `/interview`, and all state is local to the session. No
+configuration is needed.
 
 ### Dashboard mode
 
-When `dashboard` is `true` or `port` is set to a value greater than `0`, interview switches to dashboard mode. A single dashboard server aggregates interviews from **all** OpenCode sessions on the same machine.
+`dashboard: true` or `port > 0` turns on a single dashboard server that
+aggregates interviews from **all** OpenCode sessions on the machine:
 
 ```jsonc
-// Option A: dashboard on default port (43211)
-"interview": { "dashboard": true }
-
-// Option B: dashboard on custom port
-"interview": { "dashboard": true, "port": 8888 }
-
-// Option C: port > 0 implies dashboard mode
-"interview": { "port": 43211 }
+"interview": { "dashboard": true }               // default port 43211
+"interview": { "dashboard": true, "port": 8888 } // custom port
+"interview": { "port": 43211 }                   // port > 0 implies dashboard
 ```
 
-#### What the dashboard gives you
-
-- **Single URL.** One dashboard page lists all active and past interviews across all sessions.
-- **Multi-session coordination.** Each OpenCode process pushes interview state to the dashboard. The dashboard serves the web UI and relays answers back to the right session.
-- **Failover recovery.** If the dashboard process dies, the next OpenCode process to start claims the port and rebuilds state from `.md` files on disk.
-- **File browser.** Scans `interview/` (or your configured output folder) across all known project directories, including your home directory.
-
-#### How it works
-
-```
-┌──────────────────────────────────────────────┐
-│  Dashboard (dumb aggregator)                  │
-│                                               │
-│  • Receives state pushes from sessions        │
-│  • Serves dashboard UI + interview pages      │
-│  • Stores pending answers for session pickup  │
-│  • Binds to 127.0.0.1, token-authenticated    │
-└───────────▲───────────────────▲───────────────┘
-            │ POST state        │ GET pending answers
-┌───────────┴────────┐ ┌───────┴──────────────┐
-│  Session Process A  │ │  Session Process B    │
-│  (smart - drives    │ │  (smart - drives      │
-│   LLM locally)      │ │   LLM locally)        │
-└─────────────────────┘ └───────────────────────┘
-```
-
-Sessions are smart - they drive LLM interaction locally (parse state, inject prompts, write `.md` files). The dashboard is a dumb aggregator with a web UI. This means zero cross-process SDK dependency.
-
-Browser submissions use a claim/ack delivery protocol. A session claims an
-answer, chat message, block comment, or nudge before forwarding it to
-OpenCode; successful forwarding acknowledges the claim, while a rejected
-continuation rolls it back for a later retry. A failed poll therefore never
-silently drops a queued action.
-
-#### Auto-failover
-
-Any OpenCode process can become the dashboard. The first process to bind the configured port wins. If it dies:
-
-1. Other sessions detect the dead dashboard (failed state push or health probe)
-2. The next process to start claims the port
-3. The new dashboard rebuilds from `.md` files on disk using frontmatter
-
-#### Session registration
-
-Sessions register their project directory with the dashboard so it knows where to scan for interview files. This happens automatically on first `/interview` command or session event - no manual setup needed.
-
-The dashboard also scans your home directory's output folder by default, so interviews created from a home-directory OpenCode session are always visible.
-
-#### Dashboard settings
-
-The dashboard page includes a settings panel for:
-
-- **Scan days** - how far back to look for sessions (default: 30)
-- **Add/remove folders** - manually add project directories to scan
-- **Discover sessions** - re-scan the OpenCode session list for new directories
-
+- One URL lists every active and past interview, and the dashboard relays
+  answers back to the session that owns it.
+- Sessions stay smart (they drive the LLM and write `.md` files); the dashboard
+  is a dumb aggregator with a web UI, so there is no cross-process SDK
+  dependency. Submissions use a claim/ack protocol, so a failed poll never
+  silently drops a queued action.
+- It binds to `127.0.0.1`, is token-authenticated, and rebuilds from the `.md`
+  files (frontmatter) after a restart. The first process to bind the port wins;
+  another process claims it after a failed push or health probe.
+- Each session registers its project directory automatically, and the home
+  output folder is scanned by default. The dashboard settings panel controls
+  scan days (default 30), extra folders, and session discovery.
 ## Configuration
 
 ```jsonc
