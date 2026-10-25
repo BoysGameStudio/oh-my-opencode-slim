@@ -82,9 +82,9 @@ describe('session.created pairing', () => {
 
     expect(board.get('child-2')?.description).toBe('L2');
     expect(board.get('child-2')).not.toHaveProperty('provisional');
-    expect(deps.pendingCallTracker.take('b')?.earlyRegisteredTaskID).toBe(
-      'child-2',
-    );
+    expect(
+      deps.pendingCallTracker.take('b', PARENT)?.earlyRegisteredTaskID,
+    ).toBe('child-2');
   });
 
   test('already-registered child does not fence an unrelated pending', async () => {
@@ -107,7 +107,7 @@ describe('session.created pairing', () => {
     });
 
     expect(
-      deps.pendingCallTracker.take('b')?.earlyRegistrationRejected,
+      deps.pendingCallTracker.take('b', PARENT)?.earlyRegistrationRejected,
     ).toBeUndefined();
   });
 
@@ -161,7 +161,7 @@ describe('session.created pairing', () => {
     expect(board.get('child-9')?.description).toBe('unattributed oracle task');
     expect(board.get('child-9')?.provisional).toBe(true);
     expect(
-      deps.pendingCallTracker.take('a')?.earlyRegisteredTaskID,
+      deps.pendingCallTracker.take('a', PARENT)?.earlyRegisteredTaskID,
     ).toBeUndefined();
   });
 });

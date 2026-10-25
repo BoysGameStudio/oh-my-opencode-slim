@@ -354,6 +354,55 @@ describe('foreground fallback redo harness', () => {
     expect(mocks.abort).not.toHaveBeenCalled();
   });
 
+  const flush = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+
+  test('a replay read answering after a host stall still replays', async () => {
+    const { manager, mocks } = makeManager();
+    const read = deferred<unknown>();
+    mocks.messages.mockImplementation(async () => ({
+      data: [
+        { info: { id: 'a', role: 'assistant', parentID: 'u' }, parts: [] },
+      ],
+    }));
+    mocks.message.mockImplementation(() => read.promise as never);
+    manager.registerSessionAgent('stall', 'orchestrator');
+    await manager.handleEvent(redoEvents.assistant('stall'));
+    const pending = manager.handleEvent(redoEvents.error('stall'));
+    await flush();
+    jest.advanceTimersByTime(2_000);
+    await flush();
+    read.resolve({
+      data: {
+        info: { id: 'u', role: 'user' },
+        parts: [{ type: 'text', text: 'hi' }],
+      },
+    });
+    await pending;
+    expect(mocks.message).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'b' } },
+    });
+  });
+
+  test('a replay read that never answers releases the fence after two windows', async () => {
+    const { manager, mocks } = makeManager();
+    mocks.messages.mockImplementation(() => new Promise(() => {}));
+    manager.registerSessionAgent('hung', 'orchestrator');
+    await manager.handleEvent(redoEvents.assistant('hung'));
+    const pending = manager.handleEvent(redoEvents.error('hung'));
+    await flush();
+    jest.advanceTimersByTime(2_000);
+    await flush();
+    expect(manager.isFallbackInProgress('hung')).toBe(true);
+    jest.advanceTimersByTime(2_000);
+    await flush();
+    expect(manager.isFallbackInProgress('hung')).toBe(false);
+    await pending;
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+  });
+
   test('T1: content-filter chain walk starts at the head and stays exhausted after the sticky retry', async () => {
     const chain = [
       'anthropic/claude-opus-5-5',
@@ -3646,7 +3695,7 @@ describe('ForegroundFallbackManager session.error', () => {
     expect(call[0].body.model.modelID).toBe('gpt-4o');
   });
 
-  test('marks the replayed user prompt as an internal initiator', async () => {
+  test('marks the replay prompt as an internal initiator', async () => {
     await mgr.handleEvent({
       type: 'message.updated',
       properties: {
@@ -3673,8 +3722,8 @@ describe('ForegroundFallbackManager session.error', () => {
 
   test('skips malformed messages without info when locating the last user message', async () => {
     // OpenCode may return partial/streaming messages whose `info` is undefined;
-    // the fallback must ignore those rather than crash, and still re-submit the
-    // real last user message.
+    // the fallback must ignore those rather than crash, and still find the
+    // real last user turn before replaying.
     ({ mocks } = createMockClient({
       messagesData: [
         {},
@@ -3714,7 +3763,8 @@ describe('ForegroundFallbackManager session.error', () => {
     const call = mocks.promptAsync.mock.calls[0] as [
       { parts: Array<{ text?: string }> },
     ];
-    expect(call[0].body.parts[0]?.text).toBe('real prompt');
+    expect(call[0].body.parts).toHaveLength(1);
+    expect(isInternalInitiatorPart(call[0].body.parts[0])).toBe(true);
   });
 
   test('reads only the transcript tail for the replay and issues no full read', async () => {
@@ -3726,7 +3776,15 @@ describe('ForegroundFallbackManager session.error', () => {
       messagesData: [
         {
           info: { role: 'user' },
-          parts: [{ type: 'text', text: 'tail prompt' }],
+          parts: [
+            { id: 'prt_user', type: 'text', text: 'tail prompt' },
+            {
+              id: 'prt_file',
+              type: 'file',
+              mime: 'image/png',
+              url: 'data:image/png;base64,AA==',
+            },
+          ],
         },
       ],
     }));
@@ -3758,10 +3816,18 @@ describe('ForegroundFallbackManager session.error', () => {
       { query?: { limit?: number } },
     ];
     expect(listCall[0]?.query?.limit).toBe(50);
+    // Reminder only: copying the stored parts (ids included) made the v1
+    // host upsert the user's original rows instead of adding to the replay.
     const promptCall = mocks.promptAsync.mock.calls[0] as [
-      { parts: Array<{ text?: string }> },
+      { body: { parts: Array<{ id?: string; text?: string }> } },
     ];
-    expect(promptCall[0].body.parts[0]?.text).toBe('tail prompt');
+    const parts = promptCall[0].body.parts;
+    expect(parts).toHaveLength(1);
+    expect(isInternalInitiatorPart(parts[0])).toBe(true);
+    expect(parts[0]?.id).toBeUndefined();
+    expect(parts[0]?.text).toContain(
+      "Continue processing the user's original request above.",
+    );
   });
 
   test('falls back to the full transcript read when the tail has no replayable user message', async () => {
@@ -3813,7 +3879,7 @@ describe('ForegroundFallbackManager session.error', () => {
     const promptCall = mocks.promptAsync.mock.calls[0] as [
       { parts: Array<{ text?: string }> },
     ];
-    expect(promptCall[0].body.parts[0]?.text).toBe('deep prompt');
+    expect(promptCall[0].body.parts).toHaveLength(1);
   });
 
   test('keeps both errors when the tail and the full transcript reads fail', async () => {
@@ -4006,7 +4072,7 @@ describe('ForegroundFallbackManager session.error', () => {
     expect(calls.reject).toEqual([]);
   });
 
-  test('a turn longer than the tail replays its parent user message without a full read', async () => {
+  test('a turn longer than the tail finds its parent user message without a full read', async () => {
     const { calls, handoff } = handoffMock();
     const mocks = await runFallbackScenario({
       handoff,
@@ -4023,7 +4089,7 @@ describe('ForegroundFallbackManager session.error', () => {
     const call = mocks.promptAsync.mock.calls[0] as [
       { body: { parts: Array<{ text?: string }> } },
     ];
-    expect(call[0].body.parts[0]?.text).toBe('task prompt');
+    expect(call[0].body.parts).toHaveLength(1);
     expect(calls.prepare).toEqual([['sess-1', undefined, 'm2']]);
   });
 
@@ -4136,11 +4202,11 @@ describe('ForegroundFallbackManager session.error', () => {
     expect(generation).toBe(8);
   });
 
-  test('replays the last user message from v2-shaped session.messages data', async () => {
+  test('replays after a v2-shaped user message in session.messages data', async () => {
     // OpenCode 1.18+ session.messages() returns v2 SessionMessage objects
     // ({ type, text }) instead of the v1 { info, parts } shape. The fallback
-    // must locate and re-submit the v2 user text even when an assistant
-    // message appears after it.
+    // must still recognize the v2 user turn even when an assistant message
+    // appears after it.
     ({ mocks } = createMockClient({
       messagesData: [
         { id: 'm1', type: 'user', text: 'v2 prompt' },
@@ -4179,48 +4245,7 @@ describe('ForegroundFallbackManager session.error', () => {
     const call = mocks.promptAsync.mock.calls[0] as [
       { parts: Array<{ text?: string }> },
     ];
-    expect(call[0].body.parts[0]?.text).toBe('v2 prompt');
-  });
-
-  test('prefers the latest user message across mixed v1/v2 shapes', async () => {
-    ({ mocks } = createMockClient({
-      messagesData: [
-        {
-          info: { role: 'user' },
-          parts: [{ type: 'text', text: 'legacy prompt' }],
-        },
-        { id: 'm2', type: 'user', text: 'v2 prompt' },
-      ],
-    }));
-    mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-    } as any);
-
-    await mgr.handleEvent({
-      type: 'message.updated',
-      properties: {
-        info: {
-          sessionID: 'sess-1',
-          providerID: 'anthropic',
-          modelID: 'claude-opus-4-5',
-          role: 'assistant',
-        },
-      },
-    });
-
-    await mgr.handleEvent({
-      type: 'session.error',
-      properties: {
-        sessionID: 'sess-1',
-        error: { message: 'Rate limit exceeded' },
-      },
-    });
-
-    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
-    const call = mocks.promptAsync.mock.calls[0] as [
-      { parts: Array<{ text?: string }> },
-    ];
-    expect(call[0].body.parts[0]?.text).toBe('v2 prompt');
+    expect(call[0].body.parts).toHaveLength(1);
   });
 
   test('does nothing when error is not a rate limit', async () => {
@@ -8059,6 +8084,14 @@ describe('ForegroundFallbackManager no-chain sessions', () => {
     // Councillor has no chain → same-model retry with current model.
     expect(mocks.abort).not.toHaveBeenCalled();
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    // Trailer only: the user's request is not copied into the replay.
+    const call = mocks.promptAsync.mock.calls[0] as [
+      { body: { parts: Array<{ text?: string }> } },
+    ];
+    expect(call[0].body.parts).toHaveLength(1);
+    expect(call[0].body.parts[0]?.text).toStartWith(
+      'Same-model retry after transient error.',
+    );
   });
 
   test('disableChain agent on session.status: no abort (not just no re-prompt)', async () => {
@@ -8998,10 +9031,45 @@ describe('ForegroundFallbackManager same-model retry hardening', () => {
       const pending = mgr.handleEvent(streamError('hung-nc', 'e1'));
       await flush();
       jest.advanceTimersByTime(2_000);
+      await flush();
+      expect(mgr.isFallbackInProgress('hung-nc')).toBe(true);
+      jest.advanceTimersByTime(2_000);
       await pending;
       expect(mocks.promptAsync).not.toHaveBeenCalled();
       expect(mgr.isFallbackInProgress('hung-nc')).toBe(false);
       expect((mgr as any).sessionRetries.get('hung-nc') ?? 0).toBe(0);
+    });
+
+    test('a stalled user-message read still sends the same-model replay', async () => {
+      const read = deferred<unknown>();
+      const { client, mocks } = createMockClient({
+        messagesImpl: async () => ({
+          data: [
+            { info: { id: 'a', role: 'assistant', parentID: 'u' }, parts: [] },
+          ],
+        }),
+      });
+      mocks.message.mockImplementation(() => read.promise as never);
+      const mgr = new ForegroundFallbackManager(makeChains(), true, {
+        client,
+        directory: '/test',
+      } as any);
+      await seed(mgr, 'deep-nc');
+      const pending = mgr.handleEvent(streamError('deep-nc', 'e1'));
+      await flush();
+      expect(mocks.message).toHaveBeenCalledTimes(1);
+      jest.advanceTimersByTime(2_000);
+      await flush();
+      read.resolve({
+        data: {
+          info: { id: 'u', role: 'user' },
+          parts: [{ type: 'text', text: 'hi' }],
+        },
+      });
+      await pending;
+      expect(mocks.message).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect((mgr as any).sessionRetries.get('deep-nc')).toBe(1);
     });
   });
 });

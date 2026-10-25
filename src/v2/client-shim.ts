@@ -89,9 +89,9 @@ function textFromBody(args: Record<string, unknown>): string {
 }
 
 /** Map non-text v1 prompt parts (images, files) into v2 prompt `files`
- * entries. The fallback replay must not silently drop attachments: v1's
- * prompt API carries parts natively, so a text-only translation would
- * resend an attachment-dependent request without its content. Parts whose
+ * entries. A v1-style body must not silently drop attachments: v1's prompt
+ * API carries parts natively, so a text-only translation would resend an
+ * attachment-dependent request without its content. Parts whose
  * uri cannot be derived are logged and skipped (honest degradation). */
 function filesFromBody(
   args: Record<string, unknown>,
@@ -252,10 +252,9 @@ function internalInitiatorMetadataFromBody(
 
 /**
  * Pure-internal routing gate: ONLY bodies whose every part is an internal
- * initiator may take the session.synthetic admission. Mixed bodies —
- * notably foreground-fallback's replay of the user's real parts with an
- * appended internal reminder — must stay on session.prompt so they remain
- * persisted user input and keep their file attachments (the synthetic
+ * initiator may take the session.synthetic admission. Mixed bodies (user
+ * parts with an appended internal part) must stay on session.prompt so they
+ * remain persisted user input and keep their file attachments (the synthetic
  * branch forwards text only). See the mixed-replay regression test and
  * the greptile P1 review on #1158.
  */
@@ -683,9 +682,9 @@ export function buildPluginInput(
         // dedicated session.synthetic admission keeps the text model-visible
         // while skipping user-message persistence, and its default `resume`
         // preserves the wake semantics. ONLY purely-internal bodies take
-        // this route — mixed bodies (foreground-fallback's user-parts +
-        // internal reminder replay) must stay on session.prompt to preserve
-        // user-input persistence and file attachments. Hosts without
+        // this route — mixed bodies (user parts + an internal part) must
+        // stay on session.prompt to preserve user-input persistence and
+        // file attachments. Hosts without
         // session.synthetic keep the pre-fix prompt path (visible wake,
         // metadata intact).
         const internalViaSynthetic =
@@ -708,8 +707,8 @@ export function buildPluginInput(
         // snapshot that can be stale by delivery time (#1079). Purely
         // internal bodies WITHOUT the flag keep the pin semantics: the
         // interview runtime tracks its own model and must keep switching.
-        // Mixed bodies (foreground-fallback replay) still switch;
-        // `modelSwitch: 'required'` still switches.
+        // Mixed bodies still switch; `modelSwitch: 'required'` (the
+        // foreground-fallback replay) still switches.
         const inheritPersistedSelection =
           args?.modelSelection === 'inherit' &&
           args?.modelSwitch !== 'required';

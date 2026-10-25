@@ -8,9 +8,10 @@
  *   2. Aborts host retry or unknown-finish loops via client.session.abort();
  *      other session.error and message.updated paths re-prompt directly
  *      without abort.
- *   3. Re-queues the last user message via client.session.promptAsync()
- *      with the new model - promptAsync returns immediately so we never
- *      block the event handler waiting for a full LLM response.
+ *   3. Sends an internal reminder via client.session.promptAsync() with
+ *      the new model, which reads the user's request from history -
+ *      promptAsync returns immediately so we never block the event handler
+ *      waiting for a full LLM response.
  *
  * Spent-allowance errors (issue #966) mark the failing provider exhausted
  * for the descent: failover skips that provider's remaining chain entries,
@@ -56,7 +57,7 @@ import {
 } from '../../utils/session';
 import type { SessionLifecycle } from '../session-lifecycle';
 import type { createBackgroundFallbackHandoff } from '../task-session-manager/fallback-observation-transfer';
-import { isReplayableUserMessage, partsFromReplayMessage } from '../types';
+import { isReplayableUserMessage } from '../types';
 
 type BackgroundFallbackHandoff = ReturnType<
   typeof createBackgroundFallbackHandoff
@@ -530,6 +531,26 @@ const REPLAY_SEND_TIMEOUT_MS = 10_000;
  *  the last replayable user message plus the trailing message id (handoff
  *  baseline), never the full history. */
 const FALLBACK_REPLAY_TAIL_MESSAGES = 50;
+
+/** Replay reads share the host's event loop. After a stall, the expired timer
+ *  runs before the read's response, so give that same read one more window. */
+async function readForReplay<T>(
+  sessionID: string,
+  read: Promise<T>,
+  message: string,
+): Promise<T> {
+  const started = Date.now();
+  try {
+    return await withTimeout(read, HOST_CALL_TIMEOUT_MS, message);
+  } catch (err) {
+    if (!(err instanceof OperationTimeoutError)) throw err;
+    log('[foreground-fallback] replay read missed its window; waiting once', {
+      sessionID,
+      elapsedMs: Date.now() - started,
+    });
+    return withTimeout(read, HOST_CALL_TIMEOUT_MS, message);
+  }
+}
 /** Trailer marking a same-model replay; identical at every call site so the
  *  replay is recognizable as an internal retry, never a user turn. */
 const SAME_MODEL_RETRY_TRAILER = 'Same-model retry after transient error.';
@@ -2230,12 +2251,12 @@ export class ForegroundFallbackManager {
     // not pin inProgress forever. A failed read sent nothing, so refund.
     let tailResult: { data?: unknown; error?: unknown };
     try {
-      tailResult = await withTimeout<{ data?: unknown; error?: unknown }>(
+      tailResult = await readForReplay<{ data?: unknown; error?: unknown }>(
+        sessionID,
         session.messages({
           path: { id: sessionID },
           query: { limit: FALLBACK_REPLAY_TAIL_MESSAGES },
         }),
-        HOST_CALL_TIMEOUT_MS,
         'same-model replay transcript read timed out',
       );
     } catch (err) {
@@ -2250,11 +2271,11 @@ export class ForegroundFallbackManager {
         ?.info?.parentID;
       let deepResult: { data?: unknown; error?: unknown };
       try {
-        deepResult = await withTimeout<{ data?: unknown; error?: unknown }>(
+        deepResult = await readForReplay<{ data?: unknown; error?: unknown }>(
+          sessionID,
           typeof parentID === 'string'
             ? session.message({ path: { id: sessionID, messageID: parentID } })
             : session.messages({ path: { id: sessionID } }),
-          HOST_CALL_TIMEOUT_MS,
           'same-model replay transcript read timed out',
         );
       } catch (err) {
@@ -2293,11 +2314,6 @@ export class ForegroundFallbackManager {
       args: Record<string, unknown>,
     ) => Promise<unknown>;
 
-    const replayParts = partsFromReplayMessage(lastUser) as Array<{
-      type: 'text';
-      text: string;
-    }>;
-
     // No `modelSwitch: 'required'`: the replay targets the session's
     // CURRENT model, so the v2 shim may skip the switch (preserving the
     // host-side variant) and hosts without session.switchModel can still
@@ -2308,7 +2324,8 @@ export class ForegroundFallbackManager {
       path: { id: sessionID },
       body: {
         messageID: `msg${randomUUID()}`,
-        parts: [...replayParts, createInternalAgentTextPart(opts.trailerText)],
+        // Trailer only, as in execFallback.
+        parts: [createInternalAgentTextPart(opts.trailerText)],
         model,
         ...(opts.variant ? { variant: opts.variant } : {}),
         agent: opts.agentName,
@@ -3007,7 +3024,7 @@ export class ForegroundFallbackManager {
         (await this.ensureSessionAgent(sessionID));
       if (!agentName || !this.isCurrentTurn(sessionID, expectedEpoch)) return;
 
-      // Retrieve the last user message to re-submit with the fallback model.
+      // Confirm there is a user turn before sending the replay reminder.
       // Fence captured BEFORE any await in the preparation: a board
       // relaunch during the transcript read or the admission await must
       // not enroll the new generation under this (stale) attempt's
@@ -3024,12 +3041,12 @@ export class ForegroundFallbackManager {
       // ~20 s. The `limit` query keeps the hot path O(tail). A tail without a
       // user message is one long turn: read only the user message its last
       // entry answers (v1 `parentID`); shapes without that id read it all.
-      const tailResult = await withTimeout(
+      const tailResult = await readForReplay(
+        sessionID,
         session.messages({
           path: { id: sessionID },
           query: { limit: FALLBACK_REPLAY_TAIL_MESSAGES },
         }),
-        HOST_CALL_TIMEOUT_MS,
         'fallback replay transcript read timed out',
       );
       // Transcript read suspended across a dispose(): everything from
@@ -3047,14 +3064,14 @@ export class ForegroundFallbackManager {
       if (!lastUser) {
         const parentID = (messages.at(-1) as { info?: { parentID?: unknown } })
           ?.info?.parentID;
-        const deepResult = await withTimeout<{
+        const deepResult = await readForReplay<{
           data?: unknown;
           error?: unknown;
         }>(
+          sessionID,
           typeof parentID === 'string'
             ? session.message({ path: { id: sessionID, messageID: parentID } })
             : session.messages({ path: { id: sessionID } }),
-          HOST_CALL_TIMEOUT_MS,
           'fallback replay user message read timed out',
         );
         if (!this.isCurrentTurn(sessionID, expectedEpoch)) return;
@@ -3096,11 +3113,6 @@ export class ForegroundFallbackManager {
         args: Record<string, unknown> & { modelSwitch?: 'required' },
       ) => Promise<unknown>;
 
-      const replayParts = partsFromReplayMessage(lastUser) as Array<{
-        type: 'text';
-        text: string;
-      }>;
-
       // v2-only flag (consumed by the client shim): the replay's model is
       // the fallback TARGET, so a v2 host without session.switchModel must
       // reject the replay (typed error) instead of silently replaying on
@@ -3112,8 +3124,11 @@ export class ForegroundFallbackManager {
         path: { id: sessionID },
         body: {
           messageID: `msg${randomUUID()}`,
+          // Reminder only: the user's request is already in the history the
+          // fallback model reads. Copying its stored parts (ids included)
+          // would make the host upsert the original rows and re-expand
+          // file/agent parts into this message.
           parts: [
-            ...replayParts,
             createInternalAgentTextPart(
               "<system-reminder>\nThe previous model request failed and is being retried with a fallback model. Continue processing the user's original request above. Do not respond to this reminder.\n</system-reminder>",
             ),
