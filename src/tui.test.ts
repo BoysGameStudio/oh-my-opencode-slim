@@ -257,6 +257,41 @@ describe('tui sidebar agents', () => {
     expect(agentNames).not.toContain('observer');
   });
 
+  test('hides council agents from persisted snapshot models (#1672)', () => {
+    const agentNames = getSidebarAgentNames(
+      createSnapshot({
+        agentModels: {
+          oracle: 'openai/gpt-6',
+          council: 'openai/gpt-6',
+          councillor: 'openai/gpt-6',
+          'councillor-alpha': 'openai/gpt-6',
+          'councillor-beta': 'anthropic/claude-x',
+          explorer: 'openai/gpt-6-luna',
+        },
+      }),
+    );
+
+    // Ordinary agents keep their snapshot order; council surfaces never show.
+    expect(agentNames).toEqual(['oracle', 'explorer']);
+  });
+
+  test('council-only snapshot models fall back to the default agent list (#1672)', () => {
+    const agentNames = getSidebarAgentNames(
+      createSnapshot({
+        agentModels: {
+          council: 'openai/gpt-6',
+          'councillor-alpha': 'openai/gpt-6',
+        },
+      }),
+    );
+
+    expect(agentNames).toContain('explorer');
+    expect(agentNames).toContain('fixer');
+    expect(agentNames).not.toContain('council');
+    expect(agentNames).not.toContain('councillor');
+    expect(agentNames).not.toContain('councillor-alpha');
+  });
+
   test('fills empty snapshot models from the v1 host agent list (#1133)', async () => {
     const seen: unknown[] = [];
     const client = {
