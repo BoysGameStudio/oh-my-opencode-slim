@@ -31,6 +31,13 @@ import {
 
 export const STOP_CONFIRMATION_GRACE_MS = 5_000;
 export const DEFAULT_EVIDENCE_READ_TIMEOUT_MS = 5_000;
+/** Slow-tier base delay for the bounded evidence re-arm (see
+ * `scheduleEvidenceRearm`). Internal seam: no user-facing config. */
+export const DEFAULT_EVIDENCE_REARM_MS = 30_000;
+/** Cap on the slow tier's exponential backoff. */
+export const REARM_CAP_MS = 300_000;
+/** How many slow re-arms one observation episode may arm. */
+export const DEFAULT_MAX_EVIDENCE_REARMS = 12;
 export const STOPPED_WITHOUT_TERMINAL_RESULT =
   'Background session stopped before a terminal task result was received.';
 export const EVIDENCE_UNAVAILABLE_DIAGNOSTIC =
@@ -163,7 +170,23 @@ interface Observation {
   };
   quiescentSince?: number;
   candidate?: { signal: TerminalSignal; token: ObservationToken };
+  /**
+   * Last idle delivery seen, kept solely so `idleContradictsBusy` can decide
+   * whether a busy runtime observation was contradicted by a later idle
+   * (#1561). Upstream `478251a0` deleted this field as write-only dead state;
+   * this consumer is what makes it live again — do not delete it without
+   * replacing the predicate.
+   */
+  idleCandidate?: RuntimeObservation;
   retries: number;
+  /** Slow-tier arms used in this episode (#1561). Resets only on genuine
+   * live activity, never on idle redelivery. */
+  rearms: number;
+  /** Episode number whose first exhaustion already logged `gave-up`; keeps
+   * the line at most once per episode while re-arms re-enter the branch. */
+  gaveUpLoggedAtEpisode?: number;
+  /** Episode number whose final give-up already logged `rearm exhausted`. */
+  rearmExhaustedLoggedAtEpisode?: number;
   timer?: TimerHandle;
 }
 
@@ -191,6 +214,38 @@ function isForegroundNativeTerminal(
 
 function validHostTime(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * Does a held idle candidate contradict a busy runtime observation? (#1561)
+ *
+ * A busy runtime observation usually means the child is genuinely executing,
+ * and a rejected outcome read then is normal — polling it would be
+ * busy-spinning. But when the host has since delivered an idle that is
+ * provably *later* than the busy observation, the host proved termination
+ * after it: that busy is stale, and the defer is suspicious rather than
+ * healthy.
+ *
+ * Conservative by construction: uncomparable timestamps are NOT a
+ * contradiction. An uncomparable busy stays authoritative, which preserves
+ * the double-idle invariant's redelivery safety.
+ */
+export function idleContradictsBusy(
+  idleCandidate: RuntimeObservation | undefined,
+  runtime: RuntimeObservation | undefined,
+): boolean {
+  const idleAt = idleCandidate?.observedAt;
+  const busyAt = runtime?.observedAt;
+  if (!validHostTime(idleAt) || !validHostTime(busyAt)) return false;
+  if (idleAt > busyAt) return true;
+  // `activityAt` comes from `event.created` at millisecond resolution, so a
+  // sub-millisecond execution can share the busy timestamp. Fall back to
+  // delivery order: any surviving candidate was delivered after the busy
+  // observation, because the busy branch of `observe()` clears it.
+  return (
+    idleAt === busyAt &&
+    (idleCandidate?.readStartedAt ?? -1) >= (runtime?.readStartedAt ?? Infinity)
+  );
 }
 
 /** Host terminal-outcome literals the gate treats as attributable
@@ -338,6 +393,10 @@ export function createBackgroundJobTerminalGate(options: {
   graceMs?: number;
   readTimeoutMs?: number;
   maxEvidenceRetries?: number;
+  /** Slow-tier base delay for the bounded evidence re-arm (#1561). */
+  evidenceRearmMs?: number;
+  /** Slow-tier arm budget per observation episode (#1561). */
+  maxEvidenceRearms?: number;
   now?: () => number;
   /** Test seam: defaults to the platform timers. */
   setTimeout?: (callback: () => void, delay: number) => TimerHandle;
@@ -374,6 +433,7 @@ export function createBackgroundJobTerminalGate(options: {
         activityRevision: record.activityRevision,
         episode: 0,
         retries: 0,
+        rearms: 0,
       };
       observations.set(run.taskID, value);
     }
@@ -384,6 +444,7 @@ export function createBackgroundJobTerminalGate(options: {
         activityRevision: record.activityRevision,
         episode: value.episode + 1,
         retries: 0,
+        rearms: 0,
       };
       observations.set(run.taskID, value);
     }
@@ -443,6 +504,62 @@ export function createBackgroundJobTerminalGate(options: {
       : { kind: 'stale' };
   }
 
+  /**
+   * Arm the slow-tier evidence re-arm for one observation episode (#1561).
+   *
+   * The fast tier (this file's `retry()`) only arms while the evidence budget
+   * lasts. Once it is exhausted the gate used to stop reading forever, and a
+   * host outcome that became attributable afterwards stranded the board entry
+   * at `running`. This timer is the bounded continuation.
+   *
+   * Returns whether an arm was scheduled, so the give-up branch can log the
+   * difference between "the slow tier took over" and "this is final".
+   */
+  function scheduleEvidenceRearm(run: RunRef): boolean {
+    const value = observation(run);
+    if (!value) return false;
+    const client = options.input ? getClient(options.input) : undefined;
+    // Guard 1: a host that exposes `session.status` already has a poller.
+    // `createRuntimeStatusReconciler` re-passes every delayMs while
+    // `board.hasRunningJobs()` and reconciles each running record, so it
+    // retries this read forever on its own. Arming a second scheduler would
+    // give one fact two owners; the reconciler wins because it also covers
+    // every other running record in one batched read.
+    if (typeof client?.session?.status === 'function') return false;
+    // Guard 2: no readable evidence source means no read can ever improve the
+    // verdict — arming would burn timers for nothing.
+    const hasEvidenceSource =
+      options.readRuntime !== undefined ||
+      typeof client?.session?.get === 'function' ||
+      typeof client?.session?.messages === 'function';
+    if (!hasEvidenceSource) return false;
+    // Guard 3: a terminal record needs no evidence.
+    if (board.get(run.taskID)?.state !== 'running') return false;
+    // Guard 4: one timer slot per observation; the fast tier owns it when it
+    // is still arming (phases are mutually exclusive by construction).
+    if (value.timer) return false;
+    // Guard 5: bounded.
+    const max = options.maxEvidenceRearms ?? DEFAULT_MAX_EVIDENCE_REARMS;
+    if (value.rearms >= max) return false;
+    const base = options.evidenceRearmMs ?? DEFAULT_EVIDENCE_REARM_MS;
+    const delay = Math.min(base * 2 ** value.rearms, REARM_CAP_MS);
+    value.rearms += 1;
+    value.timer = setTimer(
+      () => {
+        value.timer = undefined;
+        if (observation(run) !== value) return;
+        // Background reconciliation is fail-soft: a failure must be logged and
+        // swallowed, never escape as an unhandled rejection.
+        void reconcile(run).catch((err) => {
+          log('[terminal-gate] evidence re-arm reconcile failed', String(err));
+        });
+      },
+      Math.max(1, delay),
+    );
+    value.timer.unref?.();
+    return true;
+  }
+
   function retry(run: RunRef, diagnostic?: string): GateResult {
     const value = observation(run);
     if (!value) return { kind: 'stale' };
@@ -466,16 +583,42 @@ export function createBackgroundJobTerminalGate(options: {
       value.timer.unref?.();
     }
     if (diagnostic === EVIDENCE_UNAVAILABLE_DIAGNOSTIC) {
-      // Give-up branch: the evidence retry budget is exhausted and no
-      // further reconcile is scheduled. Observation only.
-      log('[terminal-gate] terminal evidence unavailable', {
-        taskID: run.taskID,
-        generation: run.generation,
-        state: board.get(run.taskID)?.state,
-        attempt: value.retries,
-        verdict: 'gave-up',
-        reason: diagnostic,
-      });
+      // Give-up branch: the fast evidence budget is exhausted. Hand the
+      // episode to the bounded slow tier; only when that refuses is this
+      // final. Both logs are episode-scoped because re-arms re-enter here.
+      const armed = scheduleEvidenceRearm(run);
+      if (value.gaveUpLoggedAtEpisode !== value.episode) {
+        value.gaveUpLoggedAtEpisode = value.episode;
+        log('[terminal-gate] terminal evidence unavailable', {
+          taskID: run.taskID,
+          generation: run.generation,
+          state: board.get(run.taskID)?.state,
+          attempt: value.retries,
+          verdict: 'gave-up',
+          reason: diagnostic,
+          rearm: {
+            armed,
+            rearms: value.rearms,
+            maxEvidenceRearms:
+              options.maxEvidenceRearms ?? DEFAULT_MAX_EVIDENCE_REARMS,
+          },
+        });
+      } else if (
+        !armed &&
+        value.rearmExhaustedLoggedAtEpisode !== value.episode
+      ) {
+        value.rearmExhaustedLoggedAtEpisode = value.episode;
+        log('[terminal-gate] terminal evidence rearm exhausted', {
+          taskID: run.taskID,
+          generation: run.generation,
+          state: board.get(run.taskID)?.state,
+          attempt: value.retries,
+          verdict: 'gave-up',
+          rearms: value.rearms,
+          maxEvidenceRearms:
+            options.maxEvidenceRearms ?? DEFAULT_MAX_EVIDENCE_REARMS,
+        });
+      }
     }
     return deferred(run, diagnostic);
   }
@@ -617,14 +760,25 @@ export function createBackgroundJobTerminalGate(options: {
       value.quiescentSince = undefined;
       // Ambiguous busy/retry is live activity: drop held candidates.
       value.candidate = undefined;
+      value.idleCandidate = undefined;
       if (value.timer) clearTimer(value.timer);
       value.timer = undefined;
       return deferred(token);
     }
     if (predatesPublication) return { kind: 'stale' };
     if (runtime.origin === 'session.idle') {
+      // Hold the idle so a stale busy runtime can be recognised as
+      // contradicted (#1561). Only a *new* idle restarts the fast budget: a
+      // host that replays the double-idle pair (both members share one
+      // `activityAt`) would otherwise keep the budget forever, turning the
+      // fast tier into a `graceMs`-cadence poll loop. `rearms` never resets
+      // here — an idle-happy host must not buy an unbounded slow tier.
+      const isNewIdle =
+        runtime.observedAt === undefined ||
+        runtime.observedAt !== value.idleCandidate?.observedAt;
+      value.idleCandidate = runtime;
       value.pendingRuntime = false;
-      value.retries = 0;
+      if (isNewIdle) value.retries = 0;
       return deferred(token);
     }
     value.pendingRuntime =
@@ -634,7 +788,10 @@ export function createBackgroundJobTerminalGate(options: {
       value.episode += 1;
       value.quiescentSince = undefined;
       value.retries = 0;
+      // Genuine live activity starts a fresh slow-tier budget too.
+      value.rearms = 0;
       value.candidate = undefined;
+      value.idleCandidate = undefined;
       if (value.timer) clearTimer(value.timer);
       value.timer = undefined;
       value.runtime = runtime;
@@ -996,8 +1153,25 @@ export function createBackgroundJobTerminalGate(options: {
     if (
       !foregroundNativeTerminal &&
       (runtime?.kind === 'busy' || runtime?.kind === 'retry')
-    )
+    ) {
+      // A busy runtime normally means the child is still executing and a
+      // rejected outcome read is expected — polling that is busy-spinning, so
+      // a healthy busy keeps returning a bare defer with no timer.
+      //
+      // But when a later idle contradicts the busy (the host proved
+      // termination after it), the defer is suspicious and must arm a read.
+      // Fast tier only: a bare `retry()` schedules the `graceMs` timer WITHOUT
+      // marking the record uncertain, so the common short-lag case resolves
+      // in seconds with no user-visible state change. Past the budget this
+      // flows into the give-up branch, which hands off to the slow tier.
+      if (idleContradictsBusy(value.idleCandidate, runtime)) {
+        value.retries += 1;
+        return value.retries > (options.maxEvidenceRetries ?? 3)
+          ? retry(run, EVIDENCE_UNAVAILABLE_DIAGNOSTIC)
+          : retry(run);
+      }
       return deferred(run);
+    }
     if (!foregroundNativeTerminal && (!runtime || runtime.kind === 'unknown')) {
       // Occupied readers already own an availability-driven continuation;
       // they neither consume the diagnostic budget nor need a second timer.

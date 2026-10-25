@@ -8,6 +8,7 @@ import {
   type BackgroundJobTerminalGate,
   createBackgroundJobTerminalGate,
   EVIDENCE_UNAVAILABLE_DIAGNOSTIC,
+  idleContradictsBusy,
   type RuntimeObservation,
   runtimeObservationFromSnapshot,
 } from './background-job-terminal-gate';
@@ -91,6 +92,22 @@ function harness(
     advance: (time: number) => {
       now = time;
     },
+    /**
+     * Advance BOTH clocks together. The timer harness owns scheduling, while
+     * the gate's observation clock is the separate `now` seam above. The
+     * attribution window's `readCompletedAt` reads the *observation* clock, so
+     * advancing only one strands the other: a late outcome can never then be
+     * attributed. Every timer-driven test must use this helper.
+     */
+    advanceBoth: async (ms: number) => {
+      // Both clocks advance by the same DELTA but keep their own origins:
+      // the harness clock starts at 0 while this fixture's observation clock
+      // starts at 1 and may be moved absolutely with `advance()`. Syncing one
+      // to the other's absolute value would rewind the attribution window.
+      now += ms;
+      await timers.advance(ms);
+    },
+    observationNow: () => now,
   };
 }
 
@@ -2153,5 +2170,288 @@ describe('outcome corroboration (log-only mirror)', () => {
     } finally {
       capture.restore();
     }
+  });
+});
+
+describe('evidence re-arm (#1561)', () => {
+  test('idleContradictsBusy: only a provably later idle contradicts a busy', () => {
+    const busy = (
+      observedAt?: number,
+      readStartedAt = 10,
+    ): RuntimeObservation => ({
+      kind: 'busy',
+      origin: 'session.status-event',
+      readStartedAt,
+      ...(observedAt === undefined ? {} : { observedAt }),
+    });
+    const idle = (
+      observedAt?: number,
+      readStartedAt = 20,
+    ): RuntimeObservation => ({
+      kind: 'quiescent',
+      origin: 'session.idle',
+      readStartedAt,
+      ...(observedAt === undefined ? {} : { observedAt }),
+    });
+
+    // Later idle ⇒ contradicted.
+    expect(idleContradictsBusy(idle(200), busy(100))).toBe(true);
+    // Same millisecond: delivery order decides, later delivery ⇒ contradicted.
+    expect(idleContradictsBusy(idle(100, 30), busy(100, 10))).toBe(true);
+    expect(idleContradictsBusy(idle(100, 10), busy(100, 10))).toBe(true);
+    // Earlier idle ⇒ not contradicted.
+    expect(idleContradictsBusy(idle(50), busy(100))).toBe(false);
+    // Same millisecond, delivered BEFORE the busy ⇒ not contradicted.
+    expect(idleContradictsBusy(idle(100, 5), busy(100, 10))).toBe(false);
+    // Uncomparable (either side missing `observedAt`) ⇒ not contradicted.
+    expect(idleContradictsBusy(idle(undefined), busy(100))).toBe(false);
+    expect(idleContradictsBusy(idle(200), busy(undefined))).toBe(false);
+    expect(idleContradictsBusy(undefined, busy(100))).toBe(false);
+    // Invalid timestamps are not comparables either.
+    expect(idleContradictsBusy(idle(Number.NaN), busy(100))).toBe(false);
+  });
+});
+
+/**
+ * Shim-shaped harness for the #1561 re-arm tests: a client exposing ONLY
+ * `session.get` (no `session.status`, so the local polling reconciler is not
+ * in play) whose committed outcome stays hidden for the first N reads.
+ */
+function shimHarness(
+  config: {
+    hideOutcomeForReads: number;
+    gateOptions?: Record<string, unknown>;
+  } = { hideOutcomeForReads: 4 },
+) {
+  let reads = 0;
+  let committed = false;
+  // The attribution window compares host `idleAt` against the gate's
+  // OBSERVATION clock (`now()`), not wall clock, so the idle stamp must live
+  // on that clock too. Tests stamp it once the outcome commits.
+  let idleAt = 0;
+  const get = mock(async () => {
+    reads += 1;
+    return {
+      data:
+        committed && reads > config.hideOutcomeForReads
+          ? {
+              parentID: 'parent',
+              outcome: 'succeeded',
+              time: { idle: idleAt },
+            }
+          : { parentID: 'parent' },
+    };
+  });
+  const h = harness({
+    ...(config.gateOptions ?? {}),
+    baselineFor: () => undefined,
+    hostOutcomeClock: 'shared-unix-ms',
+    // Shim shape: ONLY `session.get`. No transcript source, so a
+    // window-attributed `succeeded` publishes `completed` from the host
+    // outcome alone — exactly the path the probe exercises.
+    input: { client: { session: { get } } } as never,
+  });
+  return {
+    ...h,
+    get,
+    reads: () => reads,
+    commit: (idleObservationTime?: number) => {
+      committed = true;
+      idleAt = idleObservationTime ?? h.observationNow();
+    },
+  };
+}
+
+describe('evidence re-arm behavior (#1561)', () => {
+  function captureLogs() {
+    const entries: Array<{ message: string; data: unknown }> = [];
+    const spy = spyOn(loggerModule, 'log').mockImplementation(
+      (message: string, data?: unknown) => {
+        entries.push({ message, data });
+      },
+    );
+    return {
+      entries,
+      of: (message: string) =>
+        entries.filter((entry) => entry.message === message),
+      restore: () => spy.mockRestore(),
+    };
+  }
+
+  test('T2: a healthy busy is never re-armed (no busy-spinning)', async () => {
+    const h = shimHarness({ hideOutcomeForReads: 1_000 });
+    // Busy with no idle contradiction afterwards: a genuinely executing child.
+    h.observe('busy', false, 100);
+    h.advance(100);
+    await h.gate.reconcile(h.run);
+    const readsAfterDefer = h.reads();
+    expect(h.timers.pending()).toBe(0);
+    await h.advanceBoth(500);
+    // No new reads and nothing scheduled: the gate is not a poller.
+    expect(h.reads()).toBe(readsAfterDefer);
+    expect(h.timers.pending()).toBe(0);
+    expect(h.board.get(h.run.taskID)?.state).toBe('running');
+    // ...and crucially the record is NOT marked uncertain by mere suspicion.
+    expect(h.board.get(h.run.taskID)?.statusUncertain ?? false).toBe(false);
+  });
+
+  test('T5(i): a fresh busy clears an armed re-arm and resets both budgets', async () => {
+    const h = shimHarness({ hideOutcomeForReads: 1_000 });
+    h.observe('busy', false, 100);
+    h.advance(100);
+    // A contradicting idle makes the defer suspicious → budget drains to
+    // exhaustion, which arms the slow tier.
+    const token = h.gate.capture(h.run);
+    if (!token) throw new Error('missing observation');
+    h.gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'session.idle',
+      readStartedAt: token.readStartedAt,
+      observedAt: 200,
+    });
+    h.advance(200);
+    for (let i = 0; i < 8; i++) await h.advanceBoth(5);
+    // Now a genuine busy: live activity resolves the suspicion honestly.
+    h.observe('busy', false, 900);
+    expect(h.timers.pending()).toBe(0);
+    const readsAfterBusy = h.reads();
+    await h.advanceBoth(1_000);
+    expect(h.reads()).toBe(readsAfterBusy);
+    expect(h.timers.pending()).toBe(0);
+  });
+
+  test('T1: a late-attributable outcome terminalizes the stranded board', async () => {
+    const h = shimHarness({
+      hideOutcomeForReads: 12,
+      gateOptions: { evidenceRearmMs: 1, maxEvidenceRearms: 16 },
+    });
+    h.observe('busy', false, 100);
+    h.advance(100);
+    const token = h.gate.capture(h.run);
+    if (!token) throw new Error('missing observation');
+    h.gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'session.idle',
+      readStartedAt: token.readStartedAt,
+      observedAt: 200,
+    });
+    h.advance(250);
+    // Commit the host outcome with the idle on the observation clock, inside
+    // the attribution window: lowerBound (last live busy) 100 < 250 <= read.
+    h.commit(250);
+    // The first reconcile is what starts the read loop; the re-arm continues
+    // it. Nothing else drives the gate in this unit fixture.
+    await h.gate.reconcile(h.run);
+    // Drive the fast tier, then the slow tier, until the outcome surfaces.
+    for (
+      let i = 0;
+      i < 120 && h.board.get(h.run.taskID)?.state === 'running';
+      i++
+    )
+      await h.advanceBoth(50);
+    const record = h.board.get(h.run.taskID);
+    expect(record?.state).toBe('completed');
+    expect(h.timers.pending()).toBe(0);
+  });
+
+  test('T3: exhaustion stays indeterminate and logs each line once', async () => {
+    const capture = captureLogs();
+    try {
+      const h = shimHarness({
+        hideOutcomeForReads: 1_000,
+        gateOptions: { evidenceRearmMs: 5, maxEvidenceRearms: 3 },
+      });
+      h.observe('busy', false, 100);
+      h.advance(100);
+      // Suspicion needs an idle contradiction to engage the fast tier, and a
+      // first reconcile to start reading.
+      const token = h.gate.capture(h.run);
+      if (!token) throw new Error('missing observation');
+      h.gate.observe(token, {
+        kind: 'quiescent',
+        origin: 'session.idle',
+        readStartedAt: token.readStartedAt,
+        observedAt: 200,
+      });
+      h.advance(200);
+      await h.gate.reconcile(h.run);
+      for (let i = 0; i < 60; i++) await h.advanceBoth(40);
+      const record = h.board.get(h.run.taskID);
+      expect(record?.state).toBe('running');
+      expect(record?.statusUncertain).toBe(true);
+      expect(record?.lastStatusError).toBe(EVIDENCE_UNAVAILABLE_DIAGNOSTIC);
+      expect(
+        capture.of('[terminal-gate] terminal evidence unavailable'),
+      ).toHaveLength(1);
+      expect(
+        capture.of('[terminal-gate] terminal evidence rearm exhausted'),
+      ).toHaveLength(1);
+      expect(h.timers.pending()).toBe(0);
+    } finally {
+      capture.restore();
+    }
+  });
+
+  test('T9: arming is refused where a polling reconciler owns recovery', async () => {
+    // Same exhaustion shape, but the host exposes `session.status`: the 5 s
+    // `runtime-status-reconciliation` sweeper already retries, so the gate
+    // must not become a second scheduler for the same fact.
+    const h = harness({
+      baselineFor: () => undefined,
+      readTerminalEvidence: async () => ({ data: [] }),
+      readRuntime: async (_run, readStartedAt) => ({
+        kind: 'busy' as const,
+        origin: 'session.status',
+        readStartedAt,
+      }),
+      graceMs: 5,
+    });
+    h.observe('quiescent');
+    for (let i = 0; i < 6; i++) await h.advanceBoth(5);
+    expect(h.board.get(h.run.taskID)?.state).toBe('running');
+    expect(h.timers.pending()).toBe(0);
+  });
+});
+
+describe('re-arm budget accounting (#1561)', () => {
+  test('T7: a re-arm fire performs one read and never restarts the fast tier', async () => {
+    let reads = 0;
+    const get = mock(async () => {
+      reads += 1;
+      return { data: { parentID: 'parent' } };
+    });
+    const h = harness({
+      baselineFor: () => undefined,
+      hostOutcomeClock: 'shared-unix-ms',
+      evidenceRearmMs: 2,
+      maxEvidenceRearms: 4,
+      input: { client: { session: { get } } } as never,
+    });
+    h.observe('busy', false, 100);
+    h.advance(100);
+    const token = h.gate.capture(h.run);
+    if (!token) throw new Error('missing observation');
+    h.gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'session.idle',
+      readStartedAt: token.readStartedAt,
+      observedAt: 200,
+    });
+    h.advance(250);
+    await h.gate.reconcile(h.run);
+    // Burn the fast tier, then sample each subsequent arm: every fire adds
+    // exactly one read and exactly one pending timer (never a graceMs burst).
+    const before = reads;
+    for (let i = 0; i < 60; i++) {
+      await h.advanceBoth(2);
+      if (h.timers.pending() === 0) break;
+    }
+    // Exact accounting, which is the real invariant: the remaining fast-tier
+    // reads (maxEvidenceRetries = 3, minus the one this reconcile already
+    // performed) plus exactly `maxEvidenceRearms` slow-tier reads. A re-arm
+    // that wrongly re-engaged the fast tier would overshoot this.
+    expect(reads - before).toBe(3 + 4);
+    expect(h.board.get(h.run.taskID)?.state).toBe('running');
+    expect(h.timers.pending()).toBe(0);
   });
 });
