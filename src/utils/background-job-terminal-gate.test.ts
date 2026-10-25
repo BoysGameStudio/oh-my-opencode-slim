@@ -924,6 +924,12 @@ describe('terminal gate', () => {
           return 1;
         },
         graceMs: 5,
+        // This test's intent is "exhaustion ends all scheduling", so the
+        // slow tier must not arm. The `status` variant has `readRuntime` and
+        // no `input`, so it genuinely qualifies for an arm (guards #1/#2 both
+        // pass); budget 0 is what expresses the intent. The no-API variant
+        // needs no override — the evidence-source guard already refuses it.
+        ...(source === 'status' ? { maxEvidenceRearms: 0 } : {}),
       });
       await h.gate.reconcile(h.run);
       for (
@@ -941,8 +947,13 @@ describe('terminal gate', () => {
       });
       expect(readRuntime).toHaveBeenCalledTimes(source === 'status' ? 4 : 0);
       const calls = inspect.mock.calls.length;
+      // Neither variant may leave a poll scheduled. The `status` variant has
+      // `readRuntime` but no `input`, so the re-arm's evidence-source guard
+      // refuses it too — proof that exhaustion ends all scheduling here.
+      expect(h.timers.pending()).toBe(0);
       await h.timers.advance(25); // > graceMs * 4: no poll may remain scheduled
       expect(inspect).toHaveBeenCalledTimes(calls);
+      expect(h.timers.pending()).toBe(0);
     },
   );
   test('busy during an evidence await immediately invalidates it', async () => {
@@ -2452,6 +2463,144 @@ describe('re-arm budget accounting (#1561)', () => {
     // that wrongly re-engaged the fast tier would overshoot this.
     expect(reads - before).toBe(3 + 4);
     expect(h.board.get(h.run.taskID)?.state).toBe('running');
+    expect(h.timers.pending()).toBe(0);
+  });
+});
+
+describe('replayed idle and rehydrate backstop (#1561)', () => {
+  test('T5(ii): replaying the same idle never resets the fast budget', async () => {
+    const get = mock(async () => ({ data: { parentID: 'parent' } }));
+    const h = harness({
+      baselineFor: () => undefined,
+      hostOutcomeClock: 'shared-unix-ms',
+      readTerminalEvidence: async () => undefined,
+      maxEvidenceRetries: 1,
+      graceMs: 5,
+      input: { client: { session: { get } } } as never,
+    });
+    h.observe('busy', false, 100);
+    h.advance(100);
+    // One contradicting idle engages the fast tier.
+    const token = h.gate.capture(h.run);
+    if (!token) throw new Error('missing observation');
+    h.gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'session.idle',
+      readStartedAt: token.readStartedAt,
+      observedAt: 200,
+    });
+    h.advance(200);
+    await h.gate.reconcile(h.run);
+    // Replay the SAME idle repeatedly (equal observedAt, as the double-idle
+    // pair does). With maxEvidenceRetries = 1 the budget must stay exhausted:
+    // a reset would keep re-arming fast timers forever.
+    for (let i = 0; i < 20; i++) {
+      const t = h.gate.capture(h.run);
+      if (!t) break;
+      h.gate.observe(t, {
+        kind: 'quiescent',
+        origin: 'session.idle',
+        readStartedAt: t.readStartedAt,
+        observedAt: 200,
+      });
+      await h.advanceBoth(5);
+    }
+    // The diagnostic landed: the budget was exhausted despite the replays.
+    expect(h.board.get(h.run.taskID)?.lastStatusError).toBe(
+      EVIDENCE_UNAVAILABLE_DIAGNOSTIC,
+    );
+  });
+
+  test('T8: a later reconcile still publishes after the re-arm budget is dead', async () => {
+    let committed = false;
+    let idleAt = 0;
+    const get = mock(async () => ({
+      data: committed
+        ? { parentID: 'parent', outcome: 'succeeded', time: { idle: idleAt } }
+        : { parentID: 'parent' },
+    }));
+    const h = harness({
+      baselineFor: () => undefined,
+      hostOutcomeClock: 'shared-unix-ms',
+      evidenceRearmMs: 2,
+      maxEvidenceRearms: 1,
+      input: { client: { session: { get } } } as never,
+    });
+    h.observe('busy', false, 100);
+    h.advance(100);
+    const token = h.gate.capture(h.run);
+    if (!token) throw new Error('missing observation');
+    h.gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'session.idle',
+      readStartedAt: token.readStartedAt,
+      observedAt: 200,
+    });
+    h.advance(250);
+    await h.gate.reconcile(h.run);
+    // Burn both tiers: the record stays visibly indeterminate.
+    for (let i = 0; i < 40; i++) await h.advanceBoth(10);
+    expect(h.board.get(h.run.taskID)?.state).toBe('running');
+    expect(h.board.get(h.run.taskID)?.statusUncertain).toBe(true);
+    expect(h.timers.pending()).toBe(0);
+    // The documented backstop: a later activity rehydrate still reconciles
+    // and publishes. Re-arm exhaustion must not have closed that door.
+    committed = true;
+    idleAt = h.observationNow();
+    await h.gate.reconcile(h.run);
+    const record = h.board.get(h.run.taskID);
+    expect(record?.state).toBe('completed');
+    expect(record?.terminalRevision).toBeGreaterThan(0);
+    expect(h.timers.pending()).toBe(0);
+  });
+});
+
+describe('concurrent re-arm idempotency (#1561)', () => {
+  test('T4: an event reconcile racing the re-arm publishes exactly once', async () => {
+    let committed = false;
+    let idleAt = 0;
+    const get = mock(async () => ({
+      data: committed
+        ? { parentID: 'parent', outcome: 'succeeded', time: { idle: idleAt } }
+        : { parentID: 'parent' },
+    }));
+    const h = harness({
+      baselineFor: () => undefined,
+      hostOutcomeClock: 'shared-unix-ms',
+      evidenceRearmMs: 2,
+      maxEvidenceRearms: 8,
+      input: { client: { session: { get } } } as never,
+    });
+    const publications: string[] = [];
+    h.board.addTerminalOutcomeListener((record) => {
+      publications.push(`${record.taskID}:${record.terminalRevision}`);
+    });
+    h.observe('busy', false, 100);
+    h.advance(100);
+    const token = h.gate.capture(h.run);
+    if (!token) throw new Error('missing observation');
+    h.gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'session.idle',
+      readStartedAt: token.readStartedAt,
+      observedAt: 200,
+    });
+    h.advance(250);
+    await h.gate.reconcile(h.run);
+    // Make the outcome visible, then race an event-driven reconcile against a
+    // re-arm fire: both must funnel through the per-identity `inFlight` dedup
+    // and `commit()`'s single-use authorization + board CAS.
+    committed = true;
+    idleAt = h.observationNow();
+    const racing = h.gate.reconcile(h.run);
+    await h.advanceBoth(2);
+    await racing;
+    await h.gate.reconcile(h.run);
+    const record = h.board.get(h.run.taskID);
+    expect(record?.state).toBe('completed');
+    // Exactly one publication, and therefore exactly one revision bump.
+    expect(publications).toHaveLength(1);
+    expect(record?.terminalRevision).toBe(1);
     expect(h.timers.pending()).toBe(0);
   });
 });
