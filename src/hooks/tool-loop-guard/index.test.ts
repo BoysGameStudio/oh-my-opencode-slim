@@ -676,18 +676,34 @@ describe('tool-loop-guard', () => {
       }),
     ).rejects.toThrow('infinite loop');
 
-    // Forward pagination (offset > maxEndLine) on the truncated file is allowed
+    // Forward pagination (offset > maxEndLine) or any changed range (offset/limit) is allowed
     await expect(
       hook['tool.execute.before'](beforeInput({ callID: 'p6_next' }), {
         args: { path: 'src/big.ts', offset: 101, limit: 100 },
       }),
     ).resolves.toBeUndefined();
+    await expect(
+      hook['tool.execute.before'](beforeInput({ callID: 'p6_wider_limit' }), {
+        args: { path: 'src/big.ts', offset: 1, limit: 200 },
+      }),
+    ).resolves.toBeUndefined();
   });
 
-  test('observeNewUserMessage resets read streak across user turns', async () => {
-    for (let i = 1; i <= 4; i++) {
+  test('observeNewUserMessage resets read streak across external user turns but ignores internal admissions', async () => {
+    for (let i = 1; i <= 5; i++) {
       await runIdenticalCall(`t1_${i}`, { filePath: 'a.ts' });
     }
+    // Internal admission (wake / background notification) must NOT clear a confirmed block
+    hook.observeNewUserMessage('s1', 'msg-internal-wake', {
+      internalAdmission: true,
+    });
+    await expect(
+      hook['tool.execute.before'](beforeInput({ callID: 't1_blocked' }), {
+        args: { filePath: 'a.ts' },
+      }),
+    ).rejects.toThrow('infinite loop');
+
+    // Genuine external user message resets the streak
     hook.observeNewUserMessage('s1', 'msg-next-turn');
     const fresh = await runIdenticalCall('t2_1', { filePath: 'a.ts' });
     expect(fresh.output).toBe('...file contents...');

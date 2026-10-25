@@ -252,7 +252,11 @@ export interface ToolLoopGuardHook {
     input: { tool: string; sessionID?: string; callID?: string },
     output: { output: unknown; metadata?: unknown },
   ) => Promise<void>;
-  observeNewUserMessage(sessionID: string, messageID: string): void;
+  observeNewUserMessage(
+    sessionID: string,
+    messageID: string,
+    options?: { internalAdmission?: boolean },
+  ): void;
   resetTurn(sessionID: string): void;
   resetSession(sessionID: string): void;
   resetForTests(): void;
@@ -325,6 +329,7 @@ export function createToolLoopGuardHook(
 
       let canonicalPath: string | undefined;
       let requestedOffset = 1;
+      let normalizedArgs: unknown = output.args;
       if (
         tool === 'read' &&
         output.args &&
@@ -348,12 +353,18 @@ export function createToolLoopGuardHook(
         ) {
           requestedOffset = rec.offset;
         }
+        if (canonicalPath) {
+          const rest: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(rec)) {
+            if (k === 'path' || k === 'filePath') continue;
+            if (k === 'offset' && v === 1) continue;
+            rest[k] = v;
+          }
+          normalizedArgs = { ...rest, path: canonicalPath };
+        }
       }
 
-      const key =
-        tool === 'read' && canonicalPath
-          ? `read:${canonicalPath}`
-          : fingerprint(tool, output.args);
+      const key = fingerprint(tool, normalizedArgs);
       if (TASK_SUPERVISION_TOOLS.has(tool)) {
         if (input.callID) {
           callKeys.set(input.callID, {
@@ -540,7 +551,12 @@ export function createToolLoopGuardHook(
     },
 
     /** Record a new durable user message, once per message identity. */
-    observeNewUserMessage(sessionID: string, messageID: string): void {
+    observeNewUserMessage(
+      sessionID: string,
+      messageID: string,
+      options?: { internalAdmission?: boolean },
+    ): void {
+      if (options?.internalAdmission === true) return;
       if (userMessageIdentities.get(sessionID) === messageID) return;
       userMessageIdentities.set(sessionID, messageID);
       sessions.delete(sessionID);

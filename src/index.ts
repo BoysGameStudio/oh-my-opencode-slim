@@ -3435,8 +3435,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
       taskSessionManagerHook.observeChatMessage(input, output);
       orchestratorWakeScheduler?.observeChatMessage(input, output);
-      if (messageID) {
-        toolLoopGuard.observeNewUserMessage(input.sessionID, messageID);
+      if (messageID && !internalAdmission) {
+        toolLoopGuard.observeNewUserMessage(input.sessionID, messageID, {
+          internalAdmission,
+        });
       }
     },
 
