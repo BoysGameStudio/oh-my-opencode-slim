@@ -1777,7 +1777,15 @@ export function buildResolvedAgentRegistry(
       // not the pattern string alone: narrower host denies/asks inside the
       // grant are re-appended after it (boundGrantByHost), so a broad replayed
       // allow can never reopen a host-protected subpath.
-      const denyCeiling = frozenDenyCeilings[agent];
+      // Marketplace directory guards follow finalized host order, including
+      // overrides of explicit owner denies. Replaying those denies here would
+      // make child policies disagree with the registered policy. Keep the
+      // declarative ceilings for tool, Skill, and MCP capabilities unchanged.
+      const denyCeiling = constraints
+        ? frozenDenyCeilings[agent]?.filter(
+            (rule) => rule.action !== 'external_directory',
+          )
+        : frozenDenyCeilings[agent];
       if (!denyCeiling || denyCeiling.length === 0) return compiled;
       // Idempotent: a payload that already ends with the tail built from its
       // own prefix is returned unchanged. Every tail opens with the

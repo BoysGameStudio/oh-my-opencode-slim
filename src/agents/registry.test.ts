@@ -3854,6 +3854,66 @@ describe('marketplace agent customization', () => {
     expect(child('external_directory', '/approved/asked/*')).toBe('ask');
   });
 
+  test('external_directory: V3 finalized host rules override owner denies consistently', () => {
+    for (const declaration of [
+      'deny' as const,
+      { '*': 'deny' as const, '/reference/*': 'allow' as const },
+    ]) {
+      for (const action of ['external_directory', '*']) {
+        for (const effect of ['allow', 'ask', 'deny'] as const) {
+          const registry = configured(
+            {
+              agents: {
+                'market-agent': {
+                  displayName: 'ReferenceReader',
+                  permission: { external_directory: declaration },
+                },
+              },
+            },
+            {
+              hostFlavor: 'v2',
+              mcps: [],
+              packageOverrides: v3DirectoryPackage,
+              nativePermissionsByAgent: {
+                'market-agent': [{ action, resource: '/elsewhere/*', effect }],
+              },
+            },
+          );
+          for (const name of ['market-agent', 'ReferenceReader']) {
+            const registered = registry.nativePolicies[name];
+            const childRules = registry.compileChildPermissions(
+              name,
+              registered.rules,
+            );
+            const policies = [
+              registered.decide,
+              decideOfRules(childRules),
+              decideOfRules(registry.compileChildPermissions(name, childRules)),
+            ];
+            for (const decide of policies) {
+              expect(decide('external_directory', '/elsewhere/*')).toBe(effect);
+              expect(decide('external_directory', '/unapproved/*')).toBe(
+                'deny',
+              );
+              expect(decide('external_directory', '/reference/*')).toBe(
+                typeof declaration === 'string' ? 'deny' : 'allow',
+              );
+              for (const capability of [
+                'write',
+                'shell',
+                'subagent',
+                'skill',
+                'other_mcp_query',
+              ]) {
+                expect(decide(capability, '/elsewhere/*')).toBe('deny');
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+
   test('external_directory: absent declaration and empty child payload deny; admitting the guard widens nothing else', () => {
     const registry = configured({}, { hostFlavor: 'v2' });
     const policy = registry.nativePolicies['market-agent'];

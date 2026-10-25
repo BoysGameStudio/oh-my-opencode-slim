@@ -136,9 +136,13 @@ file's `read` or `edit` permission. For example,
 `{ "/approved/*": "allow", "/approved/private/*": "deny" }`. Finalized host
 permission rules also participate in ordered matching: an applicable host
 allow, including a wildcard-action allow, can open the guard, while a later
-host deny or ask restricts an owner allow. Without an owner declaration or
-an applicable host override, the guard stays denied for the agent and its
-compiled child sessions.
+host deny or ask restricts an owner allow. This order also applies when the
+owner explicitly denies the guard: a later host allow or ask overrides that
+deny for matching directory boundaries, both at registration and in compiled
+child sessions. Directory guard denies are not replayed as package capability
+ceilings; tool, Skill, and MCP ceilings remain unchanged. Without an owner
+declaration or an applicable host override, the guard stays denied for the
+agent and its compiled child sessions.
 
 To customize the agent prompt, use the same global or project-local Markdown
 files as other OMOS agents:
