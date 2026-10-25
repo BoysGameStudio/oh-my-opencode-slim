@@ -126,6 +126,24 @@ Local skill and MCP selections do **not** expand the marketplace package's
 core-tool permissions. Effective native rules can further restrict grants,
 and ambiguous MCP namespaces are rejected.
 
+`external_directory` is an OpenCode safety guard, not a manifest tool
+capability: a package's `tools` list never grants it, and a manifest tool
+grant (for example `read`) never implies it. Owner configuration can declare
+it via `agents.<name>.permission.external_directory` — a
+whole-tool `allow`/`ask`/`deny` or a path-pattern map. The native guard checks
+an external directory boundary, normally ending in `/*`, separately from the
+file's `read` or `edit` permission. For example,
+`{ "/approved/*": "allow", "/approved/private/*": "deny" }`. Finalized host
+permission rules also participate in ordered matching: an applicable host
+allow, including a wildcard-action allow, can open the guard, while a later
+host deny or ask restricts an owner allow. This order also applies when the
+owner explicitly denies the guard: a later host allow or ask overrides that
+deny for matching directory boundaries, both at registration and in compiled
+child sessions. Directory guard denies are not replayed as package capability
+ceilings; tool, Skill, and MCP ceilings remain unchanged. Without an owner
+declaration or an applicable host override, the guard stays denied for the
+agent and its compiled child sessions.
+
 To customize the agent prompt, use the same global or project-local Markdown
 files as other OMOS agents:
 
