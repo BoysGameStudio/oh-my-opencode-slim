@@ -2006,7 +2006,12 @@ describe('terminal gate observability (INFO logs)', () => {
         state: 'running',
         attempt: 1,
         verdict: 'gave-up',
+        // No `input` and no `readRuntime`: the arm's evidence-source guard
+        // refuses, so the give-up log reports that no slow tier took over
+        // (T8's refusal path) and nothing is left scheduled.
+        rearm: { armed: false },
       });
+      expect(h.timers.pending()).toBe(0);
     } finally {
       capture.restore();
     }
@@ -2257,6 +2262,11 @@ function shimHarness(
     ...(config.gateOptions ?? {}),
     baselineFor: () => undefined,
     hostOutcomeClock: 'shared-unix-ms',
+    // No transcript on this host: undefined is classified as "transcript
+    // source unavailable", NOT as evidence. Without this the inherited
+    // default answer would publish through the transcript path and the test
+    // would never exercise the host-outcome attribution it claims to pin.
+    readTerminalEvidence: async () => undefined,
     // Shim shape: ONLY `session.get`. No transcript source, so a
     // window-attributed `succeeded` publishes `completed` from the host
     // outcome alone — exactly the path the probe exercises.
@@ -2332,37 +2342,58 @@ describe('evidence re-arm behavior (#1561)', () => {
   });
 
   test('T1: a late-attributable outcome terminalizes the stranded board', async () => {
-    const h = shimHarness({
-      hideOutcomeForReads: 12,
-      gateOptions: { evidenceRearmMs: 1, maxEvidenceRearms: 16 },
-    });
-    h.observe('busy', false, 100);
-    h.advance(100);
-    const token = h.gate.capture(h.run);
-    if (!token) throw new Error('missing observation');
-    h.gate.observe(token, {
-      kind: 'quiescent',
-      origin: 'session.idle',
-      readStartedAt: token.readStartedAt,
-      observedAt: 200,
-    });
-    h.advance(250);
-    // Commit the host outcome with the idle on the observation clock, inside
-    // the attribution window: lowerBound (last live busy) 100 < 250 <= read.
-    h.commit(250);
-    // The first reconcile is what starts the read loop; the re-arm continues
-    // it. Nothing else drives the gate in this unit fixture.
-    await h.gate.reconcile(h.run);
-    // Drive the fast tier, then the slow tier, until the outcome surfaces.
-    for (
-      let i = 0;
-      i < 120 && h.board.get(h.run.taskID)?.state === 'running';
-      i++
-    )
-      await h.advanceBoth(50);
-    const record = h.board.get(h.run.taskID);
-    expect(record?.state).toBe('completed');
-    expect(h.timers.pending()).toBe(0);
+    const capture = captureLogs();
+    try {
+      const h = shimHarness({
+        hideOutcomeForReads: 12,
+        gateOptions: { evidenceRearmMs: 1, maxEvidenceRearms: 16 },
+      });
+      h.observe('busy', false, 100);
+      h.advance(100);
+      const token = h.gate.capture(h.run);
+      if (!token) throw new Error('missing observation');
+      h.gate.observe(token, {
+        kind: 'quiescent',
+        origin: 'session.idle',
+        readStartedAt: token.readStartedAt,
+        observedAt: 200,
+      });
+      h.advance(250);
+      // Commit the host outcome with the idle on the observation clock, inside
+      // the attribution window: lowerBound (last live busy) 100 < 250 <= read.
+      h.commit(250);
+      // The first reconcile is what starts the read loop; the re-arm continues
+      // it. Nothing else drives the gate in this unit fixture.
+      await h.gate.reconcile(h.run);
+      // Nothing may publish while the outcome is still hidden: the whole point
+      // is that attribution, not suspicion, authorizes the publication.
+      expect(capture.of('[terminal-gate] terminal published')).toHaveLength(0);
+      // Drive the fast tier, then the slow tier, until the outcome surfaces.
+      for (
+        let i = 0;
+        i < 120 && h.board.get(h.run.taskID)?.state === 'running';
+        i++
+      )
+        await h.advanceBoth(50);
+      const record = h.board.get(h.run.taskID);
+      expect(record).toMatchObject({
+        state: 'completed',
+        resultSummary: 'Host reported outcome: succeeded.',
+        statusUncertain: false,
+      });
+      // Exactly one publication, and it carries the host-outcome attribution:
+      // a publication through any other path (or a second one) would fail.
+      const published = capture.of('[terminal-gate] terminal published');
+      expect(published).toHaveLength(1);
+      expect(published[0]?.data).toMatchObject({
+        taskID: h.run.taskID,
+        state: 'completed',
+        attribution: 'host-outcome',
+      });
+      expect(h.timers.pending()).toBe(0);
+    } finally {
+      capture.restore();
+    }
   });
 
   test('T3: exhaustion stays indeterminate and logs each line once', async () => {
@@ -2391,12 +2422,25 @@ describe('evidence re-arm behavior (#1561)', () => {
       expect(record?.state).toBe('running');
       expect(record?.statusUncertain).toBe(true);
       expect(record?.lastStatusError).toBe(EVIDENCE_UNAVAILABLE_DIAGNOSTIC);
-      expect(
-        capture.of('[terminal-gate] terminal evidence unavailable'),
-      ).toHaveLength(1);
-      expect(
-        capture.of('[terminal-gate] terminal evidence rearm exhausted'),
-      ).toHaveLength(1);
+      // First exhaustion logs once, and reports that the slow tier took over.
+      const gaveUps = capture.of(
+        '[terminal-gate] terminal evidence unavailable',
+      );
+      expect(gaveUps).toHaveLength(1);
+      expect(gaveUps[0]?.data).toMatchObject({
+        verdict: 'gave-up',
+        rearm: { armed: true, maxEvidenceRearms: 3 },
+      });
+      // Final give-up on the arm budget logs once, after that handoff.
+      const exhausted = capture.of(
+        '[terminal-gate] terminal evidence rearm exhausted',
+      );
+      expect(exhausted).toHaveLength(1);
+      expect(exhausted[0]?.data).toMatchObject({
+        verdict: 'gave-up',
+        rearms: 3,
+        maxEvidenceRearms: 3,
+      });
       expect(h.timers.pending()).toBe(0);
     } finally {
       capture.restore();
