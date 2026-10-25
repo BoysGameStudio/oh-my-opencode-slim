@@ -110,3 +110,4 @@ captures/
 .tokpulse-writer-locks/
 .tokpulse-migrate-*/
 .opencode/oc-tps/
+companion
