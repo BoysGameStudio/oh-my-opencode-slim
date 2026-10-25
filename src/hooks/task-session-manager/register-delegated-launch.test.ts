@@ -1,9 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
 import type { BackgroundJobTerminalGate } from '../../utils/background-job-terminal-gate';
-import type { PendingTaskCall } from './pending-call-tracker';
+import {
+  createPendingCallTracker,
+  type PendingTaskCall,
+} from './pending-call-tracker';
 import {
   handleToolExecuteAfter,
+  handleToolExecuteBefore,
   type RegisterDelegatedLaunchDeps,
   registerDelegatedLaunchFromStructured,
 } from './tool-execute-hooks';
@@ -257,6 +261,89 @@ describe('registerDelegatedLaunchFromStructured', () => {
     );
 
     expect(pending.registeredByWrapper).toBeUndefined();
+  });
+});
+
+describe('parent-scoped pending consumption', () => {
+  test('the after-hook consumes only its own parent when two parents share a call ID', async () => {
+    const tracker = createPendingCallTracker();
+    const board = new BackgroundJobBoard();
+    const first = makePending({
+      callId: 'call_shared',
+      parentSessionId: 'parent_1',
+      registeredByWrapper: true,
+    });
+    const second = makePending({
+      callId: 'call_shared',
+      parentSessionId: 'parent_2',
+      registeredByWrapper: true,
+    });
+    tracker.add(first);
+    tracker.add(second);
+    const deps = {
+      directory: '/tmp',
+      backgroundJobBoard: board,
+      terminalGate: {
+        reconcile: async () => undefined,
+      } as unknown as BackgroundJobTerminalGate,
+      taskContextTracker: {
+        pendingManagedTaskIds: new Set<string>(),
+        addContext: () => {},
+        contextFilesForPrompt: () => [],
+      },
+      pendingCallTracker: tracker,
+      hostFlavor: 'v2',
+    } as unknown as Parameters<typeof handleToolExecuteAfter>[2];
+
+    await handleToolExecuteAfter(
+      { tool: 'task', sessionID: 'parent_2', callID: 'call_shared' },
+      { output: '', metadata: {} },
+      deps,
+    );
+
+    // The wrapper gate consumes THIS parent's pending; the other parent's
+    // identically named call must survive to its own after-hook.
+    expect(tracker.peekByCallId('call_shared', 'parent_2')).toBeUndefined();
+    expect(tracker.peekByCallId('call_shared', 'parent_1')).toBe(first);
+  });
+
+  test('the before-hook error cleanup removes only its own pending', async () => {
+    const tracker = createPendingCallTracker();
+    const board = new BackgroundJobBoard();
+    const other = makePending({
+      callId: 'call_shared',
+      parentSessionId: 'parent_1',
+    });
+    tracker.add(other);
+    const deps = {
+      shouldManageSession: () => true,
+      backgroundJobBoard: board,
+      pendingCallTracker: tracker,
+      taskContextTracker: { pendingManagedTaskIds: new Set<string>() },
+      backgroundTaskConcurrency: {
+        acquire: () => ({
+          ready: Promise.reject(new Error('admission cancelled')),
+          releaseIfUnbound: () => {},
+        }),
+      },
+    } as unknown as Parameters<typeof handleToolExecuteBefore>[2];
+
+    await expect(
+      handleToolExecuteBefore(
+        { tool: 'task', sessionID: 'parent_2', callID: 'call_shared' },
+        {
+          args: {
+            subagent_type: 'explorer',
+            prompt: 'work',
+            background: true,
+          },
+        },
+        deps,
+      ),
+    ).rejects.toThrow('admission cancelled');
+
+    expect(tracker.peekByCallId('call_shared', 'parent_2')).toBeUndefined();
+    expect(tracker.peekByCallId('call_shared', 'parent_1')).toBe(other);
   });
 });
 

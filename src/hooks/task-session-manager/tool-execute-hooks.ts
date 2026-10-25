@@ -767,7 +767,7 @@ export async function handleToolExecuteBefore(
   } catch (error) {
     const tracked = deps.pendingCallTracker.take(
       pendingCall.callId,
-      undefined,
+      pendingCall.parentSessionId,
       undefined,
       {
         recordConsumed: false,
@@ -868,7 +868,7 @@ export async function handleToolExecuteAfter(
       : undefined;
   let pending = deps.pendingCallTracker.take(
     exactCallID,
-    exactCallID ? undefined : input.sessionID,
+    input.sessionID,
     deps.backgroundJobBoard,
   );
   const exactCallConfirmed =
