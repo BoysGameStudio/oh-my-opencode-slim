@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import type { EqualizeAgentPanesOptions } from './layout-equalize';
 
 type SpawnResult = {
   exited: Promise<number>;
@@ -58,15 +59,26 @@ function commands(): string[][] {
   return crossSpawnMock.mock.calls.map((call) => call[0] as string[]);
 }
 
+function createEqualizer() {
+  return mock(
+    async (_opts: EqualizeAgentPanesOptions): Promise<boolean> => true,
+  );
+}
+
 describe('HerdrMultiplexer', () => {
   const originalHerdrEnv = process.env.HERDR_ENV;
   const originalHerdrPaneId = process.env.HERDR_PANE_ID;
   const originalHerdrBinPath = process.env.HERDR_BIN_PATH;
+  const originalHerdrTabId = process.env.HERDR_TAB_ID;
+  const originalHerdrSocketPath = process.env.HERDR_SOCKET_PATH;
 
   beforeEach(() => {
     process.env.HERDR_ENV = '1';
     process.env.HERDR_PANE_ID = 'w1:p1';
     delete process.env.HERDR_BIN_PATH;
+    // Never let a real herdr socket leak into the suite.
+    delete process.env.HERDR_TAB_ID;
+    delete process.env.HERDR_SOCKET_PATH;
 
     crossSpawnMock.mockReset();
     crossSpawnMock.mockImplementation((command: string[]) => {
@@ -87,6 +99,16 @@ describe('HerdrMultiplexer', () => {
       delete process.env.HERDR_BIN_PATH;
     } else {
       process.env.HERDR_BIN_PATH = originalHerdrBinPath;
+    }
+    if (originalHerdrTabId === undefined) {
+      delete process.env.HERDR_TAB_ID;
+    } else {
+      process.env.HERDR_TAB_ID = originalHerdrTabId;
+    }
+    if (originalHerdrSocketPath === undefined) {
+      delete process.env.HERDR_SOCKET_PATH;
+    } else {
+      process.env.HERDR_SOCKET_PATH = originalHerdrSocketPath;
     }
   });
 
@@ -115,6 +137,8 @@ describe('HerdrMultiplexer', () => {
       '--cwd',
       '/repo',
       '--no-focus',
+      '--ratio',
+      '0.6',
     ]);
   });
 
@@ -158,6 +182,8 @@ describe('HerdrMultiplexer', () => {
       '--cwd',
       '/repo',
       '--no-focus',
+      '--ratio',
+      '0.6',
     ]);
 
     // 3. pane rename
@@ -514,6 +540,7 @@ describe('HerdrMultiplexer', () => {
 
     expect(directionArgIndex).toBeGreaterThanOrEqual(0);
     expect(splitCommand?.[directionArgIndex + 1]).toBe('down');
+    expect(splitCommand).not.toContain('--ratio');
   });
 
   test('tiled layout opens panes right', async () => {
@@ -536,7 +563,7 @@ describe('HerdrMultiplexer', () => {
     expect(splitCommand?.[directionArgIndex + 1]).toBe('right');
   });
 
-  test('tiled layout always splits parent right (unaffected)', async () => {
+  test('tiled layout always splits parent right without a ratio', async () => {
     const { HerdrMultiplexer } = await importFreshHerdr();
     const herdr = new HerdrMultiplexer('tiled', 60);
 
@@ -566,16 +593,37 @@ describe('HerdrMultiplexer', () => {
       '/repo',
       '--no-focus',
     ]);
+    // main_pane_size applies to main-* layouts only.
+    expect(splitCommands[0]).not.toContain('--ratio');
+    expect(splitCommands[1]).not.toContain('--ratio');
   });
 
-  test('main-horizontal layout always splits parent down (unaffected)', async () => {
+  test('even-horizontal splits the parent right without a ratio', async () => {
     const { HerdrMultiplexer } = await importFreshHerdr();
-    const herdr = new HerdrMultiplexer('main-horizontal', 60);
+    const herdr = new HerdrMultiplexer('even-horizontal', 60);
 
     await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
     await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
 
     const splitCommands = commands().filter((c) => c.includes('split'));
+    expect(splitCommands).toHaveLength(2);
+    for (const split of splitCommands) {
+      expect(split[3]).toBe('w1:p1');
+      expect(split).toContain('right');
+      expect(split).not.toContain('--ratio');
+    }
+  });
+
+  test('main-horizontal: first spawn creates the agent row below', async () => {
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-horizontal', 60);
+
+    await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+    await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
+    await herdr.spawnPane('s3', 'A3', 'http://localhost:4096', '/repo');
+
+    const splitCommands = commands().filter((c) => c.includes('split'));
+    // 1st: parent → down, sized by main_pane_size.
     expect(splitCommands[0]).toEqual([
       '/usr/bin/herdr',
       'pane',
@@ -586,7 +634,88 @@ describe('HerdrMultiplexer', () => {
       '--cwd',
       '/repo',
       '--no-focus',
+      '--ratio',
+      '0.6',
     ]);
+    // Later children stack to the right INSIDE the agent row, unsized.
+    expect(splitCommands[1]).toEqual([
+      '/usr/bin/herdr',
+      'pane',
+      'split',
+      'w1:p2',
+      '--direction',
+      'right',
+      '--cwd',
+      '/repo',
+      '--no-focus',
+    ]);
+    expect(splitCommands[2]).toEqual([
+      '/usr/bin/herdr',
+      'pane',
+      'split',
+      'w1:p2',
+      '--direction',
+      'right',
+      '--cwd',
+      '/repo',
+      '--no-focus',
+    ]);
+  });
+
+  test('main-horizontal: equalizes after each successful spawn', async () => {
+    process.env.HERDR_TAB_ID = 'w1:t1';
+    process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const equalize = createEqualizer();
+    const herdr = new HerdrMultiplexer('main-horizontal', 60, {
+      equalizer: equalize,
+    });
+
+    await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+    await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
+    await herdr.spawnPane('s3', 'A3', 'http://localhost:4096', '/repo');
+
+    expect(equalize.mock.calls).toMatchObject([
+      [
+        {
+          socketPath: '/tmp/herdr-test.sock',
+          tabId: 'w1:t1',
+          mainPaneId: 'w1:p1',
+        },
+      ],
+      [
+        {
+          socketPath: '/tmp/herdr-test.sock',
+          tabId: 'w1:t1',
+          mainPaneId: 'w1:p1',
+        },
+      ],
+      [
+        {
+          socketPath: '/tmp/herdr-test.sock',
+          tabId: 'w1:t1',
+          mainPaneId: 'w1:p1',
+        },
+      ],
+    ]);
+  });
+
+  test('main-horizontal: recreates the agent row from the parent after close', async () => {
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-horizontal', 70);
+
+    const first = await herdr.spawnPane(
+      's1',
+      'A1',
+      'http://localhost:4096',
+      '/repo',
+    );
+    await herdr.closePane(first.paneId as string);
+    await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
+
+    const splitCommands = commands().filter((c) => c.includes('split'));
+    expect(splitCommands).toHaveLength(2);
     expect(splitCommands[1]).toEqual([
       '/usr/bin/herdr',
       'pane',
@@ -594,6 +723,29 @@ describe('HerdrMultiplexer', () => {
       'w1:p1',
       '--direction',
       'down',
+      '--cwd',
+      '/repo',
+      '--no-focus',
+      '--ratio',
+      '0.7',
+    ]);
+  });
+
+  test('main-horizontal: applyLayout keeps the agent row for the same layout', async () => {
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-horizontal', 60);
+
+    await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+    await herdr.applyLayout('main-horizontal', 60);
+    await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
+
+    expect(commands()).toContainEqual([
+      '/usr/bin/herdr',
+      'pane',
+      'split',
+      'w1:p2',
+      '--direction',
+      'right',
       '--cwd',
       '/repo',
       '--no-focus',
@@ -655,7 +807,10 @@ describe('HerdrMultiplexer', () => {
       '--cwd',
       '/repo',
       '--no-focus',
+      '--ratio',
+      '0.6',
     ]);
+    // Stacked sibling inside the agent area: herdr's default 50/50, no ratio.
     expect(splitCommands[1]).toEqual([
       '/usr/bin/herdr',
       'pane',
@@ -689,6 +844,7 @@ describe('HerdrMultiplexer', () => {
       '/repo',
       '--no-focus',
     ]);
+    expect(splitCommands[2]).not.toContain('--ratio');
   });
 
   test('main-vertical: fallback to parent when agent area closed', async () => {
@@ -721,6 +877,8 @@ describe('HerdrMultiplexer', () => {
       '--cwd',
       '/repo',
       '--no-focus',
+      '--ratio',
+      '0.6',
     ]);
   });
 
@@ -762,7 +920,7 @@ describe('HerdrMultiplexer', () => {
 
     const splitCommands = commands().filter((c) => c.includes('split'));
 
-    // 1st: parent split → right (first spawn)
+    // 1st: parent split → right (first spawn), sized by main_pane_size
     expect(splitCommands[0]).toEqual([
       '/usr/bin/herdr',
       'pane',
@@ -773,9 +931,11 @@ describe('HerdrMultiplexer', () => {
       '--cwd',
       '/repo',
       '--no-focus',
+      '--ratio',
+      '0.6',
     ]);
 
-    // 2nd: agent area split → down (second spawn) — fails
+    // 2nd: agent area split → down (second spawn) — fails; no ratio
     expect(splitCommands[1]).toEqual([
       '/usr/bin/herdr',
       'pane',
@@ -788,8 +948,22 @@ describe('HerdrMultiplexer', () => {
       '--no-focus',
     ]);
 
-    // 3rd: parent split → right (fallback from failed agent area split)
+    // 3rd: agent-area split retried once (still fails)
     expect(splitCommands[2]).toEqual([
+      '/usr/bin/herdr',
+      'pane',
+      'split',
+      'w1:p2',
+      '--direction',
+      'down',
+      '--cwd',
+      '/repo',
+      '--no-focus',
+    ]);
+
+    // 4th: parent split → right, WITHOUT --ratio: the old agent area still
+    // occupies space, so sizing here would shrink the main pane twice.
+    expect(splitCommands[3]).toEqual([
       '/usr/bin/herdr',
       'pane',
       'split',
@@ -804,6 +978,61 @@ describe('HerdrMultiplexer', () => {
     // agentAreaPaneId was updated to the new pane from the parent split
     // @ts-expect-error - accessing private for test
     expect(herdr.agentAreaPaneId).toBe('w1:p3');
+  });
+
+  test('main_pane_size 80 sizes the first split at ratio 0.8', async () => {
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-horizontal', 80);
+
+    await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+
+    const split = commands().find((c) => c.includes('split'));
+    const ratioIndex = split?.indexOf('--ratio') ?? -1;
+    expect(ratioIndex).toBeGreaterThan(-1);
+    expect(split?.[ratioIndex + 1]).toBe('0.8');
+  });
+
+  test('main-vertical: recreated agent area split is sized again', async () => {
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-vertical', 70);
+
+    const first = await herdr.spawnPane(
+      's1',
+      'A1',
+      'http://localhost:4096',
+      '/repo',
+    );
+    await herdr.closePane(first.paneId as string);
+    await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
+
+    const splitCommands = commands().filter((c) => c.includes('split'));
+    expect(splitCommands).toHaveLength(2);
+    expect(splitCommands[1]).toEqual([
+      '/usr/bin/herdr',
+      'pane',
+      'split',
+      'w1:p1',
+      '--direction',
+      'right',
+      '--cwd',
+      '/repo',
+      '--no-focus',
+      '--ratio',
+      '0.7',
+    ]);
+  });
+
+  test('main-vertical: stacked sibling split carries no ratio', async () => {
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-vertical', 60);
+
+    await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+    await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
+
+    const splitCommands = commands().filter((c) => c.includes('split'));
+    expect(splitCommands[0]).toContain('--ratio');
+    expect(splitCommands[1]).toContain('w1:p2');
+    expect(splitCommands[1]).not.toContain('--ratio');
   });
 
   test('closePane clears agentAreaPaneId when agent area closed', async () => {
@@ -868,6 +1097,30 @@ describe('HerdrMultiplexer', () => {
     ]);
   });
 
+  test('applyLayout updates the size used by later main splits', async () => {
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-vertical', 60);
+
+    await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+    await herdr.applyLayout('main-horizontal', 75);
+    await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
+
+    const splitCommands = commands().filter((c) => c.includes('split'));
+    expect(splitCommands[1]).toEqual([
+      '/usr/bin/herdr',
+      'pane',
+      'split',
+      'w1:p1',
+      '--direction',
+      'down',
+      '--cwd',
+      '/repo',
+      '--no-focus',
+      '--ratio',
+      '0.75',
+    ]);
+  });
+
   test('applyLayout issues no CLI commands', async () => {
     const { HerdrMultiplexer } = await importFreshHerdr();
     const herdr = new HerdrMultiplexer('main-vertical', 60);
@@ -876,6 +1129,200 @@ describe('HerdrMultiplexer', () => {
 
     // No CLI commands should be issued
     expect(commands()).toHaveLength(0);
+  });
+
+  describe('agent-area equalization', () => {
+    test('equalizes after a successful spawn', async () => {
+      process.env.HERDR_TAB_ID = 'w1:t1';
+      process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer('main-vertical', 60, {
+        equalizer: equalize,
+      });
+
+      await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+
+      expect(equalize.mock.calls).toMatchObject([
+        [
+          {
+            socketPath: '/tmp/herdr-test.sock',
+            tabId: 'w1:t1',
+            mainPaneId: 'w1:p1',
+          },
+        ],
+      ]);
+    });
+
+    test('equalizes again after an agent pane close', async () => {
+      process.env.HERDR_TAB_ID = 'w1:t1';
+      process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer('main-vertical', 60, {
+        equalizer: equalize,
+      });
+
+      await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+      await herdr.closePane('w1:p2');
+
+      expect(equalize.mock.calls).toHaveLength(2);
+      expect(equalize.mock.calls[1][0]).toMatchObject({
+        socketPath: '/tmp/herdr-test.sock',
+        tabId: 'w1:t1',
+        mainPaneId: 'w1:p1',
+        mainPaneShare: 0.6,
+      });
+    });
+
+    test('does not equalize after a spawn when equalize_panes is false', async () => {
+      process.env.HERDR_TAB_ID = 'w1:t1';
+      process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer('main-vertical', 60, {
+        equalizer: equalize,
+        equalizePanes: false,
+      });
+
+      const result = await herdr.spawnPane(
+        's1',
+        'A1',
+        'http://localhost:4096',
+        '/repo',
+      );
+
+      expect(result).toEqual({ success: true, paneId: 'w1:p2' });
+      expect(equalize.mock.calls).toHaveLength(0);
+    });
+
+    test('does not equalize after an agent pane close when equalize_panes is false', async () => {
+      process.env.HERDR_TAB_ID = 'w1:t1';
+      process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer('main-vertical', 60, {
+        equalizer: equalize,
+        equalizePanes: false,
+      });
+
+      await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+      await herdr.closePane('w1:p2');
+
+      expect(equalize.mock.calls).toHaveLength(0);
+    });
+
+    test('equalizes with an explicit equalize_panes true', async () => {
+      process.env.HERDR_TAB_ID = 'w1:t1';
+      process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer('main-vertical', 60, {
+        equalizer: equalize,
+        equalizePanes: true,
+      });
+
+      await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+
+      expect(equalize.mock.calls).toHaveLength(1);
+    });
+
+    test('does not equalize after closing a pane it did not spawn', async () => {
+      process.env.HERDR_TAB_ID = 'w1:t1';
+      process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer('main-vertical', 60, {
+        equalizer: equalize,
+      });
+
+      await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+      await herdr.closePane('w1:p99');
+
+      expect(equalize.mock.calls).toHaveLength(1);
+    });
+
+    test('skips equalization when HERDR_TAB_ID is absent', async () => {
+      process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer('main-vertical', 60, {
+        equalizer: equalize,
+      });
+
+      const result = await herdr.spawnPane(
+        's1',
+        'A1',
+        'http://localhost:4096',
+        '/repo',
+      );
+
+      expect(result).toEqual({ success: true, paneId: 'w1:p2' });
+      expect(equalize.mock.calls).toHaveLength(0);
+    });
+
+    test('equalizer failures never change the spawn result', async () => {
+      process.env.HERDR_TAB_ID = 'w1:t1';
+      process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = mock(
+        async (_opts: EqualizeAgentPanesOptions): Promise<boolean> => {
+          throw new Error('socket exploded');
+        },
+      );
+      const herdr = new HerdrMultiplexer('main-vertical', 60, {
+        equalizer: equalize,
+      });
+
+      const result = await herdr.spawnPane(
+        's1',
+        'A1',
+        'http://localhost:4096',
+        '/repo',
+      );
+
+      expect(result).toEqual({ success: true, paneId: 'w1:p2' });
+      expect(equalize.mock.calls).toHaveLength(1);
+    });
+
+    test('does not equalize when the spawn fails', async () => {
+      process.env.HERDR_TAB_ID = 'w1:t1';
+      process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+      crossSpawnMock.mockImplementation((command: string[]) => {
+        if (command[0] === 'which') {
+          return createSpawnResult(0, '/usr/bin/herdr\n');
+        }
+        if (command.includes('split')) {
+          return createSpawnResult(1, '', 'split failed');
+        }
+        return createSpawnResult();
+      });
+
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer('main-vertical', 60, {
+        equalizer: equalize,
+      });
+
+      const result = await herdr.spawnPane(
+        's1',
+        'A1',
+        'http://localhost:4096',
+        '/repo',
+      );
+
+      expect(result).toEqual({ success: false, error: 'hard' });
+      expect(equalize.mock.calls).toHaveLength(0);
+    });
   });
 
   // Regression: concurrent spawns must not race on agentAreaPaneId (#762)
@@ -1008,5 +1455,137 @@ describe('HerdrMultiplexer', () => {
     const closes = commands().filter((command) => command.includes('close'));
     expect(closes).toHaveLength(1);
     expect(closes[0]).toEqual(['/usr/bin/herdr', 'pane', 'close', 'w1:p2']);
+  });
+
+  test('retries a sized split without --ratio and latches for the process', async () => {
+    let sizedFailures = 0;
+    crossSpawnMock.mockImplementation((command: string[]) => {
+      if (command[0] === 'which') {
+        return createSpawnResult(0, '/usr/bin/herdr\n');
+      }
+      if (command.includes('split')) {
+        if (command.includes('--ratio')) {
+          sizedFailures += 1;
+          return createSpawnResult(1, '', 'error: unexpected argument --ratio');
+        }
+        return createSpawnResult(0, `${createSplitResponse('w1:p2')}\n`);
+      }
+      return createSpawnResult();
+    });
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-vertical', 60);
+
+    const first = await herdr.spawnPane(
+      's1',
+      'A1',
+      'http://localhost:4096',
+      '/repo',
+    );
+    expect(first).toEqual({ success: true, paneId: 'w1:p2' });
+    expect(sizedFailures).toBe(1);
+
+    await herdr.closePane('w1:p2');
+    const second = await herdr.spawnPane(
+      's2',
+      'A2',
+      'http://localhost:4096',
+      '/repo',
+    );
+    expect(second.success).toBe(true);
+
+    const splits = commands().filter((command) => command.includes('split'));
+    // Only the first attempt carried --ratio; the latch keeps later spawns
+    // working on a herdr build that rejects the flag.
+    expect(
+      splits.filter((command) => command.includes('--ratio')),
+    ).toHaveLength(1);
+    expect(splits).toHaveLength(3);
+  });
+
+  test('prunes agent pane ids that vanished from the exported layout', async () => {
+    process.env.HERDR_TAB_ID = 'w1:t1';
+    process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+    let onPanesSeen: ((ids: Set<string>) => void) | undefined;
+    const equalize = mock(async (opts: EqualizeAgentPanesOptions) => {
+      onPanesSeen = opts.onPanesSeen;
+      return true;
+    });
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-vertical', 60, {
+      equalizer: equalize,
+    });
+
+    await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+    // @ts-expect-error - accessing private for test
+    expect(herdr.agentPaneIds.has('w1:p2')).toBe(true);
+
+    // Simulate the user closing that pane: it is gone from the layout.
+    onPanesSeen?.(new Set(['w1:p1']));
+
+    // @ts-expect-error - accessing private for test
+    expect(herdr.agentPaneIds.has('w1:p2')).toBe(false);
+  });
+
+  test('does not equalize or size even-*/tiled layouts', async () => {
+    process.env.HERDR_TAB_ID = 'w1:t1';
+    process.env.HERDR_SOCKET_PATH = '/tmp/herdr-test.sock';
+
+    for (const layout of [
+      'even-horizontal',
+      'even-vertical',
+      'tiled',
+    ] as const) {
+      crossSpawnMock.mockReset();
+      crossSpawnMock.mockImplementation((command: string[]) => {
+        if (command[0] === 'which') {
+          return createSpawnResult(0, '/usr/bin/herdr\n');
+        }
+        if (command.includes('split')) {
+          return createSpawnResult(0, `${createSplitResponse('w1:p2')}\n`);
+        }
+        return createSpawnResult();
+      });
+      const { HerdrMultiplexer } = await importFreshHerdr();
+      const equalize = createEqualizer();
+      const herdr = new HerdrMultiplexer(layout, 80, {
+        equalizer: equalize,
+      });
+
+      await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+
+      // No correction pass and no ratio: these layouts keep their even split.
+      expect(equalize.mock.calls).toHaveLength(0);
+      const splits = commands().filter((command) => command.includes('split'));
+      expect(splits).toHaveLength(1);
+      expect(splits[0]).not.toContain('--ratio');
+    }
+  });
+
+  test('does not latch ratio support on an unrelated split failure', async () => {
+    let sizedAttempts = 0;
+    crossSpawnMock.mockImplementation((command: string[]) => {
+      if (command[0] === 'which') {
+        return createSpawnResult(0, '/usr/bin/herdr\n');
+      }
+      if (command.includes('split')) {
+        if (command.includes('--ratio')) {
+          sizedAttempts += 1;
+          return createSpawnResult(1, '', 'error: pane would be too small');
+        }
+        return createSpawnResult(0, `${createSplitResponse('w1:p2')}\n`);
+      }
+      return createSpawnResult();
+    });
+    const { HerdrMultiplexer } = await importFreshHerdr();
+    const herdr = new HerdrMultiplexer('main-vertical', 60);
+
+    await herdr.spawnPane('s1', 'A1', 'http://localhost:4096', '/repo');
+    await herdr.closePane('w1:p2');
+    await herdr.spawnPane('s2', 'A2', 'http://localhost:4096', '/repo');
+
+    // A transient failure retried unsized, but sizing stays enabled: the
+    // second parent split tries --ratio again.
+    expect(sizedAttempts).toBe(2);
   });
 });

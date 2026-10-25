@@ -44,7 +44,9 @@ export function getMultiplexer(config: MultiplexerConfig): Multiplexer | null {
       actualType = 'zellij';
       break;
     case 'herdr':
-      multiplexer = new HerdrMultiplexer(config.layout, config.main_pane_size);
+      multiplexer = new HerdrMultiplexer(config.layout, config.main_pane_size, {
+        equalizePanes: config.equalize_panes,
+      });
       actualType = 'herdr';
       break;
     case 'cmux-tui':
@@ -89,6 +91,7 @@ export function getMultiplexer(config: MultiplexerConfig): Multiplexer | null {
         multiplexer = new HerdrMultiplexer(
           config.layout,
           config.main_pane_size,
+          { equalizePanes: config.equalize_panes },
         );
         actualType = 'herdr';
       } else if (process.env.KITTY_WINDOW_ID) {

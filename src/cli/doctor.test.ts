@@ -352,6 +352,7 @@ describe('runDoctorCheck', () => {
       type: 'tmux',
       layout: 'tiled',
       main_pane_size: 40,
+      equalize_panes: true,
     });
   });
 

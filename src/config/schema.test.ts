@@ -393,7 +393,33 @@ describe('MultiplexerConfigSchema', () => {
       type: 'none',
       layout: 'main-vertical',
       main_pane_size: 60,
+      equalize_panes: true,
     });
+  });
+
+  it('defaults equalize_panes to true and preserves an explicit false', () => {
+    expect(MultiplexerConfigSchema.parse({}).equalize_panes).toBe(true);
+    expect(
+      MultiplexerConfigSchema.parse({ equalize_panes: false }).equalize_panes,
+    ).toBe(false);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('disables pane management for a non-boolean equalize_panes', () => {
+    const result = PluginConfigSchema.safeParse({
+      multiplexer: { type: 'herdr', equalize_panes: 'yes' },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.multiplexer?.type).toBe('none');
+      // The invalid key is dropped, so the documented default applies.
+      expect(result.data.multiplexer?.equalize_panes).toBe(true);
+    }
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const message = warnSpy.mock.calls[0]?.[0] as string;
+    expect(message).toContain('Invalid multiplexer config value');
+    expect(message).toContain('equalize_panes');
   });
 
   it('exports an unsanitized schema that keeps invalid values visible', () => {

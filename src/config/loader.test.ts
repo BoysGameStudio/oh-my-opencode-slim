@@ -736,6 +736,7 @@ describe('loadPluginConfig', () => {
       layout: 'main-vertical',
       main_pane_size: 60,
       viewer: 'tui',
+      equalize_panes: true,
     });
   });
 
@@ -759,6 +760,7 @@ describe('loadPluginConfig', () => {
         layout: 'main-vertical',
         main_pane_size: 60,
         viewer: 'tui',
+        equalize_panes: true,
       });
     } finally {
       warnSpy.mockRestore();
@@ -792,6 +794,7 @@ describe('loadPluginConfig', () => {
       layout: 'tiled',
       main_pane_size: 40,
       viewer: 'mini',
+      equalize_panes: true,
     });
   });
 });
