@@ -59,11 +59,23 @@ import {
 
 const PLUGIN_NAME = 'oh-my-opencode-slim';
 const CONFIG_WARNING_COLOR = 'orange';
+/**
+ * Council agents are internal orchestration surfaces: `council`,
+ * `councillor`, and the dynamic `councillor-<name>` agents (v3 registry
+ * writes them into `snapshot.agentModels`). They must never appear as
+ * sidebar rows (#1672).
+ */
+function isCouncilSidebarAgent(agent: string): boolean {
+  return (
+    agent === 'council' ||
+    agent === 'councillor' ||
+    agent.startsWith('councillor-')
+  );
+}
+
 const FALLBACK_SIDEBAR_AGENTS = SUBAGENT_NAMES.filter(
   (agent) =>
-    agent !== 'councillor' &&
-    agent !== 'council' &&
-    !DEFAULT_DISABLED_AGENTS.includes(agent),
+    !isCouncilSidebarAgent(agent) && !DEFAULT_DISABLED_AGENTS.includes(agent),
 );
 const BORDER = { type: 'single' };
 const ACTIVITY_FRAME_MS = 100;
@@ -252,7 +264,9 @@ export function splitSidebarModelId(model: string): {
 }
 
 export function getSidebarAgentNames(snapshot: TuiSnapshot): string[] {
-  const configuredAgents = Object.keys(snapshot.agentModels);
+  const configuredAgents = Object.keys(snapshot.agentModels).filter(
+    (agent) => !isCouncilSidebarAgent(agent),
+  );
   return configuredAgents.length > 0
     ? configuredAgents
     : FALLBACK_SIDEBAR_AGENTS;
