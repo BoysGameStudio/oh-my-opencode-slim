@@ -80,7 +80,7 @@ export class OrcaMultiplexer implements Multiplexer {
   readonly type = 'orca' as const;
 
   private binaryPath: string | null = null;
-  private hasChecked = false;
+  private availabilityPromise: Promise<boolean> | null = null;
   private readonly layout: MultiplexerLayout;
   private readonly setTimer: (
     callback: () => void,
@@ -99,11 +99,16 @@ export class OrcaMultiplexer implements Multiplexer {
   }
 
   async isAvailable(): Promise<boolean> {
-    if (this.hasChecked) {
-      return this.binaryPath !== null;
+    // Cache and await the in-flight probe so concurrent callers (e.g. two
+    // child sessions spawning together) share one availability check instead
+    // of racing on a half-set flag.
+    if (!this.availabilityPromise) {
+      this.availabilityPromise = this.probeAvailability();
     }
-    this.hasChecked = true;
+    return this.availabilityPromise;
+  }
 
+  private async probeAvailability(): Promise<boolean> {
     const binary = await resolveBinary();
     if (!binary) return false;
 

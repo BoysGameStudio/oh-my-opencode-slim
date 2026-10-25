@@ -222,9 +222,9 @@ has no cwd flag (the split inherits the anchor's working directory).
 
 - **Auto / admission order**: cmux-tui (`CMUX_TUI_SOCKET` or legacy
   `CMUX_MUX_SOCKET`) → tmux (`TMUX_PANE`) → Zellij (`ZELLIJ_PANE_ID`) → Herdr
-  (`HERDR_PANE_ID`) → kitty (`KITTY_WINDOW_ID`) → Orca
-  (`ORCA_TERMINAL_HANDLE` + `TERM_PROGRAM=Orca`) → WezTerm (`WEZTERM_PANE`,
-  last so tmux/Zellij nested inside WezTerm win).
+  (`HERDR_PANE_ID`) → kitty (`KITTY_WINDOW_ID`) → WezTerm (`WEZTERM_PANE`,
+  so tmux/Zellij nested inside WezTerm win) → Orca (`ORCA_TERMINAL_HANDLE`,
+  last).
 - **Explicit adapter**: only enabled when it matches the detected adapter;
   otherwise `admission-mismatch` and no pane.
 - **Availability checks**: binary probes, Zellij >= 0.44.1 version gate, and
