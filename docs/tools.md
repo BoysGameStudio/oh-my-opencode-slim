@@ -80,7 +80,7 @@ conservatively passes the path through. Disable with
 |------|-------------|
 | `task_status` | Check task status; `result: true` retrieves a completed result; `diagnostic: true` reads an unsuccessful child's partial excerpt |
 | `task_message` | Send a non-interrupting message and return `queued` (queue-only: no wake, no steer channel) |
-| `task_reply` | Answer a child's pending question or permission request by task ID/alias and request ID |
+| `task_reply` | Answer a child's pending question or permission request by task ID/alias and request ID. On v2, question replies require `session.form.reply`; otherwise answer questions in the host UI |
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction (v1 only; on v2 continue with `subagent(sessionID, prompt)`) |
 | `wait_for_user` | Pause automatic orchestrator wake prompts until the next distinct external user message (v1 only; not registered on v2 — use the native `question` tool there) |

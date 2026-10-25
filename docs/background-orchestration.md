@@ -460,9 +460,9 @@ periodic internal wake prompt so incomplete TODOs are not abandoned. This is
 ```
 
 `intervalMs` must be an integer from `60000` to `2147483647`. `0` is invalid.
-`mode` selects the v1 wake condition: `"auto"` (default) uses todo-gating,
-falling back to children where the todo API is absent; `"todo"` and
-`"children"` pin one mode. Set `enabled: false` to disable wakes while keeping idle reconciliation
+`mode` selects the v1 wake condition: `"auto"` (default) always uses
+todo-gating; explicit `"todo"` falls back to children where the todo API is
+absent, and `"children"` selects children-driven mode. Set `enabled: false` to disable wakes while keeping idle reconciliation
 and background-job orchestration.
 
 This whole section is **v1-only**: on OpenCode v2 hosts the plugin creates no
@@ -636,8 +636,9 @@ keys and defaults.
 - **Wall-clock watchdog** — `backgroundJobs.wallClockTimeoutMs` (`0` disables;
   otherwise 60000 ms and up) supervises native background children only. On
   expiry the plugin asks the host to abort the child; the host's own terminal
-  report publishes the row, so the plugin never fabricates a terminal.
-  `abortGraceMs` bounds the wait for that confirmation.
+  report publishes the row, so the plugin never fabricates a terminal. The task
+  remains running until host evidence arrives; there is no confirmation timeout
+  (`abortGraceMs` was removed).
 ## Example Flow
 
 User asks:
