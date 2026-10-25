@@ -123,6 +123,7 @@ function makeBridge(options?: {
   requireKnownIdentity?: boolean | (() => boolean);
   marketplaceAgentNames?: () => ReadonlySet<string>;
   knownAgentNames?: () => ReadonlySet<string>;
+  defaultAgent?: () => string | undefined;
 }): ReturnType<typeof createPermissionRulesBridge> {
   return createPermissionRulesBridge(options?.session, {
     permissionForAgent: (agent) =>
@@ -141,6 +142,7 @@ function makeBridge(options?: {
     ...(options?.knownAgentNames
       ? { knownAgentNames: options.knownAgentNames }
       : {}),
+    ...(options?.defaultAgent ? { defaultAgent: options.defaultAgent } : {}),
     ...(options?.onUnavailable ? { onUnavailable: options.onUnavailable } : {}),
   });
 }
@@ -731,6 +733,63 @@ describe('createPermissionRulesBridge', () => {
     await expect(
       bridge.ensurePromptPermission('ses_root_without_agent'),
     ).rejects.toThrow('child session identity is unknown');
+    await bridge.dispose();
+  });
+
+  test('admits an agentless stored root session (`opencode run` without `--agent`) when marketplace agents are installed and default agent is non-marketplace (#1661)', async () => {
+    let lookupCount = 0;
+    const bridge = makeBridge({
+      session: {
+        get: async ({ sessionID }: { sessionID: string }) => {
+          lookupCount += 1;
+          // Host session record present, no parentID and no agent field
+          return {
+            data: {
+              id: sessionID,
+              directory: '/tmp/project',
+            },
+          };
+        },
+        update: async () => ({}),
+      } as unknown as V2Session,
+      requireKnownIdentity: () => true,
+      marketplaceAgentNames: () => new Set(['package-agent']),
+      knownAgentNames: () =>
+        new Set(['orchestrator', 'probe', 'package-agent']),
+      pluginAgents: new Set(['orchestrator', 'probe', 'package-agent']),
+      defaultAgent: () => 'orchestrator',
+    });
+
+    await expect(
+      bridge.ensurePromptPermission('ses_cli_run_default_agent'),
+    ).resolves.toBeUndefined();
+    expect(lookupCount).toBe(1);
+    await bridge.dispose();
+  });
+
+  test('denies an agentless stored root session when its resolved default agent is a marketplace agent (#1661)', async () => {
+    const bridge = makeBridge({
+      session: {
+        get: async ({ sessionID }: { sessionID: string }) => ({
+          data: {
+            id: sessionID,
+            directory: '/tmp/project',
+          },
+        }),
+        update: async () => ({}),
+      } as unknown as V2Session,
+      requireKnownIdentity: () => true,
+      marketplaceAgentNames: () => new Set(['package-agent']),
+      knownAgentNames: () => new Set(['orchestrator', 'package-agent']),
+      pluginAgents: new Set(['orchestrator', 'package-agent']),
+      defaultAgent: () => 'package-agent',
+    });
+
+    await expect(
+      bridge.ensurePromptPermission('ses_cli_run_marketplace_default'),
+    ).rejects.toThrow(
+      "direct root marketplace agent 'package-agent' cannot be admitted",
+    );
     await bridge.dispose();
   });
 
