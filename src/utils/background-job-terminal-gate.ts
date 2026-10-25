@@ -182,11 +182,16 @@ interface Observation {
   /** Slow-tier arms used in this episode (#1561). Resets only on genuine
    * live activity, never on idle redelivery. */
   rearms: number;
-  /** Episode number whose first exhaustion already logged `gave-up`; keeps
-   * the line at most once per episode while re-arms re-enter the branch. */
-  gaveUpLoggedAtEpisode?: number;
-  /** Episode number whose final give-up already logged `rearm exhausted`. */
-  rearmExhaustedLoggedAtEpisode?: number;
+  /**
+   * Set once the first exhaustion of the CURRENT recovery budget has been
+   * logged. Keyed to the budget's lifetime, not to `episode`: the unknown
+   * branch bumps `episode` on every failed read, so an episode-keyed guard
+   * would re-log on each slow read — exactly the case it must bound. Reset
+   * only where the budgets reset (live activity / new Observation).
+   */
+  gaveUpLogged?: boolean;
+  /** Same lifetime rule, for the final-give-up line. */
+  rearmExhaustedLogged?: boolean;
   timer?: TimerHandle;
 }
 
@@ -512,12 +517,23 @@ export function createBackgroundJobTerminalGate(options: {
    * host outcome that became attributable afterwards stranded the board entry
    * at `running`. This timer is the bounded continuation.
    *
-   * Returns whether an arm was scheduled, so the give-up branch can log the
-   * difference between "the slow tier took over" and "this is final".
+   * Returns why no arm was scheduled, so the caller can distinguish "recovery
+   * is still on its way" (a timer is already pending) from "the budget is
+   * genuinely spent" — logging them the same way would report a final
+   * give-up while a re-arm is still scheduled, and would burn the
+   * once-per-budget log flag on it.
    */
-  function scheduleEvidenceRearm(run: RunRef): boolean {
+  type RearmRefusal =
+    | 'armed'
+    | 'timer-pending'
+    | 'no-polling-capability'
+    | 'no-evidence-source'
+    | 'not-running'
+    | 'budget-exhausted';
+
+  function scheduleEvidenceRearm(run: RunRef): RearmRefusal {
     const value = observation(run);
-    if (!value) return false;
+    if (!value) return 'not-running';
     const client = options.input ? getClient(options.input) : undefined;
     // Guard 1: a host that exposes `session.status` already has a poller.
     // `createRuntimeStatusReconciler` re-passes every delayMs while
@@ -525,22 +541,23 @@ export function createBackgroundJobTerminalGate(options: {
     // retries this read forever on its own. Arming a second scheduler would
     // give one fact two owners; the reconciler wins because it also covers
     // every other running record in one batched read.
-    if (typeof client?.session?.status === 'function') return false;
+    if (typeof client?.session?.status === 'function')
+      return 'no-polling-capability';
     // Guard 2: no readable evidence source means no read can ever improve the
     // verdict — arming would burn timers for nothing.
     const hasEvidenceSource =
       options.readRuntime !== undefined ||
       typeof client?.session?.get === 'function' ||
       typeof client?.session?.messages === 'function';
-    if (!hasEvidenceSource) return false;
+    if (!hasEvidenceSource) return 'no-evidence-source';
     // Guard 3: a terminal record needs no evidence.
-    if (board.get(run.taskID)?.state !== 'running') return false;
-    // Guard 4: one timer slot per observation; the fast tier owns it when it
-    // is still arming (phases are mutually exclusive by construction).
-    if (value.timer) return false;
+    if (board.get(run.taskID)?.state !== 'running') return 'not-running';
+    // Guard 4: one timer slot per observation. A pending timer means recovery
+    // is ALREADY scheduled — not that the budget is spent.
+    if (value.timer) return 'timer-pending';
     // Guard 5: bounded.
     const max = options.maxEvidenceRearms ?? DEFAULT_MAX_EVIDENCE_REARMS;
-    if (value.rearms >= max) return false;
+    if (value.rearms >= max) return 'budget-exhausted';
     const base = options.evidenceRearmMs ?? DEFAULT_EVIDENCE_REARM_MS;
     const delay = Math.min(base * 2 ** value.rearms, REARM_CAP_MS);
     value.rearms += 1;
@@ -557,7 +574,7 @@ export function createBackgroundJobTerminalGate(options: {
       Math.max(1, delay),
     );
     value.timer.unref?.();
-    return true;
+    return 'armed';
   }
 
   function retry(run: RunRef, diagnostic?: string): GateResult {
@@ -586,11 +603,15 @@ export function createBackgroundJobTerminalGate(options: {
       // Give-up branch: the fast evidence budget is exhausted. Hand the
       // episode to the bounded slow tier; only when that refuses is this
       // final. Both logs are episode-scoped because re-arms re-enter here.
-      const armed = scheduleEvidenceRearm(run);
+      const refusal = scheduleEvidenceRearm(run);
+      const armed = refusal === 'armed';
       const maxEvidenceRearms =
         options.maxEvidenceRearms ?? DEFAULT_MAX_EVIDENCE_REARMS;
-      if (value.gaveUpLoggedAtEpisode !== value.episode) {
-        value.gaveUpLoggedAtEpisode = value.episode;
+      // Guards are keyed to the recovery budget's lifetime, not to `episode`:
+      // the unknown-runtime branch bumps `episode` on every failed read, so an
+      // episode-keyed guard would re-log on each slow read of the same budget.
+      if (!value.gaveUpLogged) {
+        value.gaveUpLogged = true;
         log('[terminal-gate] terminal evidence unavailable', {
           taskID: run.taskID,
           generation: run.generation,
@@ -601,11 +622,18 @@ export function createBackgroundJobTerminalGate(options: {
           rearm: { armed, rearms: value.rearms, maxEvidenceRearms },
         });
       }
-      // The final give-up is a distinct event from the first exhaustion, and
-      // it must fire even though the first log already fired this episode —
-      // hence a separate guard, not an `else` branch.
-      if (!armed && value.rearmExhaustedLoggedAtEpisode !== value.episode) {
-        value.rearmExhaustedLoggedAtEpisode = value.episode;
+      // The final give-up is a distinct event, so it gets its own guard rather
+      // than an `else` branch. Only a spent budget (or a host that can never
+      // read evidence again) is final: `timer-pending` means recovery is still
+      // scheduled, and reporting it as exhausted would be a lie — and would
+      // consume the guard that the real final give-up needs.
+      const final =
+        refusal === 'budget-exhausted' ||
+        refusal === 'no-evidence-source' ||
+        refusal === 'no-polling-capability' ||
+        refusal === 'not-running';
+      if (final && !value.rearmExhaustedLogged) {
+        value.rearmExhaustedLogged = true;
         log('[terminal-gate] terminal evidence rearm exhausted', {
           taskID: run.taskID,
           generation: run.generation,
@@ -614,6 +642,7 @@ export function createBackgroundJobTerminalGate(options: {
           rearms: value.rearms,
           maxEvidenceRearms,
           verdict: 'gave-up',
+          reason: refusal,
         });
       }
     }
@@ -785,8 +814,12 @@ export function createBackgroundJobTerminalGate(options: {
       value.episode += 1;
       value.quiescentSince = undefined;
       value.retries = 0;
-      // Genuine live activity starts a fresh slow-tier budget too.
+      // Genuine live activity starts a fresh slow-tier budget too, and with it
+      // a fresh log budget — otherwise the first exhaustion of the new run
+      // would stay silent, hiding the diagnosis for the new attempt.
       value.rearms = 0;
+      value.gaveUpLogged = false;
+      value.rearmExhaustedLogged = false;
       value.candidate = undefined;
       value.idleCandidate = undefined;
       if (value.timer) clearTimer(value.timer);

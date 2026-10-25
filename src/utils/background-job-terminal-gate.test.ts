@@ -27,6 +27,21 @@ mock.module('./opencode-client', () => ({
 }));
 
 const gates: BackgroundJobTerminalGate[] = [];
+/** Shared log capture: several suites assert on gate log lines. */
+function captureLogs() {
+  const entries: Array<{ message: string; data: unknown }> = [];
+  const spy = spyOn(loggerModule, 'log').mockImplementation(
+    (message: string, data?: unknown) => {
+      entries.push({ message, data });
+    },
+  );
+  return {
+    entries,
+    of: (message: string) =>
+      entries.filter((entry) => entry.message === message),
+    restore: () => spy.mockRestore(),
+  };
+}
 afterEach(() => {
   for (const gate of gates.splice(0)) gate.dispose();
 });
@@ -2317,11 +2332,15 @@ describe('evidence re-arm behavior (#1561)', () => {
   });
 
   test('T5(i): a fresh busy clears an armed re-arm and resets both budgets', async () => {
-    const h = shimHarness({ hideOutcomeForReads: 1_000 });
+    // The slow tier must exist for "an armed re-arm" to be cleared, so this
+    // fixture runs a real millisecond cadence: asserting an empty timer set
+    // without ever arming one would pass vacuously.
+    const h = shimHarness({
+      hideOutcomeForReads: 1_000,
+      gateOptions: { evidenceRearmMs: 5, maxEvidenceRearms: 4 },
+    });
     h.observe('busy', false, 100);
     h.advance(100);
-    // A contradicting idle makes the defer suspicious → budget drains to
-    // exhaustion, which arms the slow tier.
     const token = h.gate.capture(h.run);
     if (!token) throw new Error('missing observation');
     h.gate.observe(token, {
@@ -2331,14 +2350,31 @@ describe('evidence re-arm behavior (#1561)', () => {
       observedAt: 200,
     });
     h.advance(200);
-    for (let i = 0; i < 8; i++) await h.advanceBoth(5);
-    // Now a genuine busy: live activity resolves the suspicion honestly.
-    h.observe('busy', false, 900);
+    // Start reading, then drain the fast tier into the slow one.
+    await h.gate.reconcile(h.run);
+    for (let i = 0; i < 12; i++) await h.advanceBoth(5);
+    // A slow timer is genuinely pending now — the premise of the test.
+    expect(h.timers.pending()).toBe(1);
+    // A genuine busy: live activity resolves the suspicion honestly and
+    // clears the armed re-arm along with both budgets.
+    h.observe('busy', false, 5_000);
     expect(h.timers.pending()).toBe(0);
     const readsAfterBusy = h.reads();
     await h.advanceBoth(1_000);
     expect(h.reads()).toBe(readsAfterBusy);
     expect(h.timers.pending()).toBe(0);
+    // A *later* new idle contradiction re-engages a fresh fast budget, hence a
+    // fresh round of reads (that is what "resets both budgets" buys).
+    const token2 = h.gate.capture(h.run);
+    if (!token2) throw new Error('missing observation');
+    h.gate.observe(token2, {
+      kind: 'quiescent',
+      origin: 'session.idle',
+      readStartedAt: token2.readStartedAt,
+      observedAt: 6_000,
+    });
+    await h.gate.reconcile(h.run);
+    expect(h.reads()).toBeGreaterThan(readsAfterBusy);
   });
 
   test('T1: a late-attributable outcome terminalizes the stranded board', async () => {
@@ -2448,21 +2484,38 @@ describe('evidence re-arm behavior (#1561)', () => {
   });
 
   test('T9: arming is refused where a polling reconciler owns recovery', async () => {
-    // Same exhaustion shape, but the host exposes `session.status`: the 5 s
-    // `runtime-status-reconciliation` sweeper already retries, so the gate
-    // must not become a second scheduler for the same fact.
+    // Same exhaustion shape, but the host DOES expose `session.status`: the
+    // 5 s `runtime-status-reconciliation` sweeper already retries such
+    // records, so the gate must not become a second scheduler for one fact.
+    // The client must actually carry `session.status`, or this test would
+    // pass without ever reaching the guard it claims to pin.
+    const statusRead = mock(async () => ({
+      data: { child: { type: 'idle' } },
+    }));
     const h = harness({
       baselineFor: () => undefined,
-      readTerminalEvidence: async () => ({ data: [] }),
-      readRuntime: async (_run, readStartedAt) => ({
-        kind: 'busy' as const,
-        origin: 'session.status',
-        readStartedAt,
-      }),
+      readTerminalEvidence: async () => undefined,
       graceMs: 5,
+      evidenceRearmMs: 5,
+      input: {
+        client: { session: { status: statusRead } },
+      } as never,
     });
-    h.observe('quiescent');
-    for (let i = 0; i < 6; i++) await h.advanceBoth(5);
+    h.observe('busy', false, 100);
+    h.advance(100);
+    const token = h.gate.capture(h.run);
+    if (!token) throw new Error('missing observation');
+    h.gate.observe(token, {
+      kind: 'quiescent',
+      origin: 'session.idle',
+      readStartedAt: token.readStartedAt,
+      observedAt: 200,
+    });
+    h.advance(250);
+    // Drive to fast-budget exhaustion; the host's polling capability must stop
+    // the slow tier from arming.
+    await h.gate.reconcile(h.run);
+    for (let i = 0; i < 10; i++) await h.advanceBoth(5);
     expect(h.board.get(h.run.taskID)?.state).toBe('running');
     expect(h.timers.pending()).toBe(0);
   });
@@ -2631,13 +2684,18 @@ describe('concurrent re-arm idempotency (#1561)', () => {
     });
     h.advance(250);
     await h.gate.reconcile(h.run);
-    // Make the outcome visible, then race an event-driven reconcile against a
-    // re-arm fire: both must funnel through the per-identity `inFlight` dedup
-    // and `commit()`'s single-use authorization + board CAS.
+    // Drain the FAST tier while the outcome is still hidden, so a SLOW timer is
+    // genuinely pending. Racing against a 5 ms fast timer would not fire
+    // anything inside `advanceBoth(2)` and the test would pass vacuously.
+    for (let i = 0; i < 12; i++) await h.advanceBoth(5);
+    expect(h.timers.pending()).toBe(1);
+    // Make the outcome visible, then race an event-driven read against the
+    // pending slow timer: both must funnel through the per-identity `inFlight`
+    // dedup and `commit()`'s single-use authorization + board CAS.
     committed = true;
     idleAt = h.observationNow();
     const racing = h.gate.reconcile(h.run);
-    await h.advanceBoth(2);
+    await h.advanceBoth(5);
     await racing;
     await h.gate.reconcile(h.run);
     const record = h.board.get(h.run.taskID);
@@ -2646,5 +2704,81 @@ describe('concurrent re-arm idempotency (#1561)', () => {
     expect(publications).toHaveLength(1);
     expect(record?.terminalRevision).toBe(1);
     expect(h.timers.pending()).toBe(0);
+  });
+});
+
+describe('give-up log contract under repeated reads (#1561)', () => {
+  test('a pending re-arm is not reported as final exhaustion', async () => {
+    const capture = captureLogs();
+    try {
+      // Slow tier armed and waiting. An extra reconcile (a `task_status` call
+      // is exactly this) must not log the final line: recovery is still
+      // scheduled, and burning the once-per-budget guard there would hide the
+      // genuine final give-up later.
+      const h = shimHarness({
+        hideOutcomeForReads: 1_000,
+        gateOptions: { evidenceRearmMs: 60_000, maxEvidenceRearms: 4 },
+      });
+      h.observe('busy', false, 100);
+      h.advance(100);
+      const token = h.gate.capture(h.run);
+      if (!token) throw new Error('missing observation');
+      h.gate.observe(token, {
+        kind: 'quiescent',
+        origin: 'session.idle',
+        readStartedAt: token.readStartedAt,
+        observedAt: 200,
+      });
+      h.advance(250);
+      await h.gate.reconcile(h.run);
+      // Drain the fast tier; the slow arm is now pending for 60 s.
+      for (let i = 0; i < 12; i++) await h.advanceBoth(5);
+      expect(h.timers.pending()).toBe(1);
+      // Extra reads while it waits.
+      for (let i = 0; i < 3; i++) await h.gate.reconcile(h.run);
+      expect(
+        capture.of('[terminal-gate] terminal evidence rearm exhausted'),
+      ).toHaveLength(0);
+      // And the first-exhaustion line is still once-per-budget, not per read.
+      expect(
+        capture.of('[terminal-gate] terminal evidence unavailable'),
+      ).toHaveLength(1);
+    } finally {
+      capture.restore();
+    }
+  });
+
+  test('repeated unknown reads do not re-log give-up within one budget', async () => {
+    const capture = captureLogs();
+    try {
+      // On a host with only `session.get` and no retained busy observation,
+      // every hidden outcome observes `unknown`, which bumps `episode`. An
+      // episode-keyed guard would therefore re-log on every slow read; the
+      // guard must track the recovery budget instead.
+      let reads = 0;
+      const get = mock(async () => {
+        reads += 1;
+        return { data: { parentID: 'parent' } };
+      });
+      const h = harness({
+        baselineFor: () => undefined,
+        hostOutcomeClock: 'shared-unix-ms',
+        evidenceRearmMs: 5,
+        maxEvidenceRearms: 6,
+        input: { client: { session: { get } } } as never,
+      });
+      await h.gate.reconcile(h.run);
+      for (let i = 0; i < 80; i++) await h.advanceBoth(500);
+      expect(h.timers.pending()).toBe(0);
+      expect(reads).toBeGreaterThan(4);
+      expect(
+        capture.of('[terminal-gate] terminal evidence unavailable'),
+      ).toHaveLength(1);
+      expect(
+        capture.of('[terminal-gate] terminal evidence rearm exhausted'),
+      ).toHaveLength(1);
+    } finally {
+      capture.restore();
+    }
   });
 });
