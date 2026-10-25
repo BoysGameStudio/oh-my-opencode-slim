@@ -103,7 +103,7 @@ describe('peekByParentAndAgent', () => {
 
     // call a's after-hook consumed its pending; a late no-title
     // session.created may be a's stale child and must not claim b.
-    tracker.take('a');
+    tracker.take('a', 'parent-1');
 
     expect(tracker.peekByParentAndAgent('parent-1', 'oracle')).toBeUndefined();
   });
@@ -123,7 +123,7 @@ describe('peekByParentAndAgent', () => {
     tracker.add(pending({ callId: 'a', agentType: 'oracle' }));
     tracker.add(pending({ callId: 'b', agentType: 'fixer' }));
 
-    tracker.take('a');
+    tracker.take('a', 'parent-1');
 
     // The consumed oracle call cannot explain a fixer child.
     const hit = tracker.peekByParentAndAgent('parent-1', 'fixer');
@@ -140,7 +140,7 @@ describe('take', () => {
     tracker.add(first);
     tracker.add(second);
 
-    expect(tracker.peekByCallId('call-1')).toBeUndefined();
+    expect(tracker.peekByCallId('call-1', 'parent-3')).toBeUndefined();
     expect(tracker.take('call-1', 'wrong-parent')).toBeUndefined();
     expect(tracker.peekByCallId('call-1', 'parent-1')).toBe(first);
     expect(tracker.peekByCallId('call-1', 'parent-2')).toBe(second);
@@ -176,7 +176,7 @@ describe('take', () => {
 
     // A before-hook admission error rolls its own pending back without
     // recording consumption (tool.execute.before catch path).
-    const rolledBack = tracker.take('a', undefined, undefined, {
+    const rolledBack = tracker.take('a', 'parent-1', undefined, {
       recordConsumed: false,
     });
     expect(rolledBack?.callId).toBe('a');
@@ -230,7 +230,7 @@ describe('takeByTaskID', () => {
 
     expect(taken?.callId).toBe('a');
     // The other pending is untouched.
-    expect(tracker.take('b')?.callId).toBe('b');
+    expect(tracker.take('b', 'parent-1')?.callId).toBe('b');
   });
 
   test('returns undefined when no pending is claimed for the task ID', () => {
@@ -238,7 +238,7 @@ describe('takeByTaskID', () => {
     tracker.add(pending({ callId: 'a', earlyRegisteredTaskID: 'ses_x' }));
 
     expect(tracker.takeByTaskID('parent-1', 'ses_y')).toBeUndefined();
-    expect(tracker.take('a')?.callId).toBe('a');
+    expect(tracker.take('a', 'parent-1')?.callId).toBe('a');
   });
 
   test('leaves a pending owned by another board instance untouched', () => {
@@ -283,7 +283,7 @@ describe('takeUnresolvedFirstMatch', () => {
     // Consumption is recorded like take(): a later no-title child of
     // the same agent is treated as possibly stale.
     expect(tracker.hasConsumedCall('parent-1', 'oracle')).toBe(true);
-    expect(tracker.take('b')?.callId).toBe('b');
+    expect(tracker.take('b', 'parent-1')?.callId).toBe('b');
   });
 
   test('constrains by agent when the child agent is known', () => {
@@ -299,7 +299,7 @@ describe('takeUnresolvedFirstMatch', () => {
     });
 
     expect(taken?.callId).toBe('o1');
-    expect(tracker.take('f1')?.callId).toBe('f1');
+    expect(tracker.take('f1', 'parent-1')?.callId).toBe('f1');
   });
 
   test('returns undefined when no pending matches the known agent', () => {
@@ -312,7 +312,7 @@ describe('takeUnresolvedFirstMatch', () => {
         agentType: 'oracle',
       }),
     ).toBeUndefined();
-    expect(tracker.take('f1')?.callId).toBe('f1');
+    expect(tracker.take('f1', 'parent-1')?.callId).toBe('f1');
   });
 
   test('never consumes early-registered or rejected pendings', () => {

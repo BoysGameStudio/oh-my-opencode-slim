@@ -27,7 +27,9 @@ function makePending(
   };
 }
 
-function makeHarness() {
+function makeHarness(
+  options: { pending?: PendingTaskCall; hostFlavor?: string } = {},
+) {
   const board = new BackgroundJobBoard();
   const reconciles: Array<{
     kind?: string;
@@ -38,6 +40,7 @@ function makeHarness() {
       result?: string;
     };
   }> = [];
+  let releases = 0;
   const deps: RegisterDelegatedLaunchDeps = {
     directory: '/tmp',
     backgroundJobBoard: board,
@@ -60,7 +63,20 @@ function makeHarness() {
     bindConcurrencyTicket: () => {},
     clearRehydrateTombstone: () => {},
   };
-  return { board, deps, reconciles };
+  // After-hook shape: the tracker is the only extra dependency, and the
+  // release counter proves the pending was consumed exactly once.
+  const afterDeps = {
+    ...deps,
+    taskContextTracker: { ...deps.taskContextTracker, prune: () => {} },
+    pendingCallTracker: {
+      take: () => options.pending,
+      release: () => {
+        releases += 1;
+      },
+    },
+    hostFlavor: options.hostFlavor,
+  } as unknown as Parameters<typeof handleToolExecuteAfter>[2];
+  return { board, deps, reconciles, afterDeps, released: () => releases };
 }
 
 describe('registerDelegatedLaunchFromStructured', () => {
@@ -348,44 +364,19 @@ describe('parent-scoped pending consumption', () => {
 });
 
 describe('handleToolExecuteAfter v2 wrapper gate', () => {
-  function gateDeps(
-    board: BackgroundJobBoard,
-    pending: PendingTaskCall,
-  ): {
-    deps: Parameters<typeof handleToolExecuteAfter>[2];
-    released: () => number;
-  } {
-    let releases = 0;
-    const deps = {
-      directory: '/tmp',
-      backgroundJobBoard: board,
-      terminalGate: {
-        reconcile: async () => undefined,
-      } as unknown as BackgroundJobTerminalGate,
-      taskContextTracker: {
-        pendingManagedTaskIds: new Set<string>(),
-        addContext: () => {},
-        contextFilesForPrompt: () => [],
-        prune: () => {},
-      },
-      pendingCallTracker: {
-        take: () => pending,
-        release: () => {
-          releases += 1;
-        },
-      },
-      hostFlavor: 'v2',
-    } as unknown as Parameters<typeof handleToolExecuteAfter>[2];
-    return { deps, released: () => releases };
-  }
-
   const launchOutput =
     'The subagent is working in the background (sessionID: ses_launch).';
 
   test('gates the launch branch off for a wrapper-handled v2 call', async () => {
-    const board = new BackgroundJobBoard();
     const pending = makePending({ registeredByWrapper: true });
-    const { deps, released } = gateDeps(board, pending);
+    const {
+      board,
+      afterDeps: deps,
+      released,
+    } = makeHarness({
+      pending,
+      hostFlavor: 'v2',
+    });
 
     await handleToolExecuteAfter(
       { tool: 'task', sessionID: 'parent_1', callID: 'call_1' },
@@ -399,10 +390,9 @@ describe('handleToolExecuteAfter v2 wrapper gate', () => {
   });
 
   test('keeps the v1 prose lane live for the same pending (no gate)', async () => {
-    const board = new BackgroundJobBoard();
-    const pending = makePending({ registeredByWrapper: true });
-    const { deps } = gateDeps(board, pending);
-    (deps as { hostFlavor?: string }).hostFlavor = undefined;
+    const { board, afterDeps: deps } = makeHarness({
+      pending: makePending({ registeredByWrapper: true }),
+    });
 
     await handleToolExecuteAfter(
       { tool: 'task', sessionID: 'parent_1', callID: 'call_1' },
@@ -416,39 +406,31 @@ describe('handleToolExecuteAfter v2 wrapper gate', () => {
   const statusOutput =
     '<task id="child-1" state="completed">\n<task_result>\nok\n</task_result>\n</task>';
 
-  test('v2 registers a status-branch output without the v1 child-ref marker', async () => {
-    const board = new BackgroundJobBoard();
-    const pending = makePending();
-    const { deps } = gateDeps(board, pending);
-    const output = { output: statusOutput, metadata: {} };
+  test.each([
+    ['v2', false],
+    ['v1', true],
+  ] as const)(
+    'the %s status branch registers the launch with marker=%s',
+    async (hostFlavor, expectedMarker) => {
+      const { board, afterDeps: deps } = makeHarness({
+        pending: makePending(),
+        hostFlavor,
+      });
+      const output = { output: statusOutput, metadata: {} };
 
-    await handleToolExecuteAfter(
-      { tool: 'task', sessionID: 'parent_1', callID: 'call_1' },
-      output,
-      deps,
-    );
+      await handleToolExecuteAfter(
+        { tool: 'task', sessionID: 'parent_1', callID: 'call_1' },
+        output,
+        deps,
+      );
 
-    // Registration still happens (the alias is allocated and resolvable),
-    // but the v1-only identity comment is never rendered on v2 surfaces.
-    expect(board.get('child-1')?.state).toBe('running');
-    expect(String(output.output)).not.toContain('slim-child-ref');
-    expect(String(output.output)).toBe(statusOutput);
-  });
-
-  test('v1 renders the child-ref marker for the same status-branch output', async () => {
-    const board = new BackgroundJobBoard();
-    const pending = makePending();
-    const { deps } = gateDeps(board, pending);
-    (deps as { hostFlavor?: string }).hostFlavor = undefined;
-    const output = { output: statusOutput, metadata: {} };
-
-    await handleToolExecuteAfter(
-      { tool: 'task', sessionID: 'parent_1', callID: 'call_1' },
-      output,
-      deps,
-    );
-
-    expect(board.get('child-1')?.state).toBe('running');
-    expect(String(output.output)).toContain('slim-child-ref:v1');
-  });
+      // The alias is allocated and resolvable on both hosts; only the
+      // v1-only identity comment is flavor-dependent.
+      expect(board.get('child-1')?.state).toBe('running');
+      expect(String(output.output).includes('slim-child-ref:v1')).toBe(
+        expectedMarker,
+      );
+      if (!expectedMarker) expect(String(output.output)).toBe(statusOutput);
+    },
+  );
 });

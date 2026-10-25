@@ -241,8 +241,8 @@ export async function handleToolExecuteBefore(
     pendingCallTracker: {
       add(call: PendingTaskCall): void;
       take(
-        callID?: string,
-        sessionID?: string,
+        callID: string | undefined,
+        sessionID: string,
         ownerBoard?: BackgroundJobBoard,
         options?: { recordConsumed?: boolean },
       ): PendingTaskCall | undefined;
@@ -799,8 +799,8 @@ export async function handleToolExecuteAfter(
     terminalGate: BackgroundJobTerminalGate;
     pendingCallTracker: {
       take(
-        callID?: string,
-        sessionID?: string,
+        callID: string | undefined,
+        sessionID: string,
         ownerBoard?: BackgroundJobBoard,
         options?: { recordConsumed?: boolean },
       ): PendingTaskCall | undefined;
@@ -861,6 +861,10 @@ export async function handleToolExecuteAfter(
   }
 
   if (input.tool.toLowerCase() !== 'task') return;
+  // Task tool events are always session-scoped; a pending is keyed by
+  // (parent, callID), so an unscoped event can neither consume nor
+  // release one.
+  if (!input.sessionID) return;
 
   const exactCallID =
     typeof input.callID === 'string' && input.callID.trim() !== ''
@@ -969,42 +973,7 @@ export async function handleToolExecuteAfter(
     // for the child this output describes, regardless of call identity.
     const hostConfirmedBackground = backgroundMeta?.background === true;
     if (hostConfirmedBackground && !pending.background) {
-      // Foreground-fallback promoted this waiter to background before its
-      // fallback abort: the tool resolved via backgroundResult, so the
-      // pending (registered as a foreground call) must follow suit or the
-      // board record would stay foreground and miss the background-only
-      // observation and supervision paths.
-      pending.background = true;
-      // The foreground call skipped concurrency admission, so the
-      // promoted run would otherwise bypass the configured limits: take
-      // the same ticket a native background launch holds. No ready-await
-      // — the child is already running; registration below binds the
-      // ticket and the terminal path releases it.
-      if (
-        deps.backgroundTaskConcurrency &&
-        !pending.concurrencyTicket &&
-        // A host-promoted steer must not double-bind the running child's
-        // existing admission slot: bind() would replace it, and the
-        // terminal releaseTask frees only the newer entry.
-        !isSteeredCall(pending)
-      ) {
-        const isManagedTask = deps.backgroundJobBoard
-          .taskIDs()
-          .has(pending.parentSessionId);
-        if (!isManagedTask) {
-          pending.concurrencyTicket = deps.backgroundTaskConcurrency.acquire({
-            model: deps.getModelForAgent?.(
-              pending.agentType,
-              pending.parentSessionId,
-            ),
-          });
-          // Fire-and-forget accounting: nobody awaits ticket.ready here,
-          // so a rejection (queue cancelled by disposal while waiting)
-          // must be marked handled or it surfaces as an unhandled
-          // rejection. A granted or released ticket is unaffected.
-          void pending.concurrencyTicket.ready.catch(() => {});
-        }
-      }
+      adoptHostConfirmedBackground(pending, deps);
     }
     if (pending.earlyRegistrationRejected) {
       log(
@@ -1189,6 +1158,37 @@ export async function handleToolExecuteAfter(
     }
     pending.concurrencyTicket?.releaseIfUnbound();
   }
+}
+
+/**
+ * A foreground waiter promoted to background (or a native background launch)
+ * must follow the background lane and hold the same admission ticket a
+ * native background launch holds. The foreground call skipped admission, so
+ * take one now; registration binds it and the terminal path releases it.
+ * A host-promoted steer must not double-bind the running child's slot.
+ */
+function adoptHostConfirmedBackground(
+  pending: PendingTaskCall,
+  deps: Pick<
+    RegisterDelegatedLaunchDeps,
+    'backgroundJobBoard' | 'backgroundTaskConcurrency' | 'getModelForAgent'
+  >,
+): void {
+  pending.background = true;
+  if (
+    !deps.backgroundTaskConcurrency ||
+    pending.concurrencyTicket ||
+    isSteeredCall(pending)
+  ) {
+    return;
+  }
+  if (deps.backgroundJobBoard.taskIDs().has(pending.parentSessionId)) return;
+  pending.concurrencyTicket = deps.backgroundTaskConcurrency.acquire({
+    model: deps.getModelForAgent?.(pending.agentType, pending.parentSessionId),
+  });
+  // Nobody awaits ticket.ready on this lane, so a rejection (queue cancelled
+  // by disposal while waiting) must be marked handled.
+  void pending.concurrencyTicket.ready.catch(() => {});
 }
 
 function registerTaskOutputLaunch(
@@ -1381,36 +1381,8 @@ export async function registerDelegatedLaunchFromStructured(
   deps: RegisterDelegatedLaunchDeps,
 ): Promise<BackgroundJobRecord | undefined> {
   try {
-    // Host-confirmed background promotion (formerly only in the after-hook):
-    // a foreground waiter promoted before its fallback abort must follow the
-    // background lane and take the same admission ticket a native background
-    // launch holds. Idempotent for v1, where the after-hook already promoted.
     if (input.background && !input.pending.background) {
-      input.pending.background = true;
-      if (
-        deps.backgroundTaskConcurrency &&
-        !input.pending.concurrencyTicket &&
-        // A host-promoted steer must not double-bind the running child's
-        // existing admission slot (same rule as the after-hook block).
-        !isSteeredCall(input.pending)
-      ) {
-        const isManagedTask = deps.backgroundJobBoard
-          .taskIDs()
-          .has(input.pending.parentSessionId);
-        if (!isManagedTask) {
-          input.pending.concurrencyTicket =
-            deps.backgroundTaskConcurrency.acquire({
-              model: deps.getModelForAgent?.(
-                input.pending.agentType,
-                input.pending.parentSessionId,
-              ),
-            });
-          // Fire-and-forget accounting, matching the after-hook: nobody
-          // awaits ticket.ready here, so a rejection (queue cancelled by
-          // disposal while waiting) must be marked handled.
-          void input.pending.concurrencyTicket.ready.catch(() => {});
-        }
-      }
+      adoptHostConfirmedBackground(input.pending, deps);
     }
 
     const record = registerTaskOutputLaunch(

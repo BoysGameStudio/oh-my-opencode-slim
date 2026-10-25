@@ -202,29 +202,6 @@ describe('BackgroundJobSupervisor', () => {
     ).toEqual(expect.objectContaining({ kind: 'cancellation' }));
   });
 
-  test('a lease already held by another operation stands the watchdog down', async () => {
-    const { board, supervisor, timers, abort } = createSupervisor();
-    const job = launch(board, true);
-    supervisor.onLaunch(job);
-    // A user task_cancel (or relaunch/message operation) already owns the child.
-    const lease = board.acquireLease(
-      job.taskID,
-      job.generation,
-      'cancellation',
-    );
-    expect(lease).toBeDefined();
-
-    await timers.advanceTo(100);
-    expect(abort).not.toHaveBeenCalled();
-    // The watchdog does not forget the run: it retries the lease on a fixed
-    // interval while the competing operation still owns the child.
-    expect(timers.pending()).toBe(1);
-    if (lease) {
-      expect(board.validateLease(lease)).toBe(true);
-      board.releaseLease(lease);
-    }
-  });
-
   test('an occupied lease at expiry retries the acquisition and aborts once released', async () => {
     const { board, supervisor, timers, abort } = createSupervisor();
     const job = launch(board, true);
@@ -240,8 +217,10 @@ describe('BackgroundJobSupervisor', () => {
 
     await timers.advanceTo(100);
     expect(abort).not.toHaveBeenCalled();
-    // No abort, and the run is still tracked with one retry timer armed.
+    // No abort, the run is still tracked with one retry timer armed, and
+    // the competing lease stays valid (it was not stolen or released).
     expect(timers.pending()).toBe(1);
+    expect(lease && board.validateLease(lease)).toBe(true);
 
     if (lease) board.releaseLease(lease);
     await timers.advanceTo(100 + LEASE_RETRY_INTERVAL_MS);

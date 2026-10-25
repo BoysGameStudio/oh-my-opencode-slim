@@ -449,7 +449,7 @@ describe('parallel same-agent pairing (incident 2026-09-12)', () => {
     await hook['tool.execute.before'](...noIDBefore(L_A));
     await hook['tool.execute.before'](...noIDBefore(L_B));
     await hook['tool.execute.before'](...noIDBefore(L_C));
-    tracker.take('parent-1:anonymous-1');
+    tracker.take('parent-1:anonymous-1', 'parent-1');
 
     // No-title children are ambiguous → placeholders claim no pending.
     await hook.event(created({ child: sA }));

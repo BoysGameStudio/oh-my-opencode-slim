@@ -1,10 +1,9 @@
 /**
  * v2-only executor wrapper around the native `subagent` tool.
  *
- * v2 hosts return the child identity STRUCTURALLY
- * (`result.output.sessionID` / `result.metadata.sessionID`) and the
- * host-confirmed background marker in `result.metadata.background`; the
- * rendered text is prose for the model, not a parsing surface. This wrapper
+ * v2 hosts return the child identity and state STRUCTURALLY
+ * (`result.output.sessionID` / `result.output.status`); the rendered text is
+ * prose for the model, not a parsing surface. This wrapper
  * lets the plugin register delegated launches from the structured result
  * instead of scraping the rendered output, and marks the pending
  * handled-by-wrapper so the prose lane in `tool.execute.after` gates its
@@ -32,7 +31,9 @@ export interface SubagentStructuredLaunch {
   /** Child session/task ID from the structured executor result. */
   childTaskID: string;
   state: SubagentStructuredState;
-  /** Host-confirmed background promotion from structured metadata. */
+  /** Always false: v2.1.4 structured results carry no promotion marker.
+   *  Kept because the shared registration input still distinguishes the
+   *  prose lane's host-confirmed promotion. */
   background: boolean;
   /**
    * The child's final text, passed VERBATIM (never reformatted). Omitted
@@ -55,7 +56,7 @@ export interface SubagentExecutorWrapperOptions {
  *  when the executor threw (a thrown Tool.Error carries no structured
  *  fields). Format drift skips registration; the error still propagates
  *  unchanged. */
-export const HOST_FAILURE_MESSAGE_PATTERN =
+const HOST_FAILURE_MESSAGE_PATTERN =
   /\bSubagent (failed|cancelled) \(sessionID:\s*([^)\s]+)\)/i;
 
 /** Cross-instance replay guard: setup may re-run transforms, and a replayed
@@ -67,11 +68,6 @@ const WRAPPED_MARKER = Symbol.for(
 
 interface ExecutorResultLike {
   output?: { sessionID?: unknown; status?: unknown };
-  metadata?: {
-    sessionID?: unknown;
-    status?: unknown;
-    background?: unknown;
-  };
   /** The host-authored completion prose (the full `<subagent …>` block). */
   content?: unknown;
 }
@@ -103,12 +99,9 @@ function structuredLaunch(
 ): SubagentStructuredLaunch | undefined {
   if (!result || typeof result !== 'object') return undefined;
   const shaped = result as ExecutorResultLike;
-  const childTaskID =
-    readString(shaped.output?.sessionID) ??
-    readString(shaped.metadata?.sessionID);
+  const childTaskID = readString(shaped.output?.sessionID);
   if (!childTaskID) return undefined;
-  const rawState =
-    readString(shaped.output?.status) ?? readString(shaped.metadata?.status);
+  const rawState = readString(shaped.output?.status);
   const state: SubagentStructuredState =
     rawState === 'completed' || rawState === 'error' || rawState === 'cancelled'
       ? rawState
@@ -126,7 +119,7 @@ function structuredLaunch(
     parentSessionID,
     childTaskID,
     state,
-    background: shaped.metadata?.background === true,
+    background: false,
     ...(resultText !== undefined ? { result: resultText } : {}),
   };
 }

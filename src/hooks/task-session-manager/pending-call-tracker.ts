@@ -48,8 +48,8 @@ const MAX_PENDING_TASK_CALLS = 100;
 export interface PendingCallTracker {
   add(call: PendingTaskCall): void;
   take(
-    callId?: string,
-    parentSessionId?: string,
+    callId: string | undefined,
+    parentSessionId: string,
     ownerBoard?: BackgroundJobBoard,
     options?: { recordConsumed?: boolean },
   ): PendingTaskCall | undefined;
@@ -92,8 +92,8 @@ export interface PendingCallTracker {
    *  before-hook (callID = context.id) and mark launch registration handled,
    *  leaving the after-hook to consume and release it. No side effects. */
   peekByCallId(
-    callId: string | undefined,
-    parentSessionId?: string,
+    callId: string,
+    parentSessionId: string,
   ): PendingTaskCall | undefined;
   peekByParent(parentSessionId: string): PendingTaskCall | undefined;
   peekByParentAndAgent(
@@ -122,18 +122,6 @@ export function createPendingCallTracker(
   let anonymousPendingCallId = 0;
   const callKey = (parentSessionId: string, callId: string) =>
     JSON.stringify([parentSessionId, callId]);
-  const keyForCall = (callId: string, parentSessionId?: string) => {
-    if (parentSessionId !== undefined) {
-      return callKey(parentSessionId, callId);
-    }
-    let found: string | undefined;
-    for (const [key, call] of pendingCalls) {
-      if (call.callId !== callId) continue;
-      if (found !== undefined) return undefined;
-      found = key;
-    }
-    return found;
-  };
 
   /** Parents where a pending was consumed through the unresolved-identity
    *  drain fallback. The sole-survivor argument for a later no-callID
@@ -211,20 +199,17 @@ export function createPendingCallTracker(
       }
     },
 
-    take(
-      callId?: string,
-      parentSessionId?: string,
-      ownerBoard?: BackgroundJobBoard,
-      takeOptions?: { recordConsumed?: boolean },
-    ) {
+    take(callId, parentSessionId, ownerBoard, takeOptions) {
       // Set for a no-callId sole-survivor take on a parent whose
       // unresolved window is armed; the flag is applied only after the
       // fence checks below confirm this take actually consumes the
       // pending (a fenced take returns without consuming and must not
       // stain the pending for its owning generation).
       let unresolvedWindowTake = false;
-      let key: string | undefined;
-      if (!callId && parentSessionId) {
+      let key: string;
+      if (callId) {
+        key = callKey(parentSessionId, callId);
+      } else {
         // Without a tool call ID a take can only be sound when exactly
         // one pending exists for the parent. "A sole survivor belongs
         // to this call" is a sequential argument — it holds when the
@@ -245,8 +230,6 @@ export function createPendingCallTracker(
         // unresolved below.
         unresolvedWindowTake = unresolvedDrainParents.has(parentSessionId);
       }
-      key ??= callId ? keyForCall(callId, parentSessionId) : undefined;
-      if (!key) return undefined;
       const pending = pendingCalls.get(key);
       if (
         pending?.earlyRegistration &&
@@ -269,11 +252,9 @@ export function createPendingCallTracker(
       releaseCallLease(call);
     },
 
-    /** Exact parent/call lookup; an unscoped ambiguous ID is never guessed. */
-    peekByCallId(callId: string | undefined, parentSessionId?: string) {
-      if (!callId) return undefined;
-      const key = keyForCall(callId, parentSessionId);
-      return key === undefined ? undefined : pendingCalls.get(key);
+    /** Exact parent/call lookup; call IDs are never matched without a parent. */
+    peekByCallId(callId: string, parentSessionId: string) {
+      return pendingCalls.get(callKey(parentSessionId, callId));
     },
 
     /** Peek oldest pending call for a parent without removing it. */

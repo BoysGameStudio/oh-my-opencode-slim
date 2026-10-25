@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
   createSubagentExecutorWrapper,
-  HOST_FAILURE_MESSAGE_PATTERN,
   type SubagentStructuredLaunch,
 } from './subagent-executor-wrapper';
 
@@ -44,24 +43,6 @@ describe('createSubagentExecutorWrapper', () => {
         result: result.content,
       },
     ]);
-  });
-
-  test('carries host-confirmed background promotion from metadata', async () => {
-    const rec = recorder();
-    const wrapper = createSubagentExecutorWrapper({ register: rec.register });
-    const wrapped = wrapper.wrap(async () => ({
-      output: { sessionID: 'ses_promoted', status: 'running' },
-      metadata: { sessionID: 'ses_promoted', background: true },
-    }));
-
-    await wrapped({}, ctx);
-
-    expect(rec.launches).toHaveLength(1);
-    expect(rec.launches[0]).toMatchObject({
-      childTaskID: 'ses_promoted',
-      state: 'running',
-      background: true,
-    });
   });
 
   test('maps a completed foreground result to the terminal state', async () => {
@@ -235,7 +216,7 @@ describe('createSubagentExecutorWrapper', () => {
   test('fails open when the result carries no structured session ID', async () => {
     const rec = recorder();
     const wrapper = createSubagentExecutorWrapper({ register: rec.register });
-    const result = { content: 'not a delegated launch' };
+    const result = { output: {}, content: 'not a delegated launch' };
     const wrapped = wrapper.wrap(async () => result);
 
     expect(await wrapped({}, ctx)).toBe(result);
@@ -365,19 +346,5 @@ describe('createSubagentExecutorWrapper', () => {
     expect(wrapper.owns(wrapped)).toBe(true);
     expect(wrapper.owns(original)).toBe(false);
     expect(wrapper.owns(undefined)).toBe(false);
-  });
-
-  test('HOST_FAILURE_MESSAGE_PATTERN pins the verbatim host sentences', () => {
-    expect(
-      HOST_FAILURE_MESSAGE_PATTERN.exec(
-        'Subagent failed (sessionID: ses_abc): provider timeout',
-      )?.[2],
-    ).toBe('ses_abc');
-    expect(
-      HOST_FAILURE_MESSAGE_PATTERN.exec(
-        'Subagent cancelled (sessionID: ses_def): user interrupt',
-      )?.[2],
-    ).toBe('ses_def');
-    expect(HOST_FAILURE_MESSAGE_PATTERN.exec('Subagent finished')).toBeNull();
   });
 });
