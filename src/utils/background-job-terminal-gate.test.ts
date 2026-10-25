@@ -2653,14 +2653,31 @@ describe('replayed idle and rehydrate backstop (#1561)', () => {
 });
 
 describe('concurrent re-arm idempotency (#1561)', () => {
-  test('T4: an event reconcile racing the re-arm publishes exactly once', async () => {
+  test('T4: concurrent reads around a re-arm publish exactly once', async () => {
+    // The race must be REAL: hold a host read open, start an event-driven
+    // reconcile on top of it, then let the pending slow timer fire while that
+    // read is still unsettled. Only then do the per-identity `inFlight` dedup
+    // and `commit()`'s single-use authorization earn their keep.
+    let reads = 0;
     let committed = false;
     let idleAt = 0;
-    const get = mock(async () => ({
-      data: committed
-        ? { parentID: 'parent', outcome: 'succeeded', time: { idle: idleAt } }
-        : { parentID: 'parent' },
-    }));
+    let release: (() => void) | undefined;
+    const get = mock(async () => {
+      reads += 1;
+      const payload = {
+        data: committed
+          ? { parentID: 'parent', outcome: 'succeeded', time: { idle: idleAt } }
+          : { parentID: 'parent' },
+      };
+      // Once the outcome is committed, the first read hangs until released, so
+      // a second reconcile is guaranteed to overlap it.
+      if (committed && release === undefined) {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      return payload;
+    });
     const h = harness({
       baselineFor: () => undefined,
       hostOutcomeClock: 'shared-unix-ms',
@@ -2684,19 +2701,23 @@ describe('concurrent re-arm idempotency (#1561)', () => {
     });
     h.advance(250);
     await h.gate.reconcile(h.run);
-    // Drain the FAST tier while the outcome is still hidden, so a SLOW timer is
-    // genuinely pending. Racing against a 5 ms fast timer would not fire
-    // anything inside `advanceBoth(2)` and the test would pass vacuously.
+    // Drain the fast tier so a SLOW timer is genuinely pending.
     for (let i = 0; i < 12; i++) await h.advanceBoth(5);
     expect(h.timers.pending()).toBe(1);
-    // Make the outcome visible, then race an event-driven read against the
-    // pending slow timer: both must funnel through the per-identity `inFlight`
-    // dedup and `commit()`'s single-use authorization + board CAS.
+    // Commit, then start an event-driven reconcile whose read hangs open.
     committed = true;
     idleAt = h.observationNow();
-    const racing = h.gate.reconcile(h.run);
+    const eventReconcile = h.gate.reconcile(h.run);
+    await tick();
+    expect(release).toBeDefined();
+    // Fire the pending slow timer while that read is still unsettled: its
+    // reconcile must JOIN the open read instead of issuing a second one.
+    const readsBefore = reads;
     await h.advanceBoth(5);
-    await racing;
+    expect(reads).toBe(readsBefore);
+    // Release, then let every overlapping attempt settle.
+    release?.();
+    await eventReconcile;
     await h.gate.reconcile(h.run);
     const record = h.board.get(h.run.taskID);
     expect(record?.state).toBe('completed');
