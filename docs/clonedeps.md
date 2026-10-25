@@ -62,11 +62,9 @@ Ignored local clones live here, one folder per source repository:
 ```
 
 The safe folder name is based on the repository owner/name, not the package
-name, and may include a pinned-release suffix when multiple revisions need to
-coexist. For example, the TypeScript OpenCode repository
-`https://github.com/anomalyco/opencode.git` becomes
-`.slim/clonedeps/repos/anomalyco__opencode-v1.18.13/` when pinned to that
-release.
+name. For example, `https://github.com/anomalyco/opencode.git` becomes
+`.slim/clonedeps/repos/anomalyco__opencode/`. Do not add a version or package
+suffix: one clone per repository, shared by every manifest entry that needs it.
 
 If multiple packages come from the same monorepo, they share one cloned repo path
 and use different `packagePath` values in the manifest.

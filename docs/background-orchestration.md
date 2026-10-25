@@ -625,10 +625,9 @@ periodic internal wake prompt so incomplete TODOs are not abandoned. This is
 ```
 
 `intervalMs` must be an integer from `60000` to `2147483647`. `0` is invalid.
-`mode` selects the wake condition: `"auto"` (default) uses todo-gating on v1
-hosts and children-driven mode on v2 hosts; `"todo"` and `"children"` pin one
-mode (an explicit `"todo"` degrades to children on hosts without the todo
-API). Set `enabled: false` to disable wakes while keeping idle reconciliation
+`mode` selects the v1 wake condition: `"auto"` (default) uses todo-gating,
+falling back to children where the todo API is absent; `"todo"` and
+`"children"` pin one mode. Set `enabled: false` to disable wakes while keeping idle reconciliation
 and background-job orchestration.
 
 This whole section is **v1-only**: on OpenCode v2 hosts the plugin creates no

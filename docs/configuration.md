@@ -1022,7 +1022,7 @@ preset with only `model` (and `variant` if needed):
 }
 ```
 
-`loadAgentPrompt` (`src/config/loader.ts:418`) is preset-aware and reads
+`loadAgentPrompt` (`src/config/loader.ts:1006`) is preset-aware and reads
 `<agentName>.md` from the `oh-my-opencode-slim/` prompts directory. Lookup
 order:
 

@@ -138,9 +138,11 @@ New interview markdown files use a slugified idea followed by a unique ID.
 Example:
 
 - user input: `build a kanban app for design teams with lightweight reviews`
-- file: `interview/kanban-design-tool-<uuid>.md`
+- file: `interview/build-a-kanban-app-for-design-teams-with-lightwe-<uuid>.md`
 
-The title in the specification does not choose the filename.
+The title in the specification does not choose the filename. The slug is
+lowercased, every run of non-alphanumeric characters becomes `-`, and the
+result is cut to 48 characters.
 
 ### Frontmatter
 

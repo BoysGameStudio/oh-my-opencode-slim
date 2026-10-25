@@ -336,10 +336,10 @@ not an optional-degradation path.
       with the host error payload before the idle pair), and no
       `session.status`-based fallback remains. The execution-event
       synthesis keeps orchestrator-wake suppression/arm scheduling.
-      Automatic foreground fallback remains disabled on v2: the host has no
-      atomic turn-conditional
-      model switch, so a switch started for a failed turn could commit after a
-      newer user turn takes over. The Form and permission bridges above feed
+      Automatic foreground replay fallback remains disabled on v2: the host
+      has no atomic turn-conditional model switch, so a replay started for a
+      failed turn could commit after a newer user turn takes over. The
+      retry-hook steering path still runs and switches the model in place. The Form and permission bridges above feed
       the companion's waiting-input
       indicator and the task-session-manager input-wait gate. Form questions
       are observation-only for plugin code on the pinned v2 host: the promise
@@ -449,7 +449,7 @@ side cannot be observed.
 | Tool execute hooks (apply-patch recovery, task-session, json-recovery) | ✅ | ✅ `createToolExecuteBridges` with subagent→task normalization | — |
 | Built-in MCPs (context7, gh_grep) auto-registered | ✅ | ✅ `ctx.mcp.transform` | `ctx.mcp.transform` is present in all v2.0.x stable hosts; the runtime capability probe is belt-and-suspenders |
 | Background-job state persistence (tombstones, deletion epochs) | ➖ process-local | ✅ via `ctx.storage` | optional domain; absent → pure in-memory fallback, zero behavior change (see [Background job state](#background-job-state-rehydrate-probe-and-persistence)) |
-| Foreground model fallback (rate-limit failover) | ✅ | ❌ disabled pending an atomic turn-conditional host switch | v2's non-atomic `session.switchModel` + steer replay could alter/replay a newer turn |
+| Foreground model fallback (rate-limit failover) | ✅ | ⚠️ replay disabled; retry-hook steering active | v2's non-atomic `session.switchModel` + steer replay could alter/replay a newer turn, so only the in-place switch runs |
 | `/preset` (preset manager) | ✅ configuration writes; reload to apply | ✅ TUI entry (`./tui` → `dist/tui2.js`), with **Current session** / **Global default** selection; `/preset <name>` writes the global default | The command layer registers from an `append: "app"` slot render because `keymap.layer` is provider-scoped; commands carry an `id` and `slash.arguments`. The manager needs `ui.dialog.select` + `prompt` + `confirm`; feedback uses `ui.toast.show`. Session scope additionally requires server `ctx.storage`, session identity lookup and `ctx.rpc.register`, plus TUI `client.rpc`. It changes future subagent inference for the selected session, not its main model or existing children. User/project `.json` and `.jsonc` edits are watched (~300 ms debounce), including newly created candidates; they refresh defaults for future bindings, not saved snapshots. Global-write feedback acknowledges the refresh request, while session-apply feedback requires RPC confirmation. With persistence available, native subagent `progress` saves the child binding before the first prompt; `session.created` is not used to capture its profile. Reduced hosts retain legacy execution behavior. See [Preset switching](presets/preset-switching.md) for inheritance, reapplication and compatibility limits |
 | Default primary agent | ✅ finalized visible orchestrator identity | ✅ `draft.default(<visible orchestrator identity>)`; the canonical `orchestrator` entry remains a hidden alias when `displayName` is configured | v1 `default_agent` and v2 draft default target the same visible entry |
 | TUI default agent | ✅ orchestrator | ✅ host follows the default primary agent and hoists it to the head of the agent list | — |
@@ -779,13 +779,16 @@ Agent models are resolved the same way as v1 (per-agent `model` in
 v2, set a working provider+model in your config or the plugin's config file
 so delegated subagents can run.
 
-Automatic foreground fallback is disabled on v2, even when configured. The
-current host API cannot atomically switch a session model only if the failed
-turn is still current; an in-flight non-atomic `session.switchModel` could
-otherwise commit after a newer user turn takes over. Fallback will remain
-disabled until the host provides that turn-conditional operation. Other prompt
-callers, like the orchestrator-wake scheduler, only pin the current model and
-keep steering; this is not foreground fallback.
+The automatic replay path of foreground fallback is disabled on v2, even when
+configured: the current host API cannot atomically switch a session model only
+if the failed turn is still current, and an in-flight non-atomic
+`session.switchModel` replay could commit after a newer user turn takes over.
+The retry-hook steering path still runs: host retry events are absorbed up to
+`fallback.maxRetries`, then the model is switched in place and the host retries
+the current turn on it. `fallback.initialRetryDelayMs` has no steering form and
+is ignored there. Other prompt callers, like the orchestration scheduler (v1
+only), merely pin the current model and keep steering; this is not foreground
+fallback.
 
 ## Background job state: rehydrate probe and persistence
 

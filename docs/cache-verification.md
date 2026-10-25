@@ -44,9 +44,9 @@ mistakes that have not been made before:
   `randomUUID`, `performance.now`) outside a justified allowlist.
 - `src/v2/setup-command.test.ts` — runs the checkpoint pipeline through the
   V2 context bridge across a completion notification and tool-result
-  continuations, asserting retained boards and unchanged prior content.
-  Real tool-call batches also verify that changed boards wait for all results
-  and never separate calls from their results.
+  continuations, asserting that no job-board bytes ever enter the payload
+  (issue #1647) and that prior content stays byte-identical. Real tool-call
+  batches also verify that calls are never separated from their results.
 
 All hook injections must go through `src/hooks/cache-safe-injection.ts`; see
 the Prompt Cache Safety section in `AGENTS.md` for the authoring rules.
@@ -74,8 +74,8 @@ Each scenario is designed to fire specific plugin payload machinery:
 | `nudge` | direct file read, phase reminder across subsequent turns | extensive |
 | `todos` | todowrite churn (create/update/complete across turns) | extensive |
 | `long` | sliding cache breakpoints over a six-turn history | extensive |
-| `board` | job-board trailing injection, injected completion, reconcile | extensive |
-| `board-churn` | board strip/re-append across many turns; plateau detection (issue #874) | extensive |
+| `board` | background-job activity across turns: no board injection, completion notices only | extensive |
+| `board-churn` | many turns of job churn; the payload must never gain board bytes | extensive |
 | `running-lane` | running task tool_result mid-history across consecutive requests (PR #871) | extensive |
 | `agents` | repeated delegation, task-session reuse, subagent caching | extensive |
 

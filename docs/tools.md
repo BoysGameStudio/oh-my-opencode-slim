@@ -368,10 +368,12 @@ modified) never counts toward a block — and responds:
 The count is confirmed in `tool.execute.after`, so overlapping parallel
 calls cannot inflate it before their results are known.
 
-Exempt from the entire guard: the task-control and wait tools (`task`,
-`task_status`, `task_cancel`, `task_message`, `task_revive`,
-`wait_for_user`, `wait_for_background_tasks`) — those legitimately re-issue
-identical calls while polling a long-running background task.
+Exempt from the entire guard: `task`, `task_cancel`, `task_message`, and
+`task_revive` — they legitimately re-issue identical calls while a background
+task runs. `task_status` is warn-only (never hard-blocked), so a repeated
+status read cannot deadlock result retrieval. The wait tools (`wait_for_user`,
+`wait_for_background_tasks`) run a stricter per-turn counter of their own: the
+second repeat warns, and the guard refuses further repeats in that turn.
 
 Disable with `disabled_hooks: ["tool-loop-guard"]` (see
 [Hooks](configuration.md#hooks)).
