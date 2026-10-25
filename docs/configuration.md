@@ -621,7 +621,7 @@ The wall-clock supervisor is separately opt-in and remains disabled unless
 ```
 
 `orchestratorWake` defaults to enabled with a 5-minute continuous-idle
-interval and `"auto"` mode (todo-gated on v1 hosts, children-driven on v2).
+interval and `"auto"` mode (todo-gated on v1; v2 creates no scheduler).
 Set `enabled: false` to keep idle reconciliation and background-job orchestration
 without periodic wake prompts. See the
 [Background Orchestration](background-orchestration.md) guide for the concept,

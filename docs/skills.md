@@ -286,9 +286,8 @@ Other agents can be delegated tasks inside the worktree lane, but the Orchestrat
 Safety defaults:
 - Pre-flight check on Git repo status and dirty worktrees.
 - Strict confirmation gates for all git modifications (`worktree add/remove`, `merge`, `rebase`, `cherry-pick`, `reset --hard`, branch operations).
-- Branch names default to `omo/<slug>` but respect custom user patterns.
-- Use a proportionate final-state verification plan before final integration,
-  including checks required by repository and release instructions.
+- Branch names default to `omos/<slug>` but respect custom user patterns.
+- Use a proportionate final-state verification plan before final integration.
 
 See **[Worktrees](worktrees.md)** for the detailed safety protocol.
 

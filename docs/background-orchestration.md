@@ -615,30 +615,18 @@ in-flight prune always settles. Tombstones are consumed at most once and fence
 startup adoption.
 ### Admission and supervision
 
-Three opt-in knobs shape background execution; the
-[Configuration](configuration.md#background-job-management) table lists the
-keys and defaults.
+Three opt-in knobs shape background execution; keys, defaults, and the exact
+rules live in [Configuration](configuration.md#background-job-management).
 
-- **Concurrency** — `backgroundJobs.concurrency.{defaultConcurrency,
-  providerConcurrency, modelConcurrency}` caps concurrently running native
-  background tasks (`0` = unlimited; the most specific cap wins: model >
-  provider > default). Nested managed tasks are exempt, so a background
-  subagent that launches its own background children cannot self-deadlock.
-  Admission has no timeout: a task that never reaches a terminal state keeps
-  its slot forever, and queued tasks — including the orchestrator's `task`
-  calls — block behind it. Pair concurrency with the wall-clock watchdog.
-- **Same-provider conversion** — `backgroundJobs.sameProviderPolicy:
-  {"<provider>": "foreground"}` converts an explicit background call to the
-  foreground path when parent and child both resolve to that provider. It
-  exists for local backends that run several agent sessions on one shared model
-  runtime, where two large concurrent sessions thrash the KV cache.
-  Unconfigured or different providers keep background behavior.
-- **Wall-clock watchdog** — `backgroundJobs.wallClockTimeoutMs` (`0` disables;
-  otherwise 60000 ms and up) supervises native background children only. On
-  expiry the plugin asks the host to abort the child; the host's own terminal
-  report publishes the row, so the plugin never fabricates a terminal. The task
-  remains running until host evidence arrives; there is no confirmation timeout
-  (`abortGraceMs` was removed).
+- **Concurrency** caps running native background tasks (`0` = unlimited; the
+  most specific cap wins: model > provider > default). Nested managed tasks are
+  exempt, and admission has no timeout, so pair it with the watchdog.
+- **Same-provider conversion** (`sameProviderPolicy`) turns an explicit
+  background call into the foreground path when parent and child share the
+  configured local backend, avoiding KV-cache thrash.
+- **Wall-clock watchdog** (`wallClockTimeoutMs`) aborts a supervised child at
+  the deadline and lets the host publish the real terminal. There is no
+  confirmation timeout (`abortGraceMs` was removed).
 ## Example Flow
 
 User asks:
