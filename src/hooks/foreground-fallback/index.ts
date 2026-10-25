@@ -79,6 +79,10 @@ const QUOTA_BILLING_PATTERNS = [
   /"1310"/,
   /\bcoding plan package has expired\b/i,
   /\b(?:weekly|monthly) limit exhausted\b/i,
+  /\bindividual quota reached\b/i,
+  /\bupgrade your subscription to increase your limits\b/i,
+  /\baccount pool (?:has no account available|is unavailable)\b/i,
+  /\bquota resets? in\s+\d+(?:\.\d+)?\s*[dhms]\b/i,
 ];
 
 const PROVIDER_ERROR_PATTERNS = [
@@ -170,6 +174,7 @@ const TRANSPORT_MESSAGE_PATTERNS = [
   // messages (e.g. "stream error: Cannot connect to API") that carry no
   // transport code. Match the narrow phrase only.
   /cannot connect to api/i,
+  /did not begin a response within the pre-response time limit/i,
 ];
 const PROVIDER_OUTAGE_PATTERNS = [
   /\binternal server error\b/i,
@@ -397,6 +402,8 @@ function errorMessages(error: unknown): string[] {
     nestedField(error, 'message'),
     nestedField(nestedField(error, 'data'), 'message'),
     nestedField(nestedField(error, 'data'), 'responseBody'),
+    nestedField(nestedField(error, 'cause'), 'message'),
+    nestedField(error, 'responseBody'),
   ].map((value) => (typeof value === 'string' ? value : ''));
 }
 
