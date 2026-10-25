@@ -3,10 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import {
-  isReplayableUserMessage,
-  partsFromReplayMessage,
-} from '../hooks/types';
+import { isReplayableUserMessage } from '../hooks/types';
 import { createInternalAgentTextPart } from '../utils/internal-initiator';
 import { buildPluginInput } from './client-shim';
 import type { V2Context } from './types';
@@ -629,11 +626,11 @@ describe('v2 client shim delegation', () => {
     // (foreground-fallback depends on steering an in-flight run).
     await promptAsync({
       path: { id: 'ses_1' },
-      body: { parts: [{ type: 'text', text: 'fallback replay' }] },
+      body: { parts: [{ type: 'text', text: 'user prompt' }] },
     });
     expect(seq[2]).toMatchObject({
       m: 'prompt',
-      i: { sessionID: 'ses_1', delivery: 'steer', text: 'fallback replay' },
+      i: { sessionID: 'ses_1', delivery: 'steer', text: 'user prompt' },
     });
   });
 
@@ -787,10 +784,9 @@ describe('v2 client shim delegation', () => {
   });
 
   test('plain external prompts never route through session.synthetic', async () => {
-    // foreground-fallback replays real user parts through promptAsync —
-    // those must keep hitting session.prompt even on synthetic-capable
-    // hosts, or the fallback replay would stop being persisted as the
-    // session's user input.
+    // Real user parts sent through promptAsync must keep hitting
+    // session.prompt even on synthetic-capable hosts, or they would stop
+    // being persisted as the session's user input.
     const seq: Array<{ m: string; i: unknown }> = [];
     const input = buildPluginInput(
       makeCtx({
@@ -810,7 +806,7 @@ describe('v2 client shim delegation', () => {
       }
     ).session.promptAsync({
       path: { id: 'ses_1' },
-      body: { parts: [{ type: 'text', text: 'fallback replay' }] },
+      body: { parts: [{ type: 'text', text: 'user prompt' }] },
       modelSwitch: 'required',
     });
     expect(seq).toHaveLength(1);
@@ -818,14 +814,14 @@ describe('v2 client shim delegation', () => {
     expect(seq[0].i).toMatchObject({
       sessionID: 'ses_1',
       delivery: 'steer',
-      text: 'fallback replay',
+      text: 'user prompt',
     });
   });
 
-  test('mixed fallback replays (user parts + internal reminder) stay on session.prompt with files', async () => {
-    // Regression for the greptile P1 on #1158: foreground-fallback appends
-    // an internal-initiator reminder part to the user's real replay parts.
-    // An ANY-part gate routed the whole mixed body through
+  test('mixed bodies (user parts + internal reminder) stay on session.prompt with files', async () => {
+    // Regression for the greptile P1 on #1158: a body with the user's real
+    // parts plus an internal-initiator reminder part. An ANY-part gate
+    // routed the whole mixed body through
     // session.synthetic — dropping the file attachments (the synthetic
     // branch forwards text only) and skipping user-input persistence.
     // Only PURELY internal bodies may take the synthetic route.
@@ -1537,7 +1533,7 @@ describe('v2 client shim promptAsync model-switch hardening (#1125)', () => {
       path: { id: 'ses_1' },
       body: {
         model: { providerID: 'test', modelID: 'model-a' },
-        parts: [{ type: 'text', text: 'fallback replay' }],
+        parts: [{ type: 'text', text: 'user prompt' }],
       },
       modelVariant: 'default',
     });
@@ -1568,7 +1564,7 @@ describe('v2 client shim promptAsync model-switch hardening (#1125)', () => {
       path: { id: 'ses_1' },
       body: {
         model: { providerID: 'test', modelID: 'model-a' },
-        parts: [{ type: 'text', text: 'fallback replay' }],
+        parts: [{ type: 'text', text: 'user prompt' }],
       },
     });
     expect(seq.map((c) => c.m)).toEqual(['switchModel', 'prompt']);
@@ -1682,7 +1678,7 @@ describe('v2 client shim promptAsync model-switch hardening (#1125)', () => {
     expect(seq.map((c) => c.m)).toEqual(['prompt']);
   });
 
-  test('required fallback switch still runs for mixed replay bodies', async () => {
+  test('required model switch still runs for mixed bodies', async () => {
     const seq: Array<{ m: string; i: unknown }> = [];
     const promptAsync = makePromptAsync({
       get: async () => ({
@@ -1712,7 +1708,7 @@ describe('v2 client shim promptAsync model-switch hardening (#1125)', () => {
 });
 
 describe('v2 client shim foreground-fallback integration', () => {
-  test('replay → switchModel → steer prompt → interrupt flow', async () => {
+  test('replay → switchModel → synthetic reminder → interrupt flow', async () => {
     const seq: Array<{ m: string; i: unknown }> = [];
     const ctx = makeCtx({
       switchModel: async (i: unknown) => {
@@ -1720,6 +1716,10 @@ describe('v2 client shim foreground-fallback integration', () => {
       },
       prompt: async (i: unknown) => {
         seq.push({ m: 'prompt', i });
+        return {};
+      },
+      synthetic: async (i: unknown) => {
+        seq.push({ m: 'synthetic', i });
         return {};
       },
       interrupt: async (i: unknown) => {
@@ -1750,29 +1750,17 @@ describe('v2 client shim foreground-fallback integration', () => {
       }
     ).session;
 
-    // Step 1 of the fallback flow: fetch the transcript and locate the last
-    // replayable user message using the real pipeline helpers.
+    // Step 1 of the fallback flow: fetch the transcript and confirm a user
+    // turn using the real pipeline helper.
     const result = await session.messages({ path: { id: 'ses_1' } });
-    const lastUser = [...(result.data ?? [])]
-      .reverse()
-      .find(isReplayableUserMessage);
-    expect(lastUser).toBeDefined();
-    if (!lastUser) throw new Error('expected a replayable user message');
-    const replayParts = partsFromReplayMessage(lastUser) as Array<{
-      type: 'text';
-      text: string;
-    }>;
-    expect(replayParts).toEqual([
-      { type: 'text', text: 'Fix the failing build' },
-    ]);
+    expect([...(result.data ?? [])].some(isReplayableUserMessage)).toBe(true);
 
-    // Step 2: re-submit with the fallback model exactly like
-    // foreground-fallback does (replay parts + synthetic reminder).
+    // Step 2: the replay body foreground-fallback sends — only the internal
+    // reminder, with the required model switch.
     await session.promptAsync({
       path: { id: 'ses_1' },
       body: {
         parts: [
-          ...replayParts,
           createInternalAgentTextPart(
             'The previous model request failed and is being retried.',
           ),
@@ -1784,11 +1772,12 @@ describe('v2 client shim foreground-fallback integration', () => {
         },
         agent: 'orchestrator',
       },
+      modelSwitch: 'required',
     });
 
     // v2 semantics: switchModel first (v1 {providerID, modelID, variant} →
-    // v2 {id, providerID, variant}), then a non-blocking steer prompt carrying both the
-    // original user text and the synthetic reminder.
+    // v2 {id, providerID, variant}), then the reminder through the
+    // synthetic admission; the user's request stays in the host history.
     expect(seq[0]).toMatchObject({
       m: 'switchModel',
       i: {
@@ -1800,16 +1789,11 @@ describe('v2 client shim foreground-fallback integration', () => {
         },
       },
     });
-    expect(seq[1]).toMatchObject({
-      m: 'prompt',
-      i: { sessionID: 'ses_1', delivery: 'steer' },
-    });
-    expect((seq[1].i as { text: string }).text).toContain(
-      'Fix the failing build',
-    );
+    expect(seq[1]).toMatchObject({ m: 'synthetic', i: { sessionID: 'ses_1' } });
     expect((seq[1].i as { text: string }).text).toContain(
       'The previous model request failed',
     );
+    expect(seq.some((c) => c.m === 'prompt')).toBe(false);
 
     // Step 3: abort maps to interrupt with resume:false.
     await session.abort({ path: { id: 'ses_1' } });
@@ -1853,10 +1837,6 @@ describe('v2 client shim foreground-fallback integration', () => {
     ]);
     const message = result.data[0];
     expect(isReplayableUserMessage(message)).toBe(true);
-    expect(partsFromReplayMessage(message as never)).toEqual([
-      { type: 'text', text: 'hello' },
-      { type: 'reasoning', text: 'inner' },
-    ]);
   });
 
   // ── Task 4 live gap: terminal metadata must survive the mapping ──
@@ -2000,7 +1980,7 @@ describe('v2 client shim foreground-fallback integration', () => {
   });
 });
 
-describe('v2 client shim replay attachment preservation', () => {
+describe('v2 client shim v1 prompt attachment translation', () => {
   test('promptAsync maps image/file parts into v2 prompt files', async () => {
     const prompts: Array<Record<string, unknown>> = [];
     const input = buildPluginInput(

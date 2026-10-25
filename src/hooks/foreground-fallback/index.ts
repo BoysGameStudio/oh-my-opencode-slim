@@ -8,9 +8,10 @@
  *   2. Aborts host retry or unknown-finish loops via client.session.abort();
  *      other session.error and message.updated paths re-prompt directly
  *      without abort.
- *   3. Re-queues the last user message via client.session.promptAsync()
- *      with the new model - promptAsync returns immediately so we never
- *      block the event handler waiting for a full LLM response.
+ *   3. Sends an internal reminder via client.session.promptAsync() with
+ *      the new model, which reads the user's request from history -
+ *      promptAsync returns immediately so we never block the event handler
+ *      waiting for a full LLM response.
  *
  * Spent-allowance errors (issue #966) mark the failing provider exhausted
  * for the descent: failover skips that provider's remaining chain entries,
@@ -56,7 +57,7 @@ import {
 } from '../../utils/session';
 import type { SessionLifecycle } from '../session-lifecycle';
 import type { createBackgroundFallbackHandoff } from '../task-session-manager/fallback-observation-transfer';
-import { isReplayableUserMessage, partsFromReplayMessage } from '../types';
+import { isReplayableUserMessage } from '../types';
 
 type BackgroundFallbackHandoff = ReturnType<
   typeof createBackgroundFallbackHandoff
@@ -2293,11 +2294,6 @@ export class ForegroundFallbackManager {
       args: Record<string, unknown>,
     ) => Promise<unknown>;
 
-    const replayParts = partsFromReplayMessage(lastUser) as Array<{
-      type: 'text';
-      text: string;
-    }>;
-
     // No `modelSwitch: 'required'`: the replay targets the session's
     // CURRENT model, so the v2 shim may skip the switch (preserving the
     // host-side variant) and hosts without session.switchModel can still
@@ -2308,7 +2304,8 @@ export class ForegroundFallbackManager {
       path: { id: sessionID },
       body: {
         messageID: `msg${randomUUID()}`,
-        parts: [...replayParts, createInternalAgentTextPart(opts.trailerText)],
+        // Trailer only, as in execFallback.
+        parts: [createInternalAgentTextPart(opts.trailerText)],
         model,
         ...(opts.variant ? { variant: opts.variant } : {}),
         agent: opts.agentName,
@@ -3007,7 +3004,7 @@ export class ForegroundFallbackManager {
         (await this.ensureSessionAgent(sessionID));
       if (!agentName || !this.isCurrentTurn(sessionID, expectedEpoch)) return;
 
-      // Retrieve the last user message to re-submit with the fallback model.
+      // Confirm there is a user turn before sending the replay reminder.
       // Fence captured BEFORE any await in the preparation: a board
       // relaunch during the transcript read or the admission await must
       // not enroll the new generation under this (stale) attempt's
@@ -3096,11 +3093,6 @@ export class ForegroundFallbackManager {
         args: Record<string, unknown> & { modelSwitch?: 'required' },
       ) => Promise<unknown>;
 
-      const replayParts = partsFromReplayMessage(lastUser) as Array<{
-        type: 'text';
-        text: string;
-      }>;
-
       // v2-only flag (consumed by the client shim): the replay's model is
       // the fallback TARGET, so a v2 host without session.switchModel must
       // reject the replay (typed error) instead of silently replaying on
@@ -3112,8 +3104,11 @@ export class ForegroundFallbackManager {
         path: { id: sessionID },
         body: {
           messageID: `msg${randomUUID()}`,
+          // Reminder only: the user's request is already in the history the
+          // fallback model reads. Copying its stored parts (ids included)
+          // would make the host upsert the original rows and re-expand
+          // file/agent parts into this message.
           parts: [
-            ...replayParts,
             createInternalAgentTextPart(
               "<system-reminder>\nThe previous model request failed and is being retried with a fallback model. Continue processing the user's original request above. Do not respond to this reminder.\n</system-reminder>",
             ),

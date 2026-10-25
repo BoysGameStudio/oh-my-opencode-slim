@@ -60,7 +60,7 @@ export function findLatestUserMessage(
 }
 
 /**
- * A user message that can be replayed into a fallback prompt.
+ * A user turn that a fallback replay can follow up on.
  *
  * Accepts both the v1 transform shape (`{ info: { role: 'user' }, parts }`)
  * and the v2 `session.messages()` shape (`{ type: 'user', text }`) returned
@@ -84,17 +84,4 @@ export function isReplayableUserMessage(
   }
   const candidate = message as { type?: unknown };
   return candidate.type === 'user';
-}
-
-export function partsFromReplayMessage(
-  message: ReplayableUserMessage,
-): MessagePart[] {
-  const parts = (message as Partial<MessageWithParts>).parts;
-  if (Array.isArray(parts)) {
-    return parts;
-  }
-  const text = (message as { text?: string }).text;
-  return typeof text === 'string' && text.length > 0
-    ? [{ type: 'text', text }]
-    : [];
 }
