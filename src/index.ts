@@ -1632,7 +1632,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     deepworkGuardHook = createDeepworkGuardHook(ctx);
     jsonErrorRecovery = createJsonErrorRecoveryHook(ctx);
-    toolLoopGuard = createToolLoopGuardHook();
+    toolLoopGuard = createToolLoopGuardHook({ directory: ctx.directory });
 
     // Pre-created wrapped handlers for tool.execute.after (error-isolated)
     deepworkGuardAfter = wrapPostToolHook('deepwork-guard', (i, o) =>

@@ -637,4 +637,59 @@ describe('tool-loop-guard', () => {
     expect(o3.output).toContain(LOOP_GUARD_WARNING);
     expect(o3.output).not.toContain(WAIT_GUARD_MARKER);
   });
+
+  test('normalizes equivalent read path spellings and allows forward pagination after truncation', async () => {
+    hook = createToolLoopGuardHook({ directory: '/workspace/proj' });
+    const truncatedPage1 =
+      'Read file src/big.ts, lines 1-100\n[content]\nOutput truncated. Continue reading with offset: 101';
+    const spellings = [
+      { path: 'src/big.ts', offset: 1, limit: 100 },
+      { path: './src/big.ts', offset: 1, limit: 100 },
+      { filePath: '/workspace/proj/src/big.ts', offset: 1, limit: 100 },
+      { path: 'src//big.ts', offset: 1, limit: 100 },
+      { path: 'src/big.ts', offset: 1, limit: 100 },
+    ];
+    for (let i = 0; i < spellings.length; i++) {
+      await hook['tool.execute.before'](beforeInput({ callID: `p${i + 1}` }), {
+        args: spellings[i],
+      });
+      const out = {
+        output:
+          i === 2
+            ? 'Read file /workspace/proj/src/big.ts, lines 1-100\n[content]\nOutput truncated. Continue reading with offset: 101'
+            : truncatedPage1,
+        metadata: {},
+      };
+      await hook['tool.execute.after'](
+        afterInput({ callID: `p${i + 1}` }),
+        out,
+      );
+      if (i >= 2) {
+        expect(out.output).toContain(LOOP_GUARD_WARNING);
+      }
+    }
+
+    // 6th read of the same page is blocked even with another path alias
+    await expect(
+      hook['tool.execute.before'](beforeInput({ callID: 'p6_same' }), {
+        args: { path: './src/big.ts', offset: 1, limit: 100 },
+      }),
+    ).rejects.toThrow('infinite loop');
+
+    // Forward pagination (offset > maxEndLine) on the truncated file is allowed
+    await expect(
+      hook['tool.execute.before'](beforeInput({ callID: 'p6_next' }), {
+        args: { path: 'src/big.ts', offset: 101, limit: 100 },
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  test('observeNewUserMessage resets read streak across user turns', async () => {
+    for (let i = 1; i <= 4; i++) {
+      await runIdenticalCall(`t1_${i}`, { filePath: 'a.ts' });
+    }
+    hook.observeNewUserMessage('s1', 'msg-next-turn');
+    const fresh = await runIdenticalCall('t2_1', { filePath: 'a.ts' });
+    expect(fresh.output).toBe('...file contents...');
+  });
 });

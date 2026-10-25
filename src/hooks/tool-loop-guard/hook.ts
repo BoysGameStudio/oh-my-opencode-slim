@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { log } from '../../utils/logger';
 
 /**
@@ -113,6 +114,61 @@ STOP repeating this call. Instead:
 /** Max entries per tracking map before FIFO eviction. */
 export const MAX_TRACKED_SESSIONS = 512;
 
+export interface ToolLoopGuardOptions {
+  directory?: string;
+}
+
+export function normalizeReadTarget(
+  rawPath: string,
+  directory?: string,
+): string {
+  let cleaned = rawPath.replace(/\\/g, '/').trim().replace(/\/+/g, '/');
+  while (cleaned.startsWith('./')) {
+    cleaned = cleaned.slice(2);
+  }
+  if (directory && path.isAbsolute(rawPath)) {
+    const rel = path
+      .relative(directory, path.resolve(rawPath))
+      .replace(/\\/g, '/');
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+      return rel;
+    }
+  }
+  return path.posix.normalize(cleaned);
+}
+
+function extractReadContentAndRegion(
+  output: string,
+  canonicalPath?: string,
+): {
+  rawContent: string;
+  endLine: number;
+  truncated: boolean;
+} {
+  let text = output;
+  if (text.includes(LOOP_GUARD_MARKER)) {
+    const idx = text.indexOf(LOOP_GUARD_MARKER);
+    const stripIdx = idx > 0 && text[idx - 1] === '\n' ? idx - 1 : idx;
+    text = text.slice(0, stripIdx);
+  }
+  let endLine = 0;
+  let truncated = false;
+  const linesMatch = text.match(/^Read file .+?, lines \d+-(\d+)/m);
+  if (linesMatch) {
+    endLine = Number.parseInt(linesMatch[1], 10);
+    truncated = /\bOutput truncated\b|Continue reading with offset/i.test(text);
+  } else {
+    endLine = text ? text.split('\n').length : 0;
+  }
+  if (canonicalPath) {
+    text = text.replace(
+      /^Read file .+?, (lines \d+-.*)$/m,
+      `Read file ${canonicalPath}, $1`,
+    );
+  }
+  return { rawContent: text, endLine, truncated };
+}
+
 /** Deterministic fingerprint of tool + args, insensitive to key order. */
 function fingerprint(tool: string, args: unknown): string {
   return `${tool.toLowerCase()}:${stableStringify(args)}`;
@@ -139,12 +195,16 @@ interface SessionState {
   runs: number;
   /** Fingerprint of the most recent completed call's output. */
   lastOutput: string;
+  maxEndLine?: number;
+  truncated?: boolean;
 }
 
 interface CallState {
   sessionID: string;
   key: string;
   taskID?: string;
+  canonicalPath?: string;
+  offset?: number;
 }
 
 interface TaskSupervisionState {
@@ -152,7 +212,7 @@ interface TaskSupervisionState {
   runs: number;
 }
 
-const TASK_SUPERVISION_TOOLS = new Set(['task_status']);
+const TASK_SUPERVISION_TOOLS = new Set(['task_status', 'task_result']);
 
 function taskIDFromArgs(args: unknown): string | undefined {
   if (!args || typeof args !== 'object' || Array.isArray(args))
@@ -198,7 +258,9 @@ export interface ToolLoopGuardHook {
   resetForTests(): void;
 }
 
-export function createToolLoopGuardHook(): ToolLoopGuardHook {
+export function createToolLoopGuardHook(
+  options?: ToolLoopGuardOptions,
+): ToolLoopGuardHook {
   const sessions = new Map<string, SessionState>();
   /** Per-call state so `after` can re-check without re-deriving args. */
   const callKeys = new Map<string, CallState>();
@@ -261,7 +323,37 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
         return;
       }
 
-      const key = fingerprint(tool, output.args);
+      let canonicalPath: string | undefined;
+      let requestedOffset = 1;
+      if (
+        tool === 'read' &&
+        output.args &&
+        typeof output.args === 'object' &&
+        !Array.isArray(output.args)
+      ) {
+        const rec = output.args as Record<string, unknown>;
+        const rawPath =
+          typeof rec.path === 'string'
+            ? rec.path
+            : typeof rec.filePath === 'string'
+              ? rec.filePath
+              : undefined;
+        if (rawPath && rawPath.trim() !== '') {
+          canonicalPath = normalizeReadTarget(rawPath, options?.directory);
+        }
+        if (
+          typeof rec.offset === 'number' &&
+          Number.isFinite(rec.offset) &&
+          rec.offset >= 1
+        ) {
+          requestedOffset = rec.offset;
+        }
+      }
+
+      const key =
+        tool === 'read' && canonicalPath
+          ? `read:${canonicalPath}`
+          : fingerprint(tool, output.args);
       if (TASK_SUPERVISION_TOOLS.has(tool)) {
         if (input.callID) {
           callKeys.set(input.callID, {
@@ -287,17 +379,30 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
         existing.runs >= LOOP_GUARD_BLOCK_AT &&
         LOOP_GUARD_BLOCK_TOOLS[tool]
       ) {
-        log('[tool-loop-guard] blocked repeated tool call', {
-          sessionID,
-          tool,
-          runs: existing.runs,
-        });
-        throw new Error(
-          `Refusing to execute "${tool}": this exact call (same tool, same arguments) has returned identical results ${existing.runs} times in a row and constitutes an infinite loop. Stop repeating it. Reassess your goal, make a different call, or produce your final answer.`,
-        );
+        const isPaginating =
+          tool === 'read' &&
+          existing.truncated === true &&
+          requestedOffset > (existing.maxEndLine ?? 0);
+        if (!isPaginating) {
+          log('[tool-loop-guard] blocked repeated tool call', {
+            sessionID,
+            tool,
+            runs: existing.runs,
+          });
+          throw new Error(
+            `Refusing to execute "${tool}": this exact call (same tool, same arguments) has returned identical results ${existing.runs} times in a row and constitutes an infinite loop. Stop repeating it. Reassess your goal, make a different call, or produce your final answer.`,
+          );
+        }
       }
 
-      if (input.callID) callKeys.set(input.callID, { sessionID, key });
+      if (input.callID) {
+        callKeys.set(input.callID, {
+          sessionID,
+          key,
+          canonicalPath,
+          offset: requestedOffset,
+        });
+      }
     },
 
     'tool.execute.after': async (
@@ -373,25 +478,51 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
         }
         return;
       }
+      let endLine = 0;
+      let truncated = false;
+      let outputToHash: unknown = output.output;
+      if (tool === 'read' && typeof output.output === 'string') {
+        const extracted = extractReadContentAndRegion(
+          output.output,
+          call?.canonicalPath,
+        );
+        endLine = extracted.endLine;
+        truncated = extracted.truncated;
+        outputToHash = extracted.rawContent;
+      }
+
       const key = call?.key;
-      const outputHash = fingerprint(tool, output.output);
+      const outputHash = fingerprint(tool, outputToHash);
 
       const existing = sessions.get(sessionID);
       let state: SessionState;
       if (existing && key !== undefined && key === existing.last) {
         // Identical args. Advance the run only when the result is also
         // identical; a changed result is progress and restarts the run.
-        state = {
-          last: key,
-          runs: outputHash === existing.lastOutput ? existing.runs + 1 : 1,
-          lastOutput: outputHash,
-        };
+        state =
+          outputHash === existing.lastOutput
+            ? {
+                last: key,
+                runs: existing.runs + 1,
+                lastOutput: outputHash,
+                maxEndLine: Math.max(existing.maxEndLine ?? 0, endLine),
+                truncated,
+              }
+            : {
+                last: key,
+                runs: 1,
+                lastOutput: outputHash,
+                maxEndLine: endLine,
+                truncated,
+              };
       } else {
         // Different args or untracked call: start a fresh run.
         state = {
           last: key ?? `${tool}:<untracked>`,
           runs: 1,
           lastOutput: outputHash,
+          maxEndLine: endLine,
+          truncated,
         };
       }
       sessions.set(sessionID, state);
@@ -412,6 +543,7 @@ export function createToolLoopGuardHook(): ToolLoopGuardHook {
     observeNewUserMessage(sessionID: string, messageID: string): void {
       if (userMessageIdentities.get(sessionID) === messageID) return;
       userMessageIdentities.set(sessionID, messageID);
+      sessions.delete(sessionID);
       resetTaskSupervision(sessionID);
       waitRuns.delete(sessionID);
     },
