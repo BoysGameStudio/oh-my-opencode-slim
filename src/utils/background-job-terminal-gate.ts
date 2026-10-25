@@ -587,6 +587,8 @@ export function createBackgroundJobTerminalGate(options: {
       // episode to the bounded slow tier; only when that refuses is this
       // final. Both logs are episode-scoped because re-arms re-enter here.
       const armed = scheduleEvidenceRearm(run);
+      const maxEvidenceRearms =
+        options.maxEvidenceRearms ?? DEFAULT_MAX_EVIDENCE_REARMS;
       if (value.gaveUpLoggedAtEpisode !== value.episode) {
         value.gaveUpLoggedAtEpisode = value.episode;
         log('[terminal-gate] terminal evidence unavailable', {
@@ -596,27 +598,22 @@ export function createBackgroundJobTerminalGate(options: {
           attempt: value.retries,
           verdict: 'gave-up',
           reason: diagnostic,
-          rearm: {
-            armed,
-            rearms: value.rearms,
-            maxEvidenceRearms:
-              options.maxEvidenceRearms ?? DEFAULT_MAX_EVIDENCE_REARMS,
-          },
+          rearm: { armed, rearms: value.rearms, maxEvidenceRearms },
         });
-      } else if (
-        !armed &&
-        value.rearmExhaustedLoggedAtEpisode !== value.episode
-      ) {
+      }
+      // The final give-up is a distinct event from the first exhaustion, and
+      // it must fire even though the first log already fired this episode —
+      // hence a separate guard, not an `else` branch.
+      if (!armed && value.rearmExhaustedLoggedAtEpisode !== value.episode) {
         value.rearmExhaustedLoggedAtEpisode = value.episode;
         log('[terminal-gate] terminal evidence rearm exhausted', {
           taskID: run.taskID,
           generation: run.generation,
           state: board.get(run.taskID)?.state,
           attempt: value.retries,
-          verdict: 'gave-up',
           rearms: value.rearms,
-          maxEvidenceRearms:
-            options.maxEvidenceRearms ?? DEFAULT_MAX_EVIDENCE_REARMS,
+          maxEvidenceRearms,
+          verdict: 'gave-up',
         });
       }
     }
