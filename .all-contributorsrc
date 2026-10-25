@@ -1271,6 +1271,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "YMoose",
+      "name": "YMoose",
+      "avatar_url": "https://avatars.githubusercontent.com/u/42179813?v=4",
+      "profile": "https://github.com/YMoose",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"
