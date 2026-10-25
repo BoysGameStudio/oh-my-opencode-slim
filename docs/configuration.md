@@ -345,7 +345,7 @@ Only subagent inference settings (`model`, `variant`, `temperature`,
 skills, MCPs and marketplace activation keep their normal host lifecycle.
 Invalid configuration preserves the last-known-good defaults. On v1, apply
 the preset to the configuration and reload OpenCode as before. See
-[Preset Switching](preset-switching.md) for scope, timing and concurrent-session
+[Preset Switching](presets/preset-switching.md) for scope, timing and concurrent-session
 examples.
 
 ### Preset inheritance

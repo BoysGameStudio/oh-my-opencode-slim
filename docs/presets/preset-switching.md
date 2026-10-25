@@ -180,4 +180,4 @@ changing one does not overwrite the other. Use **Global default** to change
 future work and **Current session** to change future delegations in work that
 is already bound.
 
-> See [Configuration](configuration.md) for the full preset option reference.
+> See [Configuration](../configuration.md) for the full preset option reference.

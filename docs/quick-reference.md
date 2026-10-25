@@ -16,7 +16,7 @@
 | [Background Orchestration](background-orchestration.md) | Default scheduler-first orchestrator model for native background subagents |
 | [Interview](interview.md) | `/interview` command, browser UI, dashboard mode, multi-session coordination |
 | [Multiplexer Integration](multiplexer-integration.md) | Real-time pane monitoring, layouts, troubleshooting |
-| [Preset Switching](preset-switching.md) | `/preset` command for runtime agent model switching |
+| [Preset Switching](presets/preset-switching.md) | `/preset` command for runtime agent model switching |
 | [Codemap Skill](codemap.md) | Hierarchical codemap generation |
 
 ## ⚙️ Config & Reference
@@ -32,4 +32,4 @@
 
 | Doc | Contents |
 |-----|----------|
-| [Author's Preset](authors-preset.md) | The exact config the author runs daily - OpenAI + Fireworks AI + GitHub Copilot |
+| [Author's Preset](presets/authors-preset.md) | The exact config the author runs daily - OpenAI + Fireworks AI + GitHub Copilot |

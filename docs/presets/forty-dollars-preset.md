@@ -79,4 +79,4 @@ It represents the powerhouse dual-subscription setup for developers holding both
 | --- | --- | --- |
 | `*` | All installed skills (wildcard) | `public` |
 
-For the complete configuration reference, see [Configuration](configuration.md).
+For the complete configuration reference, see [Configuration](../configuration.md).
