@@ -1,6 +1,6 @@
 # Tools & Capabilities
 
-Built-in tools available to agents beyond the standard file and shell operations.
+What Slim adds to OpenCode. Native tools are documented upstream; this page covers the tools Slim registers and the native calls it intercepts.
 
 ## apply_patch rescue
 
@@ -39,7 +39,6 @@ Fast, structural code search and refactoring - more powerful than plain text gre
 
 | Tool | Description |
 |------|-------------|
-| `grep` | Fast content search using ripgrep |
 | `ast_grep_search` | AST-aware code pattern matching across 25 languages |
 | `ast_grep_replace` | AST-aware code refactoring with dry-run support |
 
@@ -79,9 +78,9 @@ conservatively passes the path through. Disable with
 
 | Tool | Description |
 |------|-------------|
-| `task` | Start a specialist task and return its task ID |
 | `task_status` | Check task status; `result: true` retrieves a completed result; `diagnostic: true` reads an unsuccessful child's partial excerpt |
 | `task_message` | Send a non-interrupting message and return `queued` (queue-only: no wake, no steer channel) |
+| `task_reply` | Answer a child's pending question or permission request by task ID/alias and request ID |
 | `task_cancel` | Stop a generation while retaining its session |
 | `task_revive` | Resume a retained session with a new instruction (v1 only; on v2 continue with `subagent(sessionID, prompt)`) |
 | `wait_for_user` | Pause automatic orchestrator wake prompts until the next distinct external user message (v1 only; not registered on v2 — use the native `question` tool there) |
@@ -377,14 +376,3 @@ identical calls while polling a long-running background task.
 Disable with `disabled_hooks: ["tool-loop-guard"]` (see
 [Hooks](configuration.md#hooks)).
 
----
-
-## Formatters
-
-OpenCode automatically formats files after they are written or edited, using language-specific formatters. No manual step needed.
-
-Includes Prettier, Biome, `gofmt`, `rustfmt`, `ruff`, and 20+ others.
-
-> See the [official OpenCode docs](https://opencode.ai/docs/formatters/#built-in) for the complete list.
-
----

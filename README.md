@@ -737,7 +737,7 @@ Use this section as a map: start with installation, then jump to features, confi
 | **[Developer Evals](docs/evals.md)** | Source-checkout routing/reliability harness, offline scoring, and advisory model judging |
 | **[Skills](docs/skills.md)** | Bundled skills such as `simplify`, `codemap`, `clonedeps`, `deepwork`, `verification-planning`, `step-back`, `deanchor`, `ai-estimates`, `reflect`, `worktrees`, and `oh-my-opencode-slim` |
 | **[MCPs](docs/mcps.md)** | `context7`, `gh_grep`, and how MCP permissions work per agent |
-| **[Tools](docs/tools.md)** | Built-in tool capabilities like `webfetch`, LSP tools, code search, and formatters |
+| **[Tools](docs/tools.md)** | What Slim adds: background task control, `ast_grep` search, and the enhanced `webfetch` |
 
 ---
 
