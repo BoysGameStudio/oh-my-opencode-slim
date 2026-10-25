@@ -7,6 +7,7 @@ import { log } from '../utils/logger';
 import { CmuxMultiplexer } from './cmux';
 import { HerdrMultiplexer } from './herdr';
 import { KittyMultiplexer } from './kitty';
+import { OrcaMultiplexer } from './orca';
 import { TmuxMultiplexer } from './tmux';
 import type { Multiplexer } from './types';
 import { WeztermMultiplexer } from './wezterm';
@@ -66,6 +67,10 @@ export function getMultiplexer(config: MultiplexerConfig): Multiplexer | null {
       );
       actualType = 'wezterm';
       break;
+    case 'orca':
+      multiplexer = new OrcaMultiplexer(config.layout);
+      actualType = 'orca';
+      break;
     case 'auto': {
       // Auto-detect from pane-scoped client environment signals only.
       // Note: Does NOT fall back to binary availability checks.
@@ -101,13 +106,18 @@ export function getMultiplexer(config: MultiplexerConfig): Multiplexer | null {
         );
         actualType = 'kitty';
       } else if (process.env.WEZTERM_PANE) {
-        // Last: WezTerm hosts tmux/zellij sessions, which must win when
-        // nested inside it.
+        // WezTerm hosts tmux/zellij sessions, which must win when nested
+        // inside it.
         multiplexer = new WeztermMultiplexer(
           config.layout,
           config.main_pane_size,
         );
         actualType = 'wezterm';
+      } else if (process.env.ORCA_TERMINAL_HANDLE) {
+        // Last: Orca hosts the same nested sessions, so it sits at the end of
+        // the chain for the same reason WezTerm does.
+        multiplexer = new OrcaMultiplexer(config.layout);
+        actualType = 'orca';
       } else {
         // Not inside any session, disable multiplexer
         log('[multiplexer] auto: not inside any session, disabling');

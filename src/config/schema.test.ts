@@ -13,6 +13,7 @@ import {
   DISABLED_HOOKS_VALUES,
   InterviewConfigSchema,
   MarketplaceActivationSchema,
+  MULTIPLEXER_INVALID_VALUE_MESSAGE,
   MultiplexerConfigSchema,
   MultiplexerConfigStrictSchema,
   PermissionConfigSchema,
@@ -449,6 +450,8 @@ describe('MultiplexerConfigSchema', () => {
       'zellij',
       'herdr',
       'kitty',
+      'wezterm',
+      'orca',
       'cmux-tui',
       'none',
     ] as const) {
@@ -1301,6 +1304,26 @@ describe('PluginConfigSchema removed legacy keys', () => {
       expect(
         result.error.issues.map((issue) => issue.message).join('\n'),
       ).toContain('was removed');
+    }
+  });
+
+  it('accepts orca as a multiplexer type with sibling keys', () => {
+    const parsed = MultiplexerConfigSchema.parse({
+      type: 'orca',
+      layout: 'main-horizontal',
+      main_pane_size: 40,
+    });
+    expect(parsed.type).toBe('orca');
+    expect(parsed.layout).toBe('main-horizontal');
+    expect(parsed.main_pane_size).toBe(40);
+  });
+
+  it('lists orca in the invalid multiplexer value message', () => {
+    expect(MULTIPLEXER_INVALID_VALUE_MESSAGE).toContain('orca');
+    const result = MultiplexerConfigSchema.safeParse({ type: 'bogus' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.type).toBe('none');
     }
   });
 });
