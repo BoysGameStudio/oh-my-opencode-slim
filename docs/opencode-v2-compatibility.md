@@ -298,6 +298,13 @@ not an optional-degradation path.
       the v1 after-hook output from the error text (so json-error-recovery
       still appends its reminder to a failed call's output), and an
       errored call never presents its result content as a success.
+      The v2 executor wrapper registers child identity and state from the
+      structured result, scoped by `(parentSessionID, callID)`. For terminal
+      result text, it extracts the body of a leading `<subagent>` block with
+      the shared task-output parser; an empty block supplies no answer to the
+      terminal gate. Plain content and thrown failure details are preserved.
+      The host's returned object and rendered content remain unchanged, and
+      the after-hook skips duplicate launch registration for wrapped calls.
    - `event` → `ctx.event.subscribe()` loop feeding `mapV2EventToV1`
       (`src/v2/event-adapter.ts`): additive synthesis only — the raw v2 event
       is always dispatched first (the interview bridge depends on it), then
