@@ -130,7 +130,9 @@ and ambiguous MCP namespaces are rejected.
 capability: a package's `tools` list never grants it, and a manifest tool
 grant (for example `read`) never implies it. Owner configuration can declare
 it via `agents.<name>.permission.external_directory` — a
-whole-tool `allow`/`ask`/`deny` or a path-pattern map such as
+whole-tool `allow`/`ask`/`deny` or a path-pattern map. The native guard checks
+an external directory boundary, normally ending in `/*`, separately from the
+file's `read` or `edit` permission. For example,
 `{ "/approved/*": "allow", "/approved/private/*": "deny" }`. Finalized host
 permission rules also participate in ordered matching: an applicable host
 allow, including a wildcard-action allow, can open the guard, while a later

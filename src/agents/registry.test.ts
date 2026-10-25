@@ -3520,11 +3520,7 @@ describe('marketplace agent customization', () => {
   // narrows it — never a manifest tool grant or the projection's wildcard —
   // and an absent declaration stays denied on both the registered policy and
   // every compiled child payload.
-  const externalGrid = [
-    '/approved/report.txt',
-    '/approved/private/secret.txt',
-    '/elsewhere/x.txt',
-  ];
+  const externalGrid = ['/approved/*', '/approved/private/*', '/elsewhere/*'];
 
   const decideOfRules = (rules: readonly V2PermissionRule[]) =>
     compilePermissionPolicy({ baselineRules: [], hostRules: rules }).decide;
@@ -3535,6 +3531,216 @@ describe('marketplace agent customization', () => {
     agents: {
       'market-agent': { skills: ['skill-a'], mcps: ['host-mcp'], ...agents },
     },
+  });
+
+  const v3DirectoryPackage = {
+    schemaVersion: 3,
+    skills: [],
+    mcps: [],
+    tools: ['read'],
+    routing: {
+      lane: 'External reference inspection',
+      stats: ['Read approved reference files'],
+      delegateWhen: ['Reference inspection is required'],
+      avoid: ['Implementation work'],
+      additionalInstructions: [],
+    },
+  };
+
+  test('external_directory: V3 OMO grants work without native Agent entries', () => {
+    for (const effect of ['allow', 'ask', 'deny'] as const) {
+      const registry = configured(
+        {
+          agents: {
+            'market-agent': {
+              displayName: 'ReferenceReader',
+              permission: { external_directory: effect },
+            },
+          },
+        },
+        { hostFlavor: 'v2', mcps: [], packageOverrides: v3DirectoryPackage },
+      );
+      for (const name of ['market-agent', 'ReferenceReader']) {
+        const policy = registry.nativePolicies[name];
+        const child = decideOfRules(
+          registry.compileChildPermissions(name, policy.rules),
+        );
+        expect(policy.decide('external_directory', '/reference/*')).toBe(
+          effect,
+        );
+        expect(child('external_directory', '/reference/*')).toBe(effect);
+        expect(policy.decide('read', '/reference/notes.md')).toBe('allow');
+        expect(child('read', '/reference/notes.md')).toBe('allow');
+        for (const action of [
+          'edit',
+          'write',
+          'shell',
+          'subagent',
+          'skill',
+          'other_mcp_query',
+        ]) {
+          expect(policy.decide(action, '*')).toBe('deny');
+          expect(child(action, '*')).toBe('deny');
+        }
+      }
+    }
+  });
+
+  test('external_directory: V3 host grants and narrow restrictions survive child projection', () => {
+    const registry = configured(
+      {},
+      {
+        hostFlavor: 'v2',
+        mcps: [],
+        packageOverrides: v3DirectoryPackage,
+      },
+    );
+    const finalized = [
+      ...registry.nativePolicies['market-agent'].rules,
+      { action: '*', resource: '*', effect: 'allow' as const },
+      {
+        action: 'external_directory',
+        resource: '/reference/private/*',
+        effect: 'deny' as const,
+      },
+      {
+        action: 'external_directory',
+        resource: '/reference/manual/*',
+        effect: 'ask' as const,
+      },
+    ];
+    const child = registry.compileChildPermissions('market-agent', finalized);
+    const decide = decideOfRules(child);
+    expect(decide('external_directory', '/reference/*')).toBe('allow');
+    expect(decide('external_directory', '/reference/private/*')).toBe('deny');
+    expect(decide('external_directory', '/reference/manual/*')).toBe('ask');
+    expect(decide('read', '/reference/notes.md')).toBe('allow');
+    for (const action of [
+      'write',
+      'shell',
+      'subagent',
+      'unlisted_tool',
+      'skill',
+      'other_mcp_query',
+    ]) {
+      expect(decide(action, '*')).toBe('deny');
+    }
+    const twice = decideOfRules(
+      registry.compileChildPermissions('market-agent', child),
+    );
+    for (const resource of [
+      '/reference/*',
+      '/reference/private/*',
+      '/reference/manual/*',
+    ]) {
+      expect(twice('external_directory', resource)).toBe(
+        decide('external_directory', resource),
+      );
+    }
+  });
+
+  test('external_directory: V3 directory resource maps preserve order and normalized paths', () => {
+    const registry = configured(
+      {
+        agents: {
+          'market-agent': {
+            permission: {
+              external_directory: {
+                '*': 'deny',
+                '/reference/*': 'allow',
+                '/reference/private/*': 'deny',
+                'C:/reference/*': 'allow',
+              },
+            },
+          },
+        },
+      },
+      { hostFlavor: 'v2', mcps: [], packageOverrides: v3DirectoryPackage },
+    );
+    const policy = registry.nativePolicies['market-agent'];
+    const decide = decideOfRules(
+      registry.compileChildPermissions('market-agent', policy.rules),
+    );
+    for (const [resource, effect] of [
+      ['/reference/*', 'allow'],
+      ['/reference/private/*', 'deny'],
+      ['/unapproved/*', 'deny'],
+      ['C:\\reference\\*', 'allow'],
+    ] as const) {
+      expect(policy.decide('external_directory', resource)).toBe(effect);
+      expect(decide('external_directory', resource)).toBe(effect);
+    }
+    const reversed = configured(
+      {
+        agents: {
+          'market-agent': {
+            permission: {
+              external_directory: { '/reference/*': 'allow', '*': 'deny' },
+            },
+          },
+        },
+      },
+      { hostFlavor: 'v2', mcps: [], packageOverrides: v3DirectoryPackage },
+    );
+    expect(
+      reversed.nativePolicies['market-agent'].decide(
+        'external_directory',
+        '/reference/*',
+      ),
+    ).toBe('deny');
+  });
+
+  test('external_directory: V3 wildcard and tool grants do not synthesize a guard grant', () => {
+    for (const permission of [{}, { '*': 'allow' as const }]) {
+      const registry = configured(
+        { agents: { 'market-agent': { permission } } },
+        {
+          hostFlavor: 'v2',
+          mcps: [],
+          packageOverrides: v3DirectoryPackage,
+        },
+      );
+      expect(
+        registry.nativePolicies['market-agent'].decide(
+          'external_directory',
+          '/reference/*',
+        ),
+      ).toBe('deny');
+      expect(
+        decideOfRules(registry.compileChildPermissions('market-agent', []))(
+          'external_directory',
+          '/reference/*',
+        ),
+      ).toBe('deny');
+    }
+    const noRead = configured(
+      {
+        agents: {
+          'market-agent': {
+            permission: {
+              external_directory: 'allow',
+            },
+          },
+        },
+      },
+      {
+        hostFlavor: 'v2',
+        mcps: [],
+        packageOverrides: { ...v3DirectoryPackage, tools: [] },
+      },
+    );
+    expect(
+      noRead.nativePolicies['market-agent'].decide(
+        'external_directory',
+        '/reference/*',
+      ),
+    ).toBe('allow');
+    expect(
+      noRead.nativePolicies['market-agent'].decide(
+        'read',
+        '/reference/notes.md',
+      ),
+    ).toBe('deny');
   });
 
   test('external_directory: explicit owner allow survives registered and child policies', () => {
@@ -3558,9 +3764,9 @@ describe('marketplace agent customization', () => {
     const compiled = registry.compileChildPermissions('market-agent', [
       { action: 'external_directory', resource: '*', effect: 'allow' },
     ]);
-    expect(
-      decideOfRules(compiled)('external_directory', '/approved/report.txt'),
-    ).toBe('allow');
+    expect(decideOfRules(compiled)('external_directory', '/approved/*')).toBe(
+      'allow',
+    );
   });
 
   test('external_directory: ask and deny declarations are preserved verbatim', () => {
@@ -3572,15 +3778,13 @@ describe('marketplace agent customization', () => {
         hostFlavor: 'v2',
       });
       const policy = registry.nativePolicies['market-agent'];
-      expect(policy.decide('external_directory', '/approved/report.txt')).toBe(
-        effect,
-      );
+      expect(policy.decide('external_directory', '/approved/*')).toBe(effect);
       const compiled = registry.compileChildPermissions('market-agent', [
         { action: 'external_directory', resource: '*', effect },
       ]);
-      expect(
-        decideOfRules(compiled)('external_directory', '/approved/report.txt'),
-      ).toBe(effect);
+      expect(decideOfRules(compiled)('external_directory', '/approved/*')).toBe(
+        effect,
+      );
     }
   });
 
@@ -3599,24 +3803,18 @@ describe('marketplace agent customization', () => {
       hostFlavor: 'v2',
     });
     const policy = registry.nativePolicies['market-agent'];
-    expect(policy.decide('external_directory', '/approved/report.txt')).toBe(
-      'allow',
-    );
-    expect(
-      policy.decide('external_directory', '/approved/private/secret.txt'),
-    ).toBe('deny');
-    expect(policy.decide('external_directory', '/elsewhere/x.txt')).toBe(
+    expect(policy.decide('external_directory', '/approved/*')).toBe('allow');
+    expect(policy.decide('external_directory', '/approved/private/*')).toBe(
       'deny',
     );
+    expect(policy.decide('external_directory', '/elsewhere/*')).toBe('deny');
     const compiled = registry.compileChildPermissions('market-agent', [
       ...policy.rules,
     ]);
     const decide = decideOfRules(compiled);
-    expect(decide('external_directory', '/approved/report.txt')).toBe('allow');
-    expect(decide('external_directory', '/approved/private/secret.txt')).toBe(
-      'deny',
-    );
-    expect(decide('external_directory', '/elsewhere/x.txt')).toBe('deny');
+    expect(decide('external_directory', '/approved/*')).toBe('allow');
+    expect(decide('external_directory', '/approved/private/*')).toBe('deny');
+    expect(decide('external_directory', '/elsewhere/*')).toBe('deny');
   });
 
   test('external_directory: finalized host rules bind the owner allow', () => {
@@ -3641,21 +3839,19 @@ describe('marketplace agent customization', () => {
       hostFlavor: 'v2',
     });
     const policy = registry.nativePolicies['market-agent'];
-    expect(policy.decide('external_directory', '/approved/report.txt')).toBe(
-      'allow',
-    );
-    expect(policy.decide('external_directory', '/approved/denied/x.txt')).toBe(
+    expect(policy.decide('external_directory', '/approved/*')).toBe('allow');
+    expect(policy.decide('external_directory', '/approved/denied/*')).toBe(
       'deny',
     );
-    expect(policy.decide('external_directory', '/approved/asked/y.txt')).toBe(
+    expect(policy.decide('external_directory', '/approved/asked/*')).toBe(
       'ask',
     );
     const child = decideOfRules(
       registry.compileChildPermissions('market-agent', policy.rules),
     );
-    expect(child('external_directory', '/approved/report.txt')).toBe('allow');
-    expect(child('external_directory', '/approved/denied/x.txt')).toBe('deny');
-    expect(child('external_directory', '/approved/asked/y.txt')).toBe('ask');
+    expect(child('external_directory', '/approved/*')).toBe('allow');
+    expect(child('external_directory', '/approved/denied/*')).toBe('deny');
+    expect(child('external_directory', '/approved/asked/*')).toBe('ask');
   });
 
   test('external_directory: absent declaration and empty child payload deny; admitting the guard widens nothing else', () => {
@@ -3665,9 +3861,9 @@ describe('marketplace agent customization', () => {
       expect(policy.decide('external_directory', resource)).toBe('deny');
     }
     const empty = registry.compileChildPermissions('market-agent', []);
-    expect(
-      decideOfRules(empty)('external_directory', '/approved/report.txt'),
-    ).toBe('deny');
+    expect(decideOfRules(empty)('external_directory', '/approved/*')).toBe(
+      'deny',
+    );
     // No other capability rides in with the admitted guard action: the
     // compiled child payload itself keeps undeclared tools denied, and a
     // host wildcard allow passed through the ceiling cannot admit them.
@@ -3722,7 +3918,7 @@ describe('marketplace agent customization', () => {
       expect(
         allowed.nativePolicies[name].decide(
           'external_directory',
-          '/approved/report.txt',
+          '/approved/*',
         ),
       ).toBe('allow');
     }
@@ -3733,7 +3929,7 @@ describe('marketplace agent customization', () => {
     expect(
       bare.nativePolicies.MarketVisible.decide(
         'external_directory',
-        '/approved/report.txt',
+        '/approved/*',
       ),
     ).toBe('deny');
   });
