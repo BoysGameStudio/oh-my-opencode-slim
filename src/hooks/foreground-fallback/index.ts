@@ -531,6 +531,26 @@ const REPLAY_SEND_TIMEOUT_MS = 10_000;
  *  the last replayable user message plus the trailing message id (handoff
  *  baseline), never the full history. */
 const FALLBACK_REPLAY_TAIL_MESSAGES = 50;
+
+/** Replay reads share the host's event loop. After a stall, the expired timer
+ *  runs before the read's response, so give that same read one more window. */
+async function readForReplay<T>(
+  sessionID: string,
+  read: Promise<T>,
+  message: string,
+): Promise<T> {
+  const started = Date.now();
+  try {
+    return await withTimeout(read, HOST_CALL_TIMEOUT_MS, message);
+  } catch (err) {
+    if (!(err instanceof OperationTimeoutError)) throw err;
+    log('[foreground-fallback] replay read missed its window; waiting once', {
+      sessionID,
+      elapsedMs: Date.now() - started,
+    });
+    return withTimeout(read, HOST_CALL_TIMEOUT_MS, message);
+  }
+}
 /** Trailer marking a same-model replay; identical at every call site so the
  *  replay is recognizable as an internal retry, never a user turn. */
 const SAME_MODEL_RETRY_TRAILER = 'Same-model retry after transient error.';
@@ -2231,12 +2251,12 @@ export class ForegroundFallbackManager {
     // not pin inProgress forever. A failed read sent nothing, so refund.
     let tailResult: { data?: unknown; error?: unknown };
     try {
-      tailResult = await withTimeout<{ data?: unknown; error?: unknown }>(
+      tailResult = await readForReplay<{ data?: unknown; error?: unknown }>(
+        sessionID,
         session.messages({
           path: { id: sessionID },
           query: { limit: FALLBACK_REPLAY_TAIL_MESSAGES },
         }),
-        HOST_CALL_TIMEOUT_MS,
         'same-model replay transcript read timed out',
       );
     } catch (err) {
@@ -2251,11 +2271,11 @@ export class ForegroundFallbackManager {
         ?.info?.parentID;
       let deepResult: { data?: unknown; error?: unknown };
       try {
-        deepResult = await withTimeout<{ data?: unknown; error?: unknown }>(
+        deepResult = await readForReplay<{ data?: unknown; error?: unknown }>(
+          sessionID,
           typeof parentID === 'string'
             ? session.message({ path: { id: sessionID, messageID: parentID } })
             : session.messages({ path: { id: sessionID } }),
-          HOST_CALL_TIMEOUT_MS,
           'same-model replay transcript read timed out',
         );
       } catch (err) {
@@ -3021,12 +3041,12 @@ export class ForegroundFallbackManager {
       // ~20 s. The `limit` query keeps the hot path O(tail). A tail without a
       // user message is one long turn: read only the user message its last
       // entry answers (v1 `parentID`); shapes without that id read it all.
-      const tailResult = await withTimeout(
+      const tailResult = await readForReplay(
+        sessionID,
         session.messages({
           path: { id: sessionID },
           query: { limit: FALLBACK_REPLAY_TAIL_MESSAGES },
         }),
-        HOST_CALL_TIMEOUT_MS,
         'fallback replay transcript read timed out',
       );
       // Transcript read suspended across a dispose(): everything from
@@ -3044,14 +3064,14 @@ export class ForegroundFallbackManager {
       if (!lastUser) {
         const parentID = (messages.at(-1) as { info?: { parentID?: unknown } })
           ?.info?.parentID;
-        const deepResult = await withTimeout<{
+        const deepResult = await readForReplay<{
           data?: unknown;
           error?: unknown;
         }>(
+          sessionID,
           typeof parentID === 'string'
             ? session.message({ path: { id: sessionID, messageID: parentID } })
             : session.messages({ path: { id: sessionID } }),
-          HOST_CALL_TIMEOUT_MS,
           'fallback replay user message read timed out',
         );
         if (!this.isCurrentTurn(sessionID, expectedEpoch)) return;
