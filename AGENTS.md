@@ -8,15 +8,12 @@ This document provides guidelines for AI agents operating in this repository.
 
 ## Design Constraints
 
-oh-my-opencode-slim is a **lightweight harness**: current models internalize most harness mechanics at training time, so excessive harness engineering constrains them more than it helps. Every change is reviewed against:
+oh-my-opencode-slim is a **lightweight harness**. Every change is reviewed against:
 
 - **Lightweight first** — adopt the smallest implementation that meets the requirement; no speculative abstraction, redundant configuration, or unnecessary indirection.
-- **No duplicate design** — when OpenCode v2 already owns a mechanism (session model persistence, native delegation/continuation, event delivery), reuse or observe it instead of building a parallel plugin-side state machine. Check the pinned host source under `.slim/clonedeps/repos/opencode/` before adding plugin-side machinery.
-- **Judgement over rules** — write prompts as judgement, not procedural rule prose; a rule a strong model would infer from context is a constraint, not guidance.
+- **No duplicate design** — when OpenCode v2 already owns a mechanism, reuse or observe it instead of building a parallel plugin-side state machine. Check the pinned host source under `.slim/clonedeps/repos/opencode/` before adding plugin-side machinery.
 - **One source of truth for tool instructions** — tool usage lives in tool descriptions; never restate it in agent prompts. When prompt prose and a tool description overlap, deleting the prose is the preferred change.
-- **Progressive disclosure** — skills and references load when a turn needs them; do not front-load context that most requests never use.
 - **Model-facing bytes are a budget** — prompts and tool descriptions are paid on every request, in every preset. Removal is the preferred change; an addition must state the behavior it buys, verified by rendering and counting, and must serve the cheapest supported preset, not just the dev default.
-- **Persisted state needs a reason** — plugin-side persistent state requires a production reader, clear ownership, and explicit failure/recovery semantics.
 
 ## Commands
 
