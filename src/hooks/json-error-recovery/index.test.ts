@@ -79,6 +79,43 @@ describe('json-error-recovery hook', () => {
     },
   );
 
+  test.each([
+    'src/config.ts:14: const raw = "invalid JSON arguments";',
+    'matches found:\nLine 42: throw new Error("JSON parse error: expected object");',
+    'SyntaxError: Unexpected token in JSON at position 0',
+  ])(
+    'does not append reminder for successful grep output quoting json errors: %s',
+    async (text) => {
+      const output = createOutput(text);
+      await hook['tool.execute.after'](createInput('grep'), output);
+      expect(output.output).toBe(text);
+    },
+  );
+
+  test.each([
+    'pattern match: export const msg = "failed to parse JSON";',
+    'Line 10: console.log("malformed JSON body");',
+  ])(
+    'does not append reminder for ast_grep_search output quoting json errors: %s',
+    async (text) => {
+      const output = createOutput(text);
+      await hook['tool.execute.after'](createInput('ast_grep_search'), output);
+      expect(output.output).toBe(text);
+    },
+  );
+
+  test.each([
+    '+  const output = createOutput("JSON parse error: invalid JSON arguments");',
+    'stderr: SyntaxError: Unexpected token } in JSON at position 42',
+  ])(
+    'does not append reminder for v2 shell tool output quoting json errors: %s',
+    async (text) => {
+      const output = createOutput(text);
+      await hook['tool.execute.after'](createInput('shell'), output);
+      expect(output.output).toBe(text);
+    },
+  );
+
   test('does not append duplicate reminder on repeated execution', async () => {
     const output = createOutput('JSON parse error: invalid JSON arguments');
 
@@ -113,7 +150,7 @@ describe('json-error-recovery hook', () => {
   test('exclude list contains content-heavy tools', () => {
     const expectedExcludedTools: Array<
       (typeof JSON_ERROR_TOOL_EXCLUDE_LIST)[number]
-    > = ['read', 'bash', 'webfetch'];
+    > = ['read', 'bash', 'shell', 'grep', 'ast_grep_search', 'webfetch'];
 
     const allExpectedToolsIncluded = expectedExcludedTools.every((toolName) =>
       JSON_ERROR_TOOL_EXCLUDE_LIST.includes(toolName),
