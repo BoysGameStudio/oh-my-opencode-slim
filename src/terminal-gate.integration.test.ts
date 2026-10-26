@@ -86,6 +86,11 @@ async function assembly(
      * contract, pinning the #1225 dependency: no shared clock, no
      * attribution window, no host-outcome publication. */
     withoutHostOutcomeClock?: boolean;
+    /** Extra gate options injected at the factory seam (same mechanism as
+     * `graceMs`/`withoutHostOutcomeClock`). Used by the #1561 probe to run
+     * the slow evidence re-arm on a millisecond cadence instead of the
+     * production 30 s default. */
+    gateOptions?: Record<string, unknown>;
   } = {},
 ) {
   const env = { ...process.env };
@@ -139,6 +144,7 @@ async function assembly(
       ...options,
       graceMs: setup.graceMs ?? options.graceMs,
       ...(setup.withoutHostOutcomeClock ? { hostOutcomeClock: undefined } : {}),
+      ...(setup.gateOptions ?? {}),
     });
     return gate;
   });
@@ -1225,7 +1231,11 @@ type V2RawEventSpec = {
 async function driveV2Lifecycle(
   probe: V2HostProbe,
   events: V2RawEventSpec[],
-  setup: { withoutHostOutcomeClock?: boolean } = {},
+  setup: {
+    withoutHostOutcomeClock?: boolean;
+    /** Forwarded to `assembly`'s gate-options seam (#1561 re-arm probe). */
+    gateOptions?: Record<string, unknown>;
+  } = {},
 ): Promise<ProductionBoard> {
   const childID = String(
     events.find((event) => event.type === 'session.created')?.data.sessionID ??
@@ -1236,6 +1246,7 @@ async function driveV2Lifecycle(
     graceMs: 20,
     client: probe.client,
     withoutHostOutcomeClock: setup.withoutHostOutcomeClock,
+    ...(setup.gateOptions ? { gateOptions: setup.gateOptions } : {}),
   });
   const dispatch = async (event: Record<string, unknown>) => {
     await h.hooks.event?.({ event } as never);
@@ -1803,39 +1814,59 @@ test('guard: without the hostOutcomeClock contract the attribution window never 
   }
 });
 
-// probe: late-attributable outcome after exhaustion — dead end recorded; adjudication pending
+// probe: late-attributable outcome after exhaustion — the #1561 regression.
 //
-// HONEST RESULT (fail — board stranded): the gate consults session.get
-// only twice in this scenario (initial inspect + one follow-up), then
-// never again — the busy runtime observation from the synthesized
-// status event is never contradicted (no polling capability on the
-// shim), and a rejected attribution leaves the busy defer path without
-// a retry timer. Neither a later idle pair (deduped by the continuous
-// idle guard, per the double-idle invariant) nor a later busy→idle
-// contrast cycle re-arms an outcome read. The board stays `running`
-// forever even with the outcome long since attributable.
-test.skip('probe: late-attributable outcome after exhaustion terminalizes the stranded board', async () => {
+// The host commits its outcome on schedule, but `session.get` hides it for
+// the first 12 reads — beyond the gate's fast evidence budget
+// (`maxEvidenceRetries` = 3). Before #1561 the gate consulted `session.get`
+// only for the initial inspect plus one follow-up and then never again: the
+// busy runtime observation from the synthesized status event was never
+// contradicted (the shim exposes no `session.status` to poll), and the busy
+// defer path armed no timer, so the board stayed `running` forever even once
+// the outcome was long since attributable.
+//
+// With the two-tier re-arm the defer is *suspicious* (a busy contradicted by
+// the later idle pair) and arms a read: fast retries first, then bounded
+// slow re-arms. Read 13 lands past `hideOutcomeForReads`, so attribution
+// succeeds and the normal host-outcome commit path publishes `completed`.
+//
+// The re-arm knobs are injected at the gate factory (production defaults are
+// 30 s base / 12 arms; this fixture runs a 1 ms base so the 200 × 5 ms settle
+// loop below reaches the arm). `Bun.sleep` here is the file's established
+// deliberate exception to the no-real-time rule: the timer harness cannot
+// penetrate the real v2 event pump, so this end-to-end path must advance
+// wall-clock time.
+test('probe: late-attributable outcome after exhaustion terminalizes the stranded board', async () => {
   const capture = captureGateLogs();
   try {
-    // The host commits its outcome on schedule, but session.get hides it
-    // for the first 12 reads — far beyond the gate's evidence retry
-    // budget (maxEvidenceRetries defaults to 3). The desired behavior:
-    // once the outcome becomes attributable, SOMETHING (a timer, a
-    // poll, a later reconcile trigger) picks it up and the board
-    // terminalizes instead of staying stranded post-exhaustion.
     const probe = v2ShimClient({
       outcome: 'succeeded',
       hideOutcomeForReads: 12,
     });
-    const board = await driveV2Lifecycle(probe, [
-      {
-        type: 'session.created',
-        data: { sessionID: 'child', parentID: 'parent', agent: 'explorer' },
-      },
-      { type: 'session.execution.started', data: { sessionID: 'child' } },
-      { type: 'session.execution.succeeded', data: { sessionID: 'child' } },
-    ]);
-    expect(board.get('child')?.state).toBe('completed');
+    const board = await driveV2Lifecycle(
+      probe,
+      [
+        {
+          type: 'session.created',
+          data: { sessionID: 'child', parentID: 'parent', agent: 'explorer' },
+        },
+        { type: 'session.execution.started', data: { sessionID: 'child' } },
+        { type: 'session.execution.succeeded', data: { sessionID: 'child' } },
+      ],
+      { gateOptions: { evidenceRearmMs: 1, maxEvidenceRearms: 16 } },
+    );
+    expect(board.get('child')).toMatchObject({
+      state: 'completed',
+      resultSummary: 'Host reported outcome: succeeded.',
+    });
+    // Exactly one publication, and it carries the host-outcome attribution.
+    const published = capture.of('[terminal-gate] terminal published', 'child');
+    expect(published).toHaveLength(1);
+    expect(published[0]?.data).toMatchObject({
+      taskID: 'child',
+      state: 'completed',
+      attribution: 'host-outcome',
+    });
   } finally {
     capture.restore();
   }

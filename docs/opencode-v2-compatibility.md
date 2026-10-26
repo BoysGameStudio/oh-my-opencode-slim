@@ -408,17 +408,32 @@ dead end, never a pending transcript, and a host whose transcript is present but
 unfinalized keeps waiting exactly as on v1. Independent runtime maps, native
 returns and cancellation keep their fences.
 
-Known limitation (documented dead end): a host outcome that becomes
-attributable only after the gate's evidence retry budget is exhausted (initial
-read plus 3 retries at `stopConfirmationMs` cadence, with no further events
-arriving) strands the board entry at `running` until the parent's next
-activity rehydrate reconciles it. The parked probe test in
+A host outcome that becomes attributable only after the gate's evidence retry
+budget is exhausted is still read again. Once a defer looks suspicious (a
+stale busy runtime contradicted by a later idle, or the budget itself used
+up), the gate arms the next read instead of stopping: fast retries at
+`stopConfirmationMs` cadence (the initial read plus 3 retries), then a
+bounded second tier of slow re-arms with a 30 s base that doubles per arm
+(30 + 60 + 120 + 240, then 300 s × 8, capped at 5 minutes), 12 arms,
+≈ 47.5 minutes in total. A late outcome attributes through the normal
+host-outcome path and publishes the run's true terminal state; no event has
+to arrive in the meantime. If the outcome never becomes readable, the entry
+stays visibly indeterminate (`running` with `statusUncertain`), and the
+parent's next activity rehydrate remains the backstop. The probe in
 `src/terminal-gate.integration.test.ts` (`probe: late-attributable outcome
-after exhaustion terminalizes the stranded board`, `test.skip`) records the
-mechanism: neither a later idle pair nor a busy→idle contrast cycle re-arms
-an outcome read. Note `stopConfirmationMs` doubles as the retry cadence —
-raising it stretches the stranding window proportionally (~4× its value at
-the default budget).
+after exhaustion terminalizes the stranded board`) is un-skipped and passes;
+it is this path's regression test.
+
+The slow tier arms only on hosts without `client.session.status`, and only
+where an evidence source exists. On hosts that have `session.status`,
+`createRuntimeStatusReconciler` already re-passes every 5 s while
+`board.hasRunningJobs()` and reconciles each running record — a stranded
+entry is running — so that sweeper already retries the read forever and a
+second scheduler would give one fact two owners. The re-arm parameters
+(`evidenceRearmMs` base, `maxEvidenceRearms`) are internal seams with no
+user-facing configuration. `stopConfirmationMs` remains the fast-tier
+cadence only, so raising it stretches the pre-re-arm window proportionally
+(~4× its value at the default budget) while leaving the slow tier unchanged.
 
 The first complete native agent snapshot finalizes the managed registry for
 the current plugin generation. Subsequent v1 `config()` calls and v2 agent
