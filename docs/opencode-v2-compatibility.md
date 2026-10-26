@@ -408,17 +408,32 @@ dead end, never a pending transcript, and a host whose transcript is present but
 unfinalized keeps waiting exactly as on v1. Independent runtime maps, native
 returns and cancellation keep their fences.
 
-Known limitation (documented dead end): a host outcome that becomes
-attributable only after the gate's evidence retry budget is exhausted (initial
-read plus 3 retries at `stopConfirmationMs` cadence, with no further events
-arriving) strands the board entry at `running` until the parent's next
-activity rehydrate reconciles it. The parked probe test in
+A host outcome that becomes attributable only after the gate's evidence retry
+budget is exhausted is still read again. Once a defer looks suspicious (a
+stale busy runtime contradicted by a later idle, or the budget itself used
+up), the gate arms the next read instead of stopping: fast retries at
+`stopConfirmationMs` cadence (the initial read plus 3 retries), then a
+bounded second tier of slow re-arms with a 30 s base that doubles per arm
+(30 + 60 + 120 + 240, then 300 s × 8, capped at 5 minutes), 12 arms,
+≈ 47.5 minutes in total. A late outcome attributes through the normal
+host-outcome path and publishes the run's true terminal state; no event has
+to arrive in the meantime. If the outcome never becomes readable, the entry
+stays visibly indeterminate (`running` with `statusUncertain`), and the
+parent's next activity rehydrate remains the backstop. The probe in
 `src/terminal-gate.integration.test.ts` (`probe: late-attributable outcome
-after exhaustion terminalizes the stranded board`, `test.skip`) records the
-mechanism: neither a later idle pair nor a busy→idle contrast cycle re-arms
-an outcome read. Note `stopConfirmationMs` doubles as the retry cadence —
-raising it stretches the stranding window proportionally (~4× its value at
-the default budget).
+after exhaustion terminalizes the stranded board`) is un-skipped and passes;
+it is this path's regression test.
+
+The slow tier arms only on hosts without `client.session.status`, and only
+where an evidence source exists. On hosts that have `session.status`,
+`createRuntimeStatusReconciler` already re-passes every 5 s while
+`board.hasRunningJobs()` and reconciles each running record — a stranded
+entry is running — so that sweeper already retries the read forever and a
+second scheduler would give one fact two owners. The re-arm parameters
+(`evidenceRearmMs` base, `maxEvidenceRearms`) are internal seams with no
+user-facing configuration. `stopConfirmationMs` remains the fast-tier
+cadence only, so raising it stretches the pre-re-arm window proportionally
+(~4× its value at the default budget) while leaving the slow tier unchanged.
 
 The first complete native agent snapshot finalizes the managed registry for
 the current plugin generation. Subsequent v1 `config()` calls and v2 agent
@@ -450,7 +465,7 @@ side cannot be observed.
 | Built-in MCPs (context7, gh_grep) auto-registered | ✅ | ✅ `ctx.mcp.transform` | `ctx.mcp.transform` is present in all v2.0.x stable hosts; the runtime capability probe is belt-and-suspenders |
 | Background-job state persistence (tombstones, deletion epochs) | ➖ process-local | ✅ via `ctx.storage` | optional domain; absent → pure in-memory fallback, zero behavior change (see [Background job state](#background-job-state-rehydrate-probe-and-persistence)) |
 | Foreground model fallback (rate-limit failover) | ✅ | ⚠️ replay disabled; retry-hook steering active | v2's non-atomic `session.switchModel` + steer replay could alter/replay a newer turn, so only the in-place switch runs |
-| `/preset` (preset manager) | ✅ configuration writes; reload to apply | ✅ TUI entry (`./tui` → `dist/tui2.js`), with **Current session** / **Global default** selection; `/preset <name>` writes the global default | The command layer registers from an `append: "app"` slot render because `keymap.layer` is provider-scoped; commands carry an `id` and `slash.arguments`. The manager needs `ui.dialog.select` + `prompt` + `confirm`; feedback uses `ui.toast.show`. Session scope additionally requires server `ctx.storage`, session identity lookup and `ctx.rpc.register`, plus TUI `client.rpc`. It changes future subagent inference for the selected session, not its main model or existing children. User/project `.json` and `.jsonc` edits are watched (~300 ms debounce), including newly created candidates; they refresh defaults for future bindings, not saved snapshots. Global-write feedback acknowledges the refresh request, while session-apply feedback requires RPC confirmation. With persistence available, native subagent `progress` saves the child binding before the first prompt; `session.created` is not used to capture its profile. Reduced hosts retain legacy execution behavior. See [Preset switching](presets/preset-switching.md) for inheritance, reapplication and compatibility limits |
+| `/preset` (preset manager) | ✅ configuration writes; reload to apply | ✅ TUI entry (`./tui` → `dist/tui2.js`), with **Current session** / **Global default** selection; `/preset <name>` writes the global default | The command layer registers from an `append: "app"` slot render because `keymap.layer` is provider-scoped; commands carry an `id` and `slash.arguments`. The manager needs `ui.dialog.select` + `prompt` + `confirm`; feedback uses `ui.toast.show`. Session scope additionally requires server `ctx.storage`, session identity lookup and `ctx.rpc.register`, plus TUI `client.rpc`. It changes future subagent inference for the selected session, not its main model or existing children. User/project `.json` and `.jsonc` edits are watched (~300 ms debounce), including newly created candidates; they refresh defaults for future bindings, not saved snapshots. Global-write feedback acknowledges the refresh request, while session-apply feedback requires RPC confirmation. With persistence available, native subagent `progress` saves the child binding before the first prompt; `session.created` is not used to capture its profile. Reduced hosts retain legacy execution behavior. Non-TUI clients also get a server-side `/preset <name>` command (apply-only): the result is reported through the command error channel so the switch costs no model turn and adds no context. See [Preset switching](presets/preset-switching.md) for inheritance, reapplication and compatibility limits |
 | Default primary agent | ✅ finalized visible orchestrator identity | ✅ `draft.default(<visible orchestrator identity>)`; the canonical `orchestrator` entry remains a hidden alias when `displayName` is configured | v1 `default_agent` and v2 draft default target the same visible entry |
 | TUI default agent | ✅ orchestrator | ✅ host follows the default primary agent and hoists it to the head of the agent list | — |
 | Multiplexer (tmux/zellij/herdr/cmux-tui/kitty/wezterm panes) | ✅ | ✅ TUI plugin entry wires the client-owned pane lifecycle through a v2 host adapter: shared background service and `--server` hosts are supported, `--standalone` is fail-closed (one diagnostic per process, `/subagent` fallback — opens a tab without moving focus) | Defaults are host-specific: `"tui"` on v1 (`opencode attach <url> --session <id> --dir <dir>`); `"mini"` on v2 shared (`opencode mini --session <id>`) and remote (`opencode mini --server <url> --session <id>`), with the pane cwd pinned by the adapter. Explicit `viewer: "tui"` retains the v2 full-TUI commands with a positional directory; v1 `viewer: "mini"` appends `--mini` to attach (OpenCode >= 1.17.10), without extra cwd pinning. The `OPENCODE_PASSWORD` secret is injected through the multiplexer's spawn-time environment (or a Linux + POSIX-shell `/proc` bridge on zellij/cmux-tui), never through the viewer's command line — see [Secret handling](multiplexer-integration.md#known-limitations). Events are projected from `session.created` / `session.execution.*` / `session.idle` / `session.deleted`; directory attribution is recorded at `session.created` because execution events carry none |

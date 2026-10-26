@@ -91,6 +91,7 @@ import {
   recordInternalAdmission,
 } from './internal-admissions';
 import { createV2InterviewBridge } from './interview-bridge';
+import { createPresetCommand, PRESET_COMMAND_NAME } from './preset-command';
 import { sessionPresetRpc } from './preset-rpc';
 import {
   applyRuntimeProfileOptions,
@@ -1035,6 +1036,10 @@ export interface V2PermissionRulesOptions {
   marketplaceAgentNames?: () => ReadonlySet<string>;
   /** All finalized host/plugin agent identities, including foreign agents. */
   knownAgentNames?: () => ReadonlySet<string>;
+  /** Effective default agent for agentless root sessions (`opencode run`
+   * without `--agent`). Resolved only after a host session lookup confirms
+   * the stored session record exists and has no `parentID`. */
+  defaultAgent?: () => string | undefined;
   /** Injectable degradation sink (tests observe the one-time warning
    * without mocking the logger). */
   onUnavailable?: () => void;
@@ -1513,16 +1518,40 @@ export function createPermissionRulesBridge(
             isRecord(response) && isRecord(response.data)
               ? response.data
               : response;
+          const hasStoredSessionId =
+            isRecord(record) &&
+            ((typeof record.id === 'string' && record.id.length > 0) ||
+              (typeof record.sessionID === 'string' &&
+                record.sessionID.length > 0));
+          const fallbackRootAgent =
+            hasStoredSessionId &&
+            !Object.hasOwn(record, 'parentID') &&
+            typeof record.agent !== 'string'
+              ? options.defaultAgent
+                ? options.defaultAgent()
+                : 'orchestrator'
+              : undefined;
+          const resolvedRootDefaultAgent =
+            typeof fallbackRootAgent === 'string' &&
+            fallbackRootAgent.length > 0
+              ? fallbackRootAgent
+              : undefined;
           if (
             !isRecord(record) ||
             (!Object.hasOwn(record, 'parentID') &&
-              typeof record.agent !== 'string')
+              typeof record.agent !== 'string' &&
+              !resolvedRootDefaultAgent)
           ) {
             if (marketplacePolicyRequired()) rejectUnknownIdentity();
             warnUnknownIdentity();
             return;
           }
-          const identity = identityFromPayload(record, 'lookup');
+          const identity = identityFromPayload(
+            resolvedRootDefaultAgent
+              ? { ...record, agent: resolvedRootDefaultAgent }
+              : record,
+            'lookup',
+          );
           cacheIdentity(sessionID, identity, lookup);
         } catch (err) {
           if (!lookup.invalidated) {
@@ -2720,6 +2749,24 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         log('[v2] command.transform failed', String(err));
       }
 
+      // ── /preset (server-side, non-TUI clients) ──
+      try {
+        if (isCommandEnabled('preset', { disabledCommands })) {
+          const reg = await ctx.command.transform((draft) => {
+            if (typeof draft.add !== 'function') {
+              log('[v2] command draft has no add', {
+                name: PRESET_COMMAND_NAME,
+              });
+              return;
+            }
+            draft.add(createPresetCommand(directory));
+          });
+          disposers.push(() => reg.dispose());
+        }
+      } catch (err) {
+        log('[v2] preset command registration failed', String(err));
+      }
+
       // `/interview` is a v2 command marker. The context bridge consumes the
       // rendered marker and delegates the actual behavior to the interview
       // service without expanding the global v2 client shim.
@@ -3418,6 +3465,21 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                     }
                   }
                   return names;
+                },
+                defaultAgent: () => {
+                  try {
+                    const merged = loadMergedOpenCodeConfig(directory);
+                    if (
+                      typeof merged.default_agent === 'string' &&
+                      merged.default_agent.trim().length > 0
+                    ) {
+                      return merged.default_agent.trim();
+                    }
+                  } catch {
+                    // Fall back to the plugin's registered default primary agent.
+                  }
+                  const registry = finalizedRegistry;
+                  return registry?.identities.orchestrator ?? 'orchestrator';
                 },
               });
               const permissionBridge = permissionRulesBridge;

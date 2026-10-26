@@ -156,7 +156,7 @@ Then:
 > It's **recommended** to understand how background orchestration works. The **[Orchestrator prompt](https://github.com/alvinunreal/oh-my-opencode-slim/blob/master/src/agents/orchestrator.ts#L28)** contains the scheduler rules, specialist routing logic, and thresholds for when work should be assigned to background agents. You can always delegate manually by calling a subagent via: `@agentName <task>`
 
 > [!TIP]
-> Because background agents are now the default workflow, it is **highly recommended** to enable and configure **[Multiplexer Integration](docs/multiplexer-integration.md)**. It automatically opens each agent in a dedicated Tmux, Zellij, Herdr, cmux, kitty, or WezTerm pane, so you can watch specialists work live while the Orchestrator continues coordinating the session. On OpenCode v2 hosts, panes work with the shared background service or an explicit `--server`; `--standalone` hosts cannot host panes (one diagnostic per process; use v2's native subagent surfaces instead).
+> Because background agents are now the default workflow, it is **highly recommended** to enable and configure **[Multiplexer Integration](docs/multiplexer-integration.md)**. It automatically opens each agent in a dedicated Tmux, Zellij, Herdr, cmux, kitty, WezTerm, or Orca pane, so you can watch specialists work live while the Orchestrator continues coordinating the session. On OpenCode v2 hosts, panes work with the shared background service or an explicit `--server`; `--standalone` hosts cannot host panes (one diagnostic per process; use v2's native subagent surfaces instead).
 
 The default generated configuration includes both `openai` and `opencode-go` presets.
 
@@ -715,7 +715,7 @@ Use this section as a map: start with installation, then jump to features, confi
 | **[Council](docs/council.md)** | Run multiple models in parallel and synthesize a single answer — keyword-triggered via the orchestrator's Council Mode procedure |
 | **[Custom Agents](docs/configuration.md#custom-agents)** | Define your own specialists with custom prompts, models, MCP access, and Orchestrator delegation rules |
 | **[ACP Agents](docs/acp-agents.md)** | Connect external ACP-compatible agents such as Claude Code ACP or Gemini ACP as delegatable subagents; tool and plan progress streams to the TUI while they work |
-| **[Multiplexer Integration](docs/multiplexer-integration.md)** | Watch agents work live in Tmux, Zellij, Herdr, cmux, kitty, or WezTerm panes |
+| **[Multiplexer Integration](docs/multiplexer-integration.md)** | Watch agents work live in Tmux, Zellij, Herdr, cmux, kitty, WezTerm, or Orca panes |
 | **[Codemap](docs/codemap.md)** | Generate hierarchical codemaps to understand large codebases faster |
 | **[Clonedeps](docs/clonedeps.md)** | Clone selected dependency source into an ignored local workspace for inspection |
 | **[Worktrees](docs/worktrees.md)** | Use `.slim/worktrees/` lanes for isolated parallel or risky coding work |
@@ -748,7 +748,7 @@ Use this section as a map: start with installation, then jump to features, confi
   <p><sub>Every merged contribution leaves a mark on the realm.</sub></p>
 
   <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-141-orange.svg?style=flat-square)](#contributors-)
+[![All Contributors](https://img.shields.io/badge/all_contributors-142-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 </div>
 
@@ -947,6 +947,7 @@ Use this section as a map: start with installation, then jump to features, confi
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/Phototonic"><img src="https://avatars.githubusercontent.com/u/35551999?v=4?s=100" width="100px;" alt="Lucas Wright"/><br /><sub><b>Lucas Wright</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=Phototonic" title="Code">💻</a></td>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/monsterlag"><img src="https://avatars.githubusercontent.com/u/64719697?v=4?s=100" width="100px;" alt="monsterlag"/><br /><sub><b>monsterlag</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=monsterlag" title="Code">💻</a></td>
       <td align="center" valign="top" width="16.66%"><a href="https://github.com/YMoose"><img src="https://avatars.githubusercontent.com/u/42179813?v=4?s=100" width="100px;" alt="YMoose"/><br /><sub><b>YMoose</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=YMoose" title="Code">💻</a></td>
+      <td align="center" valign="top" width="16.66%"><a href="https://github.com/mv2sa"><img src="https://avatars.githubusercontent.com/u/2573094?v=4?s=100" width="100px;" alt="Marcos Santanna"/><br /><sub><b>Marcos Santanna</b></sub></a><br /><a href="https://github.com/alvinunreal/oh-my-opencode-slim/commits?author=mv2sa" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

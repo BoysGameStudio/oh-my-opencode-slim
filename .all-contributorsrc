@@ -1280,6 +1280,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "mv2sa",
+      "name": "Marcos Santanna",
+      "avatar_url": "https://avatars.githubusercontent.com/u/2573094?v=4",
+      "profile": "https://github.com/mv2sa",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "commitConvention": "angular"

@@ -682,6 +682,9 @@ describe('client adapter detection (FR-9)', () => {
     expect(detectClientAdapter({ HERDR_PANE_ID: 'wP:p4' })).toBe('herdr');
     expect(detectClientAdapter({ KITTY_WINDOW_ID: '4' })).toBe('kitty');
     expect(detectClientAdapter({ WEZTERM_PANE: '7' })).toBe('wezterm');
+    expect(detectClientAdapter({ ORCA_TERMINAL_HANDLE: 'pane-1' })).toBe(
+      'orca',
+    );
     expect(detectClientAdapter({ CMUX_TUI_SOCKET: '/tmp/cmux.sock' })).toBe(
       'cmux-tui',
     );
@@ -697,6 +700,27 @@ describe('client adapter detection (FR-9)', () => {
     expect(
       detectClientAdapter({ WEZTERM_PANE: '7', ZELLIJ_PANE_ID: '3' }),
     ).toBe('zellij');
+  });
+
+  test('prefers tmux and zellij nested inside an orca terminal', () => {
+    expect(
+      detectClientAdapter({ ORCA_TERMINAL_HANDLE: 'pane-1', TMUX_PANE: '%1' }),
+    ).toBe('tmux');
+    expect(
+      detectClientAdapter({
+        ORCA_TERMINAL_HANDLE: 'pane-1',
+        ZELLIJ_PANE_ID: '3',
+      }),
+    ).toBe('zellij');
+  });
+
+  test('prefers wezterm over orca when both host handles are present', () => {
+    expect(
+      detectClientAdapter({
+        ORCA_TERMINAL_HANDLE: 'pane-1',
+        WEZTERM_PANE: '7',
+      }),
+    ).toBe('wezterm');
   });
 
   test('prefers the cmux signal over a nested tmux pane', () => {
@@ -945,6 +969,38 @@ describe('TUI pane wiring admission variants', () => {
     expect(h.logger.reasons()).toEqual(['admission-mismatch']);
     const context = h.logger.entries[0]?.data as { adapter?: string };
     expect(context.adapter).toBe('zellij');
+  });
+
+  test('explicit orca in an orca client: admitted and the pane is created', async () => {
+    const env = { ORCA_TERMINAL_HANDLE: 'pane-1', TERM_PROGRAM: 'Orca' };
+    const h = await createHarness({ env, config: defaultConfig('orca') });
+
+    expect(h.wiring.admission).toMatchObject({
+      enabled: true,
+      adapter: 'orca',
+    });
+    h.bus.emit('session.created', createdEvent());
+    await flush();
+
+    expect(h.createdTypes).toEqual(['orca']);
+    expect(h.adapters.get('orca')?.spawns).toHaveLength(1);
+    await h.wiring.dispose();
+  });
+
+  test('explicit zellij in an orca client: no pane and one diagnostic', async () => {
+    const env = { ORCA_TERMINAL_HANDLE: 'pane-1', TERM_PROGRAM: 'Orca' };
+    const h = await createHarness({ env, config: defaultConfig('zellij') });
+
+    expect(h.wiring.admission).toMatchObject({
+      enabled: false,
+      reason: 'admission-mismatch',
+    });
+    h.bus.emit('session.created', createdEvent());
+    await flush();
+
+    expect(h.createdTypes).toEqual([]);
+    expect(h.logger.reasons()).toEqual(['admission-mismatch']);
+    await h.wiring.dispose();
   });
 
   test('auto in tmux creates the pane through the client-local adapter', async () => {
@@ -1452,6 +1508,9 @@ describe('serverUrl reflection and probe (D3)', () => {
     );
     expect(resolveAnchoredTarget('kitty', { KITTY_WINDOW_ID: '4' })).toBe('4');
     expect(resolveAnchoredTarget('wezterm', { WEZTERM_PANE: '7' })).toBe('7');
+    expect(
+      resolveAnchoredTarget('orca', { ORCA_TERMINAL_HANDLE: 'pane-1' }),
+    ).toBe('pane-1');
     expect(
       resolveAnchoredTarget('cmux-tui', { CMUX_TUI_TERMINAL_ID: 'term_1' }),
     ).toBe('term_1');

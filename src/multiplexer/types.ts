@@ -49,10 +49,17 @@ export interface PaneSpawnOptions {
 /**
  * Core multiplexer interface
  * Implementations: TmuxMultiplexer, ZellijMultiplexer, HerdrMultiplexer,
- * CmuxMultiplexer, KittyMultiplexer, WeztermMultiplexer
+ * CmuxMultiplexer, KittyMultiplexer, WeztermMultiplexer, OrcaMultiplexer
  */
 export interface Multiplexer {
-  readonly type: 'tmux' | 'zellij' | 'herdr' | 'cmux-tui' | 'kitty' | 'wezterm';
+  readonly type:
+    | 'tmux'
+    | 'zellij'
+    | 'herdr'
+    | 'cmux-tui'
+    | 'kitty'
+    | 'wezterm'
+    | 'orca';
 
   /**
    * Check if the multiplexer binary is available on the system
