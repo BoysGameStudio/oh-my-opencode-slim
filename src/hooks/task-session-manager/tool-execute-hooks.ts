@@ -68,95 +68,6 @@ function normalizeObjectiveKey(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-/** Trigger line the orchestrator emits on a council synthesis call: the
- * session IDs / board aliases the seat dispatches returned, which the
- * harness resolves host-side from its own job board, so the
- * orchestrator never re-emits seat text as output tokens (Mixture-of-Agents
- * assembly with an independent judge). No /g flag: lastIndex state would
- * skip matches across the findIndex/exec passes. */
-const COUNCIL_SEATS_LINE_PATTERN = /^Seats:\s*(.+)$/;
-
-/** Seat body per the assembly contract; read-only over the record. Only a
- * completed terminal with text is a real response — lifecycle diagnostics
- * (cancelled/error/stopped text) must never be injected as a councillor's
- * opinion (the task_status result mode refuses non-completed terminals). */
-function councilSeatBody(record: BackgroundJobRecord | undefined): string {
-  if (!record) return '[no response — unresolved ref]';
-  if (record.state === 'running') return '[no response — still running]';
-  const terminal =
-    record.state === 'reconciled'
-      ? (record.terminalState ?? 'reconciled')
-      : record.state;
-  if (
-    terminal === 'completed' &&
-    record.resultSummary &&
-    record.resultSummary.trim() !== ''
-  ) {
-    // Verbatim: resultSummary holds the child's full terminal text.
-    return record.resultSummary;
-  }
-  return `[no response — no output (${terminal})]`;
-}
-
-/**
- * Host-side council seat assembly. When a council call's prompt carries a
- * `Seats: <id, id>` line (the IDs the seat dispatches returned), resolve
- * each ref against the CALLER's own board
- * rows (the same parent-scoped invariant the control tools enforce — a ref
- * owned by another parent never resolves), strip the trigger line, and
- * append one `## Seat: <name>` section per ref. The FINAL matching line is
- * used, so a `Seats:` roster quoted in the question cannot shadow the
- * orchestrator's refs. A trigger line with refs always rewrites: unresolved
- * refs (restart, eviction, cross-conversation) become per-seat placeholders
- * so the council sees which seats are missing. Resolution is strictly
- * read-only: no markUsed, no reconcile, no board mutation, and never a wait
- * on a running seat (a still-running ref gets a placeholder).
- */
-function assembleCouncilSeatResponses(
-  args: TaskArgs,
-  parentSessionID: string,
-  board: BackgroundJobBoard,
-): void {
-  if (typeof args.prompt !== 'string') return;
-  const lines = args.prompt.split('\n');
-  const triggerIndex = lines.findLastIndex((line) =>
-    COUNCIL_SEATS_LINE_PATTERN.test(line),
-  );
-  if (triggerIndex === -1) return;
-  const refs = (COUNCIL_SEATS_LINE_PATTERN.exec(lines[triggerIndex])?.[1] ?? '')
-    .split(',')
-    .map((ref) => ref.trim())
-    .filter((ref) => ref !== '');
-  // A trigger line always rewrites, so the council never receives a bare ID
-  // line it cannot use: unresolved refs (restart, eviction,
-  // cross-conversation) become per-seat placeholders, and a malformed
-  // empty-refs line reports itself instead of passing through silently.
-  const sections =
-    refs.length === 0
-      ? ['[no seat references were provided]']
-      : refs.map((ref) => {
-          const record = board.resolve(parentSessionID, ref);
-          return `## Seat: ${record?.agent || ref}\n${councilSeatBody(record)}`;
-        });
-  const kept = [
-    ...lines.slice(0, triggerIndex),
-    ...lines.slice(triggerIndex + 1),
-  ]
-    .join('\n')
-    .replace(/\n+$/, '');
-  // Single assignment: the trigger is stripped and the sections appended as
-  // one new string, so nothing can observe (or throw out of) a half-rewritten
-  // prompt — the assembly's sole idempotence guarantee now that the
-  // `## Seat:` sentinel is gone.
-  const assembled = `${kept}\n\n${sections.join('\n\n')}`;
-  args.prompt = assembled;
-  log('[task-session-manager] council seat assembly applied', {
-    parentSessionID,
-    seats: refs.length,
-    promptLength: assembled.length,
-  });
-}
-
 function refuseExplicitTaskId(
   requested: string,
   message: string,
@@ -354,21 +265,6 @@ export async function handleToolExecuteBefore(
   }
 
   const agentType = args.subagent_type.trim();
-  // Council Mode host-side assembly (both host flavors arrive here: the v2
-  // execute.before bridge normalizes `subagent` calls into this v1 `task`
-  // shape before the hook runs, so one injection point covers both).
-  // Unconditional and fail-open: the resolver only acts on a final Seats
-  // line and never refuses — a shape check that fails closed (rejecting
-  // prompts whose quoted content mentions a Seats line) would DoS
-  // legitimate council calls, while anything without the trigger passes
-  // through byte-identically.
-  if (agentType === 'council') {
-    assembleCouncilSeatResponses(
-      args,
-      input.sessionID,
-      deps.backgroundJobBoard,
-    );
-  }
   if (typeof args.task_id === 'string' && args.task_id.trim() !== '') {
     const canonical = deps.resolveCanonicalTaskRef
       ? await deps.resolveCanonicalTaskRef(input.sessionID, args.task_id.trim())

@@ -71,6 +71,9 @@ import {
 } from './hooks';
 import { stripTaggedContent } from './hooks/cache-safe-injection';
 import { isCommandEnabled } from './hooks/command-hook-utils';
+import { createCouncilSeatHook } from './hooks/council-seats';
+import { createManagedSeatResolver } from './hooks/council-seats/managed';
+import { createNativeSeatResolver } from './hooks/council-seats/native';
 import { isImagePart, processImageAttachments } from './hooks/image-hook';
 import { clearAllWakeSessions } from './hooks/orchestrator-wake/wake-gate';
 import { PHASE_REMINDER_METADATA_KEY } from './hooks/phase-reminder';
@@ -358,12 +361,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   // exit path releases its live-directory claim (see the catch below).
   let eventDirectoryScope: EventDirectoryScope | undefined;
 
-  // Observation-only prompt-cache watchdog; safe to create before config
-  // loads and must see every event of this location, so it sits outside the
-  // try block. `disabled_hooks: ["cache-monitor"]` gates the per-event call
-  // below; creation stays here so the pre-config event path needs no
-  // undefined handling.
-  const cacheMonitor = createCacheMonitorHook();
+  // Observation-only prompt-cache watchdog. Created after runtime init and
+  // only when `disabled_hooks` does not list "cache-monitor"; the event
+  // path below uses optional chaining so a gated generation never calls
+  // it. Every non-gated event of this location still reaches the monitor.
+  let cacheMonitor: ReturnType<typeof createCacheMonitorHook> | undefined;
 
   // Declare variables that must survive the try/catch for the return
   // closure. These are set inside the try block.
@@ -399,7 +401,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     agentName: string;
     childID?: string;
   }[] = [];
-  let autoUpdateChecker: ReturnType<typeof createAutoUpdateCheckerHook>;
+  let autoUpdateChecker:
+    | ReturnType<typeof createAutoUpdateCheckerHook>
+    | undefined;
   const v1InternalSelectionOverrides = new Map<
     string,
     {
@@ -469,17 +473,21 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   const tuiActivityDirectory = (sessionID: string): string => {
     return sessionMetadata.getDirectory(sessionID) ?? ctx.directory;
   };
-  // Sidebar activity scoping (#1147): every active session and the visible
-  // route session resolve their conversation root against the persistent
-  // sessionParents index at render time. The recorder only persists the
-  // child→parent links; roots are never stored per-activity, so a
-  // late-learned link re-roots everything consistently. Process identity
-  // cannot scope this because v2 daemons are shared across windows.
+  // Server-side TUI state writes exist only for the sidebar surface. With
+  // the sidebar disabled, every recorder call becomes a no-op: no snapshot
+  // reads, no parent hydration, no state-file writes from this process.
+  // (Pane wiring lives in the TUI entry and never reads these files.)
+  const tuiWritesEnabled = (): boolean => runtime.sidebarEnabled;
+  // Busy/retry arrived before the session's agent was known. chat.message
+  // latches the agent and flushes these so the spinner still starts. The
+  // observed status is kept so the flushed activation records the right
+  // sidebar detail (busy vs retry).
   const markTuiAgentActive = (
     sessionID: string,
     agentName: string,
     status?: 'busy' | 'retry',
   ): void => {
+    if (!tuiWritesEnabled()) return;
     const directory = tuiActivityDirectory(sessionID);
     // Alias from an already-registered board record (launch may have
     // arrived before or after busy; both orders converge here or via the
@@ -510,6 +518,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     startSessionID: string,
     directory: string,
   ): Promise<void> => {
+    if (!tuiWritesEnabled()) return;
     const sessionApi = (ctx as { client?: { session?: { get?: unknown } } })
       .client?.session;
     if (typeof sessionApi?.get !== 'function') return;
@@ -572,6 +581,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   };
   const markTuiAgentInactive = (sessionID: string): void => {
     pendingTuiBusySessions.delete(sessionID);
+    if (!tuiWritesEnabled()) return;
     const directory =
       ownedTuiActivitySessions.get(sessionID) ??
       tuiActivityDirectory(sessionID);
@@ -579,16 +589,19 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     ownedTuiActivitySessions.delete(sessionID);
   };
   const clearTuiActivities = (): void => {
+    if (!tuiWritesEnabled()) {
+      ownedTuiActivitySessions.clear();
+      return;
+    }
     for (const [sessionID, directory] of ownedTuiActivitySessions) {
       recordTuiAgentActivity({ sessionID, active: false }, directory);
     }
     ownedTuiActivitySessions.clear();
   };
-  clearTuiAgentActivities(ctx.directory);
-  let sessionLifecycle: SessionLifecycle;
+  let sessionLifecycle: SessionLifecycle | undefined;
 
   let chatHeadersHook: ReturnType<typeof createChatHeadersHook> | undefined;
-  let foregroundFallback: ForegroundFallbackManager;
+  let foregroundFallback: ForegroundFallbackManager | undefined;
   let foregroundFallbackChains: Record<string, ModelChainEntry[]> = {};
   let sessionTeamFor:
     | ((sessionID: string) => SessionTeamBundle | undefined)
@@ -598,46 +611,53 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let deepworkGuardHook: ReturnType<typeof createDeepworkGuardHook>;
   let reflectCommandHook: ReturnType<typeof createReflectCommandHook>;
   let loopCommandHook: ReturnType<typeof createLoopCommandHook>;
-  let taskSessionManagerHook: ReturnType<typeof createTaskSessionManagerHook>;
+  let taskSessionManagerHook:
+    | ReturnType<typeof createTaskSessionManagerHook>
+    | undefined;
   let phaseReminder: ReturnType<typeof createPhaseReminderHook> | undefined;
   let deepworkGoal: ReturnType<typeof createDeepworkGoalHook> | undefined;
   let councilInject: ReturnType<typeof createCouncilInjectHook> | undefined;
-  let applyPatch: ReturnType<typeof createApplyPatchHook>;
-  let searchPathGuard: ReturnType<typeof createSearchPathGuardHook>;
-  let absolutePathRescue: ReturnType<typeof createAbsolutePathRescueHook>;
-  let jsonErrorRecovery: ReturnType<typeof createJsonErrorRecoveryHook>;
-  let toolLoopGuard: ToolLoopGuardHook;
-  let deepworkGuardAfter: (i: unknown, o: unknown) => Promise<void>;
-  let jsonErrorRecoveryAfter: (i: unknown, o: unknown) => Promise<void>;
-  let taskSessionManagerAfter: (i: unknown, o: unknown) => Promise<void>;
-  let backgroundJobBoard: BackgroundJobBoard;
+  let councilSeatHook: ReturnType<typeof createCouncilSeatHook> | undefined;
+  let applyPatch: ReturnType<typeof createApplyPatchHook> | undefined;
+  let searchPathGuard: ReturnType<typeof createSearchPathGuardHook> | undefined;
+  let absolutePathRescue:
+    | ReturnType<typeof createAbsolutePathRescueHook>
+    | undefined;
+  let toolLoopGuard: ToolLoopGuardHook | undefined;
+  let deepworkGuardAfter: (i: unknown, o: unknown) => Promise<void> =
+    async () => {};
+  let jsonErrorRecoveryAfter: (i: unknown, o: unknown) => Promise<void> =
+    async () => {};
+  let taskSessionManagerAfter: (i: unknown, o: unknown) => Promise<void> =
+    async () => {};
+  let backgroundJobBoard: BackgroundJobBoard | undefined;
+  // Shared by task management and control tools; initialized only with
+  // managed lifecycle.
+  let recoverRetainedSession:
+    | ReturnType<typeof createSessionRecovery>
+    | undefined;
+  let aliasAuthority: ReturnType<typeof createAliasAuthority> | undefined;
   let tuiReusableProjection:
     | ReturnType<typeof createTuiReusableProjection>
     | undefined;
-  let backgroundJobSupervisor: BackgroundJobSupervisor;
-  let backgroundTaskConcurrency: BackgroundTaskConcurrency;
+  let backgroundJobSupervisor: BackgroundJobSupervisor | undefined;
+  let backgroundTaskConcurrency: BackgroundTaskConcurrency | undefined;
   let admissionRuntimeLease: AdmissionRuntimeLease | undefined;
   let finalHostAgentConfig: Record<string, unknown> | undefined;
-  let interviewManager: ReturnType<typeof createInterviewManager>;
+  let interviewManager: ReturnType<typeof createInterviewManager> | undefined;
   let companionManager: CompanionManager;
-  let taskCancelTools: ReturnType<typeof createCancelTaskTool>;
-  let taskMessageTools: ReturnType<typeof createTaskMessageTool>;
-  let taskReplyTools: ReturnType<typeof createTaskReplyTool>;
-  let taskReviveTools: ReturnType<typeof createTaskReviveTool>;
-  let revivedRunTracker: ReturnType<typeof createRevivedRunTracker>;
+  let revivedRunTracker: ReturnType<typeof createRevivedRunTracker> | undefined;
   let terminalGate: BackgroundJobTerminalGate | undefined;
   let markRevivedRunPending: (taskID: string) => void = () => {};
   let markRevivedRunSettled: (taskID: string) => void = () => {};
   let getRevivedContextFiles = (_taskID: string): ContextFile[] => [];
   let pruneRevivedContext = () => {};
-  let taskStatusTools: ReturnType<typeof createTaskStatusTool>;
   const taskActivityTracker = new TaskActivityTracker();
-  let waitForUserTools: ReturnType<typeof createWaitForUserTool>;
   let interviewSubmitService: ReturnType<
     typeof createInterviewManager
   >['service'];
   let acpRunTools: Record<string, ReturnType<typeof createAcpRunTool>>;
-  let webfetch: ReturnType<typeof createWebfetchTool>;
+  let webfetch: ReturnType<typeof createWebfetchTool> | undefined;
   const isFallbackPending = (taskID: string): boolean =>
     hostFlavor !== 'v2' &&
     !!(
@@ -645,6 +665,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       taskSessionManagerHook?.hasDeferredError(taskID)
     );
   let tools: Record<string, ToolDefinition>;
+  // task_* / wait_for_user registrations produced by the lifecycle block;
+  // empty when the managed background-task lifecycle is disabled.
+  let lifecycleTaskTools: Record<string, ToolDefinition> = {};
   let rewriteDisplayNameMentions: ReturnType<
     typeof createDisplayNameMentionRewriter
   >;
@@ -705,7 +728,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         rt.combinedModelInheritanceSource(name) === undefined &&
         isSwitched(name)
       ) {
-        foregroundFallback.disableChain(name);
+        foregroundFallback?.disableChain(name);
       }
     }
   }
@@ -872,6 +895,28 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     }
 
     runtime = RuntimeConfig.get(ctx.directory);
+
+    // Observation-only prompt-cache watchdog: created once the runtime
+    // config is known so `disabled_hooks: ["cache-monitor"]` skips
+    // construction entirely (fail-open by design: no creation, no call).
+    if (!runtime.disabledHooks.has('cache-monitor')) {
+      cacheMonitor = createCacheMonitorHook();
+    }
+
+    // Sidebar master switch: with `sidebar: false` the server entry never
+    // writes TUI state, so the previous generation's stale active-session
+    // marks are left to the client surface that owns them.
+    if (runtime.sidebarEnabled) {
+      clearTuiAgentActivities(ctx.directory);
+    }
+
+    // Master switch for the OMOS managed background-task lifecycle. When
+    // false, nothing board-shaped is constructed: no job board, admission
+    // lease, TUI projection, terminal gate, supervisor, revived-run
+    // tracker, session recovery, alias authority, task-session-manager
+    // hook, wake scheduler, or task_* / wait_for_user tool factories. The
+    // native OpenCode task/subagent machinery stays completely untouched.
+    const lifecycleEnabled = runtime.backgroundJobsEnabled;
     const activePresetName = runtime.getRuntimePreset() ?? config.preset;
     selectedMarketplacePackageIds = resolveDesiredMarketplacePackageIds(
       config,
@@ -882,6 +927,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     // shim; absent on v1). Threads the native delegation vocabulary into
     // prompt assembly so v2 prompts say subagent(...)/agent directly.
     const delegation = delegationWording(hostFlavor);
+    // Slash-command hooks are lifecycle-independent: they only intercept
+    // their own runtime commands.
+    deepworkCommandHook = createDeepworkCommandHook();
+    reflectCommandHook = createReflectCommandHook();
+    loopCommandHook = createLoopCommandHook();
     agentDefs = createAgents(runtime, {
       projectDirectory: ctx.directory,
       hostFlavor,
@@ -893,675 +943,617 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       Object.keys(runtime.acpAgents ?? {}).length > 0
         ? { acp_run: createAcpRunTool(runtime.acpAgents) }
         : {};
-    webfetch = createWebfetchTool(ctx, {
-      binaryDir: undefined,
-    });
-    backgroundJobBoard = new BackgroundJobBoard({
-      maxReusablePerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
-      deferNumberedAliases: true,
-      // Terminal-session GC (#1387 P2): when a retention trim evicts a
-      // terminal or retained-stopped record, remove the underlying host
-      // child session — but only a background, non-provisional child this
-      // plugin launched itself (never foreground children, unattributed
-      // placeholders, or adopted/restored/rehydrated sessions), and only
-      // after bounded host reads confirm its parentID still matches the
-      // record's parent and it is idle, and the board does not track it
-      // again. A parked child-input wait blocks removal. The prune is
-      // fire-and-forget so the synchronous board never awaits it; the
-      // delete has a deadline so the pending-prune fence always settles.
-      ...(runtime.backgroundJobs.pruneEvictedSessions
-        ? {
-            onEvictedSession: (evicted: BackgroundJobEvictedSession) => {
-              if (!isPrunableEvictedSession(evicted)) return;
-              if (listChildInputWaits(evicted.taskID).length > 0) return;
-              // Same-tick: the prune (parent read + delete) starts and is
-              // registered in one synchronous step with no await in
-              // between, so a task_revive can never observe a
-              // started-but-unregistered prune and adopt the session the
-              // delete is about to remove (#1387 race).
-              registerPendingSessionPrune(
-                evicted.taskID,
-                pruneEvictedHostSession({
-                  session: ctx.client.session,
-                  directory: ctx.directory,
-                  evicted,
-                  readTimeoutMs: DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS,
-                  deleteTimeoutMs: DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS,
-                  isTracked: (taskID) => backgroundJobBoard.isTracked(taskID),
-                }),
-              );
-            },
-          }
-        : {}),
-    });
-    admissionRuntimeLease = acquireAdmissionRuntime(
-      ctx.directory,
-      runtime.backgroundJobs.concurrency,
-    );
-    backgroundTaskConcurrency = admissionRuntimeLease.backgroundTaskConcurrency;
-
-    // Project launch identity (alias↔session) into TUI state so the
-    // clickable sidebar can label active subagent sessions. Best-effort:
-    // a failed tui-state write must never fail a launch.
-    //
-    // Each generation must retract its own projected sections on dispose:
-    // a reload reuses this PID, so the startup dead-owner sweep retains
-    // the previous generation's entries until explicitly removed.
-    tuiReusableProjection = createTuiReusableProjection({
-      board: backgroundJobBoard,
-      projectDir: ctx.directory,
-    });
-    backgroundJobBoard.addLaunchIdentityListener((event) => {
-      const directory = tuiActivityDirectory(event.taskID);
-      if (event.kind === 'registered') {
-        if (event.parentSessionID && event.parentSessionID !== event.taskID) {
-          recordTuiSessionParent(
-            event.taskID,
-            event.parentSessionID,
-            directory,
-          );
-        }
-        updateTuiSessionDetails(
-          event.taskID,
-          { alias: event.alias },
-          directory,
-        );
-      } else {
-        clearTuiSessionAlias(event.taskID, directory);
-      }
-    });
-    terminalGate = createBackgroundJobTerminalGate({
-      backgroundJobBoard: backgroundJobBoard,
-      input: ctx,
-      // Configurable stop-confirmation grace (backgroundJobs.
-      // stopConfirmationMs); the default equals
-      // STOP_CONFIRMATION_GRACE_MS, so unset config keeps v1 behavior.
-      graceMs: runtime.backgroundJobs.stopConfirmationMs,
-      baselineFor: (taskID, generation) =>
-        revivedRunTracker?.baselineFor(taskID, generation),
-      promptMessageIDFor: (taskID, generation) =>
-        revivedRunTracker?.promptMessageIDFor(taskID, generation),
-      // Local in-process integration: host and plugin timestamps share Unix ms.
-      hostOutcomeClock: 'shared-unix-ms',
-      attemptStartedAtFor: (taskID, generation) =>
-        revivedRunTracker?.attemptStartedAtFor(taskID, generation),
-      observationRevisionFor: (taskID, generation) =>
-        revivedRunTracker?.revisionFor(taskID, generation),
-      isObservationPending: (taskID, generation) =>
-        (foregroundFallback?.isFallbackInProgress(taskID) ?? false) ||
-        (taskSessionManagerHook?.hasDeferredError(taskID) ?? false) ||
-        (revivedRunTracker?.isObservationPending(taskID, generation) ?? false),
-      onRunning: (record) => {
-        if (record.background)
-          backgroundTaskConcurrency.restoreTask(
-            record.taskID,
-            sessionMetadata.getModel(record.taskID) ??
-              resolvePrimaryModelFromFinalHostConfig(record.agent) ??
-              sessionMetadata.getModel(record.parentSessionID),
-          );
-        if (
-          !revivedRunTracker?.promptMessageIDFor(
-            record.taskID,
-            record.generation,
-          )
-        )
-          backgroundJobSupervisor?.onLaunch(record);
-      },
-    });
-    backgroundJobSupervisor = new BackgroundJobSupervisor({
-      backgroundJobBoard,
-      wallClockTimeoutMs: runtime.backgroundJobs.wallClockTimeoutMs,
-      abort: (taskID) =>
-        ctx.client.session.abort({
-          path: { id: taskID },
-        }),
-    });
-    backgroundJobBoard.addTerminalOutcomeListener((record) => {
-      const current = backgroundJobBoard.get(record.taskID);
-      if (
-        current?.generation !== record.generation ||
-        current.terminalRevision !== record.terminalRevision ||
-        current.state === 'running'
-      )
-        return;
-      backgroundJobBoard.addContext(
-        record.taskID,
-        getRevivedContextFiles(record.taskID),
-      );
-      markRevivedRunSettled(record.taskID);
-      pruneRevivedContext();
-      backgroundJobSupervisor.onTerminal(record);
-      backgroundTaskConcurrency.releaseTask(record.taskID);
-    });
-    revivedRunTracker = createRevivedRunTracker({
-      input: ctx,
-      backgroundJobBoard: backgroundJobBoard,
-      terminalGate,
-      backgroundJobSupervisor,
-      resolveSelection: lifecycleSelectionResolver,
-      onRegister: (taskID) => markRevivedRunPending(taskID),
-      onSettled: (taskID) => markRevivedRunSettled(taskID),
-      contextFilesForPrompt: (taskID) => getRevivedContextFiles(taskID),
-      pruneContext: () => pruneRevivedContext(),
-      onNotificationAccepted: (taskID, runStartedAt) => {
-        markPersistedBackgroundChildDelivered(
-          taskID,
-          Date.now(),
-          runStartedAt ?? backgroundJobBoard.get(taskID)?.runStartedAt,
-        );
-      },
-      // Degraded-fallback wiring (revived-lineage strand): when every
-      // tracker notification attempt has failed, the publication this
-      // tracker suppressed in the terminal-outcome listener would
-      // otherwise never reach the idle parent. Re-emit it DIRECTLY
-      // through the wake scheduler — never through the listener's
-      // suppression chain: a revived lineage has no native notifier, so
-      // the first-publication-native-owned (and tracker-owned) skips
-      // must not apply to this fallback. The scheduler's own guards
-      // (canSchedule, one-flight wake gate, publication throttle) still
-      // apply, correctly.
-      onOwnershipReleased: (
-        parentSessionID,
-        taskID,
-        generation,
-        runStartedAt,
-      ) => {
-        void (async () => {
-          const record = backgroundJobBoard.get(taskID);
-          const delivered =
-            await orchestratorWakeScheduler?.triggerTerminalPublicationWake(
-              parentSessionID,
-              taskID,
-              generation,
-              record?.terminalRevision,
-            );
-          if (delivered === true) {
-            markPersistedBackgroundChildDelivered(
-              taskID,
-              Date.now(),
-              runStartedAt ?? record?.runStartedAt,
-            );
-          }
-        })().catch(() => undefined);
-      },
-    });
-    backgroundJobBoard.addTerminalOutcomeListener((record) => {
-      revivedRunTracker.onTerminal(record);
-      // Sidebar activity bookkeeping only: pane lifecycle runs in the client
-      // (TUI) process, never here.
-      markTuiAgentInactive(record.taskID);
-    });
-
+    webfetch =
+      runtime.webfetch.enabled !== false
+        ? createWebfetchTool(ctx, { binaryDir: undefined })
+        : undefined;
     sessionLifecycle = new SessionLifecycle(log);
     sessionLifecycle.onSessionDeleted((sessionID) => {
       compactingSessionIds.delete(sessionID);
     });
 
-    // Initialize auto-update checker hook
-    autoUpdateChecker = createAutoUpdateCheckerHook(ctx, {
-      autoUpdate: runtime.autoUpdate,
-      companion: runtime.companion,
-    });
+    if (runtime.backgroundJobsEnabled) {
+      backgroundJobBoard = new BackgroundJobBoard({
+        maxReusablePerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
+        deferNumberedAliases: true,
+        // Terminal-session GC (#1387 P2): when a retention trim evicts a
+        // terminal or retained-stopped record, remove the underlying host
+        // child session — but only a background, non-provisional child this
+        // plugin launched itself (never foreground children, unattributed
+        // placeholders, or adopted/restored/rehydrated sessions), and only
+        // after bounded host reads confirm its parentID still matches the
+        // record's parent and it is idle, and the board does not track it
+        // again. A parked child-input wait blocks removal. The prune is
+        // fire-and-forget so the synchronous board never awaits it; the
+        // delete has a deadline so the pending-prune fence always settles.
+        ...(runtime.backgroundJobs.pruneEvictedSessions
+          ? {
+              onEvictedSession: (evicted: BackgroundJobEvictedSession) => {
+                if (!isPrunableEvictedSession(evicted)) return;
+                if (listChildInputWaits(evicted.taskID).length > 0) return;
+                // Same-tick: the prune (parent read + delete) starts and is
+                // registered in one synchronous step with no await in
+                // between, so a task_revive can never observe a
+                // started-but-unregistered prune and adopt the session the
+                // delete is about to remove (#1387 race).
+                registerPendingSessionPrune(
+                  evicted.taskID,
+                  pruneEvictedHostSession({
+                    session: ctx.client.session,
+                    directory: ctx.directory,
+                    evicted,
+                    readTimeoutMs: DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS,
+                    deleteTimeoutMs: DEFAULT_RUNTIME_SESSION_STATUS_TIMEOUT_MS,
+                    isTracked: (taskID) =>
+                      backgroundJobBoard?.isTracked(taskID) ?? false,
+                  }),
+                );
+              },
+            }
+          : {}),
+      });
+      recoverRetainedSession = createSessionRecovery({
+        input: ctx,
+        backgroundJobBoard: backgroundJobBoard!,
+        isDisposed: () => instanceDisposed,
+        hostFlavor,
+      });
+      aliasAuthority = createAliasAuthority({
+        input: ctx,
+        board: backgroundJobBoard!,
+        isDisposed: () => instanceDisposed,
+      });
 
-    // disabled_hooks: "chat-headers" keeps the hook unregistered on both
-    // hosts — the v2 bridge reads v1Hooks['chat.headers'] and skips the
-    // model.request registration when the key is absent.
-    if (!runtime.disabledHooks.has('chat-headers')) {
-      chatHeadersHook = createChatHeadersHook(ctx);
-    }
-
-    // Initialize foreground fallback manager for runtime model switching.
-    // Agents without a chain (e.g. councillor, owned by CouncilManager) are
-    // left alone — FG only aborts/re-prompts when it has a model to switch to.
-    // The observation handoff brackets the re-prompt admission for
-    // BACKGROUND children (false-stop incident): prepare() defers the stop
-    // gate before the await, admit() enrolls the run tracker after host
-    // acceptance, reject() withdraws on failure; see
-    // fallback-observation-transfer.ts.
-    const backgroundFallbackHandoff = createBackgroundFallbackHandoff({
-      backgroundJobBoard: backgroundJobBoard,
-      revivedRunTracker,
-    });
-    // The current v2 host interface has no per-turn/atomic conditional
-    // switch, so an in-flight REPLAY (abort + re-prompt) can commit on the
-    // host after a newer user turn has taken over — the replay path stays
-    // disabled on v2 (a3ac0bee). The retry-hook steering path performs no
-    // replay: it mutates the host's in-flight retry decision and switches
-    // the model in place via session.switchModel, so the a3ac0bee race
-    // cannot occur. Steering is host-agnostic (only v2 hosts invoke the
-    // hook) and follows the same user switches as the replay path
-    // (fallback.enabled / disabled_hooks).
-    const fallbackUserEnabled =
-      runtime.fallback.enabled !== false &&
-      !runtime.disabledHooks.has('foreground-fallback');
-    const fallbackEnabled = fallbackUserEnabled && hostFlavor !== 'v2';
-    const v2RetryEnabled = fallbackUserEnabled;
-    if (fallbackUserEnabled && hostFlavor === 'v2') {
-      // Deterministic notice: no timestamps or per-call ids. Do not log when
-      // the user explicitly disabled fallback, including via disabled_hooks.
-      log(
-        '[foreground-fallback] v2 replay fallback disabled (no atomic per-turn model switch); retry-hook steering active',
+      admissionRuntimeLease = acquireAdmissionRuntime(
+        ctx.directory,
+        runtime.backgroundJobs.concurrency,
       );
-    }
-    // Startup generation: captured here and republished (contents swap) by
-    // registry finalize and every successful profile refresh. The manager
-    // aliases this record; see publishChainGeneration.
-    foregroundFallbackChains = runtime.modelArrays;
-    foregroundFallback = new ForegroundFallbackManager(
-      foregroundFallbackChains,
-      fallbackEnabled,
-      ctx,
-      runtime.fallback.maxRetries,
-      sessionLifecycle,
-      // A managed background-task session switching models mid-flight must
-      // move its admission accounting (provider/model caps) to the new
-      // model. No-op for unknown/non-task sessions; idempotent per model.
-      (sessionID, model) =>
-        backgroundTaskConcurrency.migrateTask(sessionID, model),
-      runtime.fallback.initialRetryDelayMs,
-      runtime.fallback.retryDelayMs,
-      backgroundFallbackHandoff,
-      // Identify confirmed background children even after cancellation or
-      // termination, so handoff preparation rejects a delayed stale replay.
-      // Undefined remains exclusive to foreground/unmanaged sessions.
-      (sessionID) => {
-        const record = backgroundJobBoard.get(sessionID);
-        return record?.background === true ? record.generation : undefined;
-      },
-      (sessionID) => backgroundJobBoard.hasRunning(sessionID),
-      v2RetryEnabled,
-    );
+      backgroundTaskConcurrency =
+        admissionRuntimeLease.backgroundTaskConcurrency;
 
-    deepworkCommandHook = createDeepworkCommandHook();
-    reflectCommandHook = createReflectCommandHook();
-    loopCommandHook = createLoopCommandHook();
-    const recoverRetainedSession = createSessionRecovery({
-      input: ctx,
-      backgroundJobBoard: backgroundJobBoard,
-      isDisposed: () => instanceDisposed,
-      hostFlavor,
-    });
-    const aliasAuthority = createAliasAuthority({
-      input: ctx,
-      board: backgroundJobBoard,
-      isDisposed: () => instanceDisposed,
-    });
-    taskSessionManagerHook = createTaskSessionManagerHook(ctx, {
-      terminalGate,
-      // Flip mechanism half reads the per-instance box declared above.
-      isBackgroundDefaultFlipArmed: backgroundDefaultFlip.isArmed,
-      // Host flavor marker; v1 hosts are structurally boardless (issue
-      // #1647): the machine board is never rendered.
-      hostFlavor,
-      maxSessionsPerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
-      backgroundJobBoard: backgroundJobBoard,
-      backgroundJobSupervisor,
-      backgroundTaskConcurrency,
-      pendingCallTracker: admissionRuntimeLease.pendingCallTracker,
-      // The stale-timestamp retirement fallback must not ack a run whose
-      // completed-job push is still queued undelivered (its own observed
-      // push retires it; acking first fences the answer out forever).
-      hasUndeliveredTerminalPush: (parentSessionID, taskID, generation) =>
-        orchestratorWakeScheduler?.hasPendingCompletedPush(
+      // Project launch identity (alias↔session) into TUI state so the
+      // clickable sidebar can label active subagent sessions. Best-effort:
+      // a failed tui-state write must never fail a launch.
+      //
+      // Each generation must retract its own projected sections on dispose:
+      // a reload reuses this PID, so the startup dead-owner sweep retains
+      // the previous generation's entries until explicitly removed.
+      // Sidebar projection and its launch-identity writes exist only for
+      // the sidebar surface; disabled means no state file, no locks, no
+      // parent/alias hydration from this process.
+      if (runtime.sidebarEnabled) {
+        tuiReusableProjection = createTuiReusableProjection({
+          board: backgroundJobBoard,
+          projectDir: ctx.directory,
+        });
+        backgroundJobBoard.addLaunchIdentityListener((event) => {
+          const directory = tuiActivityDirectory(event.taskID);
+          if (event.kind === 'registered') {
+            if (
+              event.parentSessionID &&
+              event.parentSessionID !== event.taskID
+            ) {
+              recordTuiSessionParent(
+                event.taskID,
+                event.parentSessionID,
+                directory,
+              );
+            }
+            updateTuiSessionDetails(
+              event.taskID,
+              { alias: event.alias },
+              directory,
+            );
+          } else {
+            clearTuiSessionAlias(event.taskID, directory);
+          }
+        });
+      }
+      terminalGate = createBackgroundJobTerminalGate({
+        backgroundJobBoard: backgroundJobBoard,
+        input: ctx,
+        // Configurable stop-confirmation grace (backgroundJobs.
+        // stopConfirmationMs); the default equals
+        // STOP_CONFIRMATION_GRACE_MS, so unset config keeps v1 behavior.
+        graceMs: runtime.backgroundJobs.stopConfirmationMs,
+        baselineFor: (taskID, generation) =>
+          revivedRunTracker?.baselineFor(taskID, generation),
+        promptMessageIDFor: (taskID, generation) =>
+          revivedRunTracker?.promptMessageIDFor(taskID, generation),
+        // Local in-process integration: host and plugin timestamps share Unix ms.
+        hostOutcomeClock: 'shared-unix-ms',
+        attemptStartedAtFor: (taskID, generation) =>
+          revivedRunTracker?.attemptStartedAtFor(taskID, generation),
+        observationRevisionFor: (taskID, generation) =>
+          revivedRunTracker?.revisionFor(taskID, generation),
+        isObservationPending: (taskID, generation) =>
+          (foregroundFallback?.isFallbackInProgress(taskID) ?? false) ||
+          (taskSessionManagerHook?.hasDeferredError(taskID) ?? false) ||
+          (revivedRunTracker?.isObservationPending(taskID, generation) ??
+            false),
+        onRunning: (record) => {
+          if (record.background)
+            backgroundTaskConcurrency?.restoreTask(
+              record.taskID,
+              sessionMetadata.getModel(record.taskID) ??
+                resolvePrimaryModelFromFinalHostConfig(record.agent) ??
+                sessionMetadata.getModel(record.parentSessionID),
+            );
+          if (
+            !revivedRunTracker?.promptMessageIDFor(
+              record.taskID,
+              record.generation,
+            )
+          )
+            backgroundJobSupervisor?.onLaunch(record);
+        },
+      });
+      backgroundJobSupervisor = new BackgroundJobSupervisor({
+        backgroundJobBoard,
+        wallClockTimeoutMs: runtime.backgroundJobs.wallClockTimeoutMs,
+        abort: (taskID) =>
+          ctx.client.session.abort({
+            path: { id: taskID },
+          }),
+      });
+      backgroundJobBoard!.addTerminalOutcomeListener((record) => {
+        revivedRunTracker!.onTerminal(record);
+        const current = backgroundJobBoard!.get(record.taskID);
+        if (
+          current?.generation !== record.generation ||
+          current.terminalRevision !== record.terminalRevision ||
+          current.state === 'running'
+        )
+          return;
+        backgroundJobBoard!.addContext(
+          record.taskID,
+          getRevivedContextFiles(record.taskID),
+        );
+        markRevivedRunSettled(record.taskID);
+        pruneRevivedContext();
+        backgroundJobSupervisor!.onTerminal(record);
+        backgroundTaskConcurrency?.releaseTask(record.taskID);
+      });
+      revivedRunTracker = createRevivedRunTracker({
+        input: ctx,
+        backgroundJobBoard: backgroundJobBoard,
+        terminalGate,
+        backgroundJobSupervisor,
+        resolveSelection: lifecycleSelectionResolver,
+        onRegister: (taskID) => markRevivedRunPending(taskID),
+        onSettled: (taskID) => markRevivedRunSettled(taskID),
+        contextFilesForPrompt: (taskID) => getRevivedContextFiles(taskID),
+        pruneContext: () => pruneRevivedContext(),
+        onNotificationAccepted: (taskID, runStartedAt) => {
+          markPersistedBackgroundChildDelivered(
+            taskID,
+            Date.now(),
+            runStartedAt ?? backgroundJobBoard!.get(taskID)?.runStartedAt,
+          );
+        },
+        // Degraded-fallback wiring (revived-lineage strand): when every
+        // tracker notification attempt has failed, the publication this
+        // tracker suppressed in the terminal-outcome listener would
+        // otherwise never reach the idle parent. Re-emit it DIRECTLY
+        // through the wake scheduler — never through the listener's
+        // suppression chain: a revived lineage has no native notifier, so
+        // the first-publication-native-owned (and tracker-owned) skips
+        // must not apply to this fallback. The scheduler's own guards
+        // (canSchedule, one-flight wake gate, publication throttle) still
+        // apply, correctly.
+        onOwnershipReleased: (
           parentSessionID,
           taskID,
           generation,
-        ) === true,
-      getModelForAgent,
-      sameProviderPolicy: runtime.backgroundJobs.sameProviderPolicy,
-      getSessionModel: liveSessionModel,
-      recoverRetainedSession,
-      resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
-      isDisposed: () => instanceDisposed,
-      shouldManageSession: (sessionID) =>
-        sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
-        sessionMetadata.isTaskManaged(sessionID),
-      registerSessionAsOrchestrator: (sessionID) => {
-        // Membership in task management, not a selection rewrite (#1079).
-        sessionMetadata.markTaskManaged(sessionID);
-      },
-      isFallbackInProgress: (sessionID) =>
-        foregroundFallback.isFallbackInProgress(sessionID),
-      willAttemptFallback: (sessionID) =>
-        foregroundFallback.willAttemptFallback(sessionID),
-      fallbackFailureReason: (sessionID) =>
-        foregroundFallback.fallbackFailureReason(sessionID),
-      coordinator: sessionLifecycle,
-      revivedRunTracker,
-      onChildInputWait: (notification) => {
-        const record = backgroundJobBoard.get(notification.taskID);
-        if (record?.state !== 'running') {
-          return;
-        }
-        const wait = getChildInputWait(
-          notification.taskID,
-          notification.requestID,
-        );
-        if (!wait) return;
-        queueChildInputWaitWake(record, wait);
-      },
-    });
-    markRevivedRunPending = taskSessionManagerHook.markRevivedRunPending;
-    markRevivedRunSettled = taskSessionManagerHook.clearRevivedRunPending;
-    getRevivedContextFiles = taskSessionManagerHook.contextFilesForTask;
-    pruneRevivedContext = taskSessionManagerHook.pruneTaskContext;
-
-    // v2: the host's native background notifier owns terminal delivery —
-    // steer reaches a busy parent at its next step boundary, restart
-    // recovery re-delivers from the durable KV job marker, and the inbox
-    // dedupes by message ID — and child permission/question asks are a
-    // host UI boundary the host does not route to the parent agent. No
-    // plugin wake machinery exists on v2 (council 2026-10-23): no
-    // scheduler is created, so every trigger call no-ops through the
-    // undefined optional chain, and asks stay in the sidecar for
-    // task_status pull. v1 keeps the scheduler.
-    orchestratorWakeScheduler =
-      hostFlavor === 'v2'
-        ? undefined
-        : createOrchestratorWakeScheduler(ctx, {
-            // v1 honors the configured key.
-            config: {
-              ...runtime.backgroundJobs.orchestratorWake,
-              periodicWakeEnabled:
-                runtime.backgroundJobs.orchestratorWake.periodicWakeEnabled ??
-                true,
-            },
-            // The machine board is never rendered, so wake annotations always point
-            // at the pull channel (`task_status`).
-            childInputWakeKinds: runtime.backgroundJobs.childInputWakeKinds,
-            shouldManageSession: (sessionID) =>
-              sessionMetadata.getAgent(sessionID) === 'orchestrator',
-            hasInputWait: (sessionID) =>
-              taskSessionManagerHook.hasInputWait(sessionID),
-            isFallbackInProgress: (sessionID) =>
-              foregroundFallback.isFallbackInProgress(sessionID),
-            resolveSelection: lifecycleSelectionResolver,
-            // C2 writer-lane predicate: the queued child's agent from the board
-            // record, graded by its role's write permission data. A missing
-            // record/agent reads as writer (fail-safe, verdict defaults to
-            // attaching the verification sentence).
-            isWriterLaneTask: (taskID) =>
-              roleHasWriteCapability(backgroundJobBoard.get(taskID)?.agent),
-            isStoppedJobRecoveryCurrent: (taskID, generation) => {
-              const record = backgroundJobBoard.get(taskID);
-              return (
-                record?.generation === generation &&
-                record.state === 'stopped' &&
-                record.terminalUnreconciled
+          runStartedAt,
+        ) => {
+          void (async () => {
+            const record = backgroundJobBoard!.get(taskID);
+            const delivered =
+              await orchestratorWakeScheduler?.triggerTerminalPublicationWake(
+                parentSessionID,
+                taskID,
+                generation,
+                record?.terminalRevision,
               );
-            },
-            // A queued completed-job result stays actionable only while the record
-            // is still the SAME run's terminal publication: a reopened record (or
-            // one that published again) must not be reported from a stale delta.
-            isCompletedJobCurrent: (taskID, generation) => {
-              const record = backgroundJobBoard.get(taskID);
-              return (
-                record?.generation === generation &&
-                record.terminalUnreconciled === true &&
-                (record.state === 'completed' || record.state === 'error')
-              );
-            },
-            isChildInputWaitCurrent: (taskID, requestID) => {
-              const record = backgroundJobBoard.get(taskID);
-              return (
-                record?.state === 'running' &&
-                getChildInputWait(taskID, requestID) !== undefined
-              );
-            },
-            hasPendingDelegatedWork: (sessionID) =>
-              backgroundJobBoard.hasRunning(sessionID) ||
-              backgroundJobBoard.hasTerminalUnreconciled(sessionID),
-            isPublicationCurrent: (publication) => {
-              const record = backgroundJobBoard.get(publication.taskID);
-              return (
-                record !== undefined &&
-                record.state !== 'running' &&
-                record.terminalUnreconciled === true &&
-                record.generation === publication.generation &&
-                (publication.terminalRevision === undefined ||
-                  record.terminalRevision === publication.terminalRevision)
-              );
-            },
-            onPublicationAccepted: (publication) => {
-              const record = backgroundJobBoard.get(publication.taskID);
+            if (delivered === true) {
               markPersistedBackgroundChildDelivered(
-                publication.taskID,
+                taskID,
                 Date.now(),
-                record?.runStartedAt,
+                runStartedAt ?? record?.runStartedAt,
               );
-            },
-            coordinator: sessionLifecycle,
-          });
-    // A restarted plugin starts with an empty board. If the parent stays idle
-    // it never transforms history, so restore owned children here from host
-    // state instead of waiting for the next parent request. Verification is
-    // in the scanner: parent launch evidence is required before adoption.
-    void recoverSubagentSessionsAtStartup({
-      input: ctx,
-      backgroundJobBoard: backgroundJobBoard,
-      shouldManageSession: (sessionID) =>
-        sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
-        sessionMetadata.isTaskManaged(sessionID),
-      hostFlavor,
-      isDisposed: () => instanceDisposed,
-      registerParentSession: (sessionID) => {
-        // Membership in task management, matching the transform path.
-        sessionMetadata.markTaskManaged(sessionID);
-      },
-      backgroundTaskConcurrency,
-      getModelForAgent,
-      onRecoveredTerminal: async (parentSessionID, taskID) => {
-        const record = backgroundJobBoard.get(taskID);
-        if (!record) return false;
-        return (
-          (await orchestratorWakeScheduler?.triggerTerminalPublicationWake(
+            }
+          })().catch(() => undefined);
+        },
+      });
+      backgroundJobBoard!.addTerminalOutcomeListener((record) => {
+        revivedRunTracker!.onTerminal(record);
+        // Sidebar activity bookkeeping only: pane lifecycle runs in the client
+        // (TUI) process, never here.
+        markTuiAgentInactive(record.taskID);
+      });
+
+      taskSessionManagerHook = createTaskSessionManagerHook(ctx, {
+        terminalGate,
+        // Flip mechanism half reads the per-instance box declared above.
+        isBackgroundDefaultFlipArmed: backgroundDefaultFlip.isArmed,
+        // Host flavor marker; v1 hosts are structurally boardless (issue
+        // #1647): the machine board is never rendered.
+        hostFlavor,
+        maxSessionsPerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
+        backgroundJobBoard: backgroundJobBoard,
+        backgroundJobSupervisor,
+        backgroundTaskConcurrency,
+        pendingCallTracker: admissionRuntimeLease.pendingCallTracker,
+        // The stale-timestamp retirement fallback must not ack a run whose
+        // completed-job push is still queued undelivered (its own observed
+        // push retires it; acking first fences the answer out forever).
+        hasUndeliveredTerminalPush: (parentSessionID, taskID, generation) =>
+          orchestratorWakeScheduler?.hasPendingCompletedPush(
             parentSessionID,
             taskID,
-            record.generation,
-            record.terminalRevision,
-          )) === true
-        );
-      },
-    }).catch((error: unknown) => {
-      log('[task-session-manager] startup subagent recovery failed', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    });
-    backgroundJobBoard.addTerminalOutcomeListener((record) => {
-      // A placeholder is not delegated work; its stop is not recoverable
-      // by the parent until a task launch has attributed the session.
-      if (record.provisional === true) return;
-      // A child's terminal state resolves any of its open input waits: the
-      // ask is gone with the run, so a queued wake must not fire for it and
-      // task_status must not show it after a restart. Runs on both hosts —
-      // the ask store has no run-generation fence of its own.
-      clearChildInputWaitsForSession(record.taskID);
-      // v2 has no wake machinery (no scheduler): native delivery owns
-      // stops for job-backed runs, and the plugin does not push one for
-      // a non-job run (council 2026-10-23).
-      if (hostFlavor === 'v2') return;
-      if (record.state !== 'stopped' || !record.terminalUnreconciled) return;
-      // Symmetric tracker suppression (M4): when the revived-run tracker
-      // owns this generation's delivery — it already delivered the run's
-      // terminal <task> notification — a recovery wake beside it would
-      // queue a second admission for a lineage the parent already heard
-      // from. Scoped like the publication listener's check: a stop that
-      // is the generation's FIRST publication has no tracker delivery
-      // beside it (the tracker only delivers completed/error), so the
-      // recovery wake stays that stop's one and only notification.
-      if (
-        record.terminalRevision > 1 &&
-        revivedRunTracker.willNotifyParent(record.taskID, record.generation)
-      ) {
-        log('[orchestrator-wake] stopped-job recovery wake skipped', {
-          sessionID: record.parentSessionID,
-          taskID: record.taskID,
-          generation: record.generation,
-          trigger: 'stopped-job-recovery',
-          verdict: 'skipped',
-          reason: 'revived-tracker-owns-delivery',
-        });
-        return;
-      }
-      // Host-attributed double-delivery gate: a stop the host itself
-      // reported (interrupted/cancelled — the terminal gate's own result
-      // summary, same anchor as stoppedJobRecoveryReason) is already
-      // delivered to the parent by the host's native notifier for a
-      // tool-launched generation, so a recovery wake beside it would
-      // queue a second admission for one stop. The revived-run tracker is
-      // the complementary view: when it owns this generation's delivery
-      // (task_revive lineage), omos stays the wake's author and the skip
-      // does not apply. Tracker without a record for this (taskID,
-      // generation) reads as false → only host-attributed stops fall to
-      // the native side (error-safe: at worst a redundant wake is
-      // dropped); every other stop keeps its recovery wake.
-      // First-publication only (terminalRevision === 1): the native
-      // observer is armed per tool-launched run, and every
-      // tool-launched relaunch resets the revision (board recordLaunch
-      // bumps the generation and zeroes terminalRevision), so a
-      // revision-1 host-attributed stop is always a fresh tool-launched
-      // run the native notifier covers. A later publication (rev > 1)
-      // means the child ran again WITHOUT a tool launch — e.g. a direct
-      // prompt after completion — where no native observer exists for
-      // the new run and this recovery wake is the only notification the
-      // parent gets. Skipping there would lose the stop entirely.
-      if (
-        record.terminalRevision === 1 &&
-        record.recoveredAtStartup !== true &&
-        HOST_ATTRIBUTED_STOP_OUTCOME.test(record.resultSummary ?? '') &&
-        !revivedRunTracker.willNotifyParent(record.taskID, record.generation)
-      ) {
-        log('[orchestrator-wake] stopped-job recovery wake skipped', {
-          sessionID: record.parentSessionID,
-          taskID: record.taskID,
-          generation: record.generation,
-          trigger: 'stopped-job-recovery',
-          verdict: 'skipped',
-          reason: 'native-delivers-host-attributed-stop',
-        });
-        return;
-      }
-      orchestratorWakeScheduler?.triggerStoppedJobRecovery(
-        record.parentSessionID,
-        // Self-contained stop facts (issue #1051): the recovery wake is an
-        // internal-initiator turn, and internal-initiator turns place no
-        // board, so the wake must carry the stop facts itself.
-        formatStoppedJobDelta({
-          alias: record.alias,
-          taskID: record.taskID,
-          generation: record.generation,
-          state: record.state,
-          reason: stoppedJobRecoveryReason(record),
-        }),
-        `${record.taskID}:${record.generation}`,
-      );
-    });
-    // Terminal-publication wake: completed/error publications reaching an
-    // IDLE parent (state-disjoint from the stopped recovery listener
-    // above — stopped+terminalUnreconciled vs completed|error). A busy
-    // parent is skipped inside the trigger: the native steer already
-    // delivered the first completion, so a queued wake would
-    // double-notify.
-    backgroundJobBoard.addTerminalOutcomeListener((record) => {
-      // v2 has no wake machinery: rev-1 is natively delivered, a rev>1
-      // tool relaunch re-arms the native observer, and a direct-prompt
-      // rev>1 run is out of plugin scope (council 2026-10-23).
-      if (hostFlavor === 'v2') return;
-      // Unattributed child sessions are not delegated work, just as in
-      // stopped-job recovery; their owner controls parent notifications.
-      if (record.provisional === true) return;
-      if (record.state !== 'completed' && record.state !== 'error') return;
-      // Revived-run ownership: when the tracker will deliver this run's
-      // <task> result itself (notifyParent), a publication wake beside
-      // it would queue a SECOND admission to the idle parent — the
-      // double-notify the exactly-once notification contract forbids.
-      // Scoped to the exact (taskID, generation) the tracker owns;
-      // non-revived publications are unaffected.
-      if (
-        revivedRunTracker.willNotifyParent(record.taskID, record.generation)
-      ) {
-        log('[orchestrator-wake] terminal publication wake skipped', {
-          sessionID: record.parentSessionID,
-          taskID: record.taskID,
-          generation: record.generation,
-          trigger: 'terminal-publication',
-          verdict: 'skipped',
-          reason: 'revived-tracker-owns-delivery',
-        });
-        return;
-      }
-      // First-publication ownership (live-verified on a 2.0.8 host): the
-      // native notifier delivers a run's FIRST terminal publication to
-      // the parent even while it sits idle, so a plugin push beside it
-      // would double-notify. On v2 EVERY plugin task launch AND relaunch
-      // is a host `subagent` tool call that arms the host's native
-      // background notifier — a relaunch re-arms it with a fresh
-      // `started_at`, defeating the notify dedupe — so the native
-      // contract covers the FIRST publication (terminalRevision 1) of
-      // EVERY generation, not just the original launch. Only later
-      // revisions of the same generation (rev>1: a child
-      // self-continuation, a direct prompt to the child session) have no
-      // native notifier and remain the plugin's to deliver (v1 behaves
-      // the same: the native task tool arms notifyBackgroundResult per
-      // background call). Edge: if a native delivery is ever lost
-      // host-side, the job falls back to the stale-terminal display on
-      // the parent's next activity, or stays silent until the next
-      // task_status pull.
-      // A startup-adopted row was launched before this plugin instance
-      // existed, so no native observer survives to deliver its first
-      // publication. The plugin owns that wake.
-      if (record.terminalRevision === 1 && record.recoveredAtStartup !== true) {
-        // The native notifier owns this publication. Native ownership alone
-        // is not proof of delivery, so nothing is acknowledged here: the
-        // next restart's history scan either finds a trusted current-run
-        // delivery or re-owns this terminal outcome.
-
-        log('[orchestrator-wake] terminal publication wake skipped', {
-          sessionID: record.parentSessionID,
-          taskID: record.taskID,
-          generation: record.generation,
-          trigger: 'terminal-publication',
-          verdict: 'skipped',
-          reason: 'first-publication-native-owned',
-        });
-        return;
-      }
-      // v1 is structurally boardless: the board no longer carries later
-      // terminal results. Push ONE self-contained `<completed-job>` delta
-      // through the bounded delta queue (durable across a busy parent and
-      // the publication throttle) instead of the drop-prone publication
-      // wake. The fence in the part metadata retires exactly this
-      // publication when the parent observes it.
-      if (
-        runtime.backgroundJobs.orchestratorWake.wakeOnTerminalPublication ===
-        false
-      ) {
-        return;
-      }
-      const state =
-        record.terminalState === 'completed' || record.terminalState === 'error'
-          ? record.terminalState
-          : record.state === 'completed' || record.state === 'error'
-            ? record.state
-            : undefined;
-      if (!state) return;
-      orchestratorWakeScheduler?.triggerCompletedJobPublication(
-        record.parentSessionID,
-        formatCompletedJobDelta({
-          alias: record.alias,
-          taskID: record.taskID,
-          state,
-          resultSummary: record.resultSummary ?? state,
-        }),
-        `${record.taskID}:${record.generation}`,
-        {
-          taskID: record.taskID,
-          generation: record.generation,
-          terminalRevision: record.terminalRevision,
-          state,
+            generation,
+          ) === true,
+        getModelForAgent,
+        sameProviderPolicy: runtime.backgroundJobs.sameProviderPolicy,
+        getSessionModel: liveSessionModel,
+        recoverRetainedSession,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        isDisposed: () => instanceDisposed,
+        shouldManageSession: (sessionID) =>
+          sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
+          sessionMetadata.isTaskManaged(sessionID),
+        registerSessionAsOrchestrator: (sessionID) => {
+          // Membership in task management, not a selection rewrite (#1079).
+          sessionMetadata.markTaskManaged(sessionID);
         },
-      );
-    });
+        isFallbackInProgress: (sessionID) =>
+          foregroundFallback!.isFallbackInProgress(sessionID),
+        willAttemptFallback: (sessionID) =>
+          foregroundFallback!.willAttemptFallback(sessionID),
+        fallbackFailureReason: (sessionID) =>
+          foregroundFallback!.fallbackFailureReason(sessionID),
+        coordinator: sessionLifecycle,
+        revivedRunTracker,
+        onChildInputWait: (notification) => {
+          const record = backgroundJobBoard!.get(notification.taskID);
+          if (record?.state !== 'running') {
+            return;
+          }
+          const wait = getChildInputWait(
+            notification.taskID,
+            notification.requestID,
+          );
+          if (!wait) return;
+          queueChildInputWaitWake(record, wait);
+        },
+      });
+      markRevivedRunPending = taskSessionManagerHook!.markRevivedRunPending;
+      markRevivedRunSettled = taskSessionManagerHook!.clearRevivedRunPending;
+      getRevivedContextFiles = taskSessionManagerHook!.contextFilesForTask;
+      pruneRevivedContext = taskSessionManagerHook!.pruneTaskContext;
+
+      // v2: the host's native background notifier owns terminal delivery —
+      // steer reaches a busy parent at its next step boundary, restart
+      // recovery re-delivers from the durable KV job marker, and the inbox
+      // dedupes by message ID — and child permission/question asks are a
+      // host UI boundary the host does not route to the parent agent. No
+      // plugin wake machinery exists on v2 (council 2026-10-23): no
+      // scheduler is created, so every trigger call no-ops through the
+      // undefined optional chain, and asks stay in the sidecar for
+      // task_status pull. v1 keeps the scheduler.
+      orchestratorWakeScheduler =
+        hostFlavor === 'v2'
+          ? undefined
+          : createOrchestratorWakeScheduler(ctx, {
+              // v1 honors the configured key.
+              config: {
+                ...runtime.backgroundJobs.orchestratorWake,
+                periodicWakeEnabled:
+                  runtime.backgroundJobs.orchestratorWake.periodicWakeEnabled ??
+                  true,
+              },
+              // The machine board is never rendered, so wake annotations always point
+              // at the pull channel (`task_status`).
+              childInputWakeKinds: runtime.backgroundJobs.childInputWakeKinds,
+              shouldManageSession: (sessionID) =>
+                sessionMetadata.getAgent(sessionID) === 'orchestrator',
+              hasInputWait: (sessionID) =>
+                taskSessionManagerHook!.hasInputWait(sessionID),
+              isFallbackInProgress: (sessionID) =>
+                foregroundFallback!.isFallbackInProgress(sessionID),
+              resolveSelection: lifecycleSelectionResolver,
+              // C2 writer-lane predicate: the queued child's agent from the board
+              // record, graded by its role's write permission data. A missing
+              // record/agent reads as writer (fail-safe, verdict defaults to
+              // attaching the verification sentence).
+              isWriterLaneTask: (taskID) =>
+                roleHasWriteCapability(backgroundJobBoard!.get(taskID)?.agent),
+              isStoppedJobRecoveryCurrent: (taskID, generation) => {
+                const record = backgroundJobBoard!.get(taskID);
+                return (
+                  record?.generation === generation &&
+                  record.state === 'stopped' &&
+                  record.terminalUnreconciled
+                );
+              },
+              // A queued completed-job result stays actionable only while the record
+              // is still the SAME run's terminal publication: a reopened record (or
+              // one that published again) must not be reported from a stale delta.
+              isCompletedJobCurrent: (taskID, generation) => {
+                const record = backgroundJobBoard!.get(taskID);
+                return (
+                  record?.generation === generation &&
+                  record.terminalUnreconciled === true &&
+                  (record.state === 'completed' || record.state === 'error')
+                );
+              },
+              isChildInputWaitCurrent: (taskID, requestID) => {
+                const record = backgroundJobBoard!.get(taskID);
+                return (
+                  record?.state === 'running' &&
+                  getChildInputWait(taskID, requestID) !== undefined
+                );
+              },
+              hasPendingDelegatedWork: (sessionID) =>
+                backgroundJobBoard!.hasRunning(sessionID) ||
+                backgroundJobBoard!.hasTerminalUnreconciled(sessionID),
+              isPublicationCurrent: (publication) => {
+                const record = backgroundJobBoard!.get(publication.taskID);
+                return (
+                  record !== undefined &&
+                  record.state !== 'running' &&
+                  record.terminalUnreconciled === true &&
+                  record.generation === publication.generation &&
+                  (publication.terminalRevision === undefined ||
+                    record.terminalRevision === publication.terminalRevision)
+                );
+              },
+              onPublicationAccepted: (publication) => {
+                const record = backgroundJobBoard!.get(publication.taskID);
+                markPersistedBackgroundChildDelivered(
+                  publication.taskID,
+                  Date.now(),
+                  record?.runStartedAt,
+                );
+              },
+              coordinator: sessionLifecycle,
+            });
+      // A restarted plugin starts with an empty board. If the parent stays idle
+      // it never transforms history, so restore owned children here from host
+      // state instead of waiting for the next parent request. Verification is
+      // in the scanner: parent launch evidence is required before adoption.
+      void recoverSubagentSessionsAtStartup({
+        input: ctx,
+        backgroundJobBoard: backgroundJobBoard,
+        shouldManageSession: (sessionID) =>
+          sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
+          sessionMetadata.isTaskManaged(sessionID),
+        hostFlavor,
+        isDisposed: () => instanceDisposed,
+        registerParentSession: (sessionID) => {
+          // Membership in task management, matching the transform path.
+          sessionMetadata.markTaskManaged(sessionID);
+        },
+        backgroundTaskConcurrency,
+        getModelForAgent,
+        onRecoveredTerminal: async (parentSessionID, taskID) => {
+          const record = backgroundJobBoard!.get(taskID);
+          if (!record) return false;
+          return (
+            (await orchestratorWakeScheduler?.triggerTerminalPublicationWake(
+              parentSessionID,
+              taskID,
+              record.generation,
+              record.terminalRevision,
+            )) === true
+          );
+        },
+      }).catch((error: unknown) => {
+        log('[task-session-manager] startup subagent recovery failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+      backgroundJobBoard!.addTerminalOutcomeListener((record) => {
+        // A placeholder is not delegated work; its stop is not recoverable
+        // by the parent until a task launch has attributed the session.
+        if (record.provisional === true) return;
+        // A child's terminal state resolves any of its open input waits: the
+        // ask is gone with the run, so a queued wake must not fire for it and
+        // task_status must not show it after a restart. Runs on both hosts —
+        // the ask store has no run-generation fence of its own.
+        clearChildInputWaitsForSession(record.taskID);
+        // v2 has no wake machinery (no scheduler): native delivery owns
+        // stops for job-backed runs, and the plugin does not push one for
+        // a non-job run (council 2026-10-23).
+        if (hostFlavor === 'v2') return;
+        if (record.state !== 'stopped' || !record.terminalUnreconciled) return;
+        // Symmetric tracker suppression (M4): when the revived-run tracker
+        // owns this generation's delivery — it already delivered the run's
+        // terminal <task> notification — a recovery wake beside it would
+        // queue a second admission for a lineage the parent already heard
+        // from. Scoped like the publication listener's check: a stop that
+        // is the generation's FIRST publication has no tracker delivery
+        // beside it (the tracker only delivers completed/error), so the
+        // recovery wake stays that stop's one and only notification.
+        if (
+          record.terminalRevision > 1 &&
+          revivedRunTracker!.willNotifyParent(record.taskID, record.generation)
+        ) {
+          log('[orchestrator-wake] stopped-job recovery wake skipped', {
+            sessionID: record.parentSessionID,
+            taskID: record.taskID,
+            generation: record.generation,
+            trigger: 'stopped-job-recovery',
+            verdict: 'skipped',
+            reason: 'revived-tracker-owns-delivery',
+          });
+          return;
+        }
+        // Host-attributed double-delivery gate: a stop the host itself
+        // reported (interrupted/cancelled — the terminal gate's own result
+        // summary, same anchor as stoppedJobRecoveryReason) is already
+        // delivered to the parent by the host's native notifier for a
+        // tool-launched generation, so a recovery wake beside it would
+        // queue a second admission for one stop. The revived-run tracker is
+        // the complementary view: when it owns this generation's delivery
+        // (task_revive lineage), omos stays the wake's author and the skip
+        // does not apply. Tracker without a record for this (taskID,
+        // generation) reads as false → only host-attributed stops fall to
+        // the native side (error-safe: at worst a redundant wake is
+        // dropped); every other stop keeps its recovery wake.
+        // First-publication only (terminalRevision === 1): the native
+        // observer is armed per tool-launched run, and every
+        // tool-launched relaunch resets the revision (board recordLaunch
+        // bumps the generation and zeroes terminalRevision), so a
+        // revision-1 host-attributed stop is always a fresh tool-launched
+        // run the native notifier covers. A later publication (rev > 1)
+        // means the child ran again WITHOUT a tool launch — e.g. a direct
+        // prompt after completion — where no native observer exists for
+        // the new run and this recovery wake is the only notification the
+        // parent gets. Skipping there would lose the stop entirely.
+        if (
+          record.terminalRevision === 1 &&
+          record.recoveredAtStartup !== true &&
+          HOST_ATTRIBUTED_STOP_OUTCOME.test(record.resultSummary ?? '') &&
+          !revivedRunTracker!.willNotifyParent(record.taskID, record.generation)
+        ) {
+          log('[orchestrator-wake] stopped-job recovery wake skipped', {
+            sessionID: record.parentSessionID,
+            taskID: record.taskID,
+            generation: record.generation,
+            trigger: 'stopped-job-recovery',
+            verdict: 'skipped',
+            reason: 'native-delivers-host-attributed-stop',
+          });
+          return;
+        }
+        orchestratorWakeScheduler?.triggerStoppedJobRecovery(
+          record.parentSessionID,
+          // Self-contained stop facts (issue #1051): the recovery wake is an
+          // internal-initiator turn, and internal-initiator turns place no
+          // board, so the wake must carry the stop facts itself.
+          formatStoppedJobDelta({
+            alias: record.alias,
+            taskID: record.taskID,
+            generation: record.generation,
+            state: record.state,
+            reason: stoppedJobRecoveryReason(record),
+          }),
+          `${record.taskID}:${record.generation}`,
+        );
+      });
+      // Terminal-publication wake: completed/error publications reaching an
+      // IDLE parent (state-disjoint from the stopped recovery listener
+      // above — stopped+terminalUnreconciled vs completed|error). A busy
+      // parent is skipped inside the trigger: the native steer already
+      // delivered the first completion, so a queued wake would
+      // double-notify.
+      backgroundJobBoard!.addTerminalOutcomeListener((record) => {
+        revivedRunTracker!.onTerminal(record);
+        // tool relaunch re-arms the native observer, and a direct-prompt
+        // rev>1 run is out of plugin scope (council 2026-10-23).
+        if (hostFlavor === 'v2') return;
+        // Unattributed child sessions are not delegated work, just as in
+        // stopped-job recovery; their owner controls parent notifications.
+        if (record.provisional === true) return;
+        if (record.state !== 'completed' && record.state !== 'error') return;
+        // Revived-run ownership: when the tracker will deliver this run's
+        // <task> result itself (notifyParent), a publication wake beside
+        // it would queue a SECOND admission to the idle parent — the
+        // double-notify the exactly-once notification contract forbids.
+        // Scoped to the exact (taskID, generation) the tracker owns;
+        // non-revived publications are unaffected.
+        if (
+          revivedRunTracker!.willNotifyParent(record.taskID, record.generation)
+        ) {
+          log('[orchestrator-wake] terminal publication wake skipped', {
+            sessionID: record.parentSessionID,
+            taskID: record.taskID,
+            generation: record.generation,
+            trigger: 'terminal-publication',
+            verdict: 'skipped',
+            reason: 'revived-tracker-owns-delivery',
+          });
+          return;
+        }
+        // First-publication ownership (live-verified on a 2.0.8 host): the
+        // native notifier delivers a run's FIRST terminal publication to
+        // the parent even while it sits idle, so a plugin push beside it
+        // would double-notify. On v2 EVERY plugin task launch AND relaunch
+        // is a host `subagent` tool call that arms the host's native
+        // background notifier — a relaunch re-arms it with a fresh
+        // `started_at`, defeating the notify dedupe — so the native
+        // contract covers the FIRST publication (terminalRevision 1) of
+        // EVERY generation, not just the original launch. Only later
+        // revisions of the same generation (rev>1: a child
+        // self-continuation, a direct prompt to the child session) have no
+        // native notifier and remain the plugin's to deliver (v1 behaves
+        // the same: the native task tool arms notifyBackgroundResult per
+        // background call). Edge: if a native delivery is ever lost
+        // host-side, the job falls back to the stale-terminal display on
+        // the parent's next activity, or stays silent until the next
+        // task_status pull.
+        // A startup-adopted row was launched before this plugin instance
+        // existed, so no native observer survives to deliver its first
+        // publication. The plugin owns that wake.
+        if (
+          record.terminalRevision === 1 &&
+          record.recoveredAtStartup !== true
+        ) {
+          // The native notifier owns this publication. Native ownership alone
+          // is not proof of delivery, so nothing is acknowledged here: the
+          // next restart's history scan either finds a trusted current-run
+          // delivery or re-owns this terminal outcome.
+
+          log('[orchestrator-wake] terminal publication wake skipped', {
+            sessionID: record.parentSessionID,
+            taskID: record.taskID,
+            generation: record.generation,
+            trigger: 'terminal-publication',
+            verdict: 'skipped',
+            reason: 'first-publication-native-owned',
+          });
+          return;
+        }
+        // v1 is structurally boardless: the board no longer carries later
+        // terminal results. Push ONE self-contained `<completed-job>` delta
+        // through the bounded delta queue (durable across a busy parent and
+        // the publication throttle) instead of the drop-prone publication
+        // wake. The fence in the part metadata retires exactly this
+        // publication when the parent observes it.
+        if (
+          runtime.backgroundJobs.orchestratorWake.wakeOnTerminalPublication ===
+          false
+        ) {
+          return;
+        }
+        const state =
+          record.terminalState === 'completed' ||
+          record.terminalState === 'error'
+            ? record.terminalState
+            : record.state === 'completed' || record.state === 'error'
+              ? record.state
+              : undefined;
+        if (!state) return;
+        orchestratorWakeScheduler?.triggerCompletedJobPublication(
+          record.parentSessionID,
+          formatCompletedJobDelta({
+            alias: record.alias,
+            taskID: record.taskID,
+            state,
+            resultSummary: record.resultSummary ?? state,
+          }),
+          `${record.taskID}:${record.generation}`,
+          {
+            taskID: record.taskID,
+            generation: record.generation,
+            terminalRevision: record.terminalRevision,
+            state,
+          },
+        );
+      });
+    }
 
     // Initialize hooks and wrapPostToolHook helper for error isolation
 
@@ -1624,107 +1616,249 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
     }
 
-    applyPatch = createApplyPatchHook(ctx);
+    if (!runtime.disabledHooks.has('auto-update-checker')) {
+      // Initialize auto-update checker hook
+      autoUpdateChecker = createAutoUpdateCheckerHook(ctx, {
+        autoUpdate: runtime.autoUpdate,
+        companion: runtime.companion,
+      });
+    }
 
-    searchPathGuard = createSearchPathGuardHook(ctx);
+    // disabled_hooks: "chat-headers" keeps the hook unregistered on both
+    // hosts — the v2 bridge reads v1Hooks['chat.headers'] and skips the
+    // model.request registration when the key is absent.
+    if (!runtime.disabledHooks.has('chat-headers')) {
+      chatHeadersHook = createChatHeadersHook(ctx);
+    }
 
-    absolutePathRescue = createAbsolutePathRescueHook(ctx);
+    // Initialize foreground fallback manager for runtime model switching.
+    // Agents without a chain (e.g. councillor, owned by CouncilManager) are
+    // left alone — FG only aborts/re-prompts when it has a model to switch to.
+    // The observation handoff brackets the re-prompt admission for
+    // BACKGROUND children (false-stop incident): prepare() defers the stop
+    // gate before the await, admit() enrolls the run tracker after host
+    // acceptance, reject() withdraws on failure; see
+    // fallback-observation-transfer.ts.
+    // Lifecycle off: the manager is still constructed (v2 retry steering
+    // depends on it) but the board-derived deps pass undefined instead of
+    // false-returning stubs — no board, no supervisor, no handoff exists
+    // to observe, so the manager stays honest about the absent surface.
+    const backgroundFallbackHandoff = lifecycleEnabled
+      ? createBackgroundFallbackHandoff({
+          backgroundJobBoard: backgroundJobBoard!,
+          revivedRunTracker: revivedRunTracker!,
+        })
+      : undefined;
+    // The current v2 host interface has no per-turn/atomic conditional
+    // switch, so an in-flight REPLAY (abort + re-prompt) can commit on the
+    // host after a newer user turn has taken over — the replay path stays
+    // disabled on v2 (a3ac0bee). The retry-hook steering path performs no
+    // replay: it mutates the host's in-flight retry decision and switches
+    // the model in place via session.switchModel, so the a3ac0bee race
+    // cannot occur. Steering is host-agnostic (only v2 hosts invoke the
+    // hook) and follows the same user switches as the replay path
+    // (fallback.enabled / disabled_hooks).
+    const fallbackUserEnabled =
+      runtime.fallback.enabled !== false &&
+      !runtime.disabledHooks.has('foreground-fallback');
+    const fallbackEnabled = fallbackUserEnabled && hostFlavor !== 'v2';
+    const v2RetryEnabled = fallbackUserEnabled;
+    if (fallbackUserEnabled && hostFlavor === 'v2') {
+      // Deterministic notice: no timestamps or per-call ids. Do not log when
+      // the user explicitly disabled fallback, including via disabled_hooks.
+      log(
+        '[foreground-fallback] v2 replay fallback disabled (no atomic per-turn model switch); retry-hook steering active',
+      );
+    }
+    // Startup generation: captured here and republished (contents swap) by
+    // registry finalize and every successful profile refresh. The manager
+    // aliases this record; see publishChainGeneration.
+    foregroundFallbackChains = runtime.modelArrays;
+    foregroundFallback = new ForegroundFallbackManager(
+      foregroundFallbackChains,
+      fallbackEnabled,
+      ctx,
+      runtime.fallback.maxRetries,
+      sessionLifecycle,
+      // A managed background-task session switching models mid-flight must
+      // move its admission accounting (provider/model caps) to the new
+      // model. No-op for unknown/non-task sessions; idempotent per model.
+      // Undefined when the lifecycle is off: no admission runtime exists.
+      lifecycleEnabled
+        ? (sessionID, model) =>
+            backgroundTaskConcurrency?.migrateTask(sessionID, model)
+        : undefined,
+      runtime.fallback.initialRetryDelayMs,
+      runtime.fallback.retryDelayMs,
+      backgroundFallbackHandoff,
+      // Identify confirmed background children even after cancellation or
+      // termination, so handoff preparation rejects a delayed stale replay.
+      // Undefined remains exclusive to foreground/unmanaged sessions, and
+      // is the honest value when no board exists.
+      lifecycleEnabled
+        ? (sessionID) => {
+            const record = backgroundJobBoard?.get(sessionID);
+            return record?.background === true ? record.generation : undefined;
+          }
+        : undefined,
+      lifecycleEnabled
+        ? (sessionID) => backgroundJobBoard?.hasRunning(sessionID) ?? false
+        : undefined,
+      v2RetryEnabled,
+    );
+
+    // P0 cold gating: each on-demand tool guard is only constructed when
+    // its disabled_hooks entry is absent, so a disabled guard performs no
+    // construction work and its composed before/after calls no-op. Deepwork
+    // guard keeps its per-call self-gate inside its own module.
+    if (!runtime.disabledHooks.has('apply-patch')) {
+      applyPatch = createApplyPatchHook(ctx);
+    }
+
+    if (!runtime.disabledHooks.has('search-path-guard')) {
+      searchPathGuard = createSearchPathGuardHook(ctx);
+    }
+
+    if (!runtime.disabledHooks.has('absolute-path-rescue')) {
+      absolutePathRescue = createAbsolutePathRescueHook(ctx);
+    }
 
     deepworkGuardHook = createDeepworkGuardHook(ctx);
-    jsonErrorRecovery = createJsonErrorRecoveryHook(ctx);
-    toolLoopGuard = createToolLoopGuardHook({ directory: ctx.directory });
+    if (!runtime.disabledHooks.has('json-error-recovery')) {
+      const jsonErrorRecoveryHook = createJsonErrorRecoveryHook(ctx);
+      jsonErrorRecoveryAfter = wrapPostToolHook('json-error-recovery', (i, o) =>
+        jsonErrorRecoveryHook['tool.execute.after'](i as never, o as never),
+      );
+    }
+    if (!runtime.disabledHooks.has('tool-loop-guard')) {
+      toolLoopGuard = createToolLoopGuardHook({ directory: ctx.directory });
+    }
 
     // Pre-created wrapped handlers for tool.execute.after (error-isolated)
     deepworkGuardAfter = wrapPostToolHook('deepwork-guard', (i, o) =>
       deepworkGuardHook['tool.execute.after'](i as never, o as never),
     );
-    jsonErrorRecoveryAfter = wrapPostToolHook('json-error-recovery', (i, o) =>
-      jsonErrorRecovery['tool.execute.after'](i as never, o as never),
-    );
-    taskSessionManagerAfter = wrapPostToolHook('task-session-manager', (i, o) =>
-      taskSessionManagerHook['tool.execute.after'](i as never, o as never),
-    );
-    interviewManager = createInterviewManager(ctx, config);
-    interviewSubmitService = interviewManager.service;
+    if (taskSessionManagerHook) {
+      taskSessionManagerAfter = wrapPostToolHook(
+        'task-session-manager',
+        (i, o) =>
+          taskSessionManagerHook!['tool.execute.after'](i as never, o as never),
+      );
+    }
+    // Council seat assembly: the managed resolver runs against the board
+    // while the lifecycle owns it; without the lifecycle the native resolver
+    // resolves seat refs through the host client and no board is involved.
+    // The hook only acts on council delegations carrying a final `Seats:`
+    // line and never throws.
+    councilSeatHook = createCouncilSeatHook({
+      resolveSeats: lifecycleEnabled
+        ? createManagedSeatResolver(backgroundJobBoard!)
+        : createNativeSeatResolver(ctx),
+    });
+    if (runtime.interviewEnabled) {
+      interviewManager = createInterviewManager(ctx, config);
+      interviewSubmitService = interviewManager.service;
+    }
     companionManager = new CompanionManager(
       companionSessionIdForDirectory(ctx.directory),
       ctx.directory,
       runtime.companion,
       hostFlavor,
     );
-    taskCancelTools = createCancelTaskTool({
-      input: ctx,
-      backgroundJobBoard: backgroundJobBoard,
-      terminalGate,
-      shouldManageSession: (sessionID) =>
-        sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
-        sessionMetadata.isTaskManaged(sessionID),
-      recoverRetainedSession,
-      resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
-      isDisposed: () => instanceDisposed,
-    });
-    taskMessageTools = createTaskMessageTool({
-      input: ctx,
-      backgroundJobBoard: backgroundJobBoard,
-      resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
-      isDisposed: () => instanceDisposed,
-    });
-    taskReplyTools = createTaskReplyTool({
-      input: ctx,
-      backgroundJobBoard: backgroundJobBoard,
-      resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
-      isDisposed: () => instanceDisposed,
-    });
-    taskStatusTools = createTaskStatusTool({
-      input: ctx,
-      backgroundJobBoard: backgroundJobBoard,
-      activityTracker: taskActivityTracker,
-      terminalGate,
-      resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
-      isDisposed: () => instanceDisposed,
-    });
-    taskReviveTools = createTaskReviveTool({
-      isFallbackPending,
-      ...(hostFlavor !== 'v2' && { registerIntent: registerV1DelegatedIntent }),
-      terminalGate,
-      input: ctx,
-      backgroundJobBoard: backgroundJobBoard,
-      shouldManageSession: (sessionID) =>
-        sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
-        sessionMetadata.isTaskManaged(sessionID),
-      backgroundJobSupervisor,
-      revivedRunTracker,
-      recoverRetainedSession,
-      isDisposed: () => instanceDisposed,
-      resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
-    });
-    waitForUserTools = createWaitForUserTool({
-      shouldManageSession: (sessionID) =>
-        sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
-        sessionMetadata.isTaskManaged(sessionID),
-      resolveAgentName: (agent) => resolveRuntimeAgentName(runtime, agent),
-      registerSessionAsOrchestrator: (sessionID) => {
-        sessionMetadata.markTaskManaged(sessionID);
-      },
-      beginUserWait: (sessionID) => {
-        taskSessionManagerHook.beginUserWait(sessionID);
-        orchestratorWakeScheduler?.suppress(sessionID);
-      },
-      waitForUserGuardEnabled: runtime.backgroundJobs.waitForUserGuard,
-      hasOutstandingBackgroundTasks: (sessionID) =>
-        runtime.backgroundJobs.orchestratorWake.enabled &&
-        backgroundJobBoard.hasRunning(sessionID),
-    });
+    if (lifecycleEnabled) {
+      // Invariant: the lifecycle block above initialized the shared recovery
+      // and alias state. Checked once here so TypeScript narrows it for the
+      // control-tool registrations below, instead of `!` at every option.
+      if (!recoverRetainedSession || !aliasAuthority) {
+        throw new Error(
+          'managed lifecycle enabled without recovery/alias state',
+        );
+      }
+      const taskCancelTools = createCancelTaskTool({
+        input: ctx,
+        backgroundJobBoard: backgroundJobBoard!,
+        terminalGate,
+        shouldManageSession: (sessionID) =>
+          sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
+          sessionMetadata.isTaskManaged(sessionID),
+        recoverRetainedSession,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        isDisposed: () => instanceDisposed,
+      });
+      const taskMessageTools = createTaskMessageTool({
+        input: ctx,
+        backgroundJobBoard: backgroundJobBoard!,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        isDisposed: () => instanceDisposed,
+      });
+      const taskReplyTools = createTaskReplyTool({
+        input: ctx,
+        backgroundJobBoard: backgroundJobBoard!,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        isDisposed: () => instanceDisposed,
+      });
+      const taskStatusTools = createTaskStatusTool({
+        input: ctx,
+        backgroundJobBoard: backgroundJobBoard!,
+        activityTracker: taskActivityTracker,
+        terminalGate,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        isDisposed: () => instanceDisposed,
+      });
+      const taskReviveTools = createTaskReviveTool({
+        isFallbackPending,
+        ...(hostFlavor !== 'v2' && {
+          registerIntent: registerV1DelegatedIntent,
+        }),
+        terminalGate,
+        input: ctx,
+        backgroundJobBoard: backgroundJobBoard!,
+        shouldManageSession: (sessionID) =>
+          sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
+          sessionMetadata.isTaskManaged(sessionID),
+        backgroundJobSupervisor: backgroundJobSupervisor!,
+        revivedRunTracker: revivedRunTracker!,
+        recoverRetainedSession,
+        isDisposed: () => instanceDisposed,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+      });
+      const waitForUserTools = createWaitForUserTool({
+        shouldManageSession: (sessionID) =>
+          sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
+          sessionMetadata.isTaskManaged(sessionID),
+        resolveAgentName: (agent) => resolveRuntimeAgentName(runtime, agent),
+        registerSessionAsOrchestrator: (sessionID) => {
+          sessionMetadata.markTaskManaged(sessionID);
+        },
+        beginUserWait: (sessionID) => {
+          taskSessionManagerHook?.beginUserWait(sessionID);
+          orchestratorWakeScheduler?.suppress(sessionID);
+        },
+        waitForUserGuardEnabled: runtime.backgroundJobs.waitForUserGuard,
+        hasOutstandingBackgroundTasks: (sessionID) =>
+          runtime.backgroundJobs.orchestratorWake.enabled &&
+          (backgroundJobBoard?.hasRunning(sessionID) ?? false),
+      });
+      lifecycleTaskTools = {
+        ...taskCancelTools,
+        ...taskMessageTools,
+        ...taskReplyTools,
+        // Keep master's v1 registration order (cache-stable tool list).
+        ...(hostFlavor !== 'v2' ? taskReviveTools : {}),
+        ...taskStatusTools,
+        ...(hostFlavor !== 'v2' ? waitForUserTools : {}),
+      };
+    }
 
     // v2 hosts skip wait_for_user: the native `question` tool covers the
     // blocking boundary there. task_revive remains a v1-only recovery tool;
     // v2 resumes retained sessions through native subagent(sessionID, prompt).
     // v1 registration is unchanged; the generic disabled_tools filter below
-    // still removes either tool when listed.
-    const shouldRegisterWaitForUser = hostFlavor !== 'v2';
-    const shouldRegisterTaskRevive = hostFlavor !== 'v2';
+    // still removes either tool when listed. The interview tool follows the
+    // interviewEnabled master switch in addition to disabled_commands.
     const shouldRegisterWebfetch = runtime.webfetch.enabled !== false;
-    const shouldRegisterInterview = !runtime.disabledCommands.has('interview');
+    const shouldRegisterInterview =
+      runtime.interviewEnabled && !runtime.disabledCommands.has('interview');
     const interviewTools = shouldRegisterInterview
       ? createInterviewSubmitStateTool({
           service: () => interviewSubmitService,
@@ -1732,15 +1866,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         })
       : {};
     tools = {
-      ...taskCancelTools,
-      ...taskMessageTools,
-      ...taskReplyTools,
-      ...(shouldRegisterTaskRevive ? taskReviveTools : {}),
-      ...taskStatusTools,
-      ...(shouldRegisterWaitForUser ? waitForUserTools : {}),
+      ...lifecycleTaskTools,
       ...interviewTools,
       ...acpRunTools,
-      ...(shouldRegisterWebfetch ? { webfetch } : {}),
+      ...(shouldRegisterWebfetch && webfetch ? { webfetch } : {}),
       ast_grep_search,
       ast_grep_replace,
     };
@@ -1784,6 +1913,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     runtime.disabledTools,
     runtime.webfetch.enabled !== false,
     hostFlavor,
+    runtime.backgroundJobsEnabled,
   );
   if (
     agentCount < HEALTH_CHECK.minAgents ||
@@ -1811,14 +1941,18 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
   // ── Probe jsdom (async, non-blocking) ───────────────────────────────
   // Don't await this; we don't want to block init. The warning will
-  // appear shortly after startup if jsdom is broken.
-  probeJSDOM().then((err) => {
-    if (err) {
-      const msg = `jsdom probe failed; webfetch tool will not work: ${err}`;
-      log(`[plugin] WARN: ${msg}`);
-      appLog(ctx, 'warn', msg).catch(() => {});
-    }
-  });
+  // appear shortly after startup if jsdom is broken. Skipped entirely when
+  // the enhanced webfetch is disabled: a disabled feature must not pay for
+  // the JSDOM load (the probe is the only startup importer of jsdom).
+  if (runtime.webfetch.enabled !== false) {
+    probeJSDOM().then((err) => {
+      if (err) {
+        const msg = `jsdom probe failed; webfetch tool will not work: ${err}`;
+        log(`[plugin] WARN: ${msg}`);
+        appLog(ctx, 'warn', msg).catch(() => {});
+      }
+    });
+  }
 
   if (runtime.companion?.enabled === true) {
     try {
@@ -1870,100 +2004,110 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   }
 
   let registryBridge: RegistryFactoryBridge;
-  const marketplaceService = new MarketplaceService({
-    projectDir: ctx.directory,
-    hostFlavor,
-    pluginVersion: getBuildInfo().version,
-    getLivePackages: () => {
-      if (registryRetired || !resolvedAgentRegistry) return undefined;
-      return registryBridge.requireRegistry().marketplacePackages;
-    },
-    getPresetOverride: () => runtime.getRuntimePreset() ?? undefined,
-    getDesiredState: (packageInspection) => {
-      const freshConfig = loadPluginConfig(ctx.directory, {
-        silent: true,
+  // Marketplace kill switch (P2): when disabled, no service, no store, no
+  // management tools, and no marketplace activation surface. Selected
+  // package IDs are ignored. This is distinct from an empty per-preset
+  // activation list, which keeps the service running with nothing selected.
+  const marketplaceEnabled = runtime.marketplaceEnabled;
+  const marketplaceService = marketplaceEnabled
+    ? new MarketplaceService({
+        projectDir: ctx.directory,
         hostFlavor,
-      });
-      const runtimePreset = runtime.resolveRuntimePreset(freshConfig);
-      const desiredPackageIds = resolveDesiredMarketplacePackageIds(
-        freshConfig,
-        runtimePreset ?? undefined,
-      );
-      if (hostSnapshotProvenance !== 'clean' || !latestHostSnapshot) {
-        return {
-          packageIds: desiredPackageIds,
-          error:
-            'The current host agent snapshot is not trustworthy for desired marketplace status',
-        };
-      }
-      if (
-        packageInspection.lockfileError ||
-        packageInspection.operationalError
-      ) {
-        return {
-          packageIds: desiredPackageIds,
-          error:
-            packageInspection.lockfileError ??
-            packageInspection.operationalError ??
-            'Marketplace package inspection is incomplete',
-        };
-      }
-      const installedPackages = new Map(
-        packageInspection.packages.map((stored) => [
-          stored.manifest.id,
-          stored,
-        ]),
-      );
-      const readOnlyActivationStore = {
-        loadSelected(ids: readonly string[]) {
-          const packages = new Map();
-          const errors = new Map<string, Error>();
-          for (const id of ids) {
-            const stored = installedPackages.get(id);
-            if (stored) packages.set(id, stored);
-            else
-              errors.set(id, new Error(`${id} is not installed or verified`));
-          }
-          return { packages, errors };
+        pluginVersion: getBuildInfo().version,
+        getLivePackages: () => {
+          if (registryRetired || !resolvedAgentRegistry) return undefined;
+          return registryBridge.requireRegistry().marketplacePackages;
         },
-      };
-      const freshRuntime = RuntimeConfig.createDetached(
-        ctx.directory,
-        freshConfig,
-        hostFlavor,
-      );
-      freshRuntime.captureHostConfig(latestHostSnapshot ?? {});
-      if (runtimePreset) freshRuntime.setRuntimePreset(runtimePreset);
-      const freshPluginMcps = createBuiltinMcps(freshRuntime.disabledMcps);
-      try {
-        const freshRegistry = buildResolvedAgentRegistry(freshRuntime, {
-          hostSnapshot: latestHostSnapshot,
-          nativePermissionsByAgent: latestNativePermissionsByAgent,
-          projectDirectory: ctx.directory,
-          hostFlavor,
-          pluginMcps: freshPluginMcps,
-          marketplace: {
-            selectedPackageIds: desiredPackageIds,
-            store: readOnlyActivationStore,
-            pluginVersion: getBuildInfo().version,
-            availableSkillNames: discoverPreflightSkills(
-              freshRuntime,
-              ctx.directory,
-            ),
-          },
-        });
-        return {
-          packageIds: desiredPackageIds,
-          packages: freshRegistry.marketplacePackages,
-        };
-      } catch (error) {
-        return {
-          packageIds: desiredPackageIds,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-    },
-  });
+        getPresetOverride: () => runtime.getRuntimePreset() ?? undefined,
+        getDesiredState: (packageInspection) => {
+          const freshConfig = loadPluginConfig(ctx.directory, {
+            silent: true,
+            hostFlavor,
+          });
+          const runtimePreset = runtime.resolveRuntimePreset(freshConfig);
+          const desiredPackageIds = resolveDesiredMarketplacePackageIds(
+            freshConfig,
+            runtimePreset ?? undefined,
+          );
+          if (hostSnapshotProvenance !== 'clean' || !latestHostSnapshot) {
+            return {
+              packageIds: desiredPackageIds,
+              error:
+                'The current host agent snapshot is not trustworthy for desired marketplace status',
+            };
+          }
+          if (
+            packageInspection.lockfileError ||
+            packageInspection.operationalError
+          ) {
+            return {
+              packageIds: desiredPackageIds,
+              error:
+                packageInspection.lockfileError ??
+                packageInspection.operationalError ??
+                'Marketplace package inspection is incomplete',
+            };
+          }
+          const installedPackages = new Map(
+            packageInspection.packages.map((stored) => [
+              stored.manifest.id,
+              stored,
+            ]),
+          );
+          const readOnlyActivationStore = {
+            loadSelected(ids: readonly string[]) {
+              const packages = new Map();
+              const errors = new Map<string, Error>();
+              for (const id of ids) {
+                const stored = installedPackages.get(id);
+                if (stored) packages.set(id, stored);
+                else
+                  errors.set(
+                    id,
+                    new Error(`${id} is not installed or verified`),
+                  );
+              }
+              return { packages, errors };
+            },
+          };
+          const freshRuntime = RuntimeConfig.createDetached(
+            ctx.directory,
+            freshConfig,
+            hostFlavor,
+          );
+          freshRuntime.captureHostConfig(latestHostSnapshot ?? {});
+          if (runtimePreset) freshRuntime.setRuntimePreset(runtimePreset);
+          const freshPluginMcps = createBuiltinMcps(freshRuntime.disabledMcps);
+          try {
+            const freshRegistry = buildResolvedAgentRegistry(freshRuntime, {
+              hostSnapshot: latestHostSnapshot,
+              nativePermissionsByAgent: latestNativePermissionsByAgent,
+              projectDirectory: ctx.directory,
+              hostFlavor,
+              pluginMcps: freshPluginMcps,
+              marketplace: {
+                selectedPackageIds: desiredPackageIds,
+                store: readOnlyActivationStore,
+                pluginVersion: getBuildInfo().version,
+                availableSkillNames: discoverPreflightSkills(
+                  freshRuntime,
+                  ctx.directory,
+                ),
+              },
+            });
+            return {
+              packageIds: desiredPackageIds,
+              packages: freshRegistry.marketplacePackages,
+            };
+          } catch (error) {
+            return {
+              packageIds: desiredPackageIds,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        },
+      })
+    : undefined;
   registryBridge = {
     marketplaceService,
     finalize(hostSnapshot, nativePermissionsByAgent) {
@@ -1984,14 +2128,18 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           hostFlavor,
           pluginMcps: mcps,
           nativePermissionsByAgent,
-          marketplace: {
-            selectedPackageIds: selectedMarketplacePackageIds,
-            store: marketplaceService.store,
-            pluginVersion: getBuildInfo().version,
-            availableSkillNames: selectedMarketplacePackageIds.length
-              ? discoverPreflightSkills(runtime, ctx.directory)
-              : [],
-          },
+          ...(marketplaceEnabled
+            ? {
+                marketplace: {
+                  selectedPackageIds: selectedMarketplacePackageIds,
+                  store: marketplaceService!.store,
+                  pluginVersion: getBuildInfo().version,
+                  availableSkillNames: selectedMarketplacePackageIds.length
+                    ? discoverPreflightSkills(runtime, ctx.directory)
+                    : [],
+                },
+              }
+            : {}),
           onHostModelSelected: (agentName) => {
             runtime.everModelSwitched(agentName);
           },
@@ -2023,8 +2171,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         disabledSkills: runtime.disabledSkills,
       };
       if (
-        isCommandEnabled('interview', commandGate) ||
-        isCommandEnabled('implement', commandGate)
+        (isCommandEnabled('interview', commandGate) ||
+          isCommandEnabled('implement', commandGate)) &&
+        interviewManager
       ) {
         interviewManager.registerCommand(opencodeConfig, {
           interview: isCommandEnabled('interview', commandGate),
@@ -2045,19 +2194,21 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       registryRetired = true;
     },
   };
-  const marketplaceTools = createMarketplaceTools({
-    service: marketplaceService,
-    cwd: ctx.directory,
-    getOrchestratorIdentities: () => {
-      const registry = registryBridge.requireRegistry();
-      return resolveFinalizedOrchestratorIdentities(registry);
-    },
-  });
-  if (!runtime.disabledTools.includes('marketplace_inspect')) {
-    tools.marketplace_inspect = marketplaceTools.marketplace_inspect;
-  }
-  if (!runtime.disabledTools.includes('marketplace_manage')) {
-    tools.marketplace_manage = marketplaceTools.marketplace_manage;
+  if (marketplaceEnabled && marketplaceService) {
+    const marketplaceTools = createMarketplaceTools({
+      service: marketplaceService,
+      cwd: ctx.directory,
+      getOrchestratorIdentities: () => {
+        const registry = registryBridge.requireRegistry();
+        return resolveFinalizedOrchestratorIdentities(registry);
+      },
+    });
+    if (!runtime.disabledTools.includes('marketplace_inspect')) {
+      tools.marketplace_inspect = marketplaceTools.marketplace_inspect;
+    }
+    if (!runtime.disabledTools.includes('marketplace_manage')) {
+      tools.marketplace_manage = marketplaceTools.marketplace_manage;
+    }
   }
   toolCount = Object.keys(tools).length;
 
@@ -2330,22 +2481,26 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // is the authoritative roster and already includes marketplace agents.
       // Union the fresh projection over the registry projection so a startup
       // or watcher refresh cannot shrink the roster and drop marketplace
-      // agents from the sidebar; fresh core models still win.
+      // agents from the sidebar; fresh core models still win. With the
+      // sidebar disabled there is no projection to refresh — the chain
+      // generation below still republishes.
       const registry = resolvedAgentRegistry;
-      recordTuiAgentModels(
-        {
-          agentModels: {
-            ...(registry?.tuiAgentModels ?? {}),
-            ...projection.agentModels,
+      if (runtime.sidebarEnabled) {
+        recordTuiAgentModels(
+          {
+            agentModels: {
+              ...(registry?.tuiAgentModels ?? {}),
+              ...projection.agentModels,
+            },
+            agentVariants: {
+              ...(registry?.tuiAgentVariants ?? {}),
+              ...projection.agentVariants,
+            },
+            agentDisplayNames: collectAgentDisplayNames(registry?.identities),
           },
-          agentVariants: {
-            ...(registry?.tuiAgentVariants ?? {}),
-            ...projection.agentVariants,
-          },
-          agentDisplayNames: collectAgentDisplayNames(registry?.identities),
-        },
-        ctx.directory,
-      );
+          ctx.directory,
+        );
+      }
       log('[plugin] runtime profiles refreshed from disk', {
         agents: Object.keys(profiles).length,
       });
@@ -2394,7 +2549,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           parentModel: parentModel
             ? `${parentModel.providerID}/${parentModel.id}`
             : liveSessionModel(parentSessionID),
-          activeFallback: foregroundFallback.getActiveFallback(parentSessionID),
+          activeFallback:
+            foregroundFallback?.getActiveFallback(parentSessionID),
         })
       : resolveDelegatedModelForParent(agentType, parentSessionID);
     let entry =
@@ -2418,12 +2574,15 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   // A child can move to another live location while its task board stays
   // with the delegating parent. Only task observation crosses that boundary;
   // the destination retains ownership of permissions, profiles and tools.
+  // Without the managed lifecycle there is no board to track, so the
+  // handler stays inert.
   const observeForeignTaskEvent: NonNullable<Hooks['event']> = async (
     input,
   ) => {
     if (instanceDisposed) return;
+    if (!taskSessionManagerHook || !backgroundJobBoard) return;
     const taskEvent = input as Parameters<
-      typeof taskSessionManagerHook.event
+      (typeof taskSessionManagerHook)['event']
     >[0];
     const sessionID = resolveEventSessionID(taskEvent.event);
     if (sessionID && backgroundJobBoard.isTracked(sessionID)) {
@@ -2446,8 +2605,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     // Per-instance background-default flip handle: v2 setup arms it after
     // its description rewrite verifies and disarms it with its teardown.
     'v2.backgroundDefaultFlip': backgroundDefaultFlip,
-    'v2.session.retry':
-      foregroundFallback.handleV2Retry.bind(foregroundFallback),
+    'v2.session.retry': (input: never, switchModel: never) =>
+      foregroundFallback?.handleV2Retry(input, switchModel),
     // v2-only extension hook: pin the chain generation in effect when a
     // child session registers — the same generation as its frozen profile.
     'v2.pinSessionChains': (
@@ -2455,12 +2614,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       chains?: SessionTeamBundle['chains'],
       enabled?: boolean,
     ) => {
-      foregroundFallback.pinSessionChains(sessionID, chains, enabled);
+      foregroundFallback?.pinSessionChains(sessionID, chains, enabled);
     },
     // v2-only extension hook: release the pin when the admission that
     // captured it fails, so the retry pins the generation current then.
     'v2.releaseSessionChains': (sessionID: string) => {
-      foregroundFallback.releaseSessionChains(sessionID);
+      foregroundFallback?.releaseSessionChains(sessionID);
     },
     // v2 owns its own interview bridge/service; point the submit tool and
     // text-complete fallback at it so `/interview` state lands in the same
@@ -2474,12 +2633,19 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     // wrapper): register a delegated `subagent` launch from its STRUCTURED
     // executor result, forwarding to the task-session-manager's shared fence
     // pipeline (marks the pending handled-by-wrapper for the exact-once gate).
+    // No-op when the managed lifecycle is disabled (no fence pipeline).
     'v2.registerDelegatedLaunchFromStructured': (
       input: Parameters<
-        (typeof taskSessionManagerHook)['v2.registerDelegatedLaunchFromStructured']
+        NonNullable<
+          NonNullable<
+            typeof taskSessionManagerHook
+          >['v2.registerDelegatedLaunchFromStructured']
+        >
       >[0],
     ) =>
-      taskSessionManagerHook['v2.registerDelegatedLaunchFromStructured'](input),
+      taskSessionManagerHook?.['v2.registerDelegatedLaunchFromStructured'](
+        input,
+      ),
 
     agent: agents,
 
@@ -2600,14 +2766,16 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       Object.assign(mcps, effectiveMcps);
       opencodeConfig.mcp = { ...effectiveMcps, ...hostMcpConfig };
       injectedMcps = effectiveMcps;
-      recordTuiAgentModels(
-        {
-          agentModels: registry.tuiAgentModels,
-          agentVariants: registry.tuiAgentVariants,
-          agentDisplayNames: collectAgentDisplayNames(registry.identities),
-        },
-        ctx.directory,
-      );
+      if (runtime.sidebarEnabled) {
+        recordTuiAgentModels(
+          {
+            agentModels: registry.tuiAgentModels,
+            agentVariants: registry.tuiAgentVariants,
+            agentDisplayNames: collectAgentDisplayNames(registry.identities),
+          },
+          ctx.directory,
+        );
+      }
 
       // This is the source of truth for admission. It is intentionally
       // captured only after every host/plugin merge, model pass and
@@ -2676,9 +2844,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // message id in info.id and the session id in info.sessionID. Resolve
       // by session so child activity refreshes the correct stuck timer.
       const eventSessionID = resolveEventSessionID(event);
-      if (!runtime.disabledHooks.has('cache-monitor')) {
-        await cacheMonitor.event(input);
-      }
+      // cache-monitor is created only when its disabled_hooks entry is
+      // absent; the optional chain keeps the event path fail-open either way.
+      await cacheMonitor?.event(input);
       const rawStatus = event.properties?.status;
       const statusType =
         typeof rawStatus === 'string'
@@ -2695,10 +2863,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         (event.type === 'session.idle' ||
           (event.type === 'session.status' && statusType === 'idle'))
       ) {
-        toolLoopGuard.resetTurn(eventSessionID);
+        toolLoopGuard?.resetTurn(eventSessionID);
       }
       if (eventSessionID && event.type === 'session.deleted') {
-        toolLoopGuard.resetSession(eventSessionID);
+        toolLoopGuard?.resetSession(eventSessionID);
       }
       if (eventSessionID) {
         applyActivityEvent(taskActivityTracker, event);
@@ -2769,21 +2937,24 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           // switch), migrate the admission accounting so provider/model caps
           // keep tracking the model actually in use. No-op for other
           // sessions and idempotent when the model is unchanged.
-          backgroundTaskConcurrency.migrateTask(info.sessionID, model);
+          backgroundTaskConcurrency?.migrateTask(info.sessionID, model);
         }
         if (typeof info?.agent === 'string' && providerID && modelID) {
           const agentName = resolveRuntimeAgentName(runtime, info.agent);
           const model = `${providerID}/${modelID}`;
           const variant = resolveTuiVariantForModel(agentName, model);
-          recordTuiAgentModel(
-            {
-              agentName,
-              model,
-              variant: variant ?? null,
-            },
-            (info?.sessionID && sessionMetadata.getDirectory(info.sessionID)) ??
-              ctx.directory,
-          );
+          if (runtime.sidebarEnabled) {
+            recordTuiAgentModel(
+              {
+                agentName,
+                model,
+                variant: variant ?? null,
+              },
+              (info?.sessionID &&
+                sessionMetadata.getDirectory(info.sessionID)) ??
+                ctx.directory,
+            );
+          }
         }
       }
 
@@ -2801,9 +2972,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           : (event.data?.sessionID ?? event.properties?.sessionID);
         const createdAt = info ? info.time?.created : event.created;
         if (typeof freshID === 'string' && typeof createdAt === 'number') {
-          backgroundJobBoard.noteSessionCreated(freshID, createdAt);
+          backgroundJobBoard?.noteSessionCreated(freshID, createdAt);
         }
-        if (createdSessionId && typeof createdSessionParent === 'string') {
+        if (
+          runtime.sidebarEnabled &&
+          createdSessionId &&
+          typeof createdSessionParent === 'string'
+        ) {
           // Persist the child→parent link so any process can resolve the
           // conversation root, surviving restarts and revives (#1147).
           recordTuiSessionParent(
@@ -2819,12 +2994,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
       // Resolve identity before task error bookkeeping, but replay afterwards:
       // prompt admission may synchronously emit a busy event.
-      await foregroundFallback.preflightEvent(input.event);
+      await foregroundFallback?.preflightEvent(input.event);
 
       // Invalidate task continuations before the instance-disposed cleanup
       // (the former multiplexer event handling moved to the client process
       // with the pane lifecycle; the server never touches panes).
-      await taskSessionManagerHook.event(
+      await taskSessionManagerHook?.event(
         input as {
           event: {
             type: string;
@@ -2850,12 +3025,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       );
 
       // Runtime model fallback for foreground agents (rate-limit detection)
-      await foregroundFallback.handleEvent(input.event);
+      await foregroundFallback?.handleEvent(input.event);
 
-      // Handle auto-update checking
-      await autoUpdateChecker.event(input);
+      // Handle auto-update checking; the checker only exists when its
+      // disabled_hooks entry is absent.
+      await autoUpdateChecker?.event(input);
 
-      await interviewManager.handleEvent(
+      await interviewManager?.handleEvent(
         input as {
           event: { type: string; properties?: Record<string, unknown> };
         },
@@ -2895,7 +3071,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         statusType,
       );
       if (eventSessionID && companionStatus) {
-        const job = backgroundJobBoard.get(eventSessionID);
+        const job = backgroundJobBoard?.get(eventSessionID);
         companionManager.onSessionStatus({
           sessionId: eventSessionID,
           agent: sessionMetadata.getAgent(eventSessionID),
@@ -2911,7 +3087,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         const sessionID = props?.info?.id || props?.sessionID;
 
         if (sessionID) {
-          sessionLifecycle.dispatchSessionDeleted(sessionID);
+          sessionLifecycle?.dispatchSessionDeleted(sessionID);
         }
         companionManager.onSessionDeleted(sessionID);
         if (sessionID) {
@@ -2930,8 +3106,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       terminalGate?.dispose();
       // Cancel pending initial-delay fallback timers so a reloaded
       // generation cannot observe one stale fallback call.
-      foregroundFallback.dispose();
-      await taskSessionManagerHook.event({
+      foregroundFallback?.dispose();
+      await taskSessionManagerHook?.event({
         event: { type: 'server.instance.disposed' },
       });
       await orchestratorWakeScheduler?.event({
@@ -2945,7 +3121,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       if (!hasLiveInstances()) clearAllWakeSessions();
       v1InternalSelectionOverrides.clear();
       v1DelegatedIntents.length = 0;
-      await interviewManager.dispose();
+      await interviewManager?.dispose();
       clearTuiActivities();
       tuiReusableProjection?.dispose();
       // Explicitly release this generation's companion ownership: a
@@ -2961,32 +3137,37 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     },
 
     'tool.execute.before': async (input, output) => {
-      if (!runtime.disabledHooks.has('apply-patch')) {
-        await applyPatch['tool.execute.before'](
-          input as never,
-          output as never,
-        );
-      }
+      // P0 cold gating: a guard constructed only when its disabled_hooks
+      // entry is absent; the optional chain keeps the call free of the
+      // runtime re-check that the old per-call gate performed.
+      await applyPatch?.['tool.execute.before'](
+        input as never,
+        output as never,
+      );
       // Rewrite guessed non-existing absolute paths BEFORE the search
       // guard: the guard blocks grep/glob on missing paths, so running
       // the rescue after it would never see a rescuable path (#1143).
-      if (!runtime.disabledHooks.has('absolute-path-rescue')) {
-        await absolutePathRescue['tool.execute.before'](
-          input as never,
-          output as never,
-        );
-      }
-      if (!runtime.disabledHooks.has('search-path-guard')) {
-        await searchPathGuard['tool.execute.before'](
-          input as never,
-          output as never,
-        );
-      }
+      await absolutePathRescue?.['tool.execute.before'](
+        input as never,
+        output as never,
+      );
+      await searchPathGuard?.['tool.execute.before'](
+        input as never,
+        output as never,
+      );
       await deepworkGuardHook['tool.execute.before'](
         input as never,
         output as never,
       );
-      await taskSessionManagerHook['tool.execute.before'](
+      await taskSessionManagerHook?.['tool.execute.before'](
+        input as never,
+        output as never,
+      );
+      // Council seat assembly: acts only on a council delegation whose
+      // prompt carries a final `Seats:` line, and never throws. Runs after
+      // the task-session-manager's before-hook so lifecycle fencing (task
+      // resume validation) precede the assembly rewrite.
+      await councilSeatHook?.['tool.execute.before'](
         input as never,
         output as never,
       );
@@ -3011,12 +3192,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // In particular, search-path-guard can reject grep/glob before the host
       // emits tool.execute.after; running the loop guard first would leave a
       // pending call-key entry with no completion to consume it.
-      if (!runtime.disabledHooks.has('tool-loop-guard')) {
-        await toolLoopGuard['tool.execute.before'](
-          input as never,
-          output as never,
-        );
-      }
+      await toolLoopGuard?.['tool.execute.before'](
+        input as never,
+        output as never,
+      );
     },
 
     'command.execute.before': async (input, output) => {
@@ -3031,8 +3210,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
       const slashCommand = (input as { command?: string }).command;
       if (
-        (slashCommand === 'interview' && commandEnabled('interview')) ||
-        (slashCommand === 'implement' && commandEnabled('implement'))
+        ((slashCommand === 'interview' && commandEnabled('interview')) ||
+          (slashCommand === 'implement' && commandEnabled('implement'))) &&
+        interviewManager
       ) {
         await interviewManager.handleCommandExecuteBefore(
           input as {
@@ -3172,7 +3352,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           isInternalAdmission(input.sessionID, messageID));
       if (!internalAdmission) {
         const model = input.model ?? output?.message?.model;
-        foregroundFallback.observeExternalTurn(
+        foregroundFallback?.observeExternalTurn(
           input.sessionID,
           model ? `${model.providerID}/${model.modelID}` : undefined,
         );
@@ -3316,7 +3496,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         // serving this turn. Keep fallback state in sync so a task delegated
         // before the next external admission follows that model rather than
         // a stale fallback from the preceding turn.
-        foregroundFallback.observeContinuationModel(
+        foregroundFallback?.observeContinuationModel(
           input.sessionID,
           trackedModelText,
         );
@@ -3357,7 +3537,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
 
       if (agent) {
-        foregroundFallback.registerSessionAgent(input.sessionID, agent);
+        foregroundFallback?.registerSessionAgent(input.sessionID, agent);
         if (!internalAdmission) {
           sessionMetadata.setAgent(input.sessionID, agent);
         }
@@ -3420,7 +3600,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           // circuits unchanged writes through its memo, which also keeps
           // this path in step with recordTuiAgentModels bulk replacement
           // and retries after a failed write.
-          if (agent) {
+          if (runtime.sidebarEnabled && agent) {
             recordTuiAgentModel(
               {
                 agentName: agent,
@@ -3431,12 +3611,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             );
           }
         }
-        backgroundTaskConcurrency.migrateTask(input.sessionID, model);
+        backgroundTaskConcurrency?.migrateTask(input.sessionID, model);
       }
-      taskSessionManagerHook.observeChatMessage(input, output);
+      taskSessionManagerHook?.observeChatMessage(input, output);
       orchestratorWakeScheduler?.observeChatMessage(input, output);
       if (messageID) {
-        toolLoopGuard.observeNewUserMessage(input.sessionID, messageID, {
+        toolLoopGuard?.observeNewUserMessage(input.sessionID, messageID, {
           internalAdmission,
         });
       }
@@ -3490,9 +3670,15 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
               ? orchestratorDef.config.prompt
               : buildOrchestratorPrompt({
                   disabledAgents: runtime.disabledAgents,
-                  waitForUser: !runtime.disabledTools.includes('wait_for_user'),
+                  waitForUser:
+                    runtime.backgroundJobsEnabled &&
+                    !runtime.disabledTools.includes('wait_for_user'),
                   wakeScheduler:
+                    runtime.backgroundJobsEnabled &&
                     runtime.backgroundJobs.orchestratorWake.enabled,
+                  taskMessage:
+                    runtime.backgroundJobsEnabled &&
+                    !runtime.disabledTools.includes('task_message'),
                   hostFlavor,
                   routingBlock: runtime.routingBlock,
                 });
@@ -3573,7 +3759,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // extracted from the messages above.
       const turnModelRef = sessionID
         ? parseModelRef(
-            foregroundFallback.getActiveFallback(sessionID)?.model ??
+            foregroundFallback?.getActiveFallback(sessionID)?.model ??
               sessionMetadata.getModel(sessionID),
           )
         : undefined;
@@ -3626,10 +3812,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
 
       // Repair session mappings before the phase-reminder gate.
-      await taskSessionManagerHook['experimental.chat.messages.transform'](
-        input as never,
-        typedOutput as never,
-      );
+      if (taskSessionManagerHook) {
+        await taskSessionManagerHook['experimental.chat.messages.transform'](
+          input as never,
+          typedOutput as never,
+        );
+      }
       if (phaseReminder) {
         await phaseReminder['experimental.chat.messages.transform'](
           input as never,
@@ -3642,7 +3830,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           typedOutput as never,
         );
       }
-      await taskSessionManagerHook.injectBackgroundJobBoard(input, typedOutput);
+      await taskSessionManagerHook?.injectBackgroundJobBoard(
+        input,
+        typedOutput,
+      );
       // Ordering contract: the goal pointer is the trailing-most volatile
       // message — nothing appends after it, so re-entered transforms and the
       // board's own trailing-zone strip stay ordered.
@@ -3661,16 +3852,12 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     'tool.execute.after': async (input, output) => {
       await deepworkGuardAfter(input, output);
-      if (!runtime.disabledHooks.has('json-error-recovery')) {
-        await jsonErrorRecoveryAfter(input, output);
-      }
-      if (!runtime.disabledHooks.has('tool-loop-guard')) {
-        await toolLoopGuard['tool.execute.after'](
-          input as never,
-          output as never,
-        );
-      }
-      await taskSessionManagerAfter(input, output);
+      await jsonErrorRecoveryAfter(input, output);
+      await toolLoopGuard?.['tool.execute.after'](
+        input as never,
+        output as never,
+      );
+      if (taskSessionManagerHook) await taskSessionManagerAfter(input, output);
     },
   } as Hooks & {
     'v2.foreignTaskEvent': typeof observeForeignTaskEvent;
@@ -3684,7 +3871,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       enabled?: boolean,
     ) => void;
     'v2.releaseSessionChains': (sessionID: string) => void;
-    'v2.registerDelegatedLaunchFromStructured': (typeof taskSessionManagerHook)['v2.registerDelegatedLaunchFromStructured'];
+    'v2.registerDelegatedLaunchFromStructured': NonNullable<
+      NonNullable<
+        typeof taskSessionManagerHook
+      >['v2.registerDelegatedLaunchFromStructured']
+    >;
   };
 
   return hooks;

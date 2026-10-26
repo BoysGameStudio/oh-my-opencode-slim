@@ -1,0 +1,368 @@
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test';
+import { existsSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import * as hookFactories from './hooks';
+import * as handoffFactories from './hooks/task-session-manager/fallback-observation-transfer';
+import { OhMyOpenCodeLite as plugin } from './index';
+import { getTuiStatePath, readTuiSnapshot } from './tui-state';
+import type { BackgroundJobRecord } from './utils/background-job-board';
+import * as gateFactories from './utils/background-job-terminal-gate';
+import { BackgroundTaskConcurrency } from './utils/background-task-concurrency';
+
+type PluginHooks = Awaited<ReturnType<typeof plugin>>;
+
+const noop = async () => ({ data: [] });
+
+function createClient() {
+  const session = new Proxy(
+    {
+      get: async ({ path: requestPath }: { path: { id: string } }) => ({
+        data: { id: requestPath.id },
+      }),
+      messages: noop,
+      status: async () => ({ data: {} }),
+    },
+    { get: (target, key) => Reflect.get(target, key) ?? noop },
+  );
+  return new Proxy(
+    { session, app: { log: noop } },
+    {
+      get: (target, key) =>
+        Reflect.get(target, key) ?? new Proxy({}, { get: () => noop }),
+    },
+  );
+}
+
+describe('plugin feature gates through exported hooks', () => {
+  let originalEnv: NodeJS.ProcessEnv;
+  let projectDir: string;
+
+  beforeEach(async () => {
+    originalEnv = { ...process.env };
+    projectDir = await mkdtemp(
+      path.join(os.tmpdir(), 'oh-my-opencode-slim-feature-gates-'),
+    );
+    process.env = {
+      ...originalEnv,
+      OPENCODE_CONFIG_DIR: projectDir,
+      XDG_CONFIG_HOME: projectDir,
+      XDG_DATA_HOME: path.join(projectDir, 'data'),
+      XDG_CACHE_HOME: path.join(projectDir, 'cache'),
+      OPENCODE_LOG_DIR: path.join(projectDir, 'logs'),
+    };
+    delete process.env.OH_MY_OPENCODE_SLIM_DISABLE;
+  });
+
+  afterEach(async () => {
+    process.env = originalEnv;
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  const configure = async (overrides: Record<string, unknown>) => {
+    await Bun.write(
+      path.join(projectDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        companion: { enabled: false },
+        disabled_hooks: ['auto-update-checker'],
+        ...overrides,
+      }),
+    );
+  };
+
+  const createHooks = (hostFlavor?: 'v1' | 'v2') =>
+    plugin({
+      client: createClient(),
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+      ...(hostFlavor ? { hostFlavor } : {}),
+    } as never);
+
+  for (const flavor of ['v1', 'v2'] as const) {
+    test(`${flavor}: disabling managed jobs preserves headers and real retry steering`, async () => {
+      await configure({
+        backgroundJobs: { enabled: false },
+        fallback: { enabled: true, maxRetries: 0 },
+        agents: {
+          orchestrator: { model: ['openai/gpt-b', 'openai/gpt-c'] },
+        },
+      });
+      const retrySpy = spyOn(
+        hookFactories.ForegroundFallbackManager.prototype,
+        'handleV2Retry',
+      );
+      const handoffSpy = spyOn(
+        handoffFactories,
+        'createBackgroundFallbackHandoff',
+      );
+      let hooks: PluginHooks | undefined;
+      try {
+        hooks = await createHooks(flavor);
+        for (const name of [
+          'task_status',
+          'task_message',
+          'task_reply',
+          'task_cancel',
+          'task_revive',
+          'wait_for_user',
+        ]) {
+          expect(hooks.tool?.[name]).toBeUndefined();
+        }
+        expect(hooks['chat.headers']).toBeFunction();
+        expect(handoffSpy).not.toHaveBeenCalled();
+
+        const switchModel = mock(async () => ({}));
+        const retry = {
+          sessionID: `ses_${flavor}_retry`,
+          agent: 'orchestrator',
+          model: { providerID: 'openai', id: 'gpt-b' },
+          error: { message: 'Rate limit exceeded' },
+          decision: { retry: true, delay: 2_000 },
+        };
+        await hooks['v2.session.retry']?.(retry as never, switchModel as never);
+        expect(retrySpy).toHaveBeenCalledTimes(1);
+        expect(switchModel).toHaveBeenCalledWith(retry.sessionID, {
+          providerID: 'openai',
+          id: 'gpt-c',
+        });
+        expect(retry.decision).toEqual({ retry: true, delay: 500 });
+        expect(handoffSpy).not.toHaveBeenCalled();
+      } finally {
+        await hooks?.dispose?.();
+        handoffSpy.mockRestore();
+        retrySpy.mockRestore();
+      }
+    });
+  }
+
+  test('foreground-fallback disabled hook does not dispatch retry steering', async () => {
+    await configure({
+      backgroundJobs: { enabled: false },
+      disabled_hooks: ['auto-update-checker', 'foreground-fallback'],
+      fallback: { enabled: true, maxRetries: 0 },
+      agents: {
+        orchestrator: { model: ['openai/gpt-b', 'openai/gpt-c'] },
+      },
+    });
+    const retrySpy = spyOn(
+      hookFactories.ForegroundFallbackManager.prototype,
+      'handleV2Retry',
+    );
+    let hooks: PluginHooks | undefined;
+    try {
+      hooks = await createHooks('v2');
+      const switchModel = mock(async () => ({}));
+      const retry = {
+        sessionID: 'ses_disabled_retry',
+        agent: 'orchestrator',
+        model: { providerID: 'openai', id: 'gpt-b' },
+        error: { message: 'Rate limit exceeded' },
+        decision: { retry: true, delay: 2_000 },
+      };
+      // The host still dispatches the retry hook, but disabled_hooks
+      // suppresses steering internally (v2RetryEnabled=false): the
+      // interface outcome must be a no-op switch and an untouched host
+      // decision.
+      await hooks['v2.session.retry']?.(retry as never, switchModel as never);
+      expect(retrySpy).toHaveBeenCalledTimes(1);
+      expect(switchModel).not.toHaveBeenCalled();
+      expect(retry.decision).toEqual({ retry: true, delay: 2_000 });
+    } finally {
+      await hooks?.dispose?.();
+      retrySpy.mockRestore();
+    }
+  });
+
+  test('auto-update checker is cold-gated with lifecycle on and off', async () => {
+    const checkerEvent = mock(() => undefined);
+    const factorySpy = spyOn(
+      hookFactories,
+      'createAutoUpdateCheckerHook',
+    ).mockImplementation(() => ({ event: checkerEvent }));
+    try {
+      for (const enabled of [true, false]) {
+        await configure({
+          backgroundJobs: { enabled },
+          disabled_hooks: ['auto-update-checker'],
+        });
+        const hooks = await createHooks();
+        try {
+          await hooks.event?.({
+            event: {
+              type: 'session.created',
+              properties: { info: { id: 'ses_p' } },
+            },
+          } as never);
+          expect(factorySpy).not.toHaveBeenCalled();
+          expect(checkerEvent).not.toHaveBeenCalled();
+        } finally {
+          await hooks.dispose?.();
+        }
+      }
+
+      await configure({
+        backgroundJobs: { enabled: false },
+        disabled_hooks: [],
+      });
+      const hooks = await createHooks();
+      try {
+        expect(factorySpy).toHaveBeenCalledTimes(1);
+        await hooks.event?.({
+          event: {
+            type: 'session.created',
+            properties: { info: { id: 'ses_control' } },
+          },
+        } as never);
+        expect(checkerEvent).toHaveBeenCalledTimes(1);
+      } finally {
+        await hooks.dispose?.();
+      }
+    } finally {
+      factorySpy.mockRestore();
+    }
+  });
+
+  async function exerciseSidebar(hooks: PluginHooks, externalDir: string) {
+    const call = { tool: 'task', sessionID: 'ses_p', callID: 'call_1' };
+    await hooks['tool.execute.before']?.(
+      call as never,
+      {
+        args: {
+          subagent_type: 'explorer',
+          background: true,
+          description: 'sidebar launch',
+        },
+      } as never,
+    );
+    await hooks['tool.execute.after']?.(
+      call as never,
+      {
+        output: 'task_id: ses_child\nstate: running',
+      } as never,
+    );
+    await hooks.event?.({
+      event: {
+        type: 'session.created',
+        properties: {
+          info: { id: 'ses_child', parentID: 'ses_p', directory: externalDir },
+        },
+      },
+    } as never);
+    await hooks.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'msg_child',
+            sessionID: 'ses_child',
+            agent: 'explorer',
+            providerID: 'openai',
+            modelID: 'gpt-b',
+          },
+        },
+      },
+    } as never);
+    await hooks['chat.message']?.(
+      {
+        sessionID: 'ses_child',
+        agent: 'explorer',
+        model: { providerID: 'openai', modelID: 'gpt-c', variant: 'high' },
+      } as never,
+      {} as never,
+    );
+  }
+
+  for (const sidebar of [false, true]) {
+    test(`sidebar ${sidebar} controls all state writes with managed jobs on`, async () => {
+      const externalDir = await mkdtemp(path.join(projectDir, 'external-'));
+      await configure({
+        sidebar,
+        backgroundJobs: {
+          enabled: true,
+          wallClockTimeoutMs: 0,
+          orchestratorWake: { enabled: false },
+        },
+      });
+      const hooks = await createHooks();
+      try {
+        await exerciseSidebar(hooks, externalDir);
+      } finally {
+        await hooks.dispose?.();
+      }
+      const statePath = getTuiStatePath(projectDir);
+      const externalPath = getTuiStatePath(externalDir);
+      if (sidebar) {
+        expect(existsSync(statePath)).toBe(true);
+        expect(existsSync(externalPath)).toBe(true);
+        expect(readTuiSnapshot(externalDir).agentModels.explorer).toBe(
+          'openai/gpt-c',
+        );
+        expect(readTuiSnapshot(externalDir).agentVariants.explorer).toBe(
+          'high',
+        );
+      } else {
+        for (const state of [statePath, externalPath]) {
+          expect(existsSync(state)).toBe(false);
+          expect(existsSync(`${state}.lock`)).toBe(false);
+        }
+      }
+    });
+  }
+
+  test('terminal live foreground recovery never restores background admission', async () => {
+    await configure({
+      backgroundJobs: { enabled: true, wallClockTimeoutMs: 0 },
+    });
+    let onRunning: ((record: BackgroundJobRecord) => void) | undefined;
+    const originalGate = gateFactories.createBackgroundJobTerminalGate;
+    const gateSpy = spyOn(
+      gateFactories,
+      'createBackgroundJobTerminalGate',
+    ).mockImplementation((options) => {
+      onRunning = options.onRunning;
+      return originalGate(options);
+    });
+    const restoreSpy = spyOn(
+      BackgroundTaskConcurrency.prototype,
+      'restoreTask',
+    );
+    let hooks: PluginHooks | undefined;
+    try {
+      hooks = await createHooks('v2');
+      expect(onRunning).toBeFunction();
+      const common = {
+        parentSessionID: 'ses_p',
+        agent: 'explorer',
+        generation: 1,
+        state: 'running',
+      };
+      onRunning?.({
+        ...common,
+        taskID: 'ses_fg',
+        background: false,
+      } as BackgroundJobRecord);
+      expect(restoreSpy).not.toHaveBeenCalled();
+      onRunning?.({
+        ...common,
+        taskID: 'ses_bg',
+        background: true,
+      } as BackgroundJobRecord);
+      expect(restoreSpy).toHaveBeenCalledTimes(1);
+      expect(restoreSpy).toHaveBeenCalledWith('ses_bg', undefined);
+    } finally {
+      await hooks?.dispose?.();
+      restoreSpy.mockRestore();
+      gateSpy.mockRestore();
+    }
+  });
+});

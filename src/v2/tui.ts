@@ -340,6 +340,28 @@ async function runKillAllFlow(ctx: {
 }
 
 /**
+ * Whether the update notice may be scheduled. Only an explicit
+ * `disabled_hooks: ["auto-update-checker"]` turns it off — a config read
+ * failure keeps the notice (best-effort, matching every other degraded
+ * path here, and never silently dropping a user-visible feature).
+ */
+function updateNoticeEnabled(ctx: V2TuiPluginContext): boolean {
+  try {
+    const config = loadPluginConfig(ctx.location?.directory ?? process.cwd(), {
+      silent: true,
+      hostFlavor: 'v2',
+    });
+    return !(config.disabled_hooks ?? []).includes('auto-update-checker');
+  } catch (err) {
+    log(
+      '[v2][tui] update-notice config read failed; keeping notice',
+      String(err),
+    );
+    return true;
+  }
+}
+
+/**
  * Dual contract, same as `../tui`: v1 hosts validate `{ id, tui }`, v2 hosts
  * validate `{ id, setup }`; both ignore extra keys. The `tui` field is the
  * identical v1 factory reference; the `setup` wraps the base v2 setup
@@ -397,11 +419,18 @@ const plugin = {
     // but has no UI channel on V2 — `client.tui.showToast` is a no-op in the
     // shim — so the TUI owns the message. Scheduled off the startup path and
     // silent on every failure; see ./update-notice.
-    disposers.push(
-      registerUpdateNotice(ctx, {
-        renderBadge: (latest, color) => renderUpdateBadge(latest, color),
-      }),
-    );
+    // `disabled_hooks: ["auto-update-checker"]` is the explicit off switch —
+    // a config read failure keeps the current best-effort behavior (the
+    // notice is silent anyway when no update is found).
+    if (updateNoticeEnabled(ctx)) {
+      disposers.push(
+        registerUpdateNotice(ctx, {
+          renderBadge: (latest, color) => renderUpdateBadge(latest, color),
+        }),
+      );
+    } else {
+      log('[v2][tui] update notice skipped: auto-update-checker disabled');
+    }
 
     return () => {
       for (const dispose of disposers.reverse()) dispose();

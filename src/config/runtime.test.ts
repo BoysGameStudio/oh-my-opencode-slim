@@ -180,9 +180,104 @@ describe('RuntimeConfig', () => {
     expect(runtime.routingBlock).toBe(true);
     expect(runtime.setDefaultAgent).toBe(true);
     expect(runtime.compactSidebar).toBe(true);
+    expect(runtime.sidebarEnabled).toBe(true);
+    expect(runtime.backgroundJobsEnabled).toBe(true);
+    expect(runtime.interviewEnabled).toBe(true);
+    expect(runtime.liveConfigRefresh).toBe(true);
     expect(runtime.imageRouting).toBe('direct');
     expect(runtime.companion).toBeUndefined();
     expect(runtime.council).toBeUndefined();
+  });
+
+  test('lifecycle switches default on and read explicit false', () => {
+    resetRegistry();
+    const off = RuntimeConfig.init(DIRECTORY, {
+      backgroundJobs: { enabled: false },
+      interview: { enabled: false },
+      sidebar: false,
+    });
+    expect(off.backgroundJobsEnabled).toBe(false);
+    expect(off.interviewEnabled).toBe(false);
+    expect(off.sidebarEnabled).toBe(false);
+    // Sibling backgroundJobs keys stay readable (parsed; inert at runtime).
+    expect(off.backgroundJobs.enabled).toBe(false);
+
+    RuntimeConfig.reset(DIRECTORY);
+    const partial = RuntimeConfig.init(DIRECTORY, {
+      backgroundJobs: { enabled: false, maxSessionsPerAgent: 4 },
+      interview: { maxQuestions: 5 },
+    });
+    expect(partial.backgroundJobsEnabled).toBe(false);
+    expect(partial.backgroundJobs.maxSessionsPerAgent).toBe(4);
+    expect(partial.interviewEnabled).toBe(true);
+    expect(partial.sidebarEnabled).toBe(true);
+    expect(partial.liveConfigRefresh).toBe(true);
+
+    RuntimeConfig.reset(DIRECTORY);
+    const refreshOff = RuntimeConfig.init(DIRECTORY, {
+      liveConfigRefresh: false,
+    });
+    expect(refreshOff.liveConfigRefresh).toBe(false);
+    // The switch is the config-file watcher only: /preset writes keep their
+    // own refresh path (host-side), so the derived boolean stays a pure
+    // projection of the config layer and carries no preset state.
+    expect(RuntimeConfig.get(DIRECTORY).liveConfigRefresh).toBe(false);
+  });
+
+  test('marketplaceEnabled defaults on and reads an explicit root kill switch', () => {
+    resetRegistry();
+    const runtime = RuntimeConfig.init(DIRECTORY, {});
+    expect(runtime.marketplaceEnabled).toBe(true);
+
+    const off = RuntimeConfig.init(DIRECTORY, {
+      marketplace: { enabled: false },
+    });
+    expect(off.marketplaceEnabled).toBe(false);
+
+    // The kill switch is distinct from per-preset activation: an empty
+    // activation list (no agents selected) is not the kill switch.
+    RuntimeConfig.reset(DIRECTORY);
+    const emptyActivation = RuntimeConfig.init(DIRECTORY, {
+      preset: 'fast',
+      presets: { fast: { marketplace: { agents: [] } } },
+    });
+    expect(emptyActivation.marketplaceEnabled).toBe(true);
+
+    // Even with package IDs selected, the root switch wins when false.
+    const offWithSelection = RuntimeConfig.init(DIRECTORY, {
+      marketplace: { enabled: false },
+      preset: 'fast',
+      presets: { fast: { marketplace: { agents: ['author/pkg'] } } },
+    });
+    expect(offWithSelection.marketplaceEnabled).toBe(false);
+  });
+
+  test('disabledHooks and disabledCommands return a stable set per generation', () => {
+    resetRegistry();
+    const runtime = RuntimeConfig.init(DIRECTORY, {
+      disabled_hooks: ['foreground-fallback', 'phase-reminder'],
+      disabled_commands: ['interview'],
+    });
+
+    const first = runtime.disabledHooks;
+    const second = runtime.disabledHooks;
+    expect(second).toBe(first);
+    expect(first).toEqual(new Set(['foreground-fallback', 'phase-reminder']));
+
+    const commands = runtime.disabledCommands;
+    expect(runtime.disabledCommands).toBe(commands);
+    expect(commands).toEqual(new Set(['interview']));
+
+    // Re-seeding starts a new generation: the memoized sets are rebuilt.
+    RuntimeConfig.init(DIRECTORY, {
+      disabled_hooks: ['cache-monitor'],
+    });
+    expect(runtime.disabledHooks).not.toBe(first);
+    expect(runtime.disabledHooks).toEqual(new Set(['cache-monitor']));
+    // No disabled_commands in the new seed → empty set, still stable.
+    const cleared = runtime.disabledCommands;
+    expect(runtime.disabledCommands).toBe(cleared);
+    expect(cleared).toEqual(new Set());
   });
 
   test('disabled collection defaults with an empty config', () => {
@@ -256,6 +351,7 @@ describe('RuntimeConfig', () => {
       routingBlock: false,
       setDefaultAgent: false,
       compactSidebar: false,
+      sidebar: false,
       image_routing: 'auto',
       disabled_agents: ['observer', 'orchestrator'],
       disabled_tools: ['webfetch'],
@@ -274,6 +370,7 @@ describe('RuntimeConfig', () => {
     expect(runtime.routingBlock).toBe(false);
     expect(runtime.setDefaultAgent).toBe(false);
     expect(runtime.compactSidebar).toBe(false);
+    expect(runtime.sidebarEnabled).toBe(false);
     expect(runtime.imageRouting).toBe('auto');
     // orchestrator is protected and cannot be disabled
     expect(runtime.disabledAgents).toEqual(new Set(['observer']));

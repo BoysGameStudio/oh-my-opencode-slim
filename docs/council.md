@@ -48,11 +48,20 @@ Once every councillor has responded (or the orchestrator's bounded wait on
 a silent seat expires — see [Failure behavior](#failure-behavior)), the
 orchestrator calls the council agent with the question plus a final
 `Seats: <id, id>` line listing the session IDs the seat dispatches returned;
-the harness resolves those IDs from its tracked job records and attaches the
-full stored responses before the call runs, so the orchestrator never
-re-types the seat text itself. The
+the harness resolves those IDs and attaches the full stored responses
+before the call runs, so the orchestrator never re-types the seat text
+itself. The
 council agent itself waits for no one: it has no tools and starts from
 whatever its context carries.
+
+> With the managed lifecycle **off** (native OpenCode v2 delegation, no
+> plugin job board), the same `Seats:` line still resolves: the seat hook
+> reads each child session and its transcript directly from the host —
+> never the parent's transcript — instead of the board. The prompt format
+> does not change, and one call-start cutoff guards attribution: a seat
+> whose newest prompt arrived at or after the synthesis call opened
+> reports `[no response — unverified result]` rather than replaying an
+> older answer (see [What you see](#what-you-see)).
 
 ### Who dispatches whom
 
@@ -370,6 +379,18 @@ orchestrator calls the council agent with a `Seats: <id, id>` line of the
 dispatch-returned session IDs, and
 the harness attaches the collected responses to that call; the council
 agent synthesizes the report.
+
+Which resolver attaches them depends on configuration, and the prompt does
+not change: with the managed lifecycle on, seat text comes from the parent's
+job board (aliases or session IDs both resolve); with
+`backgroundJobs.enabled: false`, it comes from the host sessions directly —
+only exact `ses_` IDs resolve, each child must still report this parent, and
+the seat body is the child's latest answer. Text from an earlier round is
+never replayed: a seat still working on its newest prompt reports
+`[no response — still running]`, an unreadable session reports
+`[no response — unverified result]`, and a seat whose newest prompt arrived at
+or after the synthesis call opened reports `[no response — unverified result]`
+too — its transcript can no longer be attributed to this council run.
 
 ### Output
 

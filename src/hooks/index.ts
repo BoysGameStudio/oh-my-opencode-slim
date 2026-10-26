@@ -7,6 +7,23 @@ export {
   COUNCIL_INJECT_METADATA_KEY,
   createCouncilInjectHook,
 } from './council-inject';
+export { createCouncilSeatHook } from './council-seats';
+export {
+  assembleCouncilPrompt,
+  buildSeatPrompt,
+  parseSeatRefs,
+  SEAT_REASONS,
+} from './council-seats/assemble';
+export { createManagedSeatResolver } from './council-seats/managed';
+export {
+  createNativeSeatResolver,
+  DEFAULT_NATIVE_SEAT_TIMEOUT_MS,
+} from './council-seats/native';
+export type {
+  SeatRequest,
+  SeatResult,
+  SeatResultResolver,
+} from './council-seats/types';
 export { createDeepworkCommandHook } from './deepwork';
 export {
   createDeepworkGoalHook,

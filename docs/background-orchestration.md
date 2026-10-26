@@ -53,6 +53,14 @@ variable the default background workflow is unavailable: configure it through
 the installer (see [Installation](installation.md)) or use the one-shot export
 above, and confirm the release with `opencode --version`.
 
+Setting `backgroundJobs.enabled: false` turns this managed layer off entirely:
+the `task_*` control tools and `wait_for_user` are not registered, and no job
+board, retention, terminal gate, watchdog, wake scheduler, or startup recovery
+runs. Native `task`/`subagent` delegation and host completion delivery keep
+working exactly as OpenCode provides them, so council seat assembly and
+ordinary background delegation still function — only the OMOS bookkeeping and
+control surface disappear. See [Configuration](configuration.md).
+
 There is no automatic legacy fallback: missing background-subagent support is an
 environment or version problem, not an intentional v1 mode.
 

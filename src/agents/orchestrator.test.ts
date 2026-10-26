@@ -1,4 +1,7 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import type { PluginConfig } from '../config';
+import { RuntimeConfig } from '../config/runtime';
+import { createAgents } from './index';
 import {
   buildOrchestratorPrompt,
   createOrchestratorAgent,
@@ -154,5 +157,114 @@ describe('createOrchestratorAgent', () => {
   test('a custom prompt replaces the built one and appends still apply', () => {
     const agent = createOrchestratorAgent(undefined, 'custom', 'extra');
     expect(agent.config.prompt).toBe('custom\n\nextra');
+  });
+});
+
+/** `createAgents`-level option resolution for the orchestrator prompt. */
+describe('createAgents orchestrator prompt gates', () => {
+  const TEST_DIRECTORY = 'runtime-test-orchestrator-gates';
+
+  function runtimeFor(config: PluginConfig | undefined = {}) {
+    RuntimeConfig.reset(TEST_DIRECTORY);
+    RuntimeConfig.init(TEST_DIRECTORY, config ?? {});
+    return RuntimeConfig.get(TEST_DIRECTORY);
+  }
+
+  /** Menus a tool that the lifecycle registers, so the prompt may name it. */
+  const capabilities = (prompt: string) => ({
+    waitForUser: prompt.includes('wait_for_user'),
+    wakeScheduler: prompt.includes('wake scheduler'),
+    taskMessage: prompt.includes('task_message'),
+    fallback: prompt.includes('once it settles'),
+  });
+
+  beforeEach(() => {
+    RuntimeConfig.reset(TEST_DIRECTORY);
+  });
+
+  afterEach(() => {
+    RuntimeConfig.reset(TEST_DIRECTORY);
+  });
+
+  test('v1 lifecycle off names no wait_for_user, no wake scheduler, no task_message', () => {
+    const agents = createAgents(
+      runtimeFor({ backgroundJobs: { enabled: false } }),
+    );
+    const prompt = agents.find((a) => a.name === 'orchestrator')?.config
+      .prompt as string;
+    expect(capabilities(prompt)).toEqual({
+      waitForUser: false,
+      wakeScheduler: false,
+      taskMessage: false,
+      fallback: true,
+    });
+  });
+
+  test('v2 lifecycle off keeps the v2 vocabulary and names no managed tool', () => {
+    const agents = createAgents(
+      runtimeFor({ backgroundJobs: { enabled: false } }),
+      { hostFlavor: 'v2' },
+    );
+    const prompt = agents.find((a) => a.name === 'orchestrator')?.config
+      .prompt as string;
+    expect(prompt).not.toContain('wait_for_user');
+    expect(prompt).not.toContain('wake scheduler');
+    expect(prompt).not.toContain('task_message');
+    // The v2 resume promise never included the scheduler.
+    expect(prompt).toContain('completion notifications resume you');
+    expect(prompt).toContain('`subagent` calls in one message');
+  });
+
+  test('disabled_tools gates task_message while the lifecycle stays on', () => {
+    const agents = createAgents(
+      runtimeFor({ disabled_tools: ['task_message'] }),
+    );
+    const prompt = agents.find((a) => a.name === 'orchestrator')?.config
+      .prompt as string;
+    expect(capabilities(prompt)).toEqual({
+      waitForUser: true,
+      wakeScheduler: true,
+      taskMessage: false,
+      fallback: true,
+    });
+    expect(prompt).toContain(
+      'task(...) once it settles, continue it once finished.',
+    );
+  });
+
+  test('v1 lifecycle off with both tools disabled still renders the fallback channel', () => {
+    const agents = createAgents(
+      runtimeFor({
+        backgroundJobs: { enabled: false },
+        disabled_tools: ['wait_for_user', 'task_message'],
+      }),
+    );
+    const prompt = agents.find((a) => a.name === 'orchestrator')?.config
+      .prompt as string;
+    expect(capabilities(prompt)).toEqual({
+      waitForUser: false,
+      wakeScheduler: false,
+      taskMessage: false,
+      fallback: true,
+    });
+  });
+
+  test('defaults keep the registered-tool prompt bytes unchanged', () => {
+    // No cold-gate is set: the default render must lead to the same bytes
+    // the snapshot-pinned builder produces with the same option defaults.
+    for (const hostFlavor of [undefined, 'v2'] as const) {
+      const agents = createAgents(
+        runtimeFor(undefined),
+        hostFlavor === undefined ? {} : { hostFlavor },
+      );
+      const prompt = agents.find((a) => a.name === 'orchestrator')?.config
+        .prompt as string;
+      expect(prompt).toBe(
+        buildOrchestratorPrompt({
+          disabledAgents: new Set(['observer', 'council', 'councillor']),
+          hostFlavor,
+        }),
+      );
+    }
   });
 });

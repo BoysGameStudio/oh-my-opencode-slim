@@ -372,6 +372,31 @@ export const MarketplaceActivationSchema = z
 
 export type MarketplaceActivation = z.infer<typeof MarketplaceActivationSchema>;
 
+/**
+ * Root-level marketplace switch. Distinct from the per-preset
+ * `marketplace` activation list (`MarketplaceActivationSchema`): the root
+ * block historically accepted (and silently ignored) activation-shaped
+ * values — package selection only ever took effect at
+ * `presets.<name>.marketplace`. The schema keeps accepting that shape so a
+ * misplaced activation list degrades to the same inert no-op as before,
+ * while `enabled: false` is the kill switch: selected package IDs are
+ * ignored and the marketplace manager, store, and tools are not
+ * initialized. An empty preset activation list keeps its existing meaning
+ * (no agents activated, service/store and tool factories still initialize).
+ */
+export const MarketplaceConfigSchema = z
+  .object({
+    enabled: z
+      .boolean()
+      .optional()
+      .describe(
+        'Master switch for the marketplace subsystem (manager, store, and the marketplace_inspect/marketplace_manage tools). When false, any selected package IDs (per-preset marketplace activation) are ignored and the subsystem is not initialized; the native host is untouched. Default true.',
+      ),
+  })
+  .passthrough();
+
+export type MarketplaceConfig = z.infer<typeof MarketplaceConfigSchema>;
+
 const MARKETPLACE_ACTIVATION_KEYS = [
   'agents',
   'agents_add',
@@ -451,6 +476,12 @@ export const InterviewOutputFolderSchema = z
   );
 
 export const InterviewConfigSchema = z.object({
+  enabled: z
+    .boolean()
+    .default(true)
+    .describe(
+      'When false, the interview subsystem is not wired up at all: the /interview command is not intercepted, the interview server and dashboard never start, and no interview state or output machinery runs. The native host is untouched. Default true.',
+    ),
   maxQuestions: z.number().int().min(1).max(10).default(2),
   outputFolder: InterviewOutputFolderSchema.default('interview'),
   autoOpenBrowser: z
@@ -515,6 +546,12 @@ export const BackgroundJobsConfigStrictSchema = z.object({
         'backgroundJobs.strategy was removed; board placement is change-only with frozen replay',
     })
     .optional(),
+  enabled: z
+    .boolean()
+    .default(true)
+    .describe(
+      'Master switch for the OMOS managed background-task lifecycle (job board, retention, wake scheduler, wall-clock watchdog, terminal gate, and the task_cancel/task_message/task_status/task_reply tools). When false, none of that runs and the native OpenCode task/subagent machinery is left completely untouched; every other backgroundJobs key stays accepted but inert. Default true.',
+    ),
   maxSessionsPerAgent: z.number().int().min(1).max(10).default(2),
   maxContextLines: z
     .never({
@@ -949,6 +986,7 @@ export const DISABLED_HOOKS_VALUES = [
   'absolute-path-rescue',
   'apply-patch',
   'council-inject',
+  'auto-update-checker',
 ] as const;
 
 /** Valid `disabled_commands` entries; single source for the enum and the loader. */
@@ -970,6 +1008,18 @@ export const RawPluginConfigSchema = z
       .optional()
       .describe(
         'Use the compact TUI sidebar layout. Defaults to true; set false to use the expanded layout.',
+      ),
+    sidebar: z
+      .boolean()
+      .optional()
+      .describe(
+        'Master switch for the OMOS TUI sidebar surface (the agent list it renders and its state file). When false, the plugin never registers or renders the sidebar and writes no sidebar state; the native host sidebar is untouched. Defaults to true.',
+      ),
+    liveConfigRefresh: z
+      .boolean()
+      .optional()
+      .describe(
+        'v2 only: master switch for the live config-file watcher that reloads runtime model/preset profiles when oh-my-opencode-slim.json(c) changes on disk. When false, v2 does not watch config files and file edits apply only after a restart; explicit /preset writes still refresh the current generation where applicable. Defaults to true.',
       ),
     stripOrchestratorModel: z
       .boolean()
@@ -1046,7 +1096,7 @@ export const RawPluginConfigSchema = z
       .describe(
         'Hook names to disable completely. Valid values: ' +
           DISABLED_HOOKS_VALUES.join(', ') +
-          '. "phase-reminder" is not registered, so orchestrator phase reminders are never injected; "foreground-fallback" marks the fallback manager inert: it is still constructed but never triggers automatic intervention, same effect as fallback.enabled = false; "chat-headers" is not registered, so the Copilot x-initiator header is never stamped (v1 chat.headers and the v2 model.request bridge); "cache-monitor" stops the prompt-cache bust watchdog, so cache warnings are never logged; the on-demand tool guards ("json-error-recovery", "tool-loop-guard", "search-path-guard", "absolute-path-rescue", "apply-patch") stop intercepting tool calls entirely, so malformed output, repeated identical calls, and invalid or guessed paths surface raw to the model; "council-inject" is not registered, so the keyword-triggered Council Mode injection is never appended to orchestrator messages. Unknown values are stripped with a warning when the config loads. A value consisting only of unknown names is treated as unset, so a lower config layer\'s list still applies.',
+          '. "phase-reminder" is not registered, so orchestrator phase reminders are never injected; "foreground-fallback" marks the fallback manager inert: it is still constructed but never triggers automatic intervention, same effect as fallback.enabled = false; "chat-headers" is not registered, so the Copilot x-initiator header is never stamped (v1 chat.headers and the v2 model.request bridge); "cache-monitor" stops the prompt-cache bust watchdog, so cache warnings are never logged; the on-demand tool guards ("json-error-recovery", "tool-loop-guard", "search-path-guard", "absolute-path-rescue", "apply-patch") stop intercepting tool calls entirely, so malformed output, repeated identical calls, and invalid or guessed paths surface raw to the model; "council-inject" is not registered, so the keyword-triggered Council Mode injection is never appended to orchestrator messages; "auto-update-checker" stops both update checking and automatic installation (a stronger switch than autoUpdate, which only controls installation). Unknown values are stripped with a warning when the config loads. A value consisting only of unknown names is treated as unset, so a lower config layer\'s list still applies.',
       ),
     disabled_commands: z
       .array(z.enum(DISABLED_COMMANDS_VALUES))
@@ -1065,6 +1115,14 @@ export const RawPluginConfigSchema = z
     companion: CompanionConfigSchema.optional(),
     webfetch: WebfetchConfigSchema.optional(),
     acpAgents: AcpAgentsConfigSchema.optional(),
+    // `marketplace: false` is the natural guess for the kill switch; read
+    // it as `{ enabled: false }` instead of rejecting the whole file.
+    marketplace: z
+      .union([
+        z.boolean().transform((enabled) => ({ enabled })),
+        MarketplaceConfigSchema,
+      ])
+      .optional(),
     tmux: z
       .never({ error: 'tmux config was removed; use multiplexer.*' })
       .optional(),

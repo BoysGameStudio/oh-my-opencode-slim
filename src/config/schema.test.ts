@@ -13,6 +13,7 @@ import {
   DISABLED_HOOKS_VALUES,
   InterviewConfigSchema,
   MarketplaceActivationSchema,
+  MarketplaceConfigSchema,
   MULTIPLEXER_INVALID_VALUE_MESSAGE,
   MultiplexerConfigSchema,
   MultiplexerConfigStrictSchema,
@@ -326,6 +327,7 @@ describe('PluginConfigSchema disabled_hooks and disabled_commands', () => {
       'absolute-path-rescue',
       'apply-patch',
       'council-inject',
+      'auto-update-checker',
     ]);
     expect(DISABLED_COMMANDS_VALUES).toEqual([
       'implement',
@@ -342,7 +344,12 @@ describe('PluginConfigSchema disabled_hooks and disabled_commands', () => {
     // (see loader.test.ts). The enum remains as defense in depth and for
     // editor completion.
     expect(
-      PluginConfigSchema.safeParse({ disabled_hooks: ['auto-update-checker'] })
+      PluginConfigSchema.safeParse({
+        disabled_hooks: ['auto-update-checker', 'phase-reminder'],
+      }).success,
+    ).toBe(true);
+    expect(
+      PluginConfigSchema.safeParse({ disabled_hooks: ['update-checker'] })
         .success,
     ).toBe(false);
     expect(
@@ -353,6 +360,17 @@ describe('PluginConfigSchema disabled_hooks and disabled_commands', () => {
         disabled_commands: ['deepwork', 'review'],
       }).success,
     ).toBe(false);
+  });
+
+  it('auto-update-checker gates update checking and installation together', () => {
+    const result = PluginConfigSchema.safeParse({
+      disabled_hooks: ['auto-update-checker'],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.disabled_hooks).toEqual(['auto-update-checker']);
+    }
   });
 });
 
@@ -681,6 +699,149 @@ describe('InterviewConfigSchema printState', () => {
   });
 });
 
+describe('InterviewConfigSchema enabled', () => {
+  it('defaults to true', () => {
+    const interviewResult = InterviewConfigSchema.safeParse({});
+    const pluginResult = PluginConfigSchema.safeParse({ interview: {} });
+
+    expect(interviewResult.success).toBe(true);
+    expect(pluginResult.success).toBe(true);
+    if (interviewResult.success) {
+      expect(interviewResult.data.enabled).toBe(true);
+    }
+    if (pluginResult.success) {
+      expect(pluginResult.data.interview?.enabled).toBe(true);
+    }
+  });
+
+  it('accepts an explicit false', () => {
+    const result = PluginConfigSchema.safeParse({
+      interview: { enabled: false, maxQuestions: 5 },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.interview?.enabled).toBe(false);
+      expect(result.data.interview?.maxQuestions).toBe(5);
+    }
+  });
+});
+
+describe('PluginConfigSchema sidebar', () => {
+  it('defaults to true and stays optional', () => {
+    const result = PluginConfigSchema.safeParse({});
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.sidebar).toBeUndefined();
+    }
+  });
+
+  it('accepts an explicit false', () => {
+    const result = PluginConfigSchema.safeParse({ sidebar: false });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.sidebar).toBe(false);
+    }
+  });
+
+  it('keeps liveConfigRefresh optional and defaults to enabled', () => {
+    const omitted = PluginConfigSchema.safeParse({});
+    const explicit = PluginConfigSchema.safeParse({ liveConfigRefresh: false });
+
+    expect(omitted.success).toBe(true);
+    expect(explicit.success).toBe(true);
+    if (omitted.success) {
+      // Effective default is true: the key stays optional (unset = enabled),
+      // matching the other top-level boolean switches; the RuntimeConfig
+      // getter derives true rather than carrying a parsed default.
+      expect(omitted.data.liveConfigRefresh).toBeUndefined();
+    }
+    if (explicit.success) {
+      expect(explicit.data.liveConfigRefresh).toBe(false);
+    }
+  });
+});
+
+describe('PluginConfigSchema marketplace (root kill switch)', () => {
+  it('reads a boolean root marketplace as the enabled switch', () => {
+    for (const enabled of [false, true]) {
+      const result = PluginConfigSchema.safeParse({ marketplace: enabled });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.marketplace).toEqual({ enabled });
+      }
+    }
+  });
+
+  it('defaults the root marketplace subsystem to enabled', () => {
+    const blockResult = MarketplaceConfigSchema.safeParse({});
+    const result = PluginConfigSchema.safeParse({ marketplace: {} });
+
+    expect(blockResult.success).toBe(true);
+    expect(result.success).toBe(true);
+    if (blockResult.success) {
+      expect(blockResult.data.enabled).toBeUndefined();
+    }
+    if (result.success) {
+      expect(result.data.marketplace?.enabled).toBeUndefined();
+    }
+  });
+
+  it('accepts an explicit enabled: false kill switch', () => {
+    const result = PluginConfigSchema.safeParse({
+      marketplace: { enabled: false },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.marketplace?.enabled).toBe(false);
+    }
+  });
+
+  it('treats a misplaced activation-shaped root block as an inert no-op', () => {
+    // Package selection only ever took effect at presets.<name>.marketplace.
+    // The baseline schema silently ignored a root-level activation list;
+    // preserve that leniency instead of rejecting the whole config layer.
+    const result = PluginConfigSchema.safeParse({
+      marketplace: { agents: ['author/pkg'] },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.marketplace?.enabled).toBeUndefined();
+    }
+  });
+
+  it('leaves per-preset marketplace activation parsing untouched', () => {
+    const result = PluginConfigSchema.safeParse({
+      preset: 'fast',
+      presets: {
+        fast: {
+          marketplace: { agents: ['author/pkg'] },
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.presets?.fast?.marketplace).toEqual({
+        agents: ['author/pkg'],
+      });
+    }
+  });
+
+  it('leaves the root block undefined when omitted', () => {
+    const result = PluginConfigSchema.safeParse({});
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.marketplace).toBeUndefined();
+    }
+  });
+});
+
 describe('PluginConfigSchema backgroundJobs', () => {
   let warnSpy: Mock<typeof console.warn>;
 
@@ -692,6 +853,45 @@ describe('PluginConfigSchema backgroundJobs', () => {
 
   afterEach(() => {
     warnSpy.mockRestore();
+  });
+
+  it('defaults backgroundJobs.enabled to true', () => {
+    const result = PluginConfigSchema.safeParse({ backgroundJobs: {} });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.backgroundJobs?.enabled).toBe(true);
+    }
+  });
+
+  it('accepts enabled: false and keeps the otherwise-inert lifecycle keys', () => {
+    // false only turns the managed lifecycle off; the sibling keys stay
+    // accepted (validated as usual, then inert at runtime).
+    const result = PluginConfigSchema.safeParse({
+      backgroundJobs: {
+        enabled: false,
+        maxSessionsPerAgent: 4,
+        orchestratorWake: { enabled: false, intervalMs: 120_000 },
+        wallClockTimeoutMs: 60_000,
+        stopConfirmationMs: 2_000,
+        concurrency: { defaultConcurrency: 2 },
+        sameProviderPolicy: { provider: 'foreground' },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.backgroundJobs?.enabled).toBe(false);
+      expect(result.data.backgroundJobs?.maxSessionsPerAgent).toBe(4);
+      expect(result.data.backgroundJobs?.wallClockTimeoutMs).toBe(60_000);
+      expect(result.data.backgroundJobs?.concurrency?.defaultConcurrency).toBe(
+        2,
+      );
+      expect(result.data.backgroundJobs?.sameProviderPolicy).toEqual({
+        provider: 'foreground',
+      });
+    }
+    expect(warnSpy).not.toHaveBeenCalled();
   });
 
   it('drops one invalid key and keeps the rest of the config layer (#1291)', () => {
