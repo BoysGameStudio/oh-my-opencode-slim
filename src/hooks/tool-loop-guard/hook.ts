@@ -556,10 +556,11 @@ export function createToolLoopGuardHook(
       messageID: string,
       options?: { internalAdmission?: boolean },
     ): void {
-      if (options?.internalAdmission === true) return;
       if (userMessageIdentities.get(sessionID) === messageID) return;
       userMessageIdentities.set(sessionID, messageID);
-      sessions.delete(sessionID);
+      // Plugin-injected admissions (wakes, completion pushes) still open a
+      // fresh polling/wait window but must not clear a confirmed read loop.
+      if (options?.internalAdmission !== true) sessions.delete(sessionID);
       resetTaskSupervision(sessionID);
       waitRuns.delete(sessionID);
     },

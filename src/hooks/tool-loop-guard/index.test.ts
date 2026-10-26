@@ -697,6 +697,30 @@ describe('tool-loop-guard', () => {
     hook.observeNewUserMessage('s1', 'msg-internal-wake', {
       internalAdmission: true,
     });
+    // ...while still resetting the per-turn wait counter.
+    for (let i = 1; i <= 2; i++) {
+      await hook['tool.execute.before'](
+        { tool: 'wait_for_background_tasks', sessionID: 's1', callID: `w${i}` },
+        {},
+      );
+      await hook['tool.execute.after'](
+        { tool: 'wait_for_background_tasks', sessionID: 's1', callID: `w${i}` },
+        { output: 'ok', metadata: {} },
+      );
+    }
+    hook.observeNewUserMessage('s1', 'msg-internal-wake-2', {
+      internalAdmission: true,
+    });
+    await expect(
+      hook['tool.execute.before'](
+        {
+          tool: 'wait_for_background_tasks',
+          sessionID: 's1',
+          callID: 'w_after',
+        },
+        {},
+      ),
+    ).resolves.toBeUndefined();
     await expect(
       hook['tool.execute.before'](beforeInput({ callID: 't1_blocked' }), {
         args: { filePath: 'a.ts' },
