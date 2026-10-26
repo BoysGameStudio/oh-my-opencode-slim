@@ -1822,14 +1822,21 @@
       }
     },
     "marketplace": {
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "description": "Master switch for the marketplace subsystem (manager, store, and the marketplace_inspect/marketplace_manage tools). When false, any selected package IDs (per-preset marketplace activation) are ignored and the subsystem is not initialized; the native host is untouched. Default true.",
+      "anyOf": [
+        {
           "type": "boolean"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "description": "Master switch for the marketplace subsystem (manager, store, and the marketplace_inspect/marketplace_manage tools). When false, any selected package IDs (per-preset marketplace activation) are ignored and the subsystem is not initialized; the native host is untouched. Default true.",
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": {}
         }
-      },
-      "additionalProperties": {}
+      ]
     },
     "tmux": {
       "not": {}

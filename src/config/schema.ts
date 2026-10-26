@@ -1116,10 +1116,10 @@ export const RawPluginConfigSchema = z
     // `marketplace: false` is the natural guess for the kill switch; read
     // it as `{ enabled: false }` instead of rejecting the whole file.
     marketplace: z
-      .preprocess(
-        (value) => (typeof value === 'boolean' ? { enabled: value } : value),
+      .union([
+        z.boolean().transform((enabled) => ({ enabled })),
         MarketplaceConfigSchema,
-      )
+      ])
       .optional(),
     tmux: z
       .never({ error: 'tmux config was removed; use multiplexer.*' })
