@@ -759,6 +759,16 @@ describe('PluginConfigSchema sidebar', () => {
 });
 
 describe('PluginConfigSchema marketplace (root kill switch)', () => {
+  it('reads a boolean root marketplace as the enabled switch', () => {
+    for (const enabled of [false, true]) {
+      const result = PluginConfigSchema.safeParse({ marketplace: enabled });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.marketplace).toEqual({ enabled });
+      }
+    }
+  });
+
   it('defaults the root marketplace subsystem to enabled', () => {
     const blockResult = MarketplaceConfigSchema.safeParse({});
     const result = PluginConfigSchema.safeParse({ marketplace: {} });

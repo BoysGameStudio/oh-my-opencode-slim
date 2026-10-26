@@ -1843,10 +1843,10 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         ...taskCancelTools,
         ...taskMessageTools,
         ...taskReplyTools,
+        // Keep master's v1 registration order (cache-stable tool list).
+        ...(hostFlavor !== 'v2' ? taskReviveTools : {}),
         ...taskStatusTools,
-        ...(hostFlavor !== 'v2'
-          ? { ...waitForUserTools, ...taskReviveTools }
-          : {}),
+        ...(hostFlavor !== 'v2' ? waitForUserTools : {}),
       };
     }
 
