@@ -1632,7 +1632,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
 
     deepworkGuardHook = createDeepworkGuardHook(ctx);
     jsonErrorRecovery = createJsonErrorRecoveryHook(ctx);
-    toolLoopGuard = createToolLoopGuardHook();
+    toolLoopGuard = createToolLoopGuardHook({ directory: ctx.directory });
 
     // Pre-created wrapped handlers for tool.execute.after (error-isolated)
     deepworkGuardAfter = wrapPostToolHook('deepwork-guard', (i, o) =>
@@ -3436,7 +3436,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       taskSessionManagerHook.observeChatMessage(input, output);
       orchestratorWakeScheduler?.observeChatMessage(input, output);
       if (messageID) {
-        toolLoopGuard.observeNewUserMessage(input.sessionID, messageID);
+        toolLoopGuard.observeNewUserMessage(input.sessionID, messageID, {
+          internalAdmission,
+        });
       }
     },
 
