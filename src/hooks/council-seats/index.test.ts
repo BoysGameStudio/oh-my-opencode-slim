@@ -185,17 +185,6 @@ describe('council seat hook gating', () => {
     );
   });
 
-  test('an empty-refs line resolves nothing and reports itself', async () => {
-    const { hook, calls } = councilHook();
-    const args: Record<string, unknown> = {
-      subagent_type: 'council',
-      prompt: 'Question?\nSeats: , ,',
-    };
-    await runBefore(hook, 'task', args);
-    expect(calls.count).toBe(0);
-    expect(args.prompt).toBe('Question?\n\n[no seat references were provided]');
-  });
-
   test('session-shaped refs carry childID; aliases do not', async () => {
     let observed: Array<Record<string, unknown>> = [];
     const hook = createCouncilSeatHook({

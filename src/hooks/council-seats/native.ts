@@ -75,7 +75,10 @@ function boundedRead<T>(
 ): Promise<T | undefined> {
   const left = remaining();
   if (left <= 0) return Promise.resolve(undefined);
-  return raceEvidenceDeadline(read(), left, timers);
+  // Defer the invocation into the promise chain: a host method that throws
+  // synchronously degrades to absence of evidence instead of rejecting
+  // the whole resolver call.
+  return raceEvidenceDeadline(Promise.resolve().then(read), left, timers);
 }
 
 function missing(reason: string): SeatResult {
@@ -88,6 +91,7 @@ function ambiguous(reason: string, label?: string): SeatResult {
 
 /** Host session info, or undefined when unreadable/unavailable. */
 async function readHostInfo(
+  session: unknown,
   get: SessionGet | undefined,
   sessionID: string,
   directory: string | undefined,
@@ -96,7 +100,9 @@ async function readHostInfo(
 ): Promise<Record<string, unknown> | undefined> {
   if (!get) return undefined;
   const response = await boundedRead(
-    () => get({ path: { id: sessionID }, query: { directory } }),
+    // SDK-generated session methods read `this._client`: invoke on the
+    // session receiver the method was read from.
+    () => get.call(session, { path: { id: sessionID }, query: { directory } }),
     remaining,
     timers,
   );
@@ -123,7 +129,8 @@ export function createNativeSeatResolver(
     const remaining = () => Math.max(0, deadline - clock());
     const client = input.client;
 
-    const get = client?.session?.get as SessionGet | undefined;
+    const session = client?.session;
+    const get = session?.get as SessionGet | undefined;
 
     return Promise.all(
       seats.map(async (seat) => {
@@ -132,6 +139,7 @@ export function createNativeSeatResolver(
           return missing('unresolved ref');
         }
         const info = await readHostInfo(
+          session,
           get,
           childID,
           directory,

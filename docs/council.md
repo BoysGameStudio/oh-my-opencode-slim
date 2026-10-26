@@ -56,8 +56,12 @@ whatever its context carries.
 
 > With the managed lifecycle **off** (native OpenCode v2 delegation, no
 > plugin job board), the same `Seats:` line still resolves: the seat hook
-> then reads each child session and its transcript directly from the host
-> instead of the board. The prompt format does not change.
+> reads each child session and its transcript directly from the host —
+> never the parent's transcript — instead of the board. The prompt format
+> does not change, and one call-start cutoff guards attribution: a seat
+> whose newest prompt arrived at or after the synthesis call opened
+> reports `[no response — unverified result]` rather than replaying an
+> older answer (see [What you see](#what-you-see)).
 
 ### Who dispatches whom
 

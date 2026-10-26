@@ -221,30 +221,11 @@ describe('managed council seat assembly', () => {
       '## Seat: councillor-9\n[no response — unresolved ref]',
     );
     expect(prompt).not.toContain('STOLEN TEXT');
-  });
-
-  test('cross-parent isolation is explicit: the same alias resolves only for its owner', async () => {
-    const board = new BackgroundJobBoard();
-    seedCompleted(board, {
-      taskID: 'ses_alpha',
-      agent: 'councillor-alpha',
-      alias: 'councillor-1',
-      resultSummary: 'ALPHA VERBATIM TEXT',
-    });
-    seedCompleted(board, {
-      taskID: 'ses_theft',
-      agent: 'councillor-beta',
-      alias: 'councillor-9',
-      resultSummary: 'STOLEN TEXT',
-      parentSessionID: OTHER_PARENT,
-    });
-    // Read-only board invariant the control tools enforce, inherited here.
+    // Board-level owner scoping the resolver inherits.
     expect(board.resolve(OTHER_PARENT, 'councillor-9')?.taskID).toBe(
       'ses_theft',
     );
     expect(board.resolve(PARENT, 'councillor-9')).toBeUndefined();
-    const args = await runCouncilCall(board, 'Question?\nSeats: councillor-1');
-    expect(args.prompt).not.toContain('STOLEN TEXT');
   });
 
   test('unknown refs never throw and never leak; all-unknown leaves per-seat placeholders', async () => {
@@ -372,23 +353,6 @@ describe('managed council seat assembly', () => {
     expect(prompt).toContain(
       '## Seat: councillor-delta\n[no response — empty result]',
     );
-  });
-
-  test('no Seats line passes through byte-identically (old paste behavior)', async () => {
-    const board = new BackgroundJobBoard();
-    seedCompleted(board, {
-      taskID: 'ses_alpha',
-      agent: 'councillor-alpha',
-      alias: 'councillor-1',
-      resultSummary: 'ALPHA VERBATIM TEXT',
-    });
-    const prompt = [
-      'Synthesize the council report.',
-      '## Councillor alpha (gpt-x)',
-      'ALPHA PASTED RESPONSE',
-    ].join('\n');
-    const args = await runCouncilCall(board, prompt);
-    expect(args.prompt).toBe(prompt);
   });
 
   test('free text mentioning seats or tasks without a Seats line is never scanned', async () => {

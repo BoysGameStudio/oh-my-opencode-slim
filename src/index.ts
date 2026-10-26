@@ -631,9 +631,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let taskSessionManagerAfter: (i: unknown, o: unknown) => Promise<void> =
     async () => {};
   let backgroundJobBoard: BackgroundJobBoard | undefined;
-  // Constructed once per generation inside the lifecycle block and shared by
-  // the task manager and the task control tools (a second copy would fence on
-  // its own `isDisposed` timing).
+  // Shared by task management and control tools; initialized only with
+  // managed lifecycle.
   let recoverRetainedSession:
     | ReturnType<typeof createSessionRecovery>
     | undefined;
@@ -1767,6 +1766,14 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       hostFlavor,
     );
     if (lifecycleEnabled) {
+      // Invariant: the lifecycle block above initialized the shared recovery
+      // and alias state. Checked once here so TypeScript narrows it for the
+      // control-tool registrations below, instead of `!` at every option.
+      if (!recoverRetainedSession || !aliasAuthority) {
+        throw new Error(
+          'managed lifecycle enabled without recovery/alias state',
+        );
+      }
       const taskCancelTools = createCancelTaskTool({
         input: ctx,
         backgroundJobBoard: backgroundJobBoard!,
@@ -1774,20 +1781,20 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         shouldManageSession: (sessionID) =>
           sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
           sessionMetadata.isTaskManaged(sessionID),
-        recoverRetainedSession: recoverRetainedSession!,
-        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
+        recoverRetainedSession,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
         isDisposed: () => instanceDisposed,
       });
       const taskMessageTools = createTaskMessageTool({
         input: ctx,
         backgroundJobBoard: backgroundJobBoard!,
-        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
         isDisposed: () => instanceDisposed,
       });
       const taskReplyTools = createTaskReplyTool({
         input: ctx,
         backgroundJobBoard: backgroundJobBoard!,
-        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
         isDisposed: () => instanceDisposed,
       });
       const taskStatusTools = createTaskStatusTool({
@@ -1795,7 +1802,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         backgroundJobBoard: backgroundJobBoard!,
         activityTracker: taskActivityTracker,
         terminalGate,
-        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
         isDisposed: () => instanceDisposed,
       });
       const taskReviveTools = createTaskReviveTool({
@@ -1811,9 +1818,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           sessionMetadata.isTaskManaged(sessionID),
         backgroundJobSupervisor: backgroundJobSupervisor!,
         revivedRunTracker: revivedRunTracker!,
-        recoverRetainedSession: recoverRetainedSession!,
+        recoverRetainedSession,
         isDisposed: () => instanceDisposed,
-        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
+        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
       });
       const waitForUserTools = createWaitForUserTool({
         shouldManageSession: (sessionID) =>

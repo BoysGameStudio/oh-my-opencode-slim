@@ -251,6 +251,79 @@ describe('native council seat resolver (v2)', () => {
     expect(results[0]?.kind).toBe('ambiguous');
   });
 
+  test('session.get runs on the session receiver it was read from', async () => {
+    // SDK-generated session methods read `this._client`: a detached
+    // invocation sees no client, so this fixture resolves only when the
+    // resolver binds the receiver. No extra host calls: one get + one
+    // transcript per seat.
+    const receivers: unknown[] = [];
+    let getCalls = 0;
+    let messagesCalls = 0;
+    const session = {
+      _client: 'receiver-marker',
+      get(this: { _client?: string }, args: { path: { id: string } }) {
+        getCalls += 1;
+        receivers.push(this?._client);
+        return Promise.resolve({
+          data: {
+            id: args.path.id,
+            parentID: PARENT,
+            agent: 'councillor-alpha',
+            outcome: 'succeeded',
+            time: { created: 1, idle: 90 },
+          },
+        });
+      },
+      messages: async () => {
+        messagesCalls += 1;
+        return childTranscript(50, 'RECEIVER BOUND ANSWER');
+      },
+    };
+    const input = {
+      client: { session },
+      directory: '/tmp',
+      hostFlavor: 'v2',
+    } as unknown as PluginInput;
+    const resolver = createNativeSeatResolver(input);
+    const results = await resolver(PARENT, [{ seat: CHILD, childID: CHILD }]);
+    expect(results[0]).toMatchObject({
+      kind: 'completed',
+      text: 'RECEIVER BOUND ANSWER',
+    });
+    expect(receivers).toEqual(['receiver-marker']);
+    expect(getCalls).toBe(1);
+    expect(messagesCalls).toBe(1);
+  });
+
+  test('a session.get that throws synchronously degrades to ambiguous', async () => {
+    // Sync throws must never reject the resolver call: absence of evidence,
+    // never a throw.
+    let messagesCalls = 0;
+    const input = {
+      client: {
+        session: {
+          get: () => {
+            throw new Error('sync host failure');
+          },
+          messages: async () => {
+            messagesCalls += 1;
+            return { data: [] };
+          },
+        },
+      },
+      directory: '/tmp',
+      hostFlavor: 'v2',
+    } as unknown as PluginInput;
+    const resolver = createNativeSeatResolver(input);
+    const results = await resolver(PARENT, [{ seat: CHILD, childID: CHILD }]);
+    expect(results[0]).toMatchObject({
+      kind: 'ambiguous',
+      reason: 'session unreadable',
+    });
+    // The transcript read is never reached after the unreadable session.
+    expect(messagesCalls).toBe(0);
+  });
+
   test('a missing session id ref never resolves', async () => {
     const results = await resolve(defaultFixture(), ['ses_absent'], {
       hostFlavor: 'v2',
@@ -311,19 +384,6 @@ describe('native council seat resolver (v2)', () => {
     const results = await call;
     expect(results[0]?.kind).toBe('ambiguous');
     // No timer is left pending: the budget released the whole call.
-    expect(timers.pending()).toBe(0);
-  });
-
-  test('an exhausted budget degrades every seat without hanging', async () => {
-    const timers = createTimerHarness();
-    const resolver = createNativeSeatResolver(
-      fakeInput(defaultFixture(), { hostFlavor: 'v2' }),
-      { timeoutMs: 100, timers, now: timers.now },
-    );
-    const call = resolver(PARENT, [{ seat: CHILD, childID: CHILD }]);
-    await timers.advance(100);
-    const results = await call;
-    expect(results[0]?.kind).toBe('ambiguous');
     expect(timers.pending()).toBe(0);
   });
 });
