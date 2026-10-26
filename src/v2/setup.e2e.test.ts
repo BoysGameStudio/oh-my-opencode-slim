@@ -419,6 +419,7 @@ describe('createV2Setup e2e', () => {
     }
     expect(calls.commandAdds.map((c) => c.name)).toContain('deepwork');
     expect(calls.commandAdds.map((c) => c.name)).toContain('interview');
+    expect(calls.commandAdds.map((c) => c.name)).toContain('preset');
     expect(calls.mcpSets.map((m) => m.name)).toEqual(['context7', 'gh_grep']);
     expect(calls.mcpSets.map((m) => m.config)).toEqual([
       expect.objectContaining({ type: 'remote' }),
@@ -1749,6 +1750,23 @@ describe('createV2Setup e2e', () => {
 
     await cleanup();
     expect(calls.disposed.length).toBeGreaterThan(0);
+  }, 20_000);
+
+  test('disabled_commands preset gates server registration', async () => {
+    await Bun.write(
+      path.join(projectDir, '.opencode', 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        companion: { enabled: false },
+        disabled_commands: ['preset'],
+      }),
+    );
+    const { ctx, calls } = makeMockV2Context(projectDir);
+    const cleanup = await createV2Setup()(ctx);
+
+    expect(calls.commandAdds.map((c) => c.name)).not.toContain('preset');
+    expect(calls.commandAdds.map((c) => c.name)).toContain('deepwork');
+
+    await cleanup();
   }, 20_000);
 
   test('reduced ctx (no agent.transform) skips gracefully', async () => {

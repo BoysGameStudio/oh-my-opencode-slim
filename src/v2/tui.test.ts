@@ -885,6 +885,22 @@ describe('v2 tui preset plugin', () => {
       }
     });
 
+    test('disabled_commands preset removes the TUI /preset command', async () => {
+      writeUserConfig({ disabled_commands: ['preset'] });
+      const stub = makeSetupCtx();
+      const cleanup = (await tui2Plugin.setup(
+        stub.ctx as unknown as V2TuiPluginContext,
+      )) as (() => void) | undefined;
+
+      stub.renderAppSlot();
+
+      expect(stub.layers[0]?.commands.map((command) => command.id)).toEqual([
+        'omo.kill_all',
+        'omo.open_subagent',
+      ]);
+      cleanup?.();
+    });
+
     test('re-invokes layer on every app slot render', async () => {
       const stub = makeSetupCtx();
       const cleanup = (await tui2Plugin.setup(

@@ -958,6 +958,7 @@ export const DISABLED_COMMANDS_VALUES = [
   'deepwork',
   'reflect',
   'loop',
+  'preset',
 ] as const;
 
 export const RawPluginConfigSchema = z
