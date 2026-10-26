@@ -1091,6 +1091,7 @@ export function createAgents(
         councillorAgents.length > 0 ? ['council'] : undefined,
       waitForUser: !runtime.disabledTools.includes('wait_for_user'),
       wakeScheduler: runtime.backgroundJobs.orchestratorWake.enabled,
+      taskMessage: runtime.backgroundJobsEnabled,
       hostFlavor: options?.hostFlavor,
       routingBlock: runtime.routingBlock,
     },

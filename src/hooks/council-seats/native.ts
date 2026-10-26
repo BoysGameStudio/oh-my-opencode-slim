@@ -180,12 +180,18 @@ export function createNativeSeatResolver(
           return ambiguous('seat prompt boundary unknown', label);
         }
         if (childInputAt >= selfPromptAt) {
+          // Resumed at/after the synthesis turn opened: the visible round may
+          // be an answer to a NEWER prompt, so its text must never be read
+          // as this seat's opinion. Never fall through to transcript text.
           return {
             kind: 'stale',
             reason: SEAT_REASONS.stale,
             ...(label ? { label } : {}),
           };
         }
+        // A completed round older than the synthesis boundary is only this
+        // seat's answer when the seat was not resumed afterwards; the check
+        // above covers that. Reaching here means the round is attributable.
 
         if (v2) {
           const state = attributeHostRoundToTranscript(

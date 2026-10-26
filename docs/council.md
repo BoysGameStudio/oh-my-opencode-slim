@@ -415,6 +415,14 @@ dispatch-returned session IDs, and
 the harness attaches the collected responses to that call; the council
 agent synthesizes the report.
 
+Which resolver attaches them depends on configuration, and the prompt does
+not change: with the managed lifecycle on, seat text comes from the parent's
+job board (aliases or session IDs both resolve); with
+`backgroundJobs.enabled: false`, it comes from the host sessions directly —
+only exact `ses_` IDs resolve, each child must still report this parent, and a
+seat resumed after the synthesis turn opened is reported as
+`[no response — stale result]` rather than replaying an older answer.
+
 ### Output
 
 Council responses include:
