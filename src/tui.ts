@@ -1912,11 +1912,11 @@ interface SidebarRuntimeAdapter {
  * a config read failure keeps the sidebar (never silently drops a feature).
  * Pane wiring reads the config itself and is NOT gated by this.
  */
-function isSidebarEnabled(directory: string): boolean {
+function isSidebarEnabled(directory: string, hostFlavor?: string): boolean {
   try {
     return (
       loadPluginConfig(directory, {
-        hostFlavor: 'v2',
+        hostFlavor,
         silent: true,
       }).sidebar !== false
     );
@@ -2023,7 +2023,10 @@ export function overlaySelectedRootModel(
 
 /** One refresh/animation/interaction lifecycle for both host slot contracts. */
 function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
-  const sidebarEnabled = isSidebarEnabled(adapter.getDirectory());
+  const sidebarEnabled = isSidebarEnabled(
+    adapter.getDirectory(),
+    adapter.hostFlavor,
+  );
   let configDirectory = adapter.getDirectory();
   let { configInvalid, compactSidebar, multiplexerType, presetName } =
     readConfigState(configDirectory, adapter.hostFlavor);
@@ -2171,7 +2174,7 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
           log('[v2][tui] config state read failed', String(err));
           return { ok: false, reason: String(err) };
         }
-        if (changed) {
+        if (changed && sidebarEnabled) {
           adapter.renderer.requestRender();
           scheduleRefresh();
         }
@@ -2179,18 +2182,28 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
       },
     );
   };
-  if (sidebarEnabled) {
-    bindConfigListener();
-    scheduleRefresh();
-  }
+  // The config listener also carries `multiplexer.type` changes to the pane
+  // wiring (onMultiplexerConfig), so it stays bound with the sidebar off.
+  bindConfigListener();
+  if (sidebarEnabled) scheduleRefresh();
   const rawRefreshMs = Number(process.env.OH_MY_OPENCODE_SLIM_TUI_REFRESH_MS);
   // Test hook: shrink the 1s sidebar poll. Guarded so a bad value cannot
   // spin the timer (setInterval clamps non-positive delays to ~1ms).
   const renderIntervalMs =
     Number.isFinite(rawRefreshMs) && rawRefreshMs >= 10 ? rawRefreshMs : 1000;
-  const renderTimer = sidebarEnabled
-    ? setInterval(scheduleRefresh, renderIntervalMs)
-    : undefined;
+  // With the sidebar off the poll only re-reads plugin config, which is
+  // still how file edits to `multiplexer.type` reach the pane wiring.
+  const pollConfigOnly = () => {
+    try {
+      applyConfigState();
+    } catch (err) {
+      log('[tui] config state read failed', String(err));
+    }
+  };
+  const renderTimer = setInterval(
+    sidebarEnabled ? scheduleRefresh : pollConfigOnly,
+    renderIntervalMs,
+  );
   const animationTimer = sidebarEnabled
     ? setInterval(() => {
         if (

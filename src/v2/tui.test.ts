@@ -1415,6 +1415,71 @@ describe('v2 tui preset plugin', () => {
       }
     });
 
+    test('disposes the pane wiring on hot reload with the sidebar disabled', async () => {
+      const stub = makeSetupCtx();
+      const projectConfigDir = path.join(projectDir, '.opencode');
+      fs.mkdirSync(projectConfigDir, { recursive: true });
+      const configPath = path.join(
+        projectConfigDir,
+        'oh-my-opencode-slim.json',
+      );
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({ sidebar: false, multiplexer: { type: 'tmux' } }),
+      );
+      process.env.TMUX_PANE = '%1';
+
+      const subscriptions = new Map<string, unknown>();
+      const unsubscribed: string[] = [];
+      let infoCalls = 0;
+      stub.ctx.data = {
+        on: (type: string, handler: (event: unknown) => void) => {
+          subscriptions.set(type, handler);
+          return () => {
+            unsubscribed.push(type);
+          };
+        },
+      };
+      stub.ctx.client = {
+        server: {
+          info: async () => {
+            infoCalls += 1;
+            if (infoCalls === 1) return { urls: ['http://127.0.0.1:1'] };
+            throw new Error('probe down');
+          },
+        },
+      };
+
+      const expectedEvents = [
+        'session.created',
+        'session.deleted',
+        'session.execution.failed',
+        'session.execution.interrupted',
+        'session.execution.started',
+        'session.execution.succeeded',
+        'session.idle',
+      ];
+
+      let cleanup: (() => void) | undefined;
+      try {
+        cleanup = (await tui2Plugin.setup(
+          stub.ctx as unknown as V2TuiPluginContext,
+        )) as (() => void) | undefined;
+        expect([...subscriptions.keys()].sort()).toEqual(expectedEvents);
+
+        // The sidebar switch must not take the pane config listener with it.
+        fs.writeFileSync(
+          configPath,
+          JSON.stringify({ sidebar: false, multiplexer: { type: 'none' } }),
+        );
+        await waitFor(() => unsubscribed.length >= expectedEvents.length);
+        expect([...unsubscribed].sort()).toEqual(expectedEvents);
+      } finally {
+        cleanup?.();
+        cleanup = undefined;
+      }
+    });
+
     test('does not leave live pane wiring behind when teardown races a rebuild', async () => {
       const stub = makeSetupCtx();
       const projectConfigDir = path.join(projectDir, '.opencode');
