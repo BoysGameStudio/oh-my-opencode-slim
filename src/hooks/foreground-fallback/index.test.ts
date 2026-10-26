@@ -3356,6 +3356,9 @@ describe('isPermanentQuotaBillingError', () => {
     expect(
       isPermanentQuotaBillingError({ message: '429 Too Many Requests' }),
     ).toBe(false);
+    expect(
+      isPermanentQuotaBillingError('Rate limited, quota resets in 30s'),
+    ).toBe(false);
   });
 });
 

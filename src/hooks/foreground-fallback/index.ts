@@ -82,7 +82,6 @@ const QUOTA_BILLING_PATTERNS = [
   /\bindividual quota reached\b/i,
   /\bupgrade your subscription to increase your limits\b/i,
   /\baccount pool (?:has no account available|is unavailable)\b/i,
-  /\bquota resets? in\s+\d+(?:\.\d+)?\s*[dhms]\b/i,
 ];
 
 const PROVIDER_ERROR_PATTERNS = [
