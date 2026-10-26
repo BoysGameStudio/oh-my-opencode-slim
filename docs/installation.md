@@ -29,41 +29,24 @@ bunx oh-my-opencode-slim@latest install --no-tui --background-subagents=yes
 
 ### Configuration Options
 
-The installer supports the following options:
-
-| Option | Description |
-|--------|-------------|
-| `--preset=<name>` | Active generated config preset: `openai` or `opencode-go` (default: `openai`) |
-| `--background-subagents=ask\|yes\|no` | Configure the required background-subagents and Exa websearch environment exports (`ask` by default; prompt defaults to yes) |
-| `--background-subagents-target=<path>` | Write the background-subagents and websearch exports to a specific shell/profile file |
-| `--no-tui` | Non-interactive mode |
-| `--dry-run` | Simulate install without writing files |
-| `--reset` | Force overwrite of existing configuration |
+Run `bunx oh-my-opencode-slim@latest install --help` for the full flag list.
+Common options: `--preset=<openai|opencode-go>` (default `openai`),
+`--background-subagents=ask|yes|no`, `--background-subagents-target=<path>`,
+`--no-tui`, `--dry-run`, `--reset`.
 
 ### Background Subagents Environment Setup
 
-Background orchestration is the default workflow. It depends on OpenCode's native
-background subagents, which are enabled by this environment variable:
+Background orchestration is the default workflow. It depends on OpenCode's
+native background subagents, enabled by two exports the installer offers to add
+to your shell startup file (the prompt defaults to yes):
 
 ```bash
 OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true
 OPENCODE_ENABLE_EXA=1
 ```
 
-The installer asks before adding those exports to your shell startup file. The
-prompt defaults to `yes` because V2's default orchestration depends on it.
-The Exa flag enables OpenCode's built-in `websearch` tool without requiring an
-API key.
-
-```bash
-bunx oh-my-opencode-slim@latest install
-```
-
-For non-interactive setup, pass the choice explicitly:
-
-```bash
-bunx oh-my-opencode-slim@latest install --no-tui --background-subagents=yes
-```
+The Exa flag enables OpenCode's built-in `websearch` tool without an API key.
+Pass `--background-subagents=no` to skip the exports.
 
 After the installer updates a shell startup file, restart your terminal or source
 the file before launching OpenCode. Examples:
@@ -348,6 +331,8 @@ See the [Multiplexer Integration Guide](multiplexer-integration.md) for more det
    - `~/.zshrc` (Zsh)
    - `~/.bashrc` (Bash)
    - `~/.config/fish/conf.d/opencode-background-subagents.fish` (Fish) — also remove `set -gx OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS true`
+
+   The installer also writes `OPENCODE_ENABLE_EXA=1` to the same startup files (and `set -gx OPENCODE_ENABLE_EXA 1` in the Fish conf); remove those lines too.
 
    Restart your terminal or `source` the file.
 

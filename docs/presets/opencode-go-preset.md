@@ -100,4 +100,4 @@ This preset defines per-agent `skills` and `mcps` via `generateLiteConfig`. The 
 | `*` | All installed skills (wildcard) | `public` |
 
 For the complete configuration reference, see
-[Configuration](configuration.md).
+[Configuration](../configuration.md).

@@ -48,7 +48,7 @@ This codemap covers the plugin repository itself and excludes the nested `openco
 | `src/hooks/loop-command/` | `/loop` runtime command: extracts goal/successCriteria/maxAttempts and drives an iterative retry loop with a per-run history directory. | [View Map](src/hooks/loop-command/codemap.md) |
 | `src/interview/` | `/interview` feature: per-session and dashboard prompt/state orchestration, persistence, local UI, and cross-process coordination. | [View Map](src/interview/codemap.md) |
 | `src/mcp/` | Built-in MCP registry and per-provider MCP definitions. | [View Map](src/mcp/codemap.md) |
-| `src/multiplexer/` | Terminal multiplexer abstraction layer: backend selection plus tmux/zellij/herdr/kitty/wezterm/cmux adapters. Pane lifecycle (admission, spawn, stable-idle close, rebuild, leftover sweep) runs in the TUI client process under `client/`; the server does not participate. | [View Map](src/multiplexer/codemap.md) |
+| `src/multiplexer/` | Terminal multiplexer abstraction layer: backend selection plus tmux/zellij/herdr/kitty/wezterm/orca/cmux adapters. Pane lifecycle (admission, spawn, stable-idle close, rebuild, leftover sweep) runs in the TUI client process under `client/`; the server does not participate. | [View Map](src/multiplexer/codemap.md) |
 | `src/multiplexer/tmux/` | tmux backend implementation for pane lifecycle and layout management. | [View Map](src/multiplexer/tmux/codemap.md) |
 | `src/multiplexer/zellij/` | zellij backend implementation for tab/pane lifecycle. | [View Map](src/multiplexer/zellij/codemap.md) |
 | `src/multiplexer/herdr/` | herdr backend implementation for pane lifecycle. | [View Map](src/multiplexer/herdr/codemap.md) |
@@ -87,7 +87,7 @@ This codemap covers the plugin repository itself and excludes the nested `openco
    - Native OpenCode background tasks are parsed from `task` output and tracked in the shared background job board (board + store + coordinator + supervisor in `src/utils/`).
    - `src/hooks/task-session-manager/` updates job-board state, resolves short aliases, and observes terminal deliveries in the parent's history (the board itself is never rendered); runtime-status reconciliation and the shared terminal-publication gate (`background-job-terminal-gate.ts`) keep board state honest against live session status.
    - `src/hooks/orchestrator-wake/` periodically nudges an idle parent orchestrator when incomplete TODOs remain, pushes later terminal results as one-shot deltas, and reacts to jobs that stop without a terminal result.
-   - The TUI client (`src/tui.ts` → `src/multiplexer/client/`) optionally mirrors those sessions into tmux, Zellij, Herdr, cmux, kitty, or WezTerm panes/surfaces; each client anchors new panes to its own pane resolved from the client environment at spawn time (never a shared registry).
+   - The TUI client (`src/tui.ts` → `src/multiplexer/client/`) optionally mirrors those sessions into tmux, Zellij, Herdr, cmux, kitty, WezTerm, or Orca panes/surfaces; each client anchors new panes to its own pane resolved from the client environment at spawn time (never a shared registry).
    - Results flow back into the parent session through notifications/output polling.
 
 4. **Install/release path**

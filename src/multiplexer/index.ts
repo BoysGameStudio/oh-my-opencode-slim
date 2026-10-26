@@ -10,6 +10,7 @@ export { CliCmuxClient, CmuxMultiplexer } from './cmux';
 export { getMultiplexer } from './factory';
 export { HerdrMultiplexer } from './herdr';
 export { KittyMultiplexer } from './kitty';
+export { OrcaMultiplexer } from './orca';
 export { TmuxMultiplexer } from './tmux';
 export type { Multiplexer, PaneResult } from './types';
 export { WeztermMultiplexer } from './wezterm';

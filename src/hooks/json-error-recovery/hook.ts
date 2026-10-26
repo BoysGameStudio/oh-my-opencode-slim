@@ -2,11 +2,14 @@ import type { PluginInput } from '@opencode-ai/plugin';
 
 export const JSON_ERROR_TOOL_EXCLUDE_LIST = [
   'bash',
+  'shell',
   'read',
   'glob',
   'webfetch',
   'task_status',
   'gh_grep_searchgithub',
+  'grep',
+  'ast_grep_search',
 ] as const;
 
 export const JSON_ERROR_PATTERNS = [

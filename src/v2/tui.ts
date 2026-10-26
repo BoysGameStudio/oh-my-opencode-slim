@@ -19,6 +19,7 @@
  */
 import type { PluginConfig } from '../config';
 import { loadPluginConfig } from '../config/loader';
+import { isCommandEnabled } from '../hooks/command-hook-utils';
 import {
   type PresetSwitchResult,
   switchPresetOnDisk,
@@ -203,18 +204,23 @@ export async function runPresetFlow(
  */
 function buildPresetLayer(
   ctx: V2PresetTuiContext,
+  presetCommandEnabled: boolean,
 ): () => { mode: string; commands: V2KeymapCommand[] } {
   return () => ({
     mode: 'global',
     commands: [
-      {
-        id: PRESET_COMMAND_ID,
-        title: PRESET_COMMAND_TITLE,
-        group: 'System',
-        palette: true,
-        slash: { name: 'preset', arguments: true },
-        run: (input?: string) => void runPresetFlow(ctx, input),
-      },
+      ...(presetCommandEnabled
+        ? [
+            {
+              id: PRESET_COMMAND_ID,
+              title: PRESET_COMMAND_TITLE,
+              group: 'System',
+              palette: true,
+              slash: { name: 'preset', arguments: true },
+              run: (input?: string) => void runPresetFlow(ctx, input),
+            },
+          ]
+        : []),
       buildKillAllCommand(ctx),
       buildOpenSubagentCommand(ctx),
     ],
@@ -372,6 +378,16 @@ const plugin = {
     const baseCleanup = await omoTui.setup(ctx);
     if (typeof baseCleanup === 'function') disposers.push(baseCleanup);
 
+    // `disabled_commands` gates the TUI entry exactly like it gates the
+    // server command: a disabled `/preset` is not registered anywhere.
+    const directory = ctx.location?.directory ?? process.cwd();
+    const presetCommandEnabled = isCommandEnabled('preset', {
+      disabledCommands: new Set(
+        loadPluginConfig(directory, { silent: true, hostFlavor: 'v2' })
+          .disabled_commands ?? [],
+      ),
+    });
+
     const slotApi = (ctx.ui as { slot?: V2SlotApi } | undefined)?.slot;
     if (typeof slotApi !== 'function') {
       log('[v2][tui] ui.slot unavailable; /preset disabled on this build');
@@ -382,7 +398,7 @@ const plugin = {
           render: () => {
             if (typeof ctx.keymap?.layer === 'function') {
               try {
-                ctx.keymap.layer(buildPresetLayer(ctx));
+                ctx.keymap.layer(buildPresetLayer(ctx, presetCommandEnabled));
               } catch (err) {
                 log('[v2][tui] keymap.layer failed', String(err));
               }

@@ -266,57 +266,17 @@ councillor only fails once every entry in the chain is exhausted.
 
 ## Choosing the Council Model vs Councillor Models
 
-There are **two separate model layers**:
-
-1. **The Council agent model** — the model behind `@council` itself, which
-   does the final synthesis.
-2. **The councillor models** — the models that actually fan out in parallel,
-   configured under `council.presets.<preset>.<councillor>.model`.
-
-### Configure the Council agent when you want to change
-
-- the **final synthesizer model**
-- shared council-agent behavior like temperature or MCPs
-
-### Configure councillors when you want to change
-
-- which models participate in the vote
-- model diversity
-- role-specific reviewer / architect / optimizer behavior
-
-### Important rule
-
-`agents.councillor` can change shared councillor settings such as temperature,
-MCPs, and skills, but **it does not choose the councillor model**.
-
-Councillor models always come from:
-
-`council.presets.<preset>.<councillor>.model`
+Two model layers: the **Council agent** model (`@council`, the final synthesis)
+and the **councillor** models that fan out in parallel. Configure the Council
+agent to change the synthesizer or shared council behavior; configure
+councillors to change who votes, model diversity, or role behavior.
+`agents.councillor` can set shared councillor options (temperature, MCPs,
+skills) but **never** the councillor model — that always comes from
+`council.presets.<preset>.<councillor>.model`.
 
 ---
 
 ## Preset Examples
-
-### Minimal second opinion
-
-```jsonc
-{
-  "presets": {
-    "openai": {
-      "council": { "model": "openai/gpt-6" }
-    }
-  },
-  "council": {
-    "presets": {
-      "second-opinion": {
-        "reviewer": { "model": "openai/gpt-6-luna" }
-      }
-    }
-  }
-}
-```
-
-### Balanced multi-provider council
 
 ```jsonc
 {
@@ -338,8 +298,9 @@ Councillor models always come from:
 }
 ```
 
----
+A single-councillor preset uses the same shape with one entry.
 
+---
 ## Role Prompts
 
 Each councillor can receive its own steering prompt:

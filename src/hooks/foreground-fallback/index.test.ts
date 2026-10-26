@@ -3313,7 +3313,7 @@ describe('ForegroundFallbackManager spent allowance (issue #966)', () => {
 });
 
 describe('isPermanentQuotaBillingError', () => {
-  test('returns true for free-tier usage exhaustion', () => {
+  test('returns true for free-tier usage exhaustion and Antigravity quota or pool exhaustion', () => {
     expect(
       isPermanentQuotaBillingError('Free usage exceeded, subscribe to Go'),
     ).toBe(true);
@@ -3322,12 +3322,42 @@ describe('isPermanentQuotaBillingError', () => {
         message: 'Free usage exceeded, subscribe to Go',
       }),
     ).toBe(true);
+    expect(
+      isPermanentQuotaBillingError({
+        message:
+          'Individual quota reached. Please upgrade your subscription to increase your limits. quota resets in 150h 8m 15s.',
+      }),
+    ).toBe(true);
+    const poolError = {
+      status: 412,
+      message:
+        'Antigravity account pool has no account available within the configured wait limit. Add accounts with `opencode auth login` or wait for account availability. Quota resets in 142h 40m 46s.',
+    };
+    expect(isFailoverError(poolError)).toBe(true);
+    expect(isPermanentQuotaBillingError(poolError)).toBe(true);
+    expect(
+      isFailoverError({
+        cause: {
+          message:
+            'Antigravity account pool is unavailable under the quota protection policy. Add accounts, wait for quota reset, or disable soft quota protection.',
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isFailoverError({
+        message:
+          'Antigravity did not begin a response within the pre-response time limit. Check your connection and try again later.',
+      }),
+    ).toBe(true);
   });
 
   test('returns false for transient rate limits', () => {
     expect(isPermanentQuotaBillingError('rate limit, retrying...')).toBe(false);
     expect(
       isPermanentQuotaBillingError({ message: '429 Too Many Requests' }),
+    ).toBe(false);
+    expect(
+      isPermanentQuotaBillingError('Rate limited, quota resets in 30s'),
     ).toBe(false);
   });
 });

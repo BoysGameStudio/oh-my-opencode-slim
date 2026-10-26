@@ -230,8 +230,11 @@ export function detectClientAdapter(
   if (env.ZELLIJ_PANE_ID) return 'zellij';
   if (env.HERDR_PANE_ID) return 'herdr';
   if (env.KITTY_WINDOW_ID) return 'kitty';
-  // Last: tmux/zellij nested inside WezTerm must win.
+  // WezTerm hosts tmux/zellij sessions, which must win when nested inside it;
+  // Orca sits after it for the same reason (a nested session inside either
+  // host still wins, checked above).
   if (env.WEZTERM_PANE) return 'wezterm';
+  if (env.ORCA_TERMINAL_HANDLE) return 'orca';
   return null;
 }
 
@@ -303,6 +306,8 @@ export function resolveAnchoredTarget(
       return env.KITTY_WINDOW_ID ?? null;
     case 'wezterm':
       return env.WEZTERM_PANE ?? null;
+    case 'orca':
+      return env.ORCA_TERMINAL_HANDLE ?? null;
     case 'cmux-tui':
       return env.CMUX_TUI_TERMINAL_ID ?? env.CMUX_TUI_SOCKET ?? null;
   }

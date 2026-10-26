@@ -1731,7 +1731,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       );
     }
     if (!runtime.disabledHooks.has('tool-loop-guard')) {
-      toolLoopGuard = createToolLoopGuardHook();
+      toolLoopGuard = createToolLoopGuardHook({ directory: ctx.directory });
     }
 
     // Pre-created wrapped handlers for tool.execute.after (error-isolated)
@@ -3616,7 +3616,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       taskSessionManagerHook?.observeChatMessage(input, output);
       orchestratorWakeScheduler?.observeChatMessage(input, output);
       if (messageID) {
-        toolLoopGuard?.observeNewUserMessage(input.sessionID, messageID);
+        toolLoopGuard?.observeNewUserMessage(input.sessionID, messageID, {
+          internalAdmission,
+        });
       }
     },
 

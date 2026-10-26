@@ -245,6 +245,7 @@ and [Council](council.md) for what remains.
 | `agents.<agent>.displayName` | string | - | Custom user-facing alias for the agent in the active config |
 | `agents.<agent>.color` | string | - | Agent display color as `#RRGGBB` or a theme color: `primary`, `secondary`, `accent`, `success`, `warning`, `error`, or `info` |
 | `agents.<agent>.description` | string | generated | Description shown to OpenCode and the orchestrator; defaults to `Custom subagent '<name>'` for custom agents |
+| `agents.<agent>.skills_include_local` | boolean | - | Adds valid skills from the project's and ancestors' `.opencode/skills/**/SKILL.md` and `.agents/skills/**/SKILL.md` trees before `skills_remove` applies |
 | `acpAgents.<name>.command` | string | - | Command for an external ACP-compatible agent; creates a wrapper subagent named `<name>` See [ACP-connected agents](#acp-connected-agents). |
 | `acpAgents.<name>.args` | string[] | `[]` | Arguments for the ACP agent command See [ACP-connected agents](#acp-connected-agents). |
 | `acpAgents.<name>.env` | object | `{}` | Extra environment variables for the ACP subprocess See [ACP-connected agents](#acp-connected-agents). |
@@ -258,7 +259,7 @@ and [Council](council.md) for what remains.
 | `disabled_agents` | string[] | `["observer"]` | Agent names to disable globally. Set to `[]` to enable Observer; this is global, not per-preset See [Custom Agents](#custom-agents). |
 | `image_routing` | `"auto"` \| `"direct"` | omitted (legacy conditional) | Optional. When omitted, resolves to `"auto"` if Observer is enabled, otherwise `"direct"`. Explicit `"auto"` saves image attachments under `.opencode/images/<session>/` and nudges delegation to @observer; saved images remain until you remove them. `"direct"` always passes image parts to the orchestrator. Remove saved images with `rm -rf .opencode/images/` (or a single session subdirectory) when they are no longer needed; session-less messages save images at the top level. |
 | `autoUpdate` | boolean | `true` | Automatically install plugin updates in the background; set to `false` for notification-only mode |
-| `multiplexer.type` | string | `"none"` | Multiplexer mode: `auto`, `tmux`, `zellij`, `herdr`, `cmux-tui`, `kitty`, `wezterm`, or `none` See [Multiplexer Integration](multiplexer-integration.md). On OpenCode v2 hosts, panes work with the shared background service or an explicit `--server`; `--standalone` hosts ignore the setting (one diagnostic per process). |
+| `multiplexer.type` | string | `"none"` | Multiplexer mode: `auto`, `tmux`, `zellij`, `herdr`, `cmux-tui`, `kitty`, `wezterm`, `orca`, or `none` See [Multiplexer Integration](multiplexer-integration.md). On OpenCode v2 hosts, panes work with the shared background service or an explicit `--server`; `--standalone` hosts ignore the setting (one diagnostic per process). |
 | `multiplexer.layout` | string | `"main-vertical"` | Layout preset: `main-vertical`, `main-horizontal`, `tiled`, `even-horizontal`, `even-vertical`. Each adapter maps it to its nearest native expression (tmux full layouts; split directions for Zellij/Herdr; built-in layouts for kitty; split order for WezTerm); cmux-tui has no layout expression and ignores it. Herdr builds an agent area for both `main-*` layouts (`main-vertical` agent column, `main-horizontal` agent row) and re-equalizes only its agent panes after each spawn/close. See [Multiplexer Integration](multiplexer-integration.md#layouts). |
 | `multiplexer.main_pane_size` | number | `60` | Main pane size as percentage (20–80) for tmux main layouts and the first Herdr/WezTerm agent split of the `main-*` layouts; Herdr then equalizes the agent panes in the agent column (`main-vertical`) or row (`main-horizontal`) after each spawn/close while the main pane keeps this share. Ignored by Zellij, kitty, and cmux-tui See [Multiplexer Integration](multiplexer-integration.md#layouts). |
 | `multiplexer.equalize_panes` | boolean | `true` | Herdr only: after each spawn and agent-pane close, equalize the `main-*` agent panes and re-assert the main pane's `main_pane_size` share via the socket API. Set `false` to keep manual pane sizes |
@@ -290,7 +291,7 @@ and [Council](council.md) for what remains.
 | `disabled_tools` | string[] | `[]` | Slim tool names to disable globally. Disabled Slim tools are not registered with OpenCode and cannot be used by agents; OpenCode built-in tools are not affected |
 | `disabled_skills` | string[] | `[]` | Skill names to disable globally. Disabled skills are not granted to agents, and disabled bundled skills are not registered; listing `reflect` here also disables the `/reflect` command |
 | `disabled_hooks` | string[] | `[]` | Hook names to disable globally: `phase-reminder`, `foreground-fallback`, `deepwork-guard`, `deepwork-goal`, `chat-headers`, `cache-monitor`, `json-error-recovery`, `tool-loop-guard`, `search-path-guard`, `absolute-path-rescue`, `apply-patch`, `council-inject`, `auto-update-checker`. `auto-update-checker` gates update **checking** and installation together, so it is stronger than `autoUpdate`, which only controls installation. Unknown values are stripped with a warning when the config loads; a value consisting only of unknown names is treated as unset, so a lower config layer's list still applies. See [Hooks](#hooks) |
-| `disabled_commands` | string[] | `[]` | Slash commands to disable globally: `interview`, `implement`, `deepwork`, `reflect`, `loop`. Disabled commands are neither registered nor intercepted at execution time, so a user-defined command with the same name is left untouched. Listing `reflect` in `disabled_skills` also disables the `/reflect` command. See [Slash Commands](#slash-commands) |
+| `disabled_commands` | string[] | `[]` | Slash commands to disable globally: `interview`, `implement`, `deepwork`, `reflect`, `loop`, `preset`. Disabled commands are neither registered nor intercepted at execution time, so a user-defined command with the same name is left untouched. Listing `reflect` in `disabled_skills` also disables the `/reflect` command. See [Slash Commands](#slash-commands) |
 | `deepworkGuardMode` | `"shadow"` \| `"enforce"` | `"shadow"` | `shadow` records receipts without blocking; `enforce` blocks completion writes whose tombstone references artifacts with no receipt. Disable the guard via `disabled_hooks` (`deepwork-guard`) |
 | `webfetch.enabled` | boolean | `true` | When `false`, the enhanced `webfetch` is not registered and OpenCode's built-in is used. See [Webfetch](webfetch.md) |
 | `fallback.enabled` | boolean | `true` | Enable Slim's foreground model-chain failover. It does not configure OpenCode provider/AI-SDK retries. On **v2 hosts** the replay path (abort + re-prompt) stays disabled — the v2 `switchModel` has no per-turn/atomic conditional form, so an in-flight replay could commit after a newer user turn has taken over — while the retry-hook steering path runs: host retry events are absorbed up to `fallback.maxRetries`, then the model is switched in place via the host `session.switchModel` and the host retries the current turn on the new model. The same switch disables both paths. |
@@ -376,7 +377,7 @@ Only subagent inference settings (`model`, `variant`, `temperature`,
 skills, MCPs and marketplace activation keep their normal host lifecycle.
 Invalid configuration preserves the last-known-good defaults. On v1, apply
 the preset to the configuration and reload OpenCode as before. See
-[Preset Switching](preset-switching.md) for scope, timing and concurrent-session
+[Preset Switching](presets/preset-switching.md) for scope, timing and concurrent-session
 examples.
 
 ### Preset inheritance
@@ -660,7 +661,7 @@ The wall-clock supervisor is separately opt-in and remains disabled unless
 ```
 
 `orchestratorWake` defaults to enabled with a 5-minute continuous-idle
-interval and `"auto"` mode (todo-gated on v1 hosts, children-driven on v2).
+interval and `"auto"` mode (todo-gated on v1; v2 creates no scheduler).
 Set `enabled: false` to keep idle reconciliation and background-job orchestration
 without periodic wake prompts. See the
 [Background Orchestration](background-orchestration.md) guide for the concept,
@@ -1062,7 +1063,7 @@ preset with only `model` (and `variant` if needed):
 }
 ```
 
-`loadAgentPrompt` (`src/config/loader.ts:418`) is preset-aware and reads
+`loadAgentPrompt` (`src/config/loader.ts:1006`) is preset-aware and reads
 `<agentName>.md` from the `oh-my-opencode-slim/` prompts directory. Lookup
 order:
 
@@ -1242,7 +1243,7 @@ Disable built-in commands via `disabled_commands`:
 { "disabled_commands": ["interview", "deepwork"] }
 ```
 
-Available commands: `interview`, `implement`, `deepwork`, `reflect`, `loop`. Disabled commands are neither registered nor intercepted at execution time, so a user-defined command with the same name is left untouched. Listing `reflect` in `disabled_skills` also disables the `/reflect` command.
+Available commands: `interview`, `implement`, `deepwork`, `reflect`, `loop`, `preset`. Disabled commands are neither registered nor intercepted at execution time, so a user-defined command with the same name is left untouched. Listing `reflect` in `disabled_skills` also disables the `/reflect` command.
 
 Invalid entries are stripped with a warning when the config loads; a value consisting only of unknown names is treated as unset, so a lower config layer's list still applies — it is not an explicit empty override.
 

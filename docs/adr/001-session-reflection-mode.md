@@ -49,6 +49,9 @@ Current `/reflect` only looks at the current conversation and project files. The
 
 ### 3. Session Discovery
 
+> **Superseded by the 2026-10 amendment at the end of this file.** Reflection
+> now queries `opencode.db` directly instead of grepping logs.
+
 **Decision:** LLM reads `~/.local/share/opencode/log/opencode.log` and greps for `session.id=ses_[a-f0-9]+` to extract session IDs.
 
 **Rationale:**

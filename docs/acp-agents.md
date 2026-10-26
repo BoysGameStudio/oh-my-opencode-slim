@@ -61,13 +61,13 @@ Or let the orchestrator delegate to it when its routing prompt matches the task.
 | `command` | string | - | ACP executable. Put flags in `args`, not here. |
 | `args` | string[] | `[]` | Arguments for the ACP command. |
 | `env` | object | `{}` | Extra environment variables for the subprocess. |
-| `cwd` | string | current session directory | Working directory override. ACP paths should be absolute. |
+| `cwd` | string | current project directory | Working directory override. ACP paths should be absolute. |
 | `description` | string | generated | Role text shown to OpenCode and the orchestrator. |
 | `prompt` | string | generated | Full prompt for the wrapper subagent. Usually unnecessary. |
 | `orchestratorPrompt` | string | generated | Exact routing block injected into the orchestrator prompt. |
-| `wrapperModel` | string | fixer default | Cheap OpenCode model used by the wrapper. |
+| `wrapperModel` | string | the preset's primary model | Model used by the wrapper subagent; when unset it follows the preset's primary model, then the session model. |
 | `permissionMode` | `ask` \| `allow` \| `reject` | `ask` | How ACP permission requests are answered. |
-| `timeoutMs` | integer | `300000` | Timeout for one ACP run. |
+| `timeoutMs` | integer | `0` | Timeout for one ACP run in milliseconds. `0` disables the timeout. |
 
 > **`permission` vs `permissionMode`:** These are separate concepts.
 > - **`permission`** (on normal custom, built-in, and preset agents) provides SDK-enforced, expressive per-tool rules with pattern support, accepting `ask`/`allow`/`deny`. See [Agent Permissions](configuration.md#agent-permissions).

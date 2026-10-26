@@ -15,7 +15,7 @@ oh-my-opencode-slim marketplace install author/package
 oh-my-opencode-slim marketplace import ./package.json
 oh-my-opencode-slim marketplace list
 oh-my-opencode-slim marketplace show author/package
-oh-my-opencode-slim marketplace verify author/package
+oh-my-opencode-slim marketplace verify [author/package]
 oh-my-opencode-slim marketplace enable author/package [--user]
 oh-my-opencode-slim marketplace disable author/package [--user]
 oh-my-opencode-slim marketplace update author/package

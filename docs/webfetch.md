@@ -75,7 +75,8 @@ caching them.
 For documentation sites, `webfetch` automatically probes for `/llms-full.txt`
 then `/llms.txt` before falling back to the page itself. Probing happens only
 when the domain looks documentation-adjacent (suffixes like `.readthedocs.io`,
-`.gitbook.io`, `docs.rs`; prefixes like `docs.`, `developer.`, `dev.`, `wiki.`)
+`.readthedocs.org`, `.gitbook.io`, `.netlify.app`, `.vercel.app`, `docs.rs`;
+prefixes like `docs.`, `developer.`, `dev.`, `wiki.`)
 and the requested format is `markdown` or `text` — `format: html` skips the
 probe, since llms.txt is plain text rather than the raw page.
 
@@ -152,14 +153,5 @@ overrides OpenCode's built-in `webfetch` when this plugin is active.
 ## Implementation
 
 The enhanced `webfetch` lives in `src/tools/smartfetch/` (the internal module is
-named "smartfetch", while the public tool name is `webfetch`). It is composed of
-these modules:
-
-| Module | Responsibility |
-|--------|---------------|
-| `tool.ts` | Entry point — permission prompts, cache lookup, llms.txt probing, binary-vs-text branching, conditional status header |
-| `network.ts` | URL normalization, redirect policy, charset/body decoding, header extraction, llms.txt probing, HTTP fetch with HTTPS upgrade fallback |
-| `utils.ts` | HTML extraction (Mozilla Readability + Turndown), heading cleanup, markdown/text cleaning, frontmatter generation, quality signal detection |
-| `cache.ts` | LRU cache keyed by URL + request options (format omitted for llms.txt); stale entries retain validators for conditional page revalidation, while stale llms.txt is probed anew |
-| `binary.ts` | Binary content persistence to disk, MIME-to-extension mapping, safe filename allocation |
-| `constants.ts` | Timeouts, size limits, docs domain heuristics, binary MIME prefixes, tool description |
+named "smartfetch"; the public tool name is `webfetch`). Module responsibilities
+are documented by the sources in that directory.

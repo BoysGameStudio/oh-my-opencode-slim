@@ -24,6 +24,15 @@ the built-in `/models`, so it triggers no LLM turn.
 > to choose **Current session** or **Global default**. `/preset <name>` keeps
 > its configuration-writing fast path: it changes the global default, not
 > the current session's binding.
+>
+> Non-TUI clients (OpenChamber, SDK consumers, ACP hosts) get a server-side
+> `/preset <name>` command. No argument lists the available presets; a name
+> writes the global default (the same on-disk result as the TUI fast path); an
+> unknown name reports the valid options. It is apply-only — create, edit and
+> delete stay in the TUI manager — and the client reports the result without a
+> model turn, so the running session keeps its existing models and the change
+> applies on the next conversation or reload. Listing `preset` in
+> `disabled_commands` removes both the TUI entry and the server command.
 
 ## Scope and when changes take effect
 
@@ -180,4 +189,4 @@ changing one does not overwrite the other. Use **Global default** to change
 future work and **Current session** to change future delegations in work that
 is already bound.
 
-> See [Configuration](configuration.md) for the full preset option reference.
+> See [Configuration](../configuration.md) for the full preset option reference.
