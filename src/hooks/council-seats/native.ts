@@ -5,16 +5,21 @@
  * lifecycle OFF.
  *
  * Only exact `ses_` child IDs resolve; any other ref is missing. One
- * bounded deadline covers the whole call (parent transcript read plus
- * every per-seat host read); there is no retry, no polling, and no
- * transcript persistence.
+ * bounded deadline covers the whole call; there is no retry, no polling,
+ * and no transcript persistence.
  *
- * The parent transcript is read ONCE to establish `selfPromptAt` (its
- * latest delivered user/synthetic input): a seat whose own latest input
- * is not strictly older was resumed after the synthesis turn started, so
- * its transcript can no longer be attributed to this round — stale. When
- * the boundary cannot be established the seat is ambiguous rather than
- * guessed.
+ * The child transcript is the attribution source: the seat body is read
+ * from the trailing round AFTER the child's latest input boundary, so a
+ * seat that was dispatched or resumed later can only ever surface the
+ * answer to that latest prompt — text from an earlier round is never
+ * replayed. A child still working on that prompt is `running`.
+ *
+ * Synthesis-time cutoff: the resolver stamps `synthesisStartedAt`
+ * synchronously, before its first await, and every transcript input
+ * boundary is compared against that stamp. A seat prompt whose input
+ * boundary lands at or after the stamp is `ambiguous` — its answer
+ * belongs to a dispatch the synthesis never observed, so the seat fails
+ * closed rather than attributing newer text to an older ref.
  *
  * Cross-parent verification is load-bearing: a child whose `parentID`
  * does not match the caller is missing, never resolved — another
@@ -113,26 +118,10 @@ export function createNativeSeatResolver(
   const directory = input.directory;
 
   return async (parentSessionID, seats) => {
-    const deadline = clock() + budget;
+    const synthesisStartedAt = clock();
+    const deadline = synthesisStartedAt + budget;
     const remaining = () => Math.max(0, deadline - clock());
     const client = input.client;
-
-    // Establish the synthesis-turn boundary once: the parent's latest
-    // delivered user/synthetic input. A seat transcript that is not
-    // strictly older belongs to a later round and must never be read as
-    // this round's answer.
-    const parentTranscript = await boundedRead(
-      () => fetchChildTranscript(client, parentSessionID, directory),
-      remaining,
-      options.timers,
-    );
-    if (parentTranscript === undefined) {
-      return seats.map(() => ambiguous('parent transcript unavailable'));
-    }
-    const selfPromptAt = latestInputAtOf(parentTranscript);
-    if (selfPromptAt === undefined) {
-      return seats.map(() => ambiguous('cannot prove the synthesis turn'));
-    }
 
     const get = client?.session?.get as SessionGet | undefined;
 
@@ -179,19 +168,15 @@ export function createNativeSeatResolver(
         if (childInputAt === undefined) {
           return ambiguous('seat prompt boundary unknown', label);
         }
-        if (childInputAt >= selfPromptAt) {
-          // Resumed at/after the synthesis turn opened: the visible round may
-          // be an answer to a NEWER prompt, so its text must never be read
-          // as this seat's opinion. Never fall through to transcript text.
-          return {
-            kind: 'stale',
-            reason: SEAT_REASONS.stale,
-            ...(label ? { label } : {}),
-          };
+        // Synthesis-time cutoff: a seat prompt at/after this stamp is work
+        // the synthesis call never observed — fail closed rather than
+        // attributing a newer answer to the older seat ref.
+        if (childInputAt >= synthesisStartedAt) {
+          return ambiguous(
+            'seat prompt is newer than the synthesis call',
+            label,
+          );
         }
-        // A completed round older than the synthesis boundary is only this
-        // seat's answer when the seat was not resumed afterwards; the check
-        // above covers that. Reaching here means the round is attributable.
 
         if (v2) {
           const state = attributeHostRoundToTranscript(

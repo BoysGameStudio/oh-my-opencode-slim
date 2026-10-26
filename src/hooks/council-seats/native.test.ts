@@ -1,11 +1,10 @@
 /**
  * Native council seat assembly (boardless, managed lifecycle OFF).
  *
- * The resolver reads the host session domain directly: the parent
- * transcript once (to establish the synthesis-turn boundary), then one
- * `session.get` + one transcript per seat. Every read is bounded by one
- * whole-call deadline driven by the deterministic timer harness — no real
- * sleeps, no polling, no retries.
+ * The resolver reads the host session domain directly: one `session.get`
+ * + one transcript per seat, every read bounded by one whole-call deadline
+ * driven by the deterministic timer harness — no real sleeps, no polling,
+ * no retries.
  */
 import { describe, expect, test } from 'bun:test';
 
@@ -71,7 +70,6 @@ interface SeatFixture {
   transcripts?: Record<string, unknown>;
   hostInfos?: Record<string, Record<string, unknown>>;
   /** v2 host info writes outcome + idle; omit for a pending round. */
-  parentTranscript?: unknown;
 }
 
 /** Fake host client. Any method not provided rejects never (so a budget
@@ -99,15 +97,10 @@ function fakeInput(
   } as unknown as PluginInput;
 }
 
-/** Default: parent's latest input at 100, one completed child at 50. */
+/** Default: one completed child at 50. */
 function defaultFixture(overrides: SeatFixture = {}): SeatFixture {
   return {
     transcripts: {
-      [PARENT]: {
-        data: [
-          message({ id: 'msg_user', role: 'user', text: 'go', created: 100 }),
-        ],
-      },
       [CHILD]: childTranscript(50, 'CHILD VERBATIM TEXT'),
     },
     hostInfos: {
@@ -217,17 +210,27 @@ describe('native council seat resolver (v2)', () => {
     expect(results[0]?.kind).toBe('empty');
   });
 
-  test('a resumed child (latest input at/after the synthesis turn) is stale', async () => {
-    // The parent's latest input is the synthesis boundary at 100; the
-    // child was steered at 200 — after the synthesis turn started.
+  test('a seat dispatched after the parent question resolves (same-turn council)', async () => {
+    // Foreground seats are launched and collected within the same turn:
+    // their prompts are newer than the parent's user input. The trailing
+    // round is the seat's answer and must resolve.
     const fixture = defaultFixture();
     fixture.transcripts = {
       ...fixture.transcripts,
-      [CHILD]: childTranscript(200, 'RESUMED ANSWER'),
+      [CHILD]: childTranscript(200, 'FRESH SEAT ANSWER'),
+    };
+    fixture.hostInfos = {
+      [CHILD]: {
+        id: CHILD,
+        parentID: PARENT,
+        agent: 'councillor-alpha',
+        outcome: 'succeeded',
+        time: { created: 1, idle: 230 },
+      },
     };
     const results = await resolve(fixture, [CHILD], { hostFlavor: 'v2' });
-    expect(results[0]?.kind).toBe('stale');
-    expect(results[0]).not.toHaveProperty('text');
+    expect(results[0]?.kind).toBe('completed');
+    expect(results[0]).toHaveProperty('text', 'FRESH SEAT ANSWER');
   });
 
   test('an unreadable session is ambiguous, never a guess', async () => {
@@ -255,7 +258,7 @@ describe('native council seat resolver (v2)', () => {
     expect(results[0]?.kind).toBe('ambiguous');
   });
 
-  test('an unresolvable parent transcript makes every seat ambiguous', async () => {
+  test('an unreadable child transcript is ambiguous, never a guess', async () => {
     const fixture = defaultFixture();
     fixture.transcripts = {};
     const results = await resolve(fixture, [CHILD], { hostFlavor: 'v2' });
@@ -395,13 +398,92 @@ describe('native council seat resolver (v1)', () => {
     expect(results[0]).not.toHaveProperty('text');
   });
 
-  test('the selfPromptAt boundary also applies on v1', async () => {
+  test('a seat dispatched after the parent question also resolves on v1', async () => {
     const fixture = defaultFixture();
     fixture.transcripts = {
       ...fixture.transcripts,
-      [CHILD]: childTranscript(200, 'RESUMED ANSWER'),
+      [CHILD]: childTranscript(200, 'FRESH SEAT ANSWER'),
     };
     const results = await resolve(fixture, [CHILD]);
-    expect(results[0]?.kind).toBe('stale');
+    expect(results[0]?.kind).toBe('completed');
+    expect(results[0]).toHaveProperty('text', 'FRESH SEAT ANSWER');
+  });
+});
+
+describe('native council seat resolver synthesis-time cutoff', () => {
+  // Oracle decision: the resolver stamps synthesisStartedAt synchronously and
+  // fails closed on any seat prompt whose input boundary lands at or after it.
+  // Injected now = 300 fixes the cutoff; the default budget keeps every read
+  // well inside the deadline.
+  const cutoffNow = () => 300;
+
+  function cutoffFixture(
+    childInputAt: number,
+    text?: string,
+    idleAt = childInputAt + 30,
+  ) {
+    const fixture = defaultFixture();
+    fixture.transcripts = {
+      ...fixture.transcripts,
+      [CHILD]: childTranscript(childInputAt, text),
+    };
+    fixture.hostInfos = {
+      [CHILD]: {
+        id: CHILD,
+        parentID: PARENT,
+        agent: 'councillor-alpha',
+        outcome: 'succeeded',
+        time: { created: 1, idle: idleAt },
+      },
+    };
+    return fixture;
+  }
+
+  test('a seat prompt before the cutoff with a trailing answer is completed', async () => {
+    const results = await resolve(
+      cutoffFixture(200, 'ANSWER BEFORE CUTOFF'),
+      [CHILD],
+      { hostFlavor: 'v2', now: cutoffNow },
+    );
+    expect(results[0]).toMatchObject({
+      kind: 'completed',
+      text: 'ANSWER BEFORE CUTOFF',
+      label: 'councillor-alpha',
+    });
+  });
+
+  test('host idle/outcome timestamps after the cutoff do not fail the seat', async () => {
+    // The cutoff compares the child's INPUT boundary to the synthesis stamp;
+    // host terminal evidence that lands after the stamp belongs to a prompt
+    // the synthesis observed, so the seat still resolves.
+    const results = await resolve(
+      cutoffFixture(200, 'ANSWER WITH LATE HOST ROUND'),
+      [CHILD],
+      { hostFlavor: 'v2', now: cutoffNow },
+    );
+    expect(results[0]?.kind).toBe('completed');
+  });
+
+  test('a seat prompt strictly after the cutoff is ambiguous with no text', async () => {
+    const results = await resolve(
+      cutoffFixture(301, 'TOO LATE ANSWER'),
+      [CHILD],
+      { hostFlavor: 'v2', now: cutoffNow },
+    );
+    expect(results[0]).toMatchObject({
+      kind: 'ambiguous',
+      reason: 'seat prompt is newer than the synthesis call',
+    });
+    expect(results[0]).not.toHaveProperty('text');
+  });
+
+  test('a seat prompt exactly on the cutoff is ambiguous', async () => {
+    const results = await resolve(
+      cutoffFixture(300, 'EXACT CUTOFF ANSWER'),
+      [CHILD],
+      { hostFlavor: 'v2', now: cutoffNow },
+    );
+    expect(results[0]?.kind).toBe('ambiguous');
+    expect(results[0]).not.toHaveProperty('text');
   });
 });

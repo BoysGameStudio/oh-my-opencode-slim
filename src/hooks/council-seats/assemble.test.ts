@@ -53,7 +53,6 @@ describe('seatBodyOf', () => {
       'running',
       'missing',
       'ambiguous',
-      'stale',
       'empty',
       'error',
     ] as const) {

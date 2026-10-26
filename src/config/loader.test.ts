@@ -475,7 +475,7 @@ describe('loadPluginConfig', () => {
     expect(config.interview?.printState).toBe(false);
   });
 
-  test('does not let a defaulted project marketplace enabled override user false', () => {
+  test('an empty project marketplace layer keeps the user false switch', () => {
     const userConfigPath = path.join(userConfigDir, 'opencode');
     const projectDir = path.join(tempDir, 'project');
     const projectConfigDir = path.join(projectDir, '.opencode');

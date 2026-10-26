@@ -14,33 +14,159 @@
  * reuses the real `loadPluginConfig` path (a written config file) so the
  * gates are proven end-to-end against the loader, not a stub.
  */
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import * as fs from 'node:fs';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import fs from 'node:fs';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
+import type { BackgroundJobStorageBackend } from '../utils/background-job-persistence';
+import {
+  configureBackgroundJobPersistence,
+  getSuppressionTombstone,
+  loadInitialBackgroundJobPersistence,
+  recordSuppression,
+} from '../utils/background-job-persistence';
+import * as configWatch from './config-watch';
 import { createV2Setup } from './setup';
 import type { V2Context, V2SessionContextEvent } from './types';
 
+/** Manually-resolved promise for holding a backend write in flight. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+/** Monotonic async counter used to await specific backend calls. */
+function createCounter() {
+  let value = 0;
+  const waiters: Array<{ threshold: number; resolve: () => void }> = [];
+  return {
+    increment() {
+      value += 1;
+      for (let index = waiters.length - 1; index >= 0; index -= 1) {
+        const waiter = waiters[index];
+        if (waiter && waiter.threshold <= value) {
+          waiters.splice(index, 1);
+          waiter.resolve();
+        }
+      }
+    },
+    at(threshold: number): Promise<void> {
+      if (value >= threshold) return Promise.resolve();
+      return new Promise((resolve) => waiters.push({ threshold, resolve }));
+    },
+  };
+}
+
+/**
+ * In-memory v2 storage with selected writes held by an explicit promise.
+ * Same-key writes are serialized by the real persistence module, so a newer
+ * save can be queued behind a held save without using a timed sleep.
+ */
+function createMemoryBackend() {
+  const map = new Map<string, unknown>();
+  const calls = new Map<string, ReturnType<typeof createCounter>>();
+  const settled = new Map<string, ReturnType<typeof createCounter>>();
+  const held = deferred<void>();
+  const heldKeys = new Set<string>();
+  const counterFor = (
+    counters: Map<string, ReturnType<typeof createCounter>>,
+    key: string,
+  ) => {
+    let counter = counters.get(key);
+    if (!counter) {
+      counter = createCounter();
+      counters.set(key, counter);
+    }
+    return counter;
+  };
+  const backend: BackgroundJobStorageBackend = {
+    get: async (key) => map.get(key),
+    set: async (key, value) => {
+      counterFor(calls, key).increment();
+      if (heldKeys.has(key)) await held.promise;
+      map.set(key, value);
+      counterFor(settled, key).increment();
+    },
+    remove: async (key) => {
+      map.delete(key);
+    },
+    scan: async ({ prefix }) => ({
+      entries: [...map.entries()]
+        .filter(([key]) => key.startsWith(prefix))
+        .map(([key, value]) => ({ key, value })),
+    }),
+  };
+  return {
+    backend,
+    map,
+    hold(...keys: string[]) {
+      for (const key of keys) heldKeys.add(key);
+    },
+    release() {
+      heldKeys.clear();
+      held.resolve();
+    },
+    waitForCalls(key: string, count: number) {
+      return counterFor(calls, key).at(count);
+    },
+    waitForSettled(key: string, count: number) {
+      return counterFor(settled, key).at(count);
+    },
+  };
+}
+
 /** Mock v2 context capturing the registrations the gates must suppress. */
-function makeCtx(projectDir: string) {
+function makeCtx(
+  projectDir: string,
+  storage: V2Context['storage'] = {
+    get: async () => undefined,
+    set: async () => {},
+    remove: async () => {},
+    scan: async () => ({ entries: [] }),
+  },
+) {
   const commandAdds: Array<{ name: string }> = [];
   const toolUpdates: Array<{ id: string }> = [];
   const hooks: string[] = [];
   const skillCallbacks = new Set<(draft: unknown) => void>();
   const contextHooks: Array<(event: never) => Promise<void>> = [];
+  const storageCalls = { get: 0, set: 0, remove: 0, scan: 0 };
+  const rpcHandlers: Array<Record<string, unknown>> = [];
+  const countedStorage = storage
+    ? {
+        get: async (key: string) => {
+          storageCalls.get += 1;
+          return storage.get(key);
+        },
+        set: async (key: string, value: unknown) => {
+          storageCalls.set += 1;
+          await storage.set(key, value);
+        },
+        remove: async (key: string) => {
+          storageCalls.remove += 1;
+          await storage.remove(key);
+        },
+        scan: async (options: {
+          prefix: string;
+          after?: string;
+          limit?: number;
+        }) => {
+          storageCalls.scan += 1;
+          return storage.scan(options);
+        },
+      }
+    : undefined;
   const reg = (label: string) => ({
     dispose: () => hooks.push(`dispose:${label}`),
   });
   const ctx = {
     app: { name: 'opencode', version: 'v2-feature-gates' },
     options: {},
-    storage: {
-      get: async () => undefined,
-      set: async () => {},
-      remove: async () => {},
-      scan: async () => ({ entries: [] }),
-    },
+    storage: countedStorage,
     location: {
       directory: projectDir,
       project: {
@@ -152,9 +278,26 @@ function makeCtx(projectDir: string) {
         text: `generated:${input.prompt}`,
       }),
     },
+    rpc: {
+      register: async (
+        _definition: unknown,
+        handlers: Record<string, unknown>,
+      ) => {
+        rpcHandlers.push(handlers);
+        return reg('rpc.register');
+      },
+    },
   } as unknown as V2Context;
 
-  return { ctx, commandAdds, toolUpdates, hooks, contextHooks };
+  return {
+    ctx,
+    commandAdds,
+    toolUpdates,
+    hooks,
+    contextHooks,
+    storageCalls,
+    rpcHandlers,
+  };
 }
 
 const INTERVIEW_MARKER =
@@ -260,6 +403,58 @@ describe('v2 setup feature gates', () => {
     }
   }, 20_000);
 
+  test('lifecycle-disabled project preserves live queued persistence writes', async () => {
+    const persistence = createMemoryBackend();
+    const tombstoneKey = 'omo/bgj/tombstone/ses_live_project';
+    const epochKey = 'omo/bgj/epoch/ses_live_project';
+    configureBackgroundJobPersistence(persistence.backend);
+    try {
+      await loadInitialBackgroundJobPersistence();
+      recordSuppression('ses_live_project', 1);
+      await persistence.waitForSettled(tombstoneKey, 1);
+      await persistence.waitForSettled(epochKey, 1);
+      const keyCount = persistence.map.size;
+      expect(keyCount).toBe(2);
+
+      // Hold the first save of each key. The second suppression for the same
+      // task queues behind those in the real per-key persistence queues.
+      persistence.hold(tombstoneKey, epochKey);
+      recordSuppression('ses_live_project', 2);
+      await persistence.waitForCalls(tombstoneKey, 2);
+      await persistence.waitForCalls(epochKey, 2);
+      expect(getSuppressionTombstone('ses_live_project')?.epoch).toBe(2);
+      expect(persistence.map.get(tombstoneKey)).toMatchObject({ epoch: 1 });
+
+      await writeProjectConfig({
+        companion: { enabled: false },
+        backgroundJobs: { enabled: false },
+      });
+      const { ctx, storageCalls } = makeCtx(projectDir, persistence.backend);
+      const cleanup = await createV2Setup()(ctx);
+      try {
+        // Assert the in-memory latest record before releasing any promise
+        // awaited below: the old off branch reset would fail here instead of
+        // leaving a flush helper hanging on a fenced queue.
+        expect(storageCalls).toEqual({ get: 0, set: 0, remove: 0, scan: 0 });
+        expect(getSuppressionTombstone('ses_live_project')?.epoch).toBe(2);
+      } finally {
+        await cleanup();
+      }
+
+      persistence.release();
+      await persistence.waitForSettled(tombstoneKey, 2);
+      await persistence.waitForSettled(epochKey, 2);
+      expect(persistence.map.size).toBeGreaterThanOrEqual(keyCount);
+      expect(persistence.map.get(tombstoneKey)).toMatchObject({
+        taskID: 'ses_live_project',
+        epoch: 2,
+      });
+      expect(persistence.map.get(epochKey)).toBe(2);
+    } finally {
+      configureBackgroundJobPersistence(undefined);
+    }
+  }, 20_000);
+
   test('lifecycle enabled (default): the structured-launch wrapper registers', async () => {
     // Defaults keep the wrapper: a config with only the companion disabled
     // must behave exactly like the baseline (no silent gate drift).
@@ -272,7 +467,7 @@ describe('v2 setup feature gates', () => {
     }
   }, 20_000);
 
-  test('liveConfigRefresh disabled: no watcher, but the startup seed still lands', async () => {
+  test('liveConfigRefresh disabled: no watcher, but seed and explicit preset refresh work', async () => {
     await writeProjectConfig({
       companion: { enabled: false },
       liveConfigRefresh: false,
@@ -282,34 +477,48 @@ describe('v2 setup feature gates', () => {
         strong: { explorer: { model: 'anthropic/claude-sonnet-4-5' } },
       },
     });
-    const { ctx } = makeCtx(projectDir);
+    const factory = configWatch.watchPluginConfigFiles;
+    const watcherFactory = spyOn(
+      configWatch,
+      'watchPluginConfigFiles',
+    ).mockImplementation(((options: configWatch.WatchPluginConfigOptions) => {
+      return factory(options);
+    }) as never);
+    const { ctx, rpcHandlers } = makeCtx(projectDir);
     const cleanup = await createV2Setup()(ctx);
     try {
-      // The one-shot startup seed ran: the sidebar projection carries the
-      // selected preset's model (this also proves `refreshProfiles` itself
-      // still functions without the watcher).
-      // eslint-disable-next-line
-      const { readTuiSnapshot } = await import('../tui-state');
-      const snapshot = readTuiSnapshot(projectDir);
-      expect(snapshot.agentModels.explorer).toBe('openai/gpt-5-mini');
+      expect(watcherFactory).not.toHaveBeenCalled();
 
-      // A config edit afterwards must NOT refresh: with the watcher off the
-      // frozen seed is the running table until restart.
-      await writeProjectConfig({
-        companion: { enabled: false },
-        liveConfigRefresh: false,
-        preset: 'strong',
-        presets: {
-          cheap: { explorer: { model: 'openai/gpt-5-mini' } },
-          strong: { explorer: { model: 'anthropic/claude-sonnet-4-5' } },
-        },
-      });
-      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      // The unconditional one-shot refresh seeds the selected profile even
+      // with filesystem watching disabled.
+      const { readTuiSnapshot } = await import('../tui-state');
       expect(readTuiSnapshot(projectDir).agentModels.explorer).toBe(
         'openai/gpt-5-mini',
       );
+
+      // The explicit /preset application uses the RPC's named refresh path,
+      // which must still resolve against the current config without a watcher.
+      const handlers = rpcHandlers[0];
+      expect(handlers).toBeDefined();
+      const apply = handlers?.apply as (
+        input: { sessionID: string; presetName: string },
+        context: { signal: AbortSignal },
+      ) => Promise<{ presetName: string }>;
+      const applied = await apply(
+        { sessionID: 'ses_preset_off', presetName: 'strong' },
+        { signal: new AbortController().signal },
+      );
+      expect(applied.presetName).toBe('strong');
+      await expect(
+        apply(
+          { sessionID: 'ses_preset_missing', presetName: 'missing' },
+          { signal: new AbortController().signal },
+        ),
+      ).rejects.toThrow('Unknown preset: missing');
+      expect(watcherFactory).not.toHaveBeenCalled();
     } finally {
       await cleanup();
+      watcherFactory.mockRestore();
     }
   }, 20_000);
 

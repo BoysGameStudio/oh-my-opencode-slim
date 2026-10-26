@@ -21,7 +21,7 @@ knows about the other.
   trailing newlines, append one `## Seat: <label>` section per seat.
   Placeholder bodies render as `[no response — <reason>]`; `SEAT_REASONS`
   holds the canonical tails (`still running`, `unresolved ref`,
-  `unverified result`, `stale result`, `empty result`, `failed`). Empty
+  `unverified result`, `empty result`, `failed`). Empty
   refs report themselves (`[no seat references were provided]`). Fail-open:
   a resolver rejection or malformed result becomes one placeholder per ref
   (`[no response — resolver error]`); assembly never throws.
@@ -42,19 +42,21 @@ knows about the other.
 - **native.ts** — `createNativeSeatResolver(input)`: no board, no
   lifecycle. Only exact `ses_` child IDs resolve. One bounded deadline
   covers the whole call (default 5 s, injectable `timeoutMs` + `timers` +
-  `now` for tests): the parent transcript is read once for
-  `selfPromptAt = latestInputAtOf(parent)` (unavailable → every seat
-  ambiguous — the synthesis-turn boundary cannot be proven); per seat, one
-  `session.get` verifies `parentID === parentSessionID` (mismatch →
-  missing, never a leak) and, when present, agent/label agreement, then
-  one child transcript read. v2 classifies the round via
+  `now` for tests): per seat, one latest round read. One `session.get` verifies
+  `parentID === parentSessionID` (mismatch → missing, never a leak) and, when
+  present, agent/label agreement; then one child transcript read classifies
+  that child's trailing round only — text from before the latest input
+  boundary is never replayed, so a re-prompted seat can only surface the
+  answer to its latest prompt. A seat whose latest prompt arrives at or
+  after the resolver's invocation stamp (`synthesisStartedAt`, captured once
+  before any read) is `ambiguous`: its answer cannot be attributed to this
+  synthesis call. v2 classifies the round via
   `hostRoundStateOf` + `attributeHostRoundToTranscript` + `composeHostRound`
   (incomplete → running, unreadable → ambiguous, completed requires
   non-empty `terminalTextOf` else empty, error/interrupted → error); v1
   uses `classifyTerminalEvidence` (textless → empty, retry/pending →
-  running). A child whose latest input is at/after `selfPromptAt` was
-  resumed after the synthesis turn started → stale. Unreadable evidence is
-  ambiguous, never a guess; the resolver never throws.
+  running). Unreadable evidence is ambiguous, never a guess; the resolver
+  never throws.
 
 ## Tests
 
@@ -66,6 +68,6 @@ knows about the other.
 - `managed.test.ts` — ported historical coverage including the v2
   execute.before bridge end-to-end, final-vs-quoted Seats line, lifecycle
   diagnostics, cross-parent isolation, 50KB verbatim inline.
-- `native.test.ts` — v2/v1 classification paths, cross-parent missing,
-  stale/resumed, unreadable sessions, whole-call budget with the
+- `native.test.ts` — v2/v1 classification paths, same-turn dispatch,
+  cross-parent missing, unreadable sessions, whole-call budget with the
   deterministic timer harness.

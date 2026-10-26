@@ -29,7 +29,6 @@ export const SEAT_REASONS = {
   running: 'still running',
   missing: 'unresolved ref',
   ambiguous: 'unverified result',
-  stale: 'stale result',
   empty: 'empty result',
   error: 'failed',
 } as const;
@@ -80,7 +79,6 @@ function seatResultOf(value: unknown): SeatResult | undefined {
     kind !== 'running' &&
     kind !== 'missing' &&
     kind !== 'ambiguous' &&
-    kind !== 'stale' &&
     kind !== 'empty' &&
     kind !== 'error'
   ) {

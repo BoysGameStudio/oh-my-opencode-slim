@@ -631,6 +631,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let taskSessionManagerAfter: (i: unknown, o: unknown) => Promise<void> =
     async () => {};
   let backgroundJobBoard: BackgroundJobBoard | undefined;
+  // Constructed once per generation inside the lifecycle block and shared by
+  // the task manager and the task control tools (a second copy would fence on
+  // its own `isDisposed` timing).
+  let recoverRetainedSession:
+    | ReturnType<typeof createSessionRecovery>
+    | undefined;
+  let aliasAuthority: ReturnType<typeof createAliasAuthority> | undefined;
   let tuiReusableProjection:
     | ReturnType<typeof createTuiReusableProjection>
     | undefined;
@@ -941,6 +948,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       runtime.webfetch.enabled !== false
         ? createWebfetchTool(ctx, { binaryDir: undefined })
         : undefined;
+    sessionLifecycle = new SessionLifecycle(log);
+    sessionLifecycle.onSessionDeleted((sessionID) => {
+      compactingSessionIds.delete(sessionID);
+    });
+
     if (runtime.backgroundJobsEnabled) {
       backgroundJobBoard = new BackgroundJobBoard({
         maxReusablePerAgent: runtime.backgroundJobs.maxSessionsPerAgent,
@@ -981,6 +993,18 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
             }
           : {}),
       });
+      recoverRetainedSession = createSessionRecovery({
+        input: ctx,
+        backgroundJobBoard: backgroundJobBoard!,
+        isDisposed: () => instanceDisposed,
+        hostFlavor,
+      });
+      aliasAuthority = createAliasAuthority({
+        input: ctx,
+        board: backgroundJobBoard!,
+        isDisposed: () => instanceDisposed,
+      });
+
       admissionRuntimeLease = acquireAdmissionRuntime(
         ctx.directory,
         runtime.backgroundJobs.concurrency,
@@ -995,31 +1019,37 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // Each generation must retract its own projected sections on dispose:
       // a reload reuses this PID, so the startup dead-owner sweep retains
       // the previous generation's entries until explicitly removed.
-      tuiReusableProjection = runtime.sidebarEnabled
-        ? createTuiReusableProjection({
-            board: backgroundJobBoard,
-            projectDir: ctx.directory,
-          })
-        : undefined;
-      backgroundJobBoard.addLaunchIdentityListener((event) => {
-        const directory = tuiActivityDirectory(event.taskID);
-        if (event.kind === 'registered') {
-          if (event.parentSessionID && event.parentSessionID !== event.taskID) {
-            recordTuiSessionParent(
+      // Sidebar projection and its launch-identity writes exist only for
+      // the sidebar surface; disabled means no state file, no locks, no
+      // parent/alias hydration from this process.
+      if (runtime.sidebarEnabled) {
+        tuiReusableProjection = createTuiReusableProjection({
+          board: backgroundJobBoard,
+          projectDir: ctx.directory,
+        });
+        backgroundJobBoard.addLaunchIdentityListener((event) => {
+          const directory = tuiActivityDirectory(event.taskID);
+          if (event.kind === 'registered') {
+            if (
+              event.parentSessionID &&
+              event.parentSessionID !== event.taskID
+            ) {
+              recordTuiSessionParent(
+                event.taskID,
+                event.parentSessionID,
+                directory,
+              );
+            }
+            updateTuiSessionDetails(
               event.taskID,
-              event.parentSessionID,
+              { alias: event.alias },
               directory,
             );
+          } else {
+            clearTuiSessionAlias(event.taskID, directory);
           }
-          updateTuiSessionDetails(
-            event.taskID,
-            { alias: event.alias },
-            directory,
-          );
-        } else {
-          clearTuiSessionAlias(event.taskID, directory);
-        }
-      });
+        });
+      }
       terminalGate = createBackgroundJobTerminalGate({
         backgroundJobBoard: backgroundJobBoard,
         input: ctx,
@@ -1043,12 +1073,13 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           (revivedRunTracker?.isObservationPending(taskID, generation) ??
             false),
         onRunning: (record) => {
-          backgroundTaskConcurrency?.restoreTask(
-            record.taskID,
-            sessionMetadata.getModel(record.taskID) ??
-              resolvePrimaryModelFromFinalHostConfig(record.agent) ??
-              sessionMetadata.getModel(record.parentSessionID),
-          );
+          if (record.background)
+            backgroundTaskConcurrency?.restoreTask(
+              record.taskID,
+              sessionMetadata.getModel(record.taskID) ??
+                resolvePrimaryModelFromFinalHostConfig(record.agent) ??
+                sessionMetadata.getModel(record.parentSessionID),
+            );
           if (
             !revivedRunTracker?.promptMessageIDFor(
               record.taskID,
@@ -1143,113 +1174,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         markTuiAgentInactive(record.taskID);
       });
 
-      sessionLifecycle = new SessionLifecycle(log);
-      sessionLifecycle.onSessionDeleted((sessionID) => {
-        compactingSessionIds.delete(sessionID);
-      });
-
-      // Initialize auto-update checker hook
-      autoUpdateChecker = createAutoUpdateCheckerHook(ctx, {
-        autoUpdate: runtime.autoUpdate,
-        companion: runtime.companion,
-      });
-
-      // disabled_hooks: "chat-headers" keeps the hook unregistered on both
-      // hosts — the v2 bridge reads v1Hooks['chat.headers'] and skips the
-      // model.request registration when the key is absent.
-      if (!runtime.disabledHooks.has('chat-headers')) {
-        chatHeadersHook = createChatHeadersHook(ctx);
-      }
-
-      // Initialize foreground fallback manager for runtime model switching.
-      // Agents without a chain (e.g. councillor, owned by CouncilManager) are
-      // left alone — FG only aborts/re-prompts when it has a model to switch to.
-      // The observation handoff brackets the re-prompt admission for
-      // BACKGROUND children (false-stop incident): prepare() defers the stop
-      // gate before the await, admit() enrolls the run tracker after host
-      // acceptance, reject() withdraws on failure; see
-      // fallback-observation-transfer.ts.
-      // Lifecycle off: the manager is still constructed (v2 retry steering
-      // depends on it) but the board-derived deps pass undefined instead of
-      // false-returning stubs — no board, no supervisor, no handoff exists
-      // to observe, so the manager stays honest about the absent surface.
-      const backgroundFallbackHandoff = lifecycleEnabled
-        ? createBackgroundFallbackHandoff({
-            backgroundJobBoard: backgroundJobBoard,
-            revivedRunTracker,
-          })
-        : undefined;
-      // The current v2 host interface has no per-turn/atomic conditional
-      // switch, so an in-flight REPLAY (abort + re-prompt) can commit on the
-      // host after a newer user turn has taken over — the replay path stays
-      // disabled on v2 (a3ac0bee). The retry-hook steering path performs no
-      // replay: it mutates the host's in-flight retry decision and switches
-      // the model in place via session.switchModel, so the a3ac0bee race
-      // cannot occur. Steering is host-agnostic (only v2 hosts invoke the
-      // hook) and follows the same user switches as the replay path
-      // (fallback.enabled / disabled_hooks).
-      const fallbackUserEnabled =
-        runtime.fallback.enabled !== false &&
-        !runtime.disabledHooks.has('foreground-fallback');
-      const fallbackEnabled = fallbackUserEnabled && hostFlavor !== 'v2';
-      const v2RetryEnabled = fallbackUserEnabled;
-      if (fallbackUserEnabled && hostFlavor === 'v2') {
-        // Deterministic notice: no timestamps or per-call ids. Do not log when
-        // the user explicitly disabled fallback, including via disabled_hooks.
-        log(
-          '[foreground-fallback] v2 replay fallback disabled (no atomic per-turn model switch); retry-hook steering active',
-        );
-      }
-      // Startup generation: captured here and republished (contents swap) by
-      // registry finalize and every successful profile refresh. The manager
-      // aliases this record; see publishChainGeneration.
-      foregroundFallbackChains = runtime.modelArrays;
-      foregroundFallback = new ForegroundFallbackManager(
-        foregroundFallbackChains,
-        fallbackEnabled,
-        ctx,
-        runtime.fallback.maxRetries,
-        sessionLifecycle,
-        // A managed background-task session switching models mid-flight must
-        // move its admission accounting (provider/model caps) to the new
-        // model. No-op for unknown/non-task sessions; idempotent per model.
-        // Undefined when the lifecycle is off: no admission runtime exists.
-        lifecycleEnabled
-          ? (sessionID, model) =>
-              backgroundTaskConcurrency?.migrateTask(sessionID, model)
-          : undefined,
-        runtime.fallback.initialRetryDelayMs,
-        runtime.fallback.retryDelayMs,
-        backgroundFallbackHandoff,
-        // Identify confirmed background children even after cancellation or
-        // termination, so handoff preparation rejects a delayed stale replay.
-        // Undefined remains exclusive to foreground/unmanaged sessions, and
-        // is the honest value when no board exists.
-        lifecycleEnabled
-          ? (sessionID) => {
-              const record = backgroundJobBoard?.get(sessionID);
-              return record?.background === true
-                ? record.generation
-                : undefined;
-            }
-          : undefined,
-        lifecycleEnabled
-          ? (sessionID) => backgroundJobBoard?.hasRunning(sessionID) ?? false
-          : undefined,
-        v2RetryEnabled,
-      );
-
-      const recoverRetainedSession = createSessionRecovery({
-        input: ctx,
-        backgroundJobBoard: backgroundJobBoard,
-        isDisposed: () => instanceDisposed,
-        hostFlavor,
-      });
-      const aliasAuthority = createAliasAuthority({
-        input: ctx,
-        board: backgroundJobBoard,
-        isDisposed: () => instanceDisposed,
-      });
       taskSessionManagerHook = createTaskSessionManagerHook(ctx, {
         terminalGate,
         // Flip mechanism half reads the per-instance box declared above.
@@ -1693,6 +1617,97 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       }
     }
 
+    if (!runtime.disabledHooks.has('auto-update-checker')) {
+      // Initialize auto-update checker hook
+      autoUpdateChecker = createAutoUpdateCheckerHook(ctx, {
+        autoUpdate: runtime.autoUpdate,
+        companion: runtime.companion,
+      });
+    }
+
+    // disabled_hooks: "chat-headers" keeps the hook unregistered on both
+    // hosts — the v2 bridge reads v1Hooks['chat.headers'] and skips the
+    // model.request registration when the key is absent.
+    if (!runtime.disabledHooks.has('chat-headers')) {
+      chatHeadersHook = createChatHeadersHook(ctx);
+    }
+
+    // Initialize foreground fallback manager for runtime model switching.
+    // Agents without a chain (e.g. councillor, owned by CouncilManager) are
+    // left alone — FG only aborts/re-prompts when it has a model to switch to.
+    // The observation handoff brackets the re-prompt admission for
+    // BACKGROUND children (false-stop incident): prepare() defers the stop
+    // gate before the await, admit() enrolls the run tracker after host
+    // acceptance, reject() withdraws on failure; see
+    // fallback-observation-transfer.ts.
+    // Lifecycle off: the manager is still constructed (v2 retry steering
+    // depends on it) but the board-derived deps pass undefined instead of
+    // false-returning stubs — no board, no supervisor, no handoff exists
+    // to observe, so the manager stays honest about the absent surface.
+    const backgroundFallbackHandoff = lifecycleEnabled
+      ? createBackgroundFallbackHandoff({
+          backgroundJobBoard: backgroundJobBoard!,
+          revivedRunTracker: revivedRunTracker!,
+        })
+      : undefined;
+    // The current v2 host interface has no per-turn/atomic conditional
+    // switch, so an in-flight REPLAY (abort + re-prompt) can commit on the
+    // host after a newer user turn has taken over — the replay path stays
+    // disabled on v2 (a3ac0bee). The retry-hook steering path performs no
+    // replay: it mutates the host's in-flight retry decision and switches
+    // the model in place via session.switchModel, so the a3ac0bee race
+    // cannot occur. Steering is host-agnostic (only v2 hosts invoke the
+    // hook) and follows the same user switches as the replay path
+    // (fallback.enabled / disabled_hooks).
+    const fallbackUserEnabled =
+      runtime.fallback.enabled !== false &&
+      !runtime.disabledHooks.has('foreground-fallback');
+    const fallbackEnabled = fallbackUserEnabled && hostFlavor !== 'v2';
+    const v2RetryEnabled = fallbackUserEnabled;
+    if (fallbackUserEnabled && hostFlavor === 'v2') {
+      // Deterministic notice: no timestamps or per-call ids. Do not log when
+      // the user explicitly disabled fallback, including via disabled_hooks.
+      log(
+        '[foreground-fallback] v2 replay fallback disabled (no atomic per-turn model switch); retry-hook steering active',
+      );
+    }
+    // Startup generation: captured here and republished (contents swap) by
+    // registry finalize and every successful profile refresh. The manager
+    // aliases this record; see publishChainGeneration.
+    foregroundFallbackChains = runtime.modelArrays;
+    foregroundFallback = new ForegroundFallbackManager(
+      foregroundFallbackChains,
+      fallbackEnabled,
+      ctx,
+      runtime.fallback.maxRetries,
+      sessionLifecycle,
+      // A managed background-task session switching models mid-flight must
+      // move its admission accounting (provider/model caps) to the new
+      // model. No-op for unknown/non-task sessions; idempotent per model.
+      // Undefined when the lifecycle is off: no admission runtime exists.
+      lifecycleEnabled
+        ? (sessionID, model) =>
+            backgroundTaskConcurrency?.migrateTask(sessionID, model)
+        : undefined,
+      runtime.fallback.initialRetryDelayMs,
+      runtime.fallback.retryDelayMs,
+      backgroundFallbackHandoff,
+      // Identify confirmed background children even after cancellation or
+      // termination, so handoff preparation rejects a delayed stale replay.
+      // Undefined remains exclusive to foreground/unmanaged sessions, and
+      // is the honest value when no board exists.
+      lifecycleEnabled
+        ? (sessionID) => {
+            const record = backgroundJobBoard?.get(sessionID);
+            return record?.background === true ? record.generation : undefined;
+          }
+        : undefined,
+      lifecycleEnabled
+        ? (sessionID) => backgroundJobBoard?.hasRunning(sessionID) ?? false
+        : undefined,
+      v2RetryEnabled,
+    );
+
     // P0 cold gating: each on-demand tool guard is only constructed when
     // its disabled_hooks entry is absent, so a disabled guard performs no
     // construction work and its composed before/after calls no-op. Deepwork
@@ -1752,17 +1767,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       hostFlavor,
     );
     if (lifecycleEnabled) {
-      const recoverRetainedSession = createSessionRecovery({
-        input: ctx,
-        backgroundJobBoard: backgroundJobBoard!,
-        isDisposed: () => instanceDisposed,
-        hostFlavor,
-      });
-      const aliasAuthority = createAliasAuthority({
-        input: ctx,
-        board: backgroundJobBoard!,
-        isDisposed: () => instanceDisposed,
-      });
       const taskCancelTools = createCancelTaskTool({
         input: ctx,
         backgroundJobBoard: backgroundJobBoard!,
@@ -1770,20 +1774,20 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         shouldManageSession: (sessionID) =>
           sessionMetadata.getAgent(sessionID) === 'orchestrator' ||
           sessionMetadata.isTaskManaged(sessionID),
-        recoverRetainedSession,
-        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        recoverRetainedSession: recoverRetainedSession!,
+        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
         isDisposed: () => instanceDisposed,
       });
       const taskMessageTools = createTaskMessageTool({
         input: ctx,
         backgroundJobBoard: backgroundJobBoard!,
-        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
         isDisposed: () => instanceDisposed,
       });
       const taskReplyTools = createTaskReplyTool({
         input: ctx,
         backgroundJobBoard: backgroundJobBoard!,
-        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
         isDisposed: () => instanceDisposed,
       });
       const taskStatusTools = createTaskStatusTool({
@@ -1791,7 +1795,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         backgroundJobBoard: backgroundJobBoard!,
         activityTracker: taskActivityTracker,
         terminalGate,
-        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
         isDisposed: () => instanceDisposed,
       });
       const taskReviveTools = createTaskReviveTool({
@@ -1807,9 +1811,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           sessionMetadata.isTaskManaged(sessionID),
         backgroundJobSupervisor: backgroundJobSupervisor!,
         revivedRunTracker: revivedRunTracker!,
-        recoverRetainedSession,
+        recoverRetainedSession: recoverRetainedSession!,
         isDisposed: () => instanceDisposed,
-        resolveCanonicalTaskRef: aliasAuthority.resolveCanonical,
+        resolveCanonicalTaskRef: aliasAuthority!.resolveCanonical,
       });
       const waitForUserTools = createWaitForUserTool({
         shouldManageSession: (sessionID) =>
@@ -2932,15 +2936,18 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           const agentName = resolveRuntimeAgentName(runtime, info.agent);
           const model = `${providerID}/${modelID}`;
           const variant = resolveTuiVariantForModel(agentName, model);
-          recordTuiAgentModel(
-            {
-              agentName,
-              model,
-              variant: variant ?? null,
-            },
-            (info?.sessionID && sessionMetadata.getDirectory(info.sessionID)) ??
-              ctx.directory,
-          );
+          if (runtime.sidebarEnabled) {
+            recordTuiAgentModel(
+              {
+                agentName,
+                model,
+                variant: variant ?? null,
+              },
+              (info?.sessionID &&
+                sessionMetadata.getDirectory(info.sessionID)) ??
+                ctx.directory,
+            );
+          }
         }
       }
 
@@ -2960,7 +2967,11 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         if (typeof freshID === 'string' && typeof createdAt === 'number') {
           backgroundJobBoard?.noteSessionCreated(freshID, createdAt);
         }
-        if (createdSessionId && typeof createdSessionParent === 'string') {
+        if (
+          runtime.sidebarEnabled &&
+          createdSessionId &&
+          typeof createdSessionParent === 'string'
+        ) {
           // Persist the child→parent link so any process can resolve the
           // conversation root, surviving restarts and revives (#1147).
           recordTuiSessionParent(
@@ -3582,7 +3593,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
           // circuits unchanged writes through its memo, which also keeps
           // this path in step with recordTuiAgentModels bulk replacement
           // and retries after a failed write.
-          if (agent) {
+          if (runtime.sidebarEnabled && agent) {
             recordTuiAgentModel(
               {
                 agentName: agent,
@@ -3650,9 +3661,15 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
               ? orchestratorDef.config.prompt
               : buildOrchestratorPrompt({
                   disabledAgents: runtime.disabledAgents,
-                  waitForUser: !runtime.disabledTools.includes('wait_for_user'),
+                  waitForUser:
+                    runtime.backgroundJobsEnabled &&
+                    !runtime.disabledTools.includes('wait_for_user'),
                   wakeScheduler:
+                    runtime.backgroundJobsEnabled &&
                     runtime.backgroundJobs.orchestratorWake.enabled,
+                  taskMessage:
+                    runtime.backgroundJobsEnabled &&
+                    !runtime.disabledTools.includes('task_message'),
                   hostFlavor,
                   routingBlock: runtime.routingBlock,
                 });

@@ -419,9 +419,13 @@ Which resolver attaches them depends on configuration, and the prompt does
 not change: with the managed lifecycle on, seat text comes from the parent's
 job board (aliases or session IDs both resolve); with
 `backgroundJobs.enabled: false`, it comes from the host sessions directly —
-only exact `ses_` IDs resolve, each child must still report this parent, and a
-seat resumed after the synthesis turn opened is reported as
-`[no response — stale result]` rather than replaying an older answer.
+only exact `ses_` IDs resolve, each child must still report this parent, and
+the seat body is the child's latest answer. Text from an earlier round is
+never replayed: a seat still working on its newest prompt reports
+`[no response — still running]`, an unreadable session reports
+`[no response — unverified result]`, and a seat whose newest prompt arrived at
+or after the synthesis call opened reports `[no response — unverified result]`
+too — its transcript can no longer be attributed to this council run.
 
 ### Output
 

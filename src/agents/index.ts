@@ -1089,9 +1089,15 @@ export function createAgents(
       disabledAgents: disabled,
       excludeDescriptions:
         councillorAgents.length > 0 ? ['council'] : undefined,
-      waitForUser: !runtime.disabledTools.includes('wait_for_user'),
-      wakeScheduler: runtime.backgroundJobs.orchestratorWake.enabled,
-      taskMessage: runtime.backgroundJobsEnabled,
+      waitForUser:
+        runtime.backgroundJobsEnabled &&
+        !runtime.disabledTools.includes('wait_for_user'),
+      wakeScheduler:
+        runtime.backgroundJobsEnabled &&
+        runtime.backgroundJobs.orchestratorWake.enabled,
+      taskMessage:
+        runtime.backgroundJobsEnabled &&
+        !runtime.disabledTools.includes('task_message'),
       hostFlavor: options?.hostFlavor,
       routingBlock: runtime.routingBlock,
     },

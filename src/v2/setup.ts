@@ -2178,8 +2178,10 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
     } else {
       // Never seed a board the v1 factory would feed from: an unseeded
       // manager keeps every lifecycle path inert (no retention, wakes,
-      // terminal gate, or board injection).
-      configureBackgroundJobPersistence(undefined);
+      // terminal gate, or board injection). The persistence backend is
+      // process-wide in a shared v2 server, so a disabled project must not
+      // reset it — that would drop another live project's backend and
+      // queued writes.
       log('[v2] managed background-job lifecycle disabled by config');
     }
 

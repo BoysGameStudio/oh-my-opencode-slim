@@ -364,33 +364,6 @@ function retainSanitizedValues(
   return out;
 }
 
-/**
- * Zod no longer defaults marketplace.enabled at the block level; keep a
- * defaulted `enabled: true` from masquerading as an explicitly configured
- * override. The merged marketplace config is normalized after all layers
- * are merged (the post-merge parse reduces it to the switch shape).
- */
-function retainExplicitMarketplaceFields(
-  parsedConfig: RawPluginConfig,
-  rawConfig: unknown,
-): RawPluginConfig {
-  if (!parsedConfig.marketplace) {
-    return parsedConfig;
-  }
-  if (
-    !isPlainRecord(rawConfig) ||
-    !isPlainRecord(rawConfig.marketplace) ||
-    !Object.hasOwn(rawConfig.marketplace, 'enabled')
-  ) {
-    const { enabled: _enabled, ...marketplace } = parsedConfig.marketplace;
-    return {
-      ...parsedConfig,
-      marketplace: marketplace as RawPluginConfig['marketplace'],
-    };
-  }
-  return parsedConfig;
-}
-
 /** Normalize preset syntax before layered config objects are merged. */
 function normalizePresetDeclarations(config: RawPluginConfig): RawPluginConfig {
   if (!config.presets) {
@@ -529,7 +502,9 @@ export function loadRawPluginConfigFromPath(
     let layerConfig = retainExplicitInterviewFields(result.data, rawConfig);
     layerConfig = retainExplicitBackgroundJobsFields(layerConfig, rawConfig);
     layerConfig = retainExplicitMultiplexerFields(layerConfig, rawConfig);
-    layerConfig = retainExplicitMarketplaceFields(layerConfig, rawConfig);
+    // marketplace.enabled carries no Zod default, so nothing parsed at this
+    // layer can masquerade as an explicit override; the merged marketplace
+    // config is normalized to the switch shape after all layers are merged.
 
     // Zod applies webfetch.enabled's default while parsing each layer. Keep
     // that default from masquerading as an explicitly configured override;

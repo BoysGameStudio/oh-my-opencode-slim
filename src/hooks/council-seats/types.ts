@@ -38,7 +38,7 @@ export interface SeatRequest {
 export type SeatResult =
   | { kind: 'completed'; text: string; label?: string }
   | {
-      kind: 'running' | 'missing' | 'ambiguous' | 'stale' | 'empty' | 'error';
+      kind: 'running' | 'missing' | 'ambiguous' | 'empty' | 'error';
       reason: string;
       label?: string;
     };
