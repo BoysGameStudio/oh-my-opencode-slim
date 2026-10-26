@@ -1289,6 +1289,7 @@
             "herdr",
             "kitty",
             "wezterm",
+            "orca",
             "cmux-tui",
             "none"
           ]

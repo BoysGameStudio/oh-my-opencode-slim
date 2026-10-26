@@ -1,8 +1,8 @@
 # Multiplexer Integration Guide
 
-Use tmux, Zellij, Herdr, cmux-tui, kitty, or WezTerm to watch subagents work in live
-views (split panes, or for cmux-tui sibling tabs) anchored to the TUI client
-that displays their parent session.
+Use tmux, Zellij, Herdr, cmux-tui, kitty, WezTerm, or Orca to watch subagents
+work in live views (split panes, or for cmux-tui sibling tabs) anchored to the
+TUI client that displays their parent session.
 
 > **Execution model:** panes are opened by the **TUI client** (`opencode attach`,
 > or the TUI process of `opencode --port`), never by the OpenCode server. Each
@@ -53,7 +53,7 @@ How it works:
 2. Every **TUI client** that displays the parent session subscribes to the
    host session events and, for each eligible child session, creates a view in
    **the pane it is itself running in** — a split pane (tmux / Zellij / Herdr /
-   kitty / WezTerm), or a sibling tab appended to that pane (cmux-tui).
+   kitty / WezTerm / Orca), or a sibling tab appended to that pane (cmux-tui).
 3. The pane runs a pure view command (v1 default shown; see
    [Deployment Modes](#deployment-modes) for v2):
 
@@ -151,7 +151,7 @@ only enables panes when the configured adapter matches what it detects.
 **Single machine (embedded TUI with a listener):**
 
 ```bash
-tmux            # or zellij / herdr / kitty / wezterm / cmux-tui
+tmux            # or zellij / herdr / kitty / wezterm / orca / cmux-tui
 opencode --port 4096
 ```
 
@@ -258,6 +258,19 @@ so tmux or Zellij running inside WezTerm still wins. Native Windows is
 unsupported and untested: without `SHELL` the adapter reports unavailable,
 and an MSYS-style `SHELL` may not resolve for native `wezterm.exe`.
 
+**Orca** — no configuration needed. Orca exports `ORCA_TERMINAL_HANDLE` (the
+handle of the pane running OpenCode) and `TERM_PROGRAM=Orca`; the plugin
+resolves the CLI from `$ORCA_CLI_BIN_DIR/orca`, falling back to `orca` on
+`PATH`, and probes availability with `orca status --json`. Child panes are
+splits of that anchor terminal (`orca terminal split --terminal <handle>
+--direction … --command …`), and the returned split handle is the pane id the
+plugin closes with (`orca terminal close --terminal <handle>`). Verify with
+`orca terminal list --json`. Auto detection checks Orca after cmux, tmux,
+Zellij, Herdr and kitty, so a nested session inside an Orca terminal still
+wins. Two limits: `terminal split` has no `--cwd`, so panes open at the
+worktree path, and Windows hosts are refused (see
+[Known Limitations](#known-limitations)).
+
 ### 4. Trigger delegated work
 
 Ask OpenCode to do something that launches subagents. New panes appear next to
@@ -278,12 +291,12 @@ inside that pane).
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `type` | string | `"none"` | `"auto"`, `"tmux"`, `"zellij"`, `"herdr"`, `"cmux-tui"`, `"kitty"`, `"wezterm"`, or `"none"` |
-| `layout` | string | `"main-vertical"` | Layout preset: `main-vertical`, `main-horizontal`, `tiled`, `even-horizontal`, `even-vertical`. Each adapter maps it to its nearest native expression; cmux-tui has no layout expression and ignores it (see [Layouts](#layouts)). Herdr builds an agent area for both `main-*` layouts and re-equalizes only its agent panes after each spawn/close |
-| `main_pane_size` | number | `60` | Main pane size percentage (`20`–`80`). Applied by tmux for the `main-*` layouts, and by Herdr (first agent-area split of the `main-*` layouts; the agent panes in the resulting column or row are then re-equalized after each spawn/close while the main pane keeps this share) and WezTerm (first agent split); ignored by Zellij, kitty, and cmux-tui |
+| `type` | string | `"none"` | `"auto"`, `"tmux"`, `"zellij"`, `"herdr"`, `"cmux-tui"`, `"kitty"`, `"wezterm"`, `"orca"`, or `"none"` |
+| `layout` | string | `"main-vertical"` | Layout preset: `main-vertical`, `main-horizontal`, `tiled`, `even-horizontal`, `even-vertical`. Each adapter maps it to its nearest native expression; cmux-tui has no layout expression and ignores it, and Orca only maps it to a split direction at spawn time (see [Layouts](#layouts)). Herdr builds an agent area for both `main-*` layouts and re-equalizes only its agent panes after each spawn/close |
+| `main_pane_size` | number | `60` | Main pane size percentage (`20`–`80`). Applied by tmux for the `main-*` layouts, and by Herdr (first agent-area split of the `main-*` layouts; the agent panes in the resulting column or row are then re-equalized after each spawn/close while the main pane keeps this share) and WezTerm (first agent split); ignored by Zellij, kitty, cmux-tui, and Orca |
 | `equalize_panes` | boolean | `true` | Herdr only: after each spawn and agent-pane close, equalize the `main-*` agent panes and re-assert the main pane's `main_pane_size` share through Herdr's socket API. Set `false` to keep manual pane sizes |
 | `cmux_tui_binary` | string | omitted | Explicit path to the cmux-tui binary. When omitted, the client resolves `cmux-tui` first, then `cmux`, on `PATH` |
-| `viewer` | string | `"tui"` on v1, `"mini"` on v2 | Subagent pane surface: `"tui"` (full interface) or `"mini"` (lightweight interface). Explicit values override the host default. On v1, `"mini"` requires OpenCode >= 1.17.10 and runs `opencode attach <url> --session <id> --dir <dir> --mini`, without additional pane-cwd pinning. On v2 it runs `opencode mini` without a positional directory, so adapters pin the cwd (herdr/kitty/WezTerm natively, tmux `-c`, Zellij `--cwd`, cmux-tui `cd` for POSIX shells and fish). Changing the value takes effect on the next opencode start |
+| `viewer` | string | `"tui"` on v1, `"mini"` on v2 | Subagent pane surface: `"tui"` (full interface) or `"mini"` (lightweight interface). Explicit values override the host default. On v1, `"mini"` requires OpenCode >= 1.17.10 and runs `opencode attach <url> --session <id> --dir <dir> --mini`, without additional pane-cwd pinning. On v2 it runs `opencode mini` without a positional directory, so adapters pin the cwd (herdr/kitty/WezTerm natively, tmux `-c`, Zellij `--cwd`, cmux-tui and Orca `cd` for POSIX shells and fish). Changing the value takes effect on the next opencode start |
 
 All `multiplexer.*` values are read by the client only. An invalid value
 disables pane management (fail-closed) with a once-per-process diagnostic.
@@ -296,15 +309,16 @@ has no exact equivalent, it uses the nearest native expression (marked
 Herdr/WezTerm agent split. Herdr then equalizes only its agent panes after each
 spawn/close, leaving the main pane's share intact, while cmux-tui ignores both
 settings entirely (its child views are tabs inside the parent pane, not panes in
-a layout).
+a layout) and Orca ignores `main_pane_size` (it has no layout primitives, so the
+layout only picks the split direction at spawn time).
 
-| Layout | tmux | Zellij | Herdr | kitty | WezTerm | cmux-tui |
-|--------|------|--------|-------|-------|---------|------|
-| `main-vertical` | `-h` split, then `select-layout main-vertical` (+ `main-pane-width`) | `new-pane --direction right` | `pane split --direction right`; *approximate* agent column (below) | `tall` layout | `split-pane --right --percent <100 - main_pane_size>`; *approximate* agent column (below) | ignored (no layout expression) |
-| `main-horizontal` | `-v` split, then `select-layout main-horizontal` (+ `main-pane-height`) | `new-pane --direction down` | `pane split --direction down`; *approximate* agent row (to the right) | `fat` layout | `split-pane --bottom --percent <100 - main_pane_size>`; *approximate* agent row | ignored (no layout expression) |
-| `even-horizontal` | `-h` split, then `select-layout even-horizontal` | no direction (Zellij's native placement) | `pane split --direction right` | `horizontal` layout | `split-pane --right` from the parent | ignored (no layout expression) |
-| `even-vertical` | `-v` split, then `select-layout even-vertical` | no direction (native placement) | `pane split --direction down` | `vertical` layout | `split-pane --bottom` from the parent | ignored (no layout expression) |
-| `tiled` | `-h` split, then `select-layout tiled` | no direction (native placement) | `pane split --direction right` | `grid` layout | `split-pane --right` from the parent | ignored (no layout expression) |
+| Layout | tmux | Zellij | Herdr | kitty | WezTerm | Orca | cmux-tui |
+|--------|------|--------|-------|-------|---------|------|------|
+| `main-vertical` | `-h` split, then `select-layout main-vertical` (+ `main-pane-width`) | `new-pane --direction right` | `pane split --direction right`; *approximate* agent column (below) | `tall` layout | `split-pane --right --percent <100 - main_pane_size>`; *approximate* agent column (below) | `terminal split --direction horizontal` from the anchor; *approximate*, unsized | ignored (no layout expression) |
+| `main-horizontal` | `-v` split, then `select-layout main-horizontal` (+ `main-pane-height`) | `new-pane --direction down` | `pane split --direction down`; *approximate* agent row (to the right) | `fat` layout | `split-pane --bottom --percent <100 - main_pane_size>`; *approximate* agent row | `terminal split --direction vertical` from the anchor; *approximate*, unsized | ignored (no layout expression) |
+| `even-horizontal` | `-h` split, then `select-layout even-horizontal` | no direction (Zellij's native placement) | `pane split --direction right` | `horizontal` layout | `split-pane --right` from the parent | `terminal split --direction horizontal` from the anchor | ignored (no layout expression) |
+| `even-vertical` | `-v` split, then `select-layout even-vertical` | no direction (native placement) | `pane split --direction down` | `vertical` layout | `split-pane --bottom` from the parent | `terminal split --direction vertical` from the anchor | ignored (no layout expression) |
+| `tiled` | `-h` split, then `select-layout tiled` | no direction (native placement) | `pane split --direction right` | `grid` layout | `split-pane --right` from the parent | `terminal split --direction horizontal` from the anchor | ignored (no layout expression) |
 
 Adapter notes:
 
@@ -354,6 +368,15 @@ Adapter notes:
   Closing sends Ctrl+C and then `kill-pane`; a failure counts as closed only
   on WezTerm's `no such pane N` error, so a transient CLI error keeps the pane
   tracked instead of forgetting a live viewer.
+- **Orca** — no layout primitives: `applyLayout` is a no-op and
+  `main_pane_size` is ignored. The layout only selects the split direction at
+  spawn time (`horizontal` for `main-vertical`, `even-horizontal` and `tiled`;
+  `vertical` for `main-horizontal` and `even-vertical`), and every child
+  splits the anchor terminal — there is no agent area, no sizing and no
+  rebalancing. `horizontal` is assumed to mean side-by-side. A split is
+  bounded (5 s); a timeout is logged and reported as a soft failure, because
+  the pane may still have opened. Closing is immediate (`orca terminal
+  close`, no Ctrl+C grace) and a failed close keeps the pane tracked.
 - **cmux-tui** — no layout expression: child views are tabs inside the parent
   pane, so `multiplexer.layout` and `multiplexer.main_pane_size` are ignored
   and no layout command is issued.
@@ -419,7 +442,8 @@ produces one `multiplexer.host-unsupported` record per process; shared and
 
 - **Crash-leftover views are best-effort.** Views carry adapter-specific
   metadata encoding the owner pid and child session id (except WezTerm, whose
-  CLI cannot set a pane title, so its leftovers are never swept). tmux /
+  CLI cannot set a pane title, and Orca, which sets none because the pane's
+  shell auto-titles over it — neither adapter's leftovers are ever swept). tmux /
   Zellij / Herdr / kitty write it into the pane title (`omosc:<owner pid>:<child session id>`);
   cmux-tui embeds a `# omosc:<owner pid>:<child session id>` data marker in the
   spawned process's argv instead (its tab name is the human-readable
@@ -457,6 +481,28 @@ produces one `multiplexer.host-unsupported` record per process; shared and
   implementation wrote `omosc:<pid>:<session>` into the pane name; the new
   sweep identifies cmux-tui views only by the argv data marker, so those legacy
   panes cannot be recognized and must be closed by hand.
+- **Orca panes open at the worktree path.** `orca terminal split` has no
+  `--cwd`, so the viewer starts in the directory Orca opens for the split
+  (the worktree path) rather than the project directory; child sessions that
+  inherit the worktree directory are unaffected. The v2 `mini` viewer, which
+  has no directory argument, runs `cd <dir> && …` first (POSIX shells and
+  fish).
+- **Orca has no layout primitives.** `applyLayout` is a no-op and
+  `main_pane_size` is ignored: the layout only picks the split direction at
+  spawn time, every child splits the anchor terminal, and nothing is ever
+  resized or rebalanced.
+- **A timed-out Orca split is a soft failure.** The split command is bounded
+  (5 s); a timeout is logged and reported as `adapter-unavailable`, never as
+  pane loss, because the split may still have opened the pane. Since Orca
+  titles cannot carry the sweep marker, such a pane is never swept — close it
+  manually if it appears.
+- **Orca pane titles are best-effort and unused.** `orca terminal
+  set-pane-title` works, but the pane's shell auto-titles over it, so the
+  plugin sets no title and never reads one back; crash-leftover Orca views are
+  left for you to close manually (same stance as WezTerm).
+- **Windows Orca hosts are refused.** `spawnPane` reports unavailable on
+  win32 instead of typing a POSIX-quoted viewer command into a cmd/PowerShell
+  pane (the #1620 class of bug). No pane is created.
 - **Stable idle is a debounce, not task-level completion.** A pane closes when
   the child stays idle past the debounce window (default 5 s) and a final
   re-check finds it not busy: an absent `/session/status` entry counts as
@@ -490,7 +536,7 @@ produces one `multiplexer.host-unsupported` record per process; shared and
   `OPENCODE_PASSWORD`. Where the multiplexer CLI has a spawn-time env flag,
   the secret is injected there and exists only in the new pane's environment:
   tmux `split-window -e OPENCODE_PASSWORD=…`, herdr `pane split --env …`,
-  kitty `kitten @ launch --env …`. Zellij, WezTerm, and cmux-tui have no
+  kitty `kitten @ launch --env …`. Zellij, WezTerm, cmux-tui, and Orca have no
   such flag, so the pane launch script reads the value from the plugin process's own
   `/proc/<pid>/environ` (readable by the owning user only) and exports it
   before the viewer starts; the secret never enters command text or argv.
@@ -584,7 +630,8 @@ removed or changed behavior, with migration guidance:
 **Panes open in the wrong place**
 
 - The view is always created in the pane that displays the parent session at
-  spawn time: a split for tmux / Zellij / Herdr / kitty / WezTerm, or a tab inside that
+  spawn time: a split for tmux / Zellij / Herdr / kitty / WezTerm / Orca, or a
+  tab inside that
   pane for cmux-tui. Move the parent session to another pane/multiplexer first;
   a rebuild after the child turns busy follows the new position.
 - Missing anchor (`adapter-not-found`) means no multiplexer command was issued
@@ -636,8 +683,8 @@ removed or changed behavior, with migration guidance:
 
 **Leftover views after a client crash**
 
-- The sweep is best-effort, and WezTerm panes are never swept (close them
-  manually). For tmux / Zellij / Herdr / kitty it often cannot
+- The sweep is best-effort, and WezTerm and Orca panes are never swept (close
+  them manually). For tmux / Zellij / Herdr / kitty it often cannot
   match a pane whose title was rewritten by `opencode attach`. For cmux-tui it
   identifies views by the `# omosc:...` argv marker; exited terminals keep that
   argv and `terminal close` still works on them, so a crashed client's leftover

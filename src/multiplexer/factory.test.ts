@@ -21,6 +21,8 @@ const PANE_ENV_KEYS = [
   'KITTY_PID',
   'KITTY_WINDOW_ID',
   'WEZTERM_PANE',
+  'ORCA_TERMINAL_HANDLE',
+  'TERM_PROGRAM',
   'CMUX_TUI_SOCKET',
   'CMUX_MUX_SOCKET',
   'CMUX_SOCKET_PATH',
@@ -322,6 +324,47 @@ describe('multiplexer factory', () => {
       'auto-wezterm-zellij',
     );
     expect(zellijFirst({ ...BASE_CONFIG, type: 'auto' })?.type).toBe('zellij');
+  });
+
+  test('returns an orca instance when type is orca', async () => {
+    process.env.ORCA_TERMINAL_HANDLE = 'pane-1';
+
+    const { getMultiplexer } = await importFreshFactory('orca-explicit');
+    const multiplexer = getMultiplexer({ ...BASE_CONFIG, type: 'orca' });
+
+    expect(multiplexer).not.toBeNull();
+    expect(multiplexer?.type).toBe('orca');
+  });
+
+  test('auto-detects orca from ORCA_TERMINAL_HANDLE', async () => {
+    process.env.ORCA_TERMINAL_HANDLE = 'pane-1';
+
+    const { getMultiplexer } = await importFreshFactory('auto-orca');
+
+    expect(getMultiplexer({ ...BASE_CONFIG, type: 'auto' })?.type).toBe('orca');
+  });
+
+  test('auto prefers nested multiplexers over the orca terminal', async () => {
+    process.env.ORCA_TERMINAL_HANDLE = 'pane-1';
+    process.env.TMUX_PANE = '%1';
+    const { getMultiplexer: tmuxFirst } =
+      await importFreshFactory('auto-orca-tmux');
+    expect(tmuxFirst({ ...BASE_CONFIG, type: 'auto' })?.type).toBe('tmux');
+
+    delete process.env.TMUX_PANE;
+    process.env.ZELLIJ_PANE_ID = '3';
+    const { getMultiplexer: zellijFirst } =
+      await importFreshFactory('auto-orca-zellij');
+    expect(zellijFirst({ ...BASE_CONFIG, type: 'auto' })?.type).toBe('zellij');
+  });
+
+  test('auto prefers wezterm over orca when both host handles are present', async () => {
+    process.env.ORCA_TERMINAL_HANDLE = 'pane-1';
+    process.env.WEZTERM_PANE = '7';
+    const { getMultiplexer } = await importFreshFactory('auto-orca-wezterm');
+    expect(getMultiplexer({ ...BASE_CONFIG, type: 'auto' })?.type).toBe(
+      'wezterm',
+    );
   });
 
   test('auto returns null when no pane-level signal is present', async () => {

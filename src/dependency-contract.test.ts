@@ -85,6 +85,7 @@ const ADAPTER_DIRS = [
   'kitty',
   'cmux',
   'wezterm',
+  'orca',
 ].map((dir) => `${path.join(SRC_DIR, 'multiplexer', dir)}${path.sep}`);
 
 /**
