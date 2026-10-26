@@ -31,7 +31,8 @@ the built-in `/models`, so it triggers no LLM turn.
 > unknown name reports the valid options. It is apply-only — create, edit and
 > delete stay in the TUI manager — and the client reports the result without a
 > model turn, so the running session keeps its existing models and the change
-> applies on the next conversation or reload.
+> applies on the next conversation or reload. Listing `preset` in
+> `disabled_commands` removes both the TUI entry and the server command.
 
 ## Scope and when changes take effect
 
