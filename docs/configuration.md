@@ -216,6 +216,7 @@ All config files support **JSONC** (JSON with Comments):
 | `agents.<agent>.displayName` | string | - | Custom user-facing alias for the agent in the active config |
 | `agents.<agent>.color` | string | - | Agent display color as `#RRGGBB` or a theme color: `primary`, `secondary`, `accent`, `success`, `warning`, `error`, or `info` |
 | `agents.<agent>.description` | string | generated | Description shown to OpenCode and the orchestrator; defaults to `Custom subagent '<name>'` for custom agents |
+| `agents.<agent>.skills_include_local` | boolean | - | Adds valid skills from the project's and ancestors' `.opencode/skills/**/SKILL.md` and `.agents/skills/**/SKILL.md` trees before `skills_remove` applies |
 | `acpAgents.<name>.command` | string | - | Command for an external ACP-compatible agent; creates a wrapper subagent named `<name>` See [ACP-connected agents](#acp-connected-agents). |
 | `acpAgents.<name>.args` | string[] | `[]` | Arguments for the ACP agent command See [ACP-connected agents](#acp-connected-agents). |
 | `acpAgents.<name>.env` | object | `{}` | Extra environment variables for the ACP subprocess See [ACP-connected agents](#acp-connected-agents). |
@@ -345,7 +346,7 @@ Only subagent inference settings (`model`, `variant`, `temperature`,
 skills, MCPs and marketplace activation keep their normal host lifecycle.
 Invalid configuration preserves the last-known-good defaults. On v1, apply
 the preset to the configuration and reload OpenCode as before. See
-[Preset Switching](preset-switching.md) for scope, timing and concurrent-session
+[Preset Switching](presets/preset-switching.md) for scope, timing and concurrent-session
 examples.
 
 ### Preset inheritance
@@ -620,7 +621,7 @@ The wall-clock supervisor is separately opt-in and remains disabled unless
 ```
 
 `orchestratorWake` defaults to enabled with a 5-minute continuous-idle
-interval and `"auto"` mode (todo-gated on v1 hosts, children-driven on v2).
+interval and `"auto"` mode (todo-gated on v1; v2 creates no scheduler).
 Set `enabled: false` to keep idle reconciliation and background-job orchestration
 without periodic wake prompts. See the
 [Background Orchestration](background-orchestration.md) guide for the concept,
@@ -1022,7 +1023,7 @@ preset with only `model` (and `variant` if needed):
 }
 ```
 
-`loadAgentPrompt` (`src/config/loader.ts:418`) is preset-aware and reads
+`loadAgentPrompt` (`src/config/loader.ts:1006`) is preset-aware and reads
 `<agentName>.md` from the `oh-my-opencode-slim/` prompts directory. Lookup
 order:
 

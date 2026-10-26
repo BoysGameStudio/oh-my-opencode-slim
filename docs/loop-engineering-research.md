@@ -101,29 +101,29 @@ Osmani's framework identifies five primitives that compose a loop, plus durable 
 |---------|-------------|-------|----------|
 | `SKILL.md` format | Yes | Yes | Yes |
 | Per-agent assignment | Yes | Yes | Yes (with permissions) |
-| Bundled skills | No (user-created) | Yes (Agent Skills) | Yes (7 bundled) |
+| Bundled skills | No (user-created) | Yes (Agent Skills) | Yes (12 bundled) |
 | Skill marketplace | Yes (plugins) | Yes | No |
 | Intent debt prevention | Yes | Yes | Yes |
 
-**Verdict:** All three have mature skill systems. OpenCode's is notably rich with 7 bundled skills, per-agent permission control, and automatic sync on plugin updates.
+**Verdict:** All three have mature skill systems. OpenCode's is notably rich with 12 bundled skills, per-agent permission control, and automatic sync on plugin updates.
 
 ### Connectors / MCP
 
 | Feature | Claude Code | Codex | OpenCode |
 |---------|-------------|-------|----------|
 | MCP server support | Yes | Yes (Connectors) | Yes |
-| Built-in MCPs | No (user-configured) | Yes | Yes (3 built-in) |
+| Built-in MCPs | No (user-configured) | Yes | Yes (2 built-in) |
 | Per-agent MCP permissions | No | No | Yes (wildcard, exclusion, explicit) |
 | Remote MCP servers | Yes | Yes | Yes |
 | Local MCP servers | Yes | Yes | Yes |
 
-**Verdict:** All three support MCP. OpenCode stands out with 3 built-in MCPs (websearch, context7, gh_grep) and a sophisticated per-agent permission system.
+**Verdict:** All three support MCP. OpenCode stands out with 2 built-in MCPs (context7, gh_grep) and a sophisticated per-agent permission system.
 
 ### Sub-agents (Maker/Checker Split)
 
 | Feature | Claude Code | Codex | OpenCode |
 |---------|-------------|-------|----------|
-| Agent spawning | Yes | Yes | Yes (9 agents) |
+| Agent spawning | Yes | Yes | Yes (8 agents) |
 | Background execution | Yes | Yes | Yes (background jobs) |
 | Maker/checker split | Yes | Yes | Yes (orchestrator dispatches, specialists execute) |
 | Depth tracking | Yes | Yes | Native (OpenCode's subagent_depth) |
@@ -132,7 +132,7 @@ Osmani's framework identifies five primitives that compose a loop, plus durable 
 | Cancellation | Yes | Yes | Yes (`task_cancel` tool) |
 | Parallel dispatch | Yes | Yes | Yes (explicit in orchestrator prompt) |
 
-**Verdict:** All three have sub-agent support. OpenCode's is the most structured with 9 specialized agents, a formal Background Job Board, session reuse, and a dedicated orchestrator that never implements directly.
+**Verdict:** All three have sub-agent support. OpenCode's is the most structured with 8 specialized agents, a formal Background Job Board, session reuse, and a dedicated orchestrator that never implements directly.
 
 ### Loop Engine (Iteration Primitive)
 
@@ -213,9 +213,9 @@ In its purest form, Ralph is a Bash loop. That's it.
 
 | Building Block | Status | Implementation |
 |----------------|--------|----------------|
-| **Skills** | Mature | 7 bundled skills, per-agent permissions, auto-sync |
-| **Connectors/MCP** | Mature | 3 built-in MCPs, per-agent permission system |
-| **Sub-agents** | Mature | 9 agents, Background Job Board, session reuse |
+| **Skills** | Mature | 12 bundled skills, per-agent permissions, auto-sync |
+| **Connectors/MCP** | Mature | 2 built-in MCPs, per-agent permission system |
+| **Sub-agents** | Mature | 8 agents, Background Job Board, session reuse |
 | **Worktrees** | Skill-only | Orchestrator skill, apply-patch hook support |
 | **Automations** | Not implemented | Deferred to Phase 4 |
 | **Loop engine** | Spec only | Fully designed, not implemented |

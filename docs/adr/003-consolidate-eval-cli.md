@@ -89,7 +89,7 @@ the unqualified system `opencode` is never auto-selected because it may be v2.
 `startServe`/`stopServe` descriptions below describe the original consolidation,
 not the current module map. See `src/evals/README.md` and `docs/evals.md`.
 
-- `startServe`/`stopServe` are private functions in `eval.ts`, not exported.
+- `startServe`/`stopServe` live in `src/cli/eval-server.ts`; they are not exported from `eval.ts`.
 - `--diff` reads result files with `loadLatestResultPath` + `loadAllResults` from the runner.
 - `--precheck` validates all suites against `EvalSuiteSchema` then exits.
 - `--collect` reads stdin interactively and writes an outputs JSON, then exits.

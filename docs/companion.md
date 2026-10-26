@@ -296,66 +296,9 @@ a new npm plugin release is published, managed installs update without manual
 
 ---
 
-## V2 Release Strategy
+## Release strategy
 
-For the desktop companion app, the release workflow follows the V2 distribution
-plan:
-
-1. **GitHub Release Assets**: companion binaries are uploaded to
-   `companion-vX.Y.Z` releases in
-   [oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion/releases).
-2. **Separate Companion Versioning**: the companion uses its own version so the
-   plugin can ship beta updates without rebuilding native binaries every time.
-3. **OS/Arch Detection**: `companion install` selects the archive for the
-   current target.
-4. **Manifest + Checksums**: the plugin ships
-   `src/companion/companion-manifest.json`, which names the companion release
-   and SHA256 checksum for each supported archive.
-5. **No R2 Required**: GitHub Releases are the source of truth. R2 can be added
-   later as a mirror if download volume becomes a problem.
-
-Release assets retain the following names (replace `X.Y.Z` with the version
-in the installed plugin's manifest):
-
-```text
-oh-my-opencode-slim-companion-vX.Y.Z-aarch64-apple-darwin.tar.gz
-oh-my-opencode-slim-companion-vX.Y.Z-x86_64-apple-darwin.tar.gz
-oh-my-opencode-slim-companion-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
-oh-my-opencode-slim-companion-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz
-oh-my-opencode-slim-companion-vX.Y.Z-x86_64-pc-windows-msvc.zip
-```
-
-Supported installer targets:
-
-- macOS arm64: `aarch64-apple-darwin`
-- macOS x64: `x86_64-apple-darwin`
-- Linux x64: `x86_64-unknown-linux-gnu`
-- Linux arm64: `aarch64-unknown-linux-gnu`
-- Windows x64: `x86_64-pc-windows-msvc`
-
-## Maintainer Release Process
-
-Companion binaries are **not** built on every plugin beta. Native CI and the
-autonomous release workflow run in
-[oh-my-opencode-companion](https://github.com/alvinunreal/oh-my-opencode-companion).
-Native fixes and protocol changes should be developed and released there.
-
-This plugin repository only synchronizes published release metadata:
-
-```bash
-gh workflow run companion-manifest-sync.yml \
-  --repo alvinunreal/oh-my-opencode-slim
-```
-
-The same workflow runs every six hours and does nothing when already aligned.
-It requires a complete published release and hashes all five archives before
-opening or updating the plugin manifest PR; API errors fail closed. It never
-builds native code or writes to the native repository. No cross-repository write
-token is needed; the plugin's own `GITHUB_TOKEN` creates its local PR.
-
-For local recovery, run `bun run sync:companion-manifest`, then
-`bun run verify:companion-manifest` (offline consistency) and
-`bun run verify:companion-release` (pinned remote identity and actual checksums).
-Merge the reviewed manifest PR and publish the plugin to deliver the new native
-version to managed installs. See [release process](release.md) for commands,
-release guards, and manual archive synchronization.
+Companion binaries are released separately from the plugin, as GitHub Release
+assets in the native repository. See
+[release](release.md#companion-release-strategy) for asset names, supported
+targets, and the manifest-sync workflow.

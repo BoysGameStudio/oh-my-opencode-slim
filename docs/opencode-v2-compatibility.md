@@ -336,10 +336,10 @@ not an optional-degradation path.
       with the host error payload before the idle pair), and no
       `session.status`-based fallback remains. The execution-event
       synthesis keeps orchestrator-wake suppression/arm scheduling.
-      Automatic foreground fallback remains disabled on v2: the host has no
-      atomic turn-conditional
-      model switch, so a switch started for a failed turn could commit after a
-      newer user turn takes over. The Form and permission bridges above feed
+      Automatic foreground replay fallback remains disabled on v2: the host
+      has no atomic turn-conditional model switch, so a replay started for a
+      failed turn could commit after a newer user turn takes over. The
+      retry-hook steering path still runs and switches the model in place. The Form and permission bridges above feed
       the companion's waiting-input
       indicator and the task-session-manager input-wait gate. Form questions
       are observation-only for plugin code on the pinned v2 host: the promise
@@ -464,11 +464,11 @@ side cannot be observed.
 | Tool execute hooks (apply-patch recovery, task-session, json-recovery) | ✅ | ✅ `createToolExecuteBridges` with subagent→task normalization | — |
 | Built-in MCPs (context7, gh_grep) auto-registered | ✅ | ✅ `ctx.mcp.transform` | `ctx.mcp.transform` is present in all v2.0.x stable hosts; the runtime capability probe is belt-and-suspenders |
 | Background-job state persistence (tombstones, deletion epochs) | ➖ process-local | ✅ via `ctx.storage` | optional domain; absent → pure in-memory fallback, zero behavior change (see [Background job state](#background-job-state-rehydrate-probe-and-persistence)) |
-| Foreground model fallback (rate-limit failover) | ✅ | ❌ disabled pending an atomic turn-conditional host switch | v2's non-atomic `session.switchModel` + steer replay could alter/replay a newer turn |
-| `/preset` (preset manager) | ✅ configuration writes; reload to apply | ✅ TUI entry (`./tui` → `dist/tui2.js`), with **Current session** / **Global default** selection; `/preset <name>` writes the global default | The command layer registers from an `append: "app"` slot render because `keymap.layer` is provider-scoped; commands carry an `id` and `slash.arguments`. The manager needs `ui.dialog.select` + `prompt` + `confirm`; feedback uses `ui.toast.show`. Session scope additionally requires server `ctx.storage`, session identity lookup and `ctx.rpc.register`, plus TUI `client.rpc`. It changes future subagent inference for the selected session, not its main model or existing children. User/project `.json` and `.jsonc` edits are watched (~300 ms debounce), including newly created candidates; they refresh defaults for future bindings, not saved snapshots. Global-write feedback acknowledges the refresh request, while session-apply feedback requires RPC confirmation. With persistence available, native subagent `progress` saves the child binding before the first prompt; `session.created` is not used to capture its profile. Reduced hosts retain legacy execution behavior. Non-TUI clients also get a server-side `/preset <name>` command (apply-only): the result is reported through the command error channel so the switch costs no model turn and adds no context. See [Preset switching](preset-switching.md) for inheritance, reapplication and compatibility limits |
+| Foreground model fallback (rate-limit failover) | ✅ | ⚠️ replay disabled; retry-hook steering active | v2's non-atomic `session.switchModel` + steer replay could alter/replay a newer turn, so only the in-place switch runs |
+| `/preset` (preset manager) | ✅ configuration writes; reload to apply | ✅ TUI entry (`./tui` → `dist/tui2.js`), with **Current session** / **Global default** selection; `/preset <name>` writes the global default | The command layer registers from an `append: "app"` slot render because `keymap.layer` is provider-scoped; commands carry an `id` and `slash.arguments`. The manager needs `ui.dialog.select` + `prompt` + `confirm`; feedback uses `ui.toast.show`. Session scope additionally requires server `ctx.storage`, session identity lookup and `ctx.rpc.register`, plus TUI `client.rpc`. It changes future subagent inference for the selected session, not its main model or existing children. User/project `.json` and `.jsonc` edits are watched (~300 ms debounce), including newly created candidates; they refresh defaults for future bindings, not saved snapshots. Global-write feedback acknowledges the refresh request, while session-apply feedback requires RPC confirmation. With persistence available, native subagent `progress` saves the child binding before the first prompt; `session.created` is not used to capture its profile. Reduced hosts retain legacy execution behavior. Non-TUI clients also get a server-side `/preset <name>` command (apply-only): the result is reported through the command error channel so the switch costs no model turn and adds no context. See [Preset switching](presets/preset-switching.md) for inheritance, reapplication and compatibility limits |
 | Default primary agent | ✅ finalized visible orchestrator identity | ✅ `draft.default(<visible orchestrator identity>)`; the canonical `orchestrator` entry remains a hidden alias when `displayName` is configured | v1 `default_agent` and v2 draft default target the same visible entry |
 | TUI default agent | ✅ orchestrator | ✅ host follows the default primary agent and hoists it to the head of the agent list | — |
-| Multiplexer (tmux/zellij/herdr/cmux-tui panes) | ✅ | ✅ TUI plugin entry wires the client-owned pane lifecycle through a v2 host adapter: shared background service and `--server` hosts are supported, `--standalone` is fail-closed (one diagnostic per process, `/subagent` fallback — opens a tab without moving focus) | Defaults are host-specific: `"tui"` on v1 (`opencode attach <url> --session <id> --dir <dir>`); `"mini"` on v2 shared (`opencode mini --session <id>`) and remote (`opencode mini --server <url> --session <id>`), with the pane cwd pinned by the adapter. Explicit `viewer: "tui"` retains the v2 full-TUI commands with a positional directory; v1 `viewer: "mini"` appends `--mini` to attach (OpenCode >= 1.17.10), without extra cwd pinning. The `OPENCODE_PASSWORD` secret is injected through the multiplexer's spawn-time environment (or a Linux + POSIX-shell `/proc` bridge on zellij/cmux-tui), never through the viewer's command line — see [Secret handling](multiplexer-integration.md#known-limitations). Events are projected from `session.created` / `session.execution.*` / `session.idle` / `session.deleted`; directory attribution is recorded at `session.created` because execution events carry none |
+| Multiplexer (tmux/zellij/herdr/cmux-tui/kitty/wezterm panes) | ✅ | ✅ TUI plugin entry wires the client-owned pane lifecycle through a v2 host adapter: shared background service and `--server` hosts are supported, `--standalone` is fail-closed (one diagnostic per process, `/subagent` fallback — opens a tab without moving focus) | Defaults are host-specific: `"tui"` on v1 (`opencode attach <url> --session <id> --dir <dir>`); `"mini"` on v2 shared (`opencode mini --session <id>`) and remote (`opencode mini --server <url> --session <id>`), with the pane cwd pinned by the adapter. Explicit `viewer: "tui"` retains the v2 full-TUI commands with a positional directory; v1 `viewer: "mini"` appends `--mini` to attach (OpenCode >= 1.17.10), without extra cwd pinning. The `OPENCODE_PASSWORD` secret is injected through the multiplexer's spawn-time environment (or a Linux + POSIX-shell `/proc` bridge on zellij/cmux-tui), never through the viewer's command line — see [Secret handling](multiplexer-integration.md#known-limitations). Events are projected from `session.created` / `session.execution.*` / `session.idle` / `session.deleted`; directory attribution is recorded at `session.created` because execution events carry none |
 | Orchestrator-wake scheduler | ✅ todo-gated (host `todo`/`children`/`status` APIs) | ❌ not created (council 2026-10-23) | v2 runs no plugin wake machinery: the native background notifier owns terminal delivery and `task_status` is the pull channel; the whole `backgroundJobs.orchestratorWake` section is v1-only |
 | `chat.headers` (Copilot `x-initiator` routing) | ✅ | ✅ via `session.hook("model.request")` | transport-level only; auxiliary kinds are covered by v2's built-in Copilot provider hook |
 | Companion app | ✅ | ⚠️ unverified | independent desktop app; test separately against v2 |
@@ -704,7 +704,7 @@ is not read for plugin config):
 
 ```json
 {
-  "plugin": ["oh-my-opencode-slim@2.2.25"]
+  "plugin": ["oh-my-opencode-slim@<exact-version>"]
 }
 ```
 
@@ -794,13 +794,16 @@ Agent models are resolved the same way as v1 (per-agent `model` in
 v2, set a working provider+model in your config or the plugin's config file
 so delegated subagents can run.
 
-Automatic foreground fallback is disabled on v2, even when configured. The
-current host API cannot atomically switch a session model only if the failed
-turn is still current; an in-flight non-atomic `session.switchModel` could
-otherwise commit after a newer user turn takes over. Fallback will remain
-disabled until the host provides that turn-conditional operation. Other prompt
-callers, like the orchestrator-wake scheduler, only pin the current model and
-keep steering; this is not foreground fallback.
+The automatic replay path of foreground fallback is disabled on v2, even when
+configured: the current host API cannot atomically switch a session model only
+if the failed turn is still current, and an in-flight non-atomic
+`session.switchModel` replay could commit after a newer user turn takes over.
+The retry-hook steering path still runs: host retry events are absorbed up to
+`fallback.maxRetries`, then the model is switched in place and the host retries
+the current turn on it. `fallback.initialRetryDelayMs` has no steering form and
+is ignored there. Other prompt callers, like the orchestration scheduler (v1
+only), merely pin the current model and keep steering; this is not foreground
+fallback.
 
 ## Background job state: rehydrate probe and persistence
 
@@ -835,43 +838,16 @@ does not add placeholder agents or automatically relaunch work to mask the race.
 
 ### Read-only task diagnostics
 
-`task_status` accepts `diagnostic: true` for tracked failed, cancelled, or stopped
-children. Startup recovery normally re-adopts restarted children onto the board
-with their historical run start; v2 also re-delivers completions. An owned
-untracked handle returns ordinary read-only observed status plus a notice that
-diagnostics require a tracked record, with no excerpt or extra transcript read.
-Foreign-parent handles remain rejected.
-It never registers, prompts, or reconciles a child. Running children are
-refused; completed children use `result: true`. Missing or ambiguous evidence
-is explicit. Excerpts include assistant text and short assistant/failed-tool
-errors, not tool inputs or successful outputs. The tool's rendered diagnostic
-response fits 6,144 UTF-8 bytes, including headers, errors, and truncation
-markers; plugin warnings may be appended separately. The fetch requests a
-limit and our own scans are bounded. The paged messages route honours the limit.
-Without that route, the context fallback fetches full raw context, checks it for
-compaction, then selects only the newest requested entries before conversion.
-Dropped entries or compaction mark the page incomplete; fetching raw context
-itself is not bounded by the shim. No-limit and paged history-boundary reads are
-unchanged. Missing attribution outside the scan window
-is reported as uncertain or unavailable, never guessed.
-Excerpts start after the latest real input in the scan window and exclude
-assistant messages created before the tracked run start. Input may predate
-registration; missing creation times or only pre-start evidence makes the
-excerpt unavailable. Host compaction messages are excluded and labelled.
-Terminal reasons use recorded host error/outcome reasons, then attributable
-assistant error text, then the state name, not stored partial findings.
-
-Diagnostics are read-only and not consumption or acknowledgement. Observed
-state is evidence, execution completion ends a run, and parent acceptance is
-separate; diagnostics do not replace the completion/acceptance flow.
-The fixed next-step line advises awaiting or re-delegating, not marking the task
-accepted; it does not depend on a host-specific revival tool.
-`last_activity_source` reports `observed-activity` (tracker event, possibly
-lagging), `host-busy` (coarse host activity beyond run start, not progress),
-`launch-time` (no activity evidence beyond the run start time, not proof of
-inactivity), or `unknown`. Session-keyed tracker entries may predate a revive;
-the underlying activity timestamps are unchanged.
-
+On v2, `task_status(diagnostic: true)` follows the same contract as on v1
+(read-only, non-final, running children refused, completed children use
+`result: true`) — see [Tools](tools.md#background-task-control). The v2-specific
+differences: the paged messages route honours the requested limit; without it
+the shim fetches full raw context, checks it for compaction, and selects only the
+newest requested entries, marking dropped entries or compaction incomplete.
+Fetching that raw context is not bounded by the shim, and there is no status map
+to fall back on — missing or ambiguous attribution is reported as uncertain,
+never guessed. Startup recovery re-adopts restarted children; v2 additionally
+re-delivers completions.
 ### Rehydrate existence probe (`session.get`)
 
 Rehydration re-registers persisted *running* task tool parts so a plugin

@@ -94,4 +94,4 @@ server.
 | `simplify` | Code simplification | `public` |
 
 For the complete configuration reference, see
-[Configuration](configuration.md).
+[Configuration](../configuration.md).

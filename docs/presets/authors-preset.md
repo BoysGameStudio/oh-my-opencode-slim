@@ -148,4 +148,4 @@ Each skill is listed with a short description and its source. The config block a
 | `web-perf` | Web performance optimization | `author` |
 | `workers-best-practices` | Worker best practices | `author` |
 
-For the complete configuration reference, see [Configuration](configuration.md).
+For the complete configuration reference, see [Configuration](../configuration.md).

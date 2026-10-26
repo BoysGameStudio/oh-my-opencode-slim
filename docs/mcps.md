@@ -44,7 +44,9 @@ If you define an MCP server with the same name in `opencode.json` / `opencode.js
 | `designer` | none |
 | `oracle` | none |
 | `fixer` | none |
- | `councillor` | none |
+| `observer` | none (disabled by default; see `disabled_agents`) |
+| `council` | none |
+| `councillor` | none |
 
 ---
 

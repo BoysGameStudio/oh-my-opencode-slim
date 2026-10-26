@@ -28,4 +28,4 @@ Codex Plus covers the OpenAI models and Copilot covers the design models, so you
 | --- | --- | --- |
 | `*` | All installed skills (wildcard) | `public` |
 
-For the complete configuration reference, see [Configuration](configuration.md).
+For the complete configuration reference, see [Configuration](../configuration.md).

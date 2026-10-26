@@ -68,7 +68,12 @@ worktree can override selected agent fields without duplicating the shared
 configuration above it. Within each directory, `.jsonc` takes precedence over
 `.json`; sibling directories are not searched.
 
-The root `agents.*` configuration (defined at the top level of user or project config) always takes precedence over the active preset configurations. To override a root agent choice globally, you must specify the override in the project-level root `agents.*` rather than inside a local preset configuration alone.
+The root `agents.*` configuration (defined at the top level of user or project config) always takes precedence over the preset selected in the config file. To override a root agent choice globally, you must specify the override in the project-level root `agents.*` rather than inside a local preset configuration alone.
+
+On v2, `/preset` → **Current session** resolves the selected preset through the
+same merge — root `agents.*` entries still take precedence — and saves those
+resolved settings for future delegations in that session. **Global default**, or
+`/preset <name>`, changes the default for future session bindings instead.
 
 ---
 

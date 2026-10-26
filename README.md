@@ -185,7 +185,7 @@ configuration until you explicitly reapply a preset to that session.
 Already-created children keep their own configuration. Main-session models,
 prompts, tools, skills and MCPs are not switched by the session action.
 On v1, reload OpenCode after applying a preset. See
-[Preset Switching](docs/preset-switching.md) for scope and timing, and
+[Preset Switching](docs/presets/preset-switching.md) for scope and timing, and
 [Configuration](docs/configuration.md#preset-inheritance) for the inheritance
 example and precedence rules.
 
@@ -206,11 +206,11 @@ following OpenCode's directory discovery. See
 > have access to rather than copy-pasting one blindly. The bundled
 > `oh-my-opencode-slim` skill can help: ask the Orchestrator to tune your setup.
 
-- **[OpenAI Preset](docs/openai-preset.md)** — the default generated preset; runs all agents on OpenAI models.
-- **[OpenCode Go Preset](docs/opencode-go-preset.md)** — runs the agents on OpenCode Go models; enables the Observer agent for visual analysis since its orchestrator model isn't multimodal.
-- **[Author's Preset](docs/authors-preset.md)** — the exact config the author runs day to day, with third-party skills.
-- **[$30 Preset](docs/thirty-dollars-preset.md)** — a mixed-provider setup built around Codex Plus and GitHub Copilot Pro for about $30/month.
-- **[$40 Preset](docs/forty-dollars-preset.md)** — a dual-subscription setup pairing Claude Pro and ChatGPT Plus for about $40/month.
+- **[OpenAI Preset](docs/presets/openai-preset.md)** — the default generated preset; runs all agents on OpenAI models.
+- **[OpenCode Go Preset](docs/presets/opencode-go-preset.md)** — runs the agents on OpenCode Go models; enables the Observer agent for visual analysis since its orchestrator model isn't multimodal.
+- **[Author's Preset](docs/presets/authors-preset.md)** — the exact config the author runs day to day, with third-party skills.
+- **[$30 Preset](docs/presets/thirty-dollars-preset.md)** — a mixed-provider setup built around Codex Plus and GitHub Copilot Pro for about $30/month.
+- **[$40 Preset](docs/presets/forty-dollars-preset.md)** — a dual-subscription setup pairing Claude Pro and ChatGPT Plus for about $40/month.
 
 ### For Alternative Providers
 
@@ -719,7 +719,7 @@ Use this section as a map: start with installation, then jump to features, confi
 | **[Codemap](docs/codemap.md)** | Generate hierarchical codemaps to understand large codebases faster |
 | **[Clonedeps](docs/clonedeps.md)** | Clone selected dependency source into an ignored local workspace for inspection |
 | **[Worktrees](docs/worktrees.md)** | Use `.slim/worktrees/` lanes for isolated parallel or risky coding work |
-| **[Preset Switching](docs/preset-switching.md)** | Switch agent model presets at runtime with `/preset` |
+| **[Preset Switching](docs/presets/preset-switching.md)** | Switch agent model presets at runtime with `/preset` |
 | **[Interview](docs/interview.md)** | Turn rough ideas into a structured markdown spec through a browser-based Q&A flow, then implement it with `/implement` |
 | **[Companion](docs/companion.md)** | Floating window companion for parsing, help, and types |
 
@@ -737,7 +737,7 @@ Use this section as a map: start with installation, then jump to features, confi
 | **[Developer Evals](docs/evals.md)** | Source-checkout routing/reliability harness, offline scoring, and advisory model judging |
 | **[Skills](docs/skills.md)** | Bundled skills such as `simplify`, `codemap`, `clonedeps`, `deepwork`, `verification-planning`, `step-back`, `deanchor`, `ai-estimates`, `reflect`, `worktrees`, and `oh-my-opencode-slim` |
 | **[MCPs](docs/mcps.md)** | `context7`, `gh_grep`, and how MCP permissions work per agent |
-| **[Tools](docs/tools.md)** | Built-in tool capabilities like `webfetch`, LSP tools, code search, and formatters |
+| **[Tools](docs/tools.md)** | What Slim adds: background task control, `ast_grep` search, and the enhanced `webfetch` |
 
 ---
 
