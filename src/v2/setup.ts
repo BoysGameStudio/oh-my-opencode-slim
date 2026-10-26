@@ -91,6 +91,7 @@ import {
   recordInternalAdmission,
 } from './internal-admissions';
 import { createV2InterviewBridge } from './interview-bridge';
+import { createPresetCommand, PRESET_COMMAND_NAME } from './preset-command';
 import { sessionPresetRpc } from './preset-rpc';
 import {
   applyRuntimeProfileOptions,
@@ -2718,6 +2719,24 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         }
       } catch (err) {
         log('[v2] command.transform failed', String(err));
+      }
+
+      // ── /preset (server-side, non-TUI clients) ──
+      try {
+        if (isCommandEnabled('preset', { disabledCommands })) {
+          const reg = await ctx.command.transform((draft) => {
+            if (typeof draft.add !== 'function') {
+              log('[v2] command draft has no add', {
+                name: PRESET_COMMAND_NAME,
+              });
+              return;
+            }
+            draft.add(createPresetCommand(directory));
+          });
+          disposers.push(() => reg.dispose());
+        }
+      } catch (err) {
+        log('[v2] preset command registration failed', String(err));
       }
 
       // `/interview` is a v2 command marker. The context bridge consumes the
