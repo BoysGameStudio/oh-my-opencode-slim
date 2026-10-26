@@ -445,6 +445,7 @@ describe('loadPluginConfig', () => {
     const config = loadPluginConfig(projectDir, { silent: true });
 
     expect(config.interview).toEqual({
+      enabled: true,
       maxQuestions: 7,
       outputFolder: 'project-interviews',
       autoOpenBrowser: false,
@@ -472,6 +473,50 @@ describe('loadPluginConfig', () => {
     const config = loadPluginConfig(projectDir, { silent: true });
 
     expect(config.interview?.printState).toBe(false);
+  });
+
+  test('does not let a defaulted project marketplace enabled override user false', () => {
+    const userConfigPath = path.join(userConfigDir, 'opencode');
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(userConfigPath, { recursive: true });
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(userConfigPath, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        marketplace: { enabled: false },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        marketplace: {},
+      }),
+    );
+
+    const config = loadPluginConfig(projectDir, { silent: true });
+
+    expect(config.marketplace).toEqual({ enabled: false });
+  });
+
+  test('lets a project layer disable the marketplace over an enabled user layer', () => {
+    const userConfigPath = path.join(userConfigDir, 'opencode');
+    const projectDir = path.join(tempDir, 'project-marketplace-off');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(userConfigPath, { recursive: true });
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(userConfigPath, 'oh-my-opencode-slim.json'),
+      JSON.stringify({}),
+    );
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({ marketplace: { enabled: false } }),
+    );
+
+    const config = loadPluginConfig(projectDir, { silent: true });
+
+    expect(config.marketplace).toEqual({ enabled: false });
   });
 
   test('does not let a defaulted project webfetch enabled override user false', () => {
@@ -1422,7 +1467,7 @@ describe('onWarning callback', () => {
     fs.writeFileSync(
       path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
       JSON.stringify({
-        disabled_hooks: 'auto-update-checker',
+        disabled_hooks: 'nonexistent-hook',
         disabled_tools: ['webfetch'],
         agents: { oracle: { model: 'test/model' } },
       }),
@@ -1443,7 +1488,7 @@ describe('onWarning callback', () => {
     expect(warnings[0]?.message).toContain('should be an array; normalized');
     expect(warnings[1]?.kind).toBe('normalized');
     expect(warnings[1]?.message).toContain(
-      'contains only unknown values (["auto-update-checker"])',
+      'contains only unknown values (["nonexistent-hook"])',
     );
     expect(warnings[1]?.message).toContain('Valid values');
   });
@@ -1477,7 +1522,7 @@ describe('onWarning callback', () => {
     [
       'disabled_hooks',
       ['phase-reminder'],
-      ['auto-update-checker'],
+      ['nonexistent-hook'],
       ['phase-reminder'],
     ],
     ['disabled_commands', ['reflect'], ['council'], ['reflect']],
@@ -1535,7 +1580,7 @@ describe('onWarning callback', () => {
     fs.writeFileSync(
       path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
       JSON.stringify({
-        disabled_hooks: ['auto-update-checker', 'phase-reminder'],
+        disabled_hooks: ['nonexistent-hook', 'phase-reminder'],
         disabled_tools: ['webfetch'],
       }),
     );
@@ -1551,7 +1596,7 @@ describe('onWarning callback', () => {
     expect(config.disabled_tools).toEqual(['webfetch']);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]?.kind).toBe('normalized');
-    expect(warnings[0]?.message).toContain('auto-update-checker');
+    expect(warnings[0]?.message).toContain('nonexistent-hook');
     expect(warnings[0]?.message).toContain('Valid values');
   });
 
@@ -1589,6 +1634,53 @@ describe('onWarning callback', () => {
       'apply-patch',
     ]);
     expect(warnings).toHaveLength(0);
+  });
+
+  test('accepts the auto-update-checker hook value without stripping', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        disabled_hooks: ['auto-update-checker'],
+      }),
+    );
+
+    const warnings: ConfigLoadWarning[] = [];
+    const config = loadPluginConfig(projectDir, {
+      onWarning: (warning) => warnings.push(warning),
+    });
+
+    expect(config.disabled_hooks).toEqual(['auto-update-checker']);
+    expect(warnings).toHaveLength(0);
+  });
+
+  test('retains an explicit interview.enabled across the layer pass', () => {
+    const projectDir = path.join(tempDir, 'project');
+    const projectConfigDir = path.join(projectDir, '.opencode');
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectConfigDir, 'oh-my-opencode-slim.json'),
+      JSON.stringify({
+        interview: { enabled: false, maxQuestions: 3 },
+      }),
+    );
+
+    const config = loadPluginConfig(projectDir, { silent: true });
+
+    // retainExplicitInterviewFields keeps only raw-layer keys, so an
+    // explicit master switch must survive instead of being silently
+    // replaced by the default true during the layer merge.
+    expect(config.interview).toEqual({
+      enabled: false,
+      maxQuestions: 3,
+      outputFolder: 'interview',
+      autoOpenBrowser: true,
+      port: 0,
+      dashboard: false,
+      printState: false,
+    });
   });
 
   test('strips unknown disabled_commands entries instead of rejecting the config', () => {

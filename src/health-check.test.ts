@@ -62,4 +62,51 @@ describe('plugin health thresholds', () => {
     expect(minimumExpectedToolCount(null as any)).toBe(9);
     expect(minimumExpectedToolCount({} as any)).toBe(9);
   });
+
+  test('defaults the lifecycle switch to true (additive parameter)', () => {
+    // Existing callers pass three arguments; the fourth must not change
+    // the floor they already computed.
+    expect(minimumExpectedToolCount([], true, 'v1')).toBe(9);
+    expect(minimumExpectedToolCount([], true, 'v2')).toBe(7);
+    expect(minimumExpectedToolCount(['task_reply'])).toBe(8);
+  });
+
+  test('drops the floor by six on v1 when the managed lifecycle is off', () => {
+    // task_cancel, task_message, task_status, task_reply, task_revive and
+    // wait_for_user all disappear → 9 - 6 = 3.
+    expect(minimumExpectedToolCount([], true, 'v1', false)).toBe(3);
+    expect(minimumExpectedToolCount([], true, undefined, false)).toBe(3);
+    // Listing the unregistered tools under disabled_tools must not
+    // double-count them (v1 floor is already at 3).
+    expect(
+      minimumExpectedToolCount(
+        ['task_cancel', 'task_message', 'task_status', 'task_reply'],
+        true,
+        'v1',
+        false,
+      ),
+    ).toBe(3);
+    expect(
+      minimumExpectedToolCount(
+        ['task_revive', 'wait_for_user'],
+        true,
+        'v1',
+        false,
+      ),
+    ).toBe(3);
+    // webfetch is independent of the lifecycle switch and still counted.
+    expect(minimumExpectedToolCount([], false, 'v1', false)).toBe(2);
+  });
+
+  test('drops the floor by four on v2 when the managed lifecycle is off', () => {
+    // v2 already drops wait_for_user and task_revive; off removes the four
+    // remaining task tools → 9 - 2 - 4 = 3.
+    expect(minimumExpectedToolCount([], true, 'v2', false)).toBe(3);
+    expect(minimumExpectedToolCount(['task_reply'], true, 'v2', false)).toBe(3);
+    // The v2-unregistered tools stay non-counting.
+    expect(minimumExpectedToolCount(['task_revive'], true, 'v2', false)).toBe(
+      3,
+    );
+    expect(minimumExpectedToolCount([], false, 'v2', false)).toBe(2);
+  });
 });

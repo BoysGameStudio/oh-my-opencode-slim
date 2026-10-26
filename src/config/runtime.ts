@@ -78,6 +78,7 @@ const DEFAULT_MULTIPLEXER: MultiplexerConfig =
   MultiplexerConfigStrictSchema.parse({});
 
 const DEFAULT_BACKGROUND_JOBS: BackgroundJobsConfig = {
+  enabled: true,
   maxSessionsPerAgent: DEFAULT_MAX_SESSIONS_PER_AGENT,
   orchestratorWake: {
     enabled: true,
@@ -235,10 +236,17 @@ export class RuntimeConfig {
   private runtimePresetName: string | null = null;
   private switchedModels = new Set<string>();
   private localSkillNamesCache: readonly string[] | undefined;
+  // Memoized disabled-* sets: computed once per instance per config
+  // generation (re-seeding clears them) instead of allocating a fresh Set
+  // on every hot-path read.
+  private disabledHooksCache: ReadonlySet<string> | undefined;
+  private disabledCommandsCache: ReadonlySet<string> | undefined;
 
   private seedPlugin(pluginConfig: ResolvedPluginConfig): void {
     this.pluginConfig = deepFreeze(clonePlain(pluginConfig));
     this.localSkillNamesCache = undefined;
+    this.disabledHooksCache = undefined;
+    this.disabledCommandsCache = undefined;
   }
 
   /**
@@ -342,14 +350,20 @@ export class RuntimeConfig {
 
   /** Hook names disabled via config; empty when none are configured. */
   get disabledHooks(): ReadonlySet<string> {
-    const value = this.pluginConfig?.disabled_hooks;
-    return new Set(Array.isArray(value) ? value : []);
+    if (this.disabledHooksCache === undefined) {
+      const value = this.pluginConfig?.disabled_hooks;
+      this.disabledHooksCache = new Set(Array.isArray(value) ? value : []);
+    }
+    return this.disabledHooksCache;
   }
 
   /** Command names disabled via config; empty when none are configured. */
   get disabledCommands(): ReadonlySet<string> {
-    const value = this.pluginConfig?.disabled_commands;
-    return new Set(Array.isArray(value) ? value : []);
+    if (this.disabledCommandsCache === undefined) {
+      const value = this.pluginConfig?.disabled_commands;
+      this.disabledCommandsCache = new Set(Array.isArray(value) ? value : []);
+    }
+    return this.disabledCommandsCache;
   }
 
   /** Custom agent names declared in config.agents (was getCustomAgentNames). */
@@ -416,6 +430,38 @@ export class RuntimeConfig {
 
   get autoUpdate(): boolean {
     return this.pluginConfig?.autoUpdate ?? true;
+  }
+
+  get backgroundJobsEnabled(): boolean {
+    return this.pluginConfig?.backgroundJobs?.enabled !== false;
+  }
+
+  get interviewEnabled(): boolean {
+    return this.pluginConfig?.interview?.enabled !== false;
+  }
+
+  get sidebarEnabled(): boolean {
+    return this.pluginConfig?.sidebar !== false;
+  }
+
+  /**
+   * v2 live config-file watcher switch. Distinct from model refresh
+   * capability: `false` only stops v2 from watching config files on disk —
+   * explicit /preset writes still refresh the current generation where
+   * applicable.
+   */
+  get liveConfigRefresh(): boolean {
+    return this.pluginConfig?.liveConfigRefresh !== false;
+  }
+
+  /**
+   * Root-level marketplace kill switch. Distinct from per-preset `marketplace`
+   * activation lists: an empty list still activates no agents while the
+   * service/store and tool factories stay initialized; `false` ignores any
+   * selected package IDs and the manager/store are not initialized at all.
+   */
+  get marketplaceEnabled(): boolean {
+    return this.pluginConfig?.marketplace?.enabled !== false;
   }
 
   get stripOrchestratorModel(): boolean {

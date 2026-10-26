@@ -193,11 +193,14 @@ All config files support **JSONC** (JSON with Comments):
 |--------|------|---------|-------------|
 | `preset` | string | - | Active preset name (e.g. `"openai"`, `"best"`) |
 | `setDefaultAgent` | boolean | `true` | When `true`, sets OpenCode's `default_agent` to the orchestrator if unset or pointing at a subagent; `false` leaves it untouched |
+| `sidebar` | boolean | `true` | Master switch for the OMOS TUI sidebar surface (the agent list it renders and its state file). When `false`, the plugin never registers or renders the sidebar and writes no sidebar state; the native host sidebar is untouched |
+| `liveConfigRefresh` | boolean | `true` | v2 only: master switch for the live config-file watcher that reloads runtime model/preset profiles when `oh-my-opencode-slim.json(c)` changes on disk. When `false`, v2 does not watch config files and file edits apply only after a restart; explicit `/preset` writes still refresh the current generation where applicable |
 | `stripOrchestratorModel` | boolean | `false` | Preserve a runtime `/model` selection for the orchestrator after subagent dispatch by omitting its configured model from the SDK config. A selected preset's explicit `orchestrator.model` is retained. Without a runtime selection, this opt-in delegates the initial orchestrator choice to OpenCode's session default. |
 | `routingBlock` | boolean | `true` | When false, removes the `<Agents>` routing block from the built-in orchestrator prompt. The host's native delegation-tool roster still lists every enabled agent with its one-line description, but it carries no Delegate/Don't routing criteria — the block's routing guidance (~300 tokens) has no roster equivalent, so `false` trades routing quality for tokens, or drops stock routing claims that drift against custom agent prompts (`agents.<name>.prompt`). Applies on v1 and v2 hosts. No effect when an orchestrator.md override already replaces the whole prompt. |
 | `presets` | object | - | Named preset configurations. New preset names are limited to letters, digits, `-`, and `_`; `__omo_*` and JavaScript reserved property names (`__proto__`, `constructor`, `prototype`) are rejected for new presets (pre-existing entries with other names stay visible and applicable) |
 | `presets.<name>.extends` | string | - | Optional single parent preset. The parent is resolved before the child; multiple parents are not supported |
 | `presets.<name>.<agent>.model` | string \| array | - | Model ID in `provider/model` format, or a non-empty ordered fallback chain (array of IDs or `{ id, variant }`) |
+| `marketplace.enabled` | boolean | `true` | Kill switch for the marketplace subsystem: when `false`, any selected package IDs (`presets.<name>.marketplace` activation lists) are ignored and the marketplace manager, store, and `marketplace_inspect`/`marketplace_manage` tools are not initialized. Distinct from an empty preset activation list, which simply activates no agents while the service/store and tool factories still initialize See [Marketplace](marketplace.md). |
 | `presets.<name>.marketplace` | object | - | Marketplace activation: `agents`, `agents_add`, `agents_remove` (package IDs). See [Marketplace](marketplace.md) |
 | `presets.<name>.<agent>.temperature` | number | - | Optional temperature (0–2); when omitted, OpenCode chooses its default |
 | `presets.<name>.<agent>.variant` | string | - | Reasoning effort: `"low"`, `"medium"`, `"high"`, or `"max"` (provider-specific). Takes precedence over a `variant` carried inline by the model chain's first entry |
@@ -237,6 +240,7 @@ All config files support **JSONC** (JSON with Comments):
 | `multiplexer.viewer` | string | `"tui"` on v1, `"mini"` on v2 | Subagent pane surface: `"tui"` (full interface) or `"mini"` (lightweight interface). Explicit values override the host default. On v1, `"mini"` requires OpenCode >= 1.17.10 and runs `attach ... --dir <dir> --mini`; on v2 it runs `opencode mini` without a positional directory. Changes take effect on the next opencode start. See [Multiplexer Integration](multiplexer-integration.md). |
 | `multiplexer.zellij_pane_mode` | — | — | Removed: ignored with a warning. See [Removed config keys](#removed-config-keys). |
 | `tmux` (top-level) | — | — | Removed: ignored with a warning. Use `multiplexer.*`. See [Removed config keys](#removed-config-keys). |
+| `backgroundJobs.enabled` | boolean | `true` | Master switch for the OMOS managed background-task lifecycle (job board, retention, wake scheduler, wall-clock watchdog, terminal gate, and the `task_cancel`/`task_message`/`task_status`/`task_reply` tools). When `false`, none of that runs and the native OpenCode task/subagent machinery is left completely untouched; every other `backgroundJobs.*` key stays accepted but inert. The `/interview`-style foreground flows are unaffected See [Background Job Management](#background-job-management). |
 | `backgroundJobs.maxSessionsPerAgent` | integer | `2` | Maximum completed/reconciled reusable child sessions per specialist type in the current orchestrator session (1–10) See [Background Job Management](#background-job-management). |
 | `backgroundJobs.maxRetainedSnapshots` | — | — | Removed: ignored with a warning. See [Removed config keys](#removed-config-keys). |
 | `backgroundJobs.strategy` | — | — | Removed: board placement is change-only. See [Removed config keys](#removed-config-keys). |
@@ -259,7 +263,7 @@ All config files support **JSONC** (JSON with Comments):
 | `disabled_mcps` | string[] | `[]` | MCP server IDs to disable globally |
 | `disabled_tools` | string[] | `[]` | Slim tool names to disable globally. Disabled Slim tools are not registered with OpenCode and cannot be used by agents; OpenCode built-in tools are not affected |
 | `disabled_skills` | string[] | `[]` | Skill names to disable globally. Disabled skills are not granted to agents, and disabled bundled skills are not registered; listing `reflect` here also disables the `/reflect` command |
-| `disabled_hooks` | string[] | `[]` | Hook names to disable globally: `phase-reminder`, `foreground-fallback`, `deepwork-guard`, `deepwork-goal`, `chat-headers`, `cache-monitor`, `json-error-recovery`, `tool-loop-guard`, `search-path-guard`, `absolute-path-rescue`, `apply-patch`, `council-inject`. Unknown values are stripped with a warning when the config loads; a value consisting only of unknown names is treated as unset, so a lower config layer's list still applies. See [Hooks](#hooks) |
+| `disabled_hooks` | string[] | `[]` | Hook names to disable globally: `phase-reminder`, `foreground-fallback`, `deepwork-guard`, `deepwork-goal`, `chat-headers`, `cache-monitor`, `json-error-recovery`, `tool-loop-guard`, `search-path-guard`, `absolute-path-rescue`, `apply-patch`, `council-inject`, `auto-update-checker`. `auto-update-checker` gates update **checking** and installation together, so it is stronger than `autoUpdate`, which only controls installation. Unknown values are stripped with a warning when the config loads; a value consisting only of unknown names is treated as unset, so a lower config layer's list still applies. See [Hooks](#hooks) |
 | `disabled_commands` | string[] | `[]` | Slash commands to disable globally: `interview`, `implement`, `deepwork`, `reflect`, `loop`. Disabled commands are neither registered nor intercepted at execution time, so a user-defined command with the same name is left untouched. Listing `reflect` in `disabled_skills` also disables the `/reflect` command. See [Slash Commands](#slash-commands) |
 | `deepworkGuardMode` | `"shadow"` \| `"enforce"` | `"shadow"` | `shadow` records receipts without blocking; `enforce` blocks completion writes whose tombstone references artifacts with no receipt. Disable the guard via `disabled_hooks` (`deepwork-guard`) |
 | `webfetch.enabled` | boolean | `true` | When `false`, the enhanced `webfetch` is not registered and OpenCode's built-in is used. See [Webfetch](webfetch.md) |
@@ -274,6 +278,7 @@ All config files support **JSONC** (JSON with Comments):
 | `council.presets.<name>.<councillor>.prompt` | string | - | Optional role guidance for the councillor See [Council configuration note](#council-configuration-note). |
 | `council.default_preset` | string | `"default"` | Default preset when none is specified See [Council configuration note](#council-configuration-note). |
 | — | — | — | *Timeouts, retries, and bounded waits are handled by the orchestrator's injected Council Mode procedure (`src/hooks/council-inject/index.ts`); execution modes are no longer configured.* |
+| `interview.enabled` | boolean | `true` | Master switch for the interview subsystem. When `false`, the `/interview` command is not intercepted, the interview server and dashboard never start, and no interview state or output machinery runs; the native host is untouched See [Interview configuration](interview.md). |
 | `interview.maxQuestions` | integer | `2` | Max questions per interview round (1–10) See [Interview configuration](interview.md). |
 | `interview.outputFolder` | string | `"interview"` | Directory where interview markdown files are written relative to the project root; absolute paths and `..` traversal are rejected See [Interview configuration](interview.md). |
 | `interview.autoOpenBrowser` | boolean | `true` | Automatically open the interview UI in your default browser during interactive runs; suppressed in tests and CI See [Interview configuration](interview.md). |
@@ -516,6 +521,15 @@ package installs.
 With `autoUpdate` set to `false`, this becomes notification-only mode: you'll
 see that a new version is available, but the plugin won't install it
 automatically.
+
+To disable update checking as well as installation, list the checker in
+`disabled_hooks` (on both v1 and v2, including the v2 TUI notice):
+
+```jsonc
+{
+  "disabled_hooks": ["auto-update-checker"]
+}
+```
 
 Auto-update never crosses major versions. For example, a 1.x install can
 auto-update to a newer 1.x release, but it won't auto-install 2.x. When a newer
@@ -1184,13 +1198,14 @@ Available hooks:
 - **Model failover**: `foreground-fallback` — same effect as `fallback.enabled = false`.
 - **Tool guards**: `json-error-recovery`, `tool-loop-guard`, `search-path-guard`, `absolute-path-rescue`, `apply-patch` — each stops intercepting tool calls entirely, so malformed output, repeated identical calls, and invalid or guessed paths surface raw to the model.
 - **Deepwork**: `deepwork-goal` turns the post-compaction goal pointer off (the model then relies on the skill's resume discipline alone); `deepwork-guard` turns the receipt/claim guard off (see `deepworkGuardMode`).
+- **Update checking**: `auto-update-checker` — stops both the startup update check (including the notification) and the automatic installation. It is the stronger switch: `autoUpdate: false` only suppresses installation, notifications may still appear.
 - **Telemetry / headers**: `cache-monitor` (prompt-cache bust watchdog; warnings stop), `chat-headers` (Copilot `x-initiator` header on both the v1 `chat.headers` hook and the v2 `model.request` bridge).
 
 Guards such as `tool-loop-guard`, `search-path-guard`, `absolute-path-rescue`, and `apply-patch` protect against model-side loops, bad paths, and malformed patches. Disable them only when you want raw upstream behavior.
 
 Notes:
 
-- Injection surfaces that have dedicated switches are not listed here: wake prompts (`backgroundJobs.orchestratorWake.enabled`, `backgroundJobs.childInputWake`) and image routing (`image_routing`). `autoUpdate` controls automatic installation of updates; update notifications may still appear when it is false.
+- Injection surfaces that have dedicated switches are not listed here: wake prompts (`backgroundJobs.orchestratorWake.enabled`, `backgroundJobs.childInputWake`), the whole managed background-task lifecycle (`backgroundJobs.enabled`), the interview subsystem (`interview.enabled`), the TUI sidebar (`sidebar`), and image routing (`image_routing`). `autoUpdate` controls automatic installation of updates; use the `auto-update-checker` hook name to stop update checking too.
 - Invalid entries are stripped with a warning when the config loads; a value consisting only of unknown names is treated as unset, so a lower config layer's list still applies.
 
 ### Slash Commands

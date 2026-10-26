@@ -23,6 +23,7 @@ import {
   DISABLED_HOOKS_VALUES,
   InterviewConfigSchema,
   type MarketplaceActivation,
+  MarketplaceConfigSchema,
   MultiplexerConfigSchema,
   PluginConfigSchema,
   type RawPluginConfig,
@@ -111,6 +112,7 @@ function warnLegacyPromptFile(agentName: string, fileName: string): void {
   );
 }
 const INTERVIEW_CONFIG_KEYS = [
+  'enabled',
   'maxQuestions',
   'outputFolder',
   'autoOpenBrowser',
@@ -362,6 +364,33 @@ function retainSanitizedValues(
   return out;
 }
 
+/**
+ * Zod no longer defaults marketplace.enabled at the block level; keep a
+ * defaulted `enabled: true` from masquerading as an explicitly configured
+ * override. The merged marketplace config is normalized after all layers
+ * are merged (the post-merge parse reduces it to the switch shape).
+ */
+function retainExplicitMarketplaceFields(
+  parsedConfig: RawPluginConfig,
+  rawConfig: unknown,
+): RawPluginConfig {
+  if (!parsedConfig.marketplace) {
+    return parsedConfig;
+  }
+  if (
+    !isPlainRecord(rawConfig) ||
+    !isPlainRecord(rawConfig.marketplace) ||
+    !Object.hasOwn(rawConfig.marketplace, 'enabled')
+  ) {
+    const { enabled: _enabled, ...marketplace } = parsedConfig.marketplace;
+    return {
+      ...parsedConfig,
+      marketplace: marketplace as RawPluginConfig['marketplace'],
+    };
+  }
+  return parsedConfig;
+}
+
 /** Normalize preset syntax before layered config objects are merged. */
 function normalizePresetDeclarations(config: RawPluginConfig): RawPluginConfig {
   if (!config.presets) {
@@ -500,6 +529,7 @@ export function loadRawPluginConfigFromPath(
     let layerConfig = retainExplicitInterviewFields(result.data, rawConfig);
     layerConfig = retainExplicitBackgroundJobsFields(layerConfig, rawConfig);
     layerConfig = retainExplicitMultiplexerFields(layerConfig, rawConfig);
+    layerConfig = retainExplicitMarketplaceFields(layerConfig, rawConfig);
 
     // Zod applies webfetch.enabled's default while parsing each layer. Keep
     // that default from masquerading as an explicitly configured override;
@@ -752,6 +782,10 @@ export function mergePluginConfigs(
       base.webfetch as Record<string, unknown> | undefined,
       override.webfetch as Record<string, unknown> | undefined,
     ) as RawPluginConfig['webfetch'],
+    marketplace: deepMerge(
+      base.marketplace as Record<string, unknown> | undefined,
+      override.marketplace as Record<string, unknown> | undefined,
+    ) as RawPluginConfig['marketplace'],
     acpAgents: deepMerge(base.acpAgents, override.acpAgents),
     companion: deepMerge(
       base.companion as Record<string, unknown> | undefined,
@@ -841,6 +875,13 @@ export function loadPluginConfig(
 
   if (config.webfetch) {
     config.webfetch = WebfetchConfigSchema.parse(config.webfetch);
+  }
+  if (config.marketplace) {
+    // Normalize to the switch shape: a misplaced activation-shaped root
+    // block (baseline-inert) loses its directive keys here so only
+    // `enabled` survives the merge.
+    const parsedMarketplace = MarketplaceConfigSchema.parse(config.marketplace);
+    config.marketplace = { enabled: parsedMarketplace.enabled !== false };
   }
   if (config.interview) {
     config.interview = InterviewConfigSchema.parse(config.interview);

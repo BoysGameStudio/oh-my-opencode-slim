@@ -1907,6 +1907,41 @@ interface SidebarRuntimeAdapter {
 }
 
 /**
+ * The sidebar master switch (`sidebar: false`, default true). Computed once
+ * per setup/`tui()` call from the same plugin config the runtime reads, so
+ * a config read failure keeps the sidebar (never silently drops a feature).
+ * Pane wiring reads the config itself and is NOT gated by this.
+ */
+function isSidebarEnabled(directory: string): boolean {
+  try {
+    return (
+      loadPluginConfig(directory, {
+        hostFlavor: 'v2',
+        silent: true,
+      }).sidebar !== false
+    );
+  } catch (err) {
+    log('[tui] sidebar config read failed; keeping sidebar', String(err));
+    return true;
+  }
+}
+
+/** Shape `readTuiSnapshot` returns for an empty/missing state file. */
+const EMPTY_TUI_SNAPSHOT: TuiSnapshot = {
+  version: 1,
+  updatedAt: 0,
+  agentModels: {},
+  agentVariants: {},
+  agentDisplayNames: {},
+  activeSessions: {},
+  activityPids: {},
+  sessionParents: {},
+  sessionDetails: {},
+  reusableByAgent: {},
+  reusableOwners: {},
+};
+
+/**
  * Resolve the live picker selection that may overlay the orchestrator row.
  *
  * Gate 1 — route: only a session route yields a sessionID; the home
@@ -1988,6 +2023,7 @@ export function overlaySelectedRootModel(
 
 /** One refresh/animation/interaction lifecycle for both host slot contracts. */
 function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
+  const sidebarEnabled = isSidebarEnabled(adapter.getDirectory());
   let configDirectory = adapter.getDirectory();
   let { configInvalid, compactSidebar, multiplexerType, presetName } =
     readConfigState(configDirectory, adapter.hostFlavor);
@@ -2012,7 +2048,7 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
     return changed;
   };
   const [snapshot, setSnapshot] = createSignal(
-    readTuiSnapshot(configDirectory),
+    sidebarEnabled ? readTuiSnapshot(configDirectory) : EMPTY_TUI_SNAPSHOT,
   );
   const [animationNow, setAnimationNow] = createSignal(Date.now());
   const [sessionPreset, setSessionPreset] = createSignal<{
@@ -2029,6 +2065,7 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
   );
   const refreshSidebar = async () => {
     if (disposed) return;
+    if (!sidebarEnabled) return;
     const currentDirectory = adapter.getDirectory();
     const currentSession = adapter.getVisibleSession();
     let nextSnapshot = await readTuiSnapshotAsync(currentDirectory);
@@ -2142,57 +2179,65 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
       },
     );
   };
-  bindConfigListener();
-  scheduleRefresh();
+  if (sidebarEnabled) {
+    bindConfigListener();
+    scheduleRefresh();
+  }
   const rawRefreshMs = Number(process.env.OH_MY_OPENCODE_SLIM_TUI_REFRESH_MS);
   // Test hook: shrink the 1s sidebar poll. Guarded so a bad value cannot
   // spin the timer (setInterval clamps non-positive delays to ~1ms).
   const renderIntervalMs =
     Number.isFinite(rawRefreshMs) && rawRefreshMs >= 10 ? rawRefreshMs : 1000;
-  const renderTimer = setInterval(scheduleRefresh, renderIntervalMs);
-  const animationTimer = setInterval(() => {
-    if (
-      !disposed &&
-      getActiveSidebarAgentNames(snapshot(), adapter.getVisibleSession()).size >
-        0
-    ) {
-      setAnimationNow(Date.now());
-    }
-  }, ACTIVITY_FRAME_MS);
+  const renderTimer = sidebarEnabled
+    ? setInterval(scheduleRefresh, renderIntervalMs)
+    : undefined;
+  const animationTimer = sidebarEnabled
+    ? setInterval(() => {
+        if (
+          !disposed &&
+          getActiveSidebarAgentNames(snapshot(), adapter.getVisibleSession())
+            .size > 0
+        ) {
+          setAnimationNow(Date.now());
+        }
+      }, ACTIVITY_FRAME_MS)
+    : undefined;
 
-  const disposeSlot = adapter.registerSlot(() =>
-    reactiveElement(() => {
-      const visible = adapter.getVisibleSession();
-      const currentSnapshot = snapshot();
-      const projection = sessionPreset();
-      const sessionLabel = !adapter.readSessionPreset
-        ? undefined
-        : visible === undefined
-          ? 'No session displayed'
-          : projection?.directory === adapter.getDirectory() &&
-              projection.sessionID === visible
-            ? projection.label
-            : 'Loading…';
-      interaction.syncScope(
-        configDirectory,
-        visible === undefined
-          ? undefined
-          : resolveTuiSnapshotRoot(currentSnapshot, visible),
-      );
-      return renderSidebar(
-        currentSnapshot,
-        adapter.version,
-        adapter.theme(),
-        configInvalid,
-        compactSidebar,
-        animationNow,
-        visible,
-        interaction,
-        adapter.getPresetRow?.(configDirectory, presetName, sessionLabel),
-        modelNames(),
-      );
-    }),
-  );
+  const disposeSlot = sidebarEnabled
+    ? adapter.registerSlot(() =>
+        reactiveElement(() => {
+          const visible = adapter.getVisibleSession();
+          const currentSnapshot = snapshot();
+          const projection = sessionPreset();
+          const sessionLabel = !adapter.readSessionPreset
+            ? undefined
+            : visible === undefined
+              ? 'No session displayed'
+              : projection?.directory === adapter.getDirectory() &&
+                  projection.sessionID === visible
+                ? projection.label
+                : 'Loading…';
+          interaction.syncScope(
+            configDirectory,
+            visible === undefined
+              ? undefined
+              : resolveTuiSnapshotRoot(currentSnapshot, visible),
+          );
+          return renderSidebar(
+            currentSnapshot,
+            adapter.version,
+            adapter.theme(),
+            configInvalid,
+            compactSidebar,
+            animationNow,
+            visible,
+            interaction,
+            adapter.getPresetRow?.(configDirectory, presetName, sessionLabel),
+            modelNames(),
+          );
+        }),
+      )
+    : undefined;
 
   return {
     getDirectory: () => configDirectory,
@@ -2203,8 +2248,8 @@ function createSidebarRuntime(adapter: SidebarRuntimeAdapter) {
       disposed = true;
       unregisterConfigListener();
       disposeSlot?.();
-      clearInterval(renderTimer);
-      clearInterval(animationTimer);
+      if (renderTimer !== undefined) clearInterval(renderTimer);
+      if (animationTimer !== undefined) clearInterval(animationTimer);
     },
   };
 }

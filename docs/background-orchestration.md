@@ -88,6 +88,14 @@ The task API and background-control tools are:
 | `task_revive` | Resume a retained session with a new instruction |
 | `wait_for_user` | Plugin-provided orchestrator tool (v1 only) that pauses automatic orchestrator wakes while the user performs external manual work; not registered on v2, where the native `question` tool is the blocking boundary |
 
+Setting `backgroundJobs.enabled: false` turns this managed layer off entirely:
+the `task_*` control tools and `wait_for_user` are not registered, and no job
+board, retention, terminal gate, watchdog, wake scheduler, or startup recovery
+runs. Native `task`/`subagent` delegation and host completion delivery keep
+working exactly as OpenCode provides them, so council seat assembly and
+ordinary background delegation still function — only the OMOS bookkeeping and
+control surface disappear. See [Configuration](configuration.md).
+
 The delegation tool named `task()` here is `subagent()` on v2, with
 `task_id`/`sessionID` as the matching resume id; bare `task()` mentions on this
 page refer to that host-specific delegation tool.

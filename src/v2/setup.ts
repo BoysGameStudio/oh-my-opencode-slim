@@ -2144,30 +2144,43 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
     // Configured BEFORE the v1 factory runs so board/ledger creation
     // seeds from the persisted state. Absent domain → pure in-memory
     // fallback with zero behavior change (v1 hosts never reach here).
-    try {
-      const storage = ctx.storage;
-      if (
-        storage &&
-        typeof storage.get === 'function' &&
-        typeof storage.set === 'function' &&
-        typeof storage.remove === 'function' &&
-        typeof storage.scan === 'function'
-      ) {
-        configureBackgroundJobPersistence(storage);
-        await loadInitialBackgroundJobPersistence();
-        log('[v2] background-job persistence enabled via ctx.storage');
-      } else {
-        // Storage-less reactivation: actively reset to the documented
-        // process-local fallback instead of retaining the previous
-        // activation's backend/seed state (fenced — pending writes from
-        // the old epoch are discarded).
-        configureBackgroundJobPersistence(undefined);
-        log(
-          '[v2] ctx.storage unavailable; background-job state stays process-local',
-        );
+    // Skipped entirely when the managed lifecycle is disabled: no board
+    // state is loaded or seeded, and the v1 task-manager paths stay frozen
+    // out (the v1 event hook already no-ops them without a seeded board).
+    const preFlightConfig = loadPluginConfig(directory, { hostFlavor: 'v2' });
+    const lifecycleEnabled = preFlightConfig.backgroundJobs?.enabled !== false;
+    if (lifecycleEnabled) {
+      try {
+        const storage = ctx.storage;
+        if (
+          storage &&
+          typeof storage.get === 'function' &&
+          typeof storage.set === 'function' &&
+          typeof storage.remove === 'function' &&
+          typeof storage.scan === 'function'
+        ) {
+          configureBackgroundJobPersistence(storage);
+          await loadInitialBackgroundJobPersistence();
+          log('[v2] background-job persistence enabled via ctx.storage');
+        } else {
+          // Storage-less reactivation: actively reset to the documented
+          // process-local fallback instead of retaining the previous
+          // activation's backend/seed state (fenced — pending writes from
+          // the old epoch are discarded).
+          configureBackgroundJobPersistence(undefined);
+          log(
+            '[v2] ctx.storage unavailable; background-job state stays process-local',
+          );
+        }
+      } catch (err) {
+        log('[v2] background-job persistence init failed', String(err));
       }
-    } catch (err) {
-      log('[v2] background-job persistence init failed', String(err));
+    } else {
+      // Never seed a board the v1 factory would feed from: an unseeded
+      // manager keeps every lifecycle path inert (no retention, wakes,
+      // terminal gate, or board injection).
+      configureBackgroundJobPersistence(undefined);
+      log('[v2] managed background-job lifecycle disabled by config');
     }
 
     try {
@@ -2232,19 +2245,45 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       const implementCommandEnabled = isCommandEnabled('implement', {
         disabledCommands,
       });
-      const interviewBridge = createV2InterviewBridge(ctx, interviewConfig, {
-        commandEnabled: interviewCommandEnabled,
-        implementEnabled: implementCommandEnabled,
+      // Master switches (default true — an untouched config keeps every
+      // behavior). `sidebar`/`liveConfigRefresh` are read from the raw
+      // config here because the parsed interview config above is the only
+      // structured view that carries `.enabled` today.
+      const interviewEnabled = interviewConfig.enabled !== false;
+      const sidebarEnabled = pluginConfig.sidebar !== false;
+      const liveRefreshEnabled = pluginConfig.liveConfigRefresh !== false;
+      const updateCheckerEnabled = !(
+        pluginConfig.disabled_hooks ?? []
+      ).includes('auto-update-checker');
+      // The server-side auto-update checker is gated by the v1 factory's own
+      // disabled_hooks read; surface the decision once for the setup log.
+      log('[v2] feature switches', {
+        lifecycle: lifecycleEnabled,
+        interview: interviewEnabled,
+        sidebar: sidebarEnabled,
+        liveConfigRefresh: liveRefreshEnabled,
+        updateChecker: updateCheckerEnabled,
       });
-      disposers.push(() => interviewBridge.dispose());
+      const interviewBridge = interviewEnabled
+        ? createV2InterviewBridge(ctx, interviewConfig, {
+            commandEnabled: interviewCommandEnabled,
+            implementEnabled: implementCommandEnabled,
+          })
+        : undefined;
+      if (interviewBridge) disposers.push(() => interviewBridge.dispose());
       // The submit tool and text-complete fallback are built inside the v1
       // factory against the v1 interview manager. On v2 the bridge owns the
       // live transcript and active interviews, so point them at its service.
-      (
-        v1Hooks as {
-          'v2.setInterviewService'?: (service: unknown) => void;
-        }
-      )['v2.setInterviewService']?.(interviewBridge.service);
+      // With the interview subsystem disabled there is no bridge service to
+      // hand over: the v1 manager is either absent (v2 host) or left on its
+      // own default service, and no interview machinery ever runs.
+      if (interviewBridge) {
+        (
+          v1Hooks as {
+            'v2.setInterviewService'?: (service: unknown) => void;
+          }
+        )['v2.setInterviewService']?.(interviewBridge.service);
+      }
 
       // Commands do not depend on agent finalization or host state.
       let finalizedRegistry:
@@ -2354,10 +2393,12 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
         // v1 publishes this projection from its config hook; v2 never calls
         // that hook, so finalization owns the startup sidebar identity
         // snapshot. Refresh reads the same frozen registry identity table.
-        recordTuiAgentDisplayNames(
-          collectAgentDisplayNames(registry.identities),
-          directory,
-        );
+        if (sidebarEnabled) {
+          recordTuiAgentDisplayNames(
+            collectAgentDisplayNames(registry.identities),
+            directory,
+          );
+        }
         // Log inside finalization because the transform await only confirms
         // registration; the callback may not have run yet.
         log('[v2] agents registered', {
@@ -2597,6 +2638,8 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
           // Startup has no last-good table. Seed from the loader's normal
           // fallback config so malformed input stays non-fatal, then make all
           // later watcher refreshes strict and retain this seed on failure.
+          // The one-shot seed is unconditional: an explicit `/preset` write
+          // must keep resolving even when the file watcher is disabled.
           const initial = await refreshProfiles({ allowInvalidFallback: true });
           if (!initial.ok) {
             throw new Error(initial.reason);
@@ -2606,20 +2649,26 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
             {},
             initial.profiles,
           );
-          const runner = createProfileRefreshRunner({
-            refresh: refreshProfiles,
-            apply: (profiles) => {
-              currentProfiles = reconcileRuntimeProfileOptionKeys(
-                currentProfiles,
-                profiles,
-              );
-            },
-          });
-          const watch = watchPluginConfigFiles({
-            directory,
-            onChanged: (signal) => runner(signal),
-          });
-          disposers.push(() => watch.dispose());
+          if (liveRefreshEnabled) {
+            const runner = createProfileRefreshRunner({
+              refresh: refreshProfiles,
+              apply: (profiles) => {
+                currentProfiles = reconcileRuntimeProfileOptionKeys(
+                  currentProfiles,
+                  profiles,
+                );
+              },
+            });
+            const watch = watchPluginConfigFiles({
+              directory,
+              onChanged: (signal) => runner(signal),
+            });
+            disposers.push(() => watch.dispose());
+          } else {
+            log(
+              '[v2] live config refresh disabled by config; profile reload needs a restart',
+            );
+          }
         } else {
           log(
             '[v2] v1 factory exposes no v2.refreshProfiles hook; config edits need a reload',
@@ -2723,19 +2772,23 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
       // `/interview` is a v2 command marker. The context bridge consumes the
       // rendered marker and delegates the actual behavior to the interview
       // service without expanding the global v2 client shim.
-      try {
-        const reg = await ctx.command.transform((draft) => {
-          try {
-            if (interviewCommandEnabled || implementCommandEnabled) {
-              interviewBridge.registerCommand(draft);
+      // Skipped together with the bridge when the interview subsystem is
+      // disabled: no marker registration exists to consume.
+      if (interviewBridge) {
+        try {
+          const reg = await ctx.command.transform((draft) => {
+            try {
+              if (interviewCommandEnabled || implementCommandEnabled) {
+                interviewBridge.registerCommand(draft);
+              }
+            } catch (err) {
+              log('[v2] interview command adapt failed', String(err));
             }
-          } catch (err) {
-            log('[v2] interview command adapt failed', String(err));
-          }
-        });
-        disposers.push(() => reg.dispose());
-      } catch (err) {
-        log('[v2] interview command registration failed', String(err));
+          });
+          disposers.push(() => reg.dispose());
+        } catch (err) {
+          log('[v2] interview command registration failed', String(err));
+        }
       }
 
       // ── Bundled skills (ctx.skill.transform — in-process, never disk-copied) ──
@@ -2994,8 +3047,11 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
           ? (sessionID: string) => contextRead({ sessionID })
           : undefined;
         const handler = createSessionContextHandler({
-          interviewHandleContext: (event) =>
-            interviewBridge.handleContext(event),
+          // Interview marker bridge (transcript projection + /interview);
+          // a no-op when the interview subsystem is disabled by config.
+          interviewHandleContext: interviewBridge
+            ? (event) => interviewBridge.handleContext(event)
+            : async () => {},
           commandBefore,
           chatMessage: undefined,
           observeContextAgent: promptBridge?.observeContext,
@@ -3262,7 +3318,11 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                 exactCallConfirmed: boolean;
               }) => Promise<unknown>)
             | undefined;
-          if (before && (backgroundFlip || registerStructuredLaunch)) {
+          if (
+            before &&
+            lifecycleEnabled &&
+            (backgroundFlip || registerStructuredLaunch)
+          ) {
             try {
               const wrapper = registerStructuredLaunch
                 ? createSubagentExecutorWrapper({
@@ -3466,7 +3526,7 @@ export function createV2Setup(): (ctx: V2Context) => Promise<V2Cleanup> {
                     }
                   }
                   try {
-                    await interviewBridge.handleEvent(next.value);
+                    await interviewBridge?.handleEvent(next.value);
                     if (isStreamDelta) {
                       if (eventHook) await eventHook({ event: next.value });
                       continue;

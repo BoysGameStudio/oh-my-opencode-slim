@@ -1,52 +1,41 @@
 /**
- * Council Mode host-side seat assembly (tool.execute.before resolver).
+ * Managed council seat assembly (tool.execute.before → board resolver).
  *
  * The orchestrator emits only a `Seats: <ref, ref>` line on the council
- * synthesis call; the harness resolves those refs from its own Background
- * Job Board (parent-scoped, read-only) and inlines the stored terminal text,
- * so the orchestrator never re-emits seat text as 2-5x-priced output tokens.
- * v2 native `subagent` calls reach the same resolver because the v2
- * execute.before bridge normalizes them into the v1 `task` shape first —
- * test 1 pins that end-to-end path through the real bridge.
+ * synthesis call; the managed resolver resolves those refs from the
+ * caller's Background Job Board (parent-scoped, read-only) and inlines
+ * the stored terminal text, so the orchestrator never re-emits seat text
+ * as output tokens. v2 native `subagent` calls reach the same resolver
+ * because the v2 execute.before bridge normalizes them into the v1 `task`
+ * shape first — test 1 pins that end-to-end path through the real bridge.
  */
 import { describe, expect, test } from 'bun:test';
+
 import { BackgroundJobBoard } from '../../utils/background-job-board';
 import { createToolExecuteBridges } from '../../v2/setup';
-import { handleToolExecuteBefore } from './tool-execute-hooks';
+import { createCouncilSeatHook } from './index';
+import { createManagedSeatResolver } from './managed';
 
 const PARENT = 'ses_parent';
 const OTHER_PARENT = 'ses_other';
 
-/** Minimal deps for the resolver path: managed session, board, pending stub. */
-function deps(board: BackgroundJobBoard, hostFlavor?: string) {
-  return {
-    shouldManageSession: () => true,
-    backgroundJobBoard: board,
-    pendingCallTracker: {
-      add() {},
-      take: () => undefined,
-      pendingCallId: () => 'call_council',
-    },
-    taskContextTracker: { pendingManagedTaskIds: new Set<string>() },
-    hostFlavor,
-  };
-}
-
+/** One council synthesis call through the seat hook. */
 async function runCouncilCall(
   board: BackgroundJobBoard,
   prompt: string,
-  hostFlavor?: string,
 ): Promise<Record<string, unknown>> {
+  const hook = createCouncilSeatHook({
+    resolveSeats: createManagedSeatResolver(board),
+  });
   const args: Record<string, unknown> = {
     subagent_type: 'council',
     description: 'Council synthesis',
     prompt,
     background: false,
   };
-  await handleToolExecuteBefore(
+  await hook['tool.execute.before'](
     { tool: 'task', sessionID: PARENT, callID: 'call_council' },
     { args },
-    deps(board, hostFlavor),
   );
   return args;
 }
@@ -92,7 +81,7 @@ function seedRunning(
   return record.alias;
 }
 
-describe('council seat assembly', () => {
+describe('managed council seat assembly', () => {
   test('v2 native subagent call reaches the resolver through the execute.before bridge', async () => {
     const board = new BackgroundJobBoard();
     seedCompleted(board, {
@@ -118,9 +107,12 @@ describe('council seat assembly', () => {
         background: false,
       },
     };
+    const hook = createCouncilSeatHook({
+      resolveSeats: createManagedSeatResolver(board),
+    });
     const bridges = createToolExecuteBridges(
       (hookInput, output) =>
-        handleToolExecuteBefore(hookInput, output, deps(board, 'v2')),
+        hook['tool.execute.before'](hookInput, output as never),
       undefined,
     );
     await bridges.beforeBridge(event);
@@ -136,6 +128,8 @@ describe('council seat assembly', () => {
         'BETA VERBATIM TEXT',
       ].join('\n'),
     );
+    // The bridge wrote the assembled prompt back under the v2 `agent` name.
+    expect((event.input as { agent: string }).agent).toBe('council');
   });
 
   test('v1 task call with a Seats line is rewritten with resolved sections', async () => {
@@ -202,27 +196,6 @@ describe('council seat assembly', () => {
     );
   });
 
-  test('assembly fires with no disabled_hooks config', async () => {
-    // The council-assembly toggle is gone. A plain resolver deps object
-    // assembles the final Seats line without any disabled_hooks input.
-    const board = new BackgroundJobBoard();
-    seedCompleted(board, {
-      taskID: 'ses_alpha',
-      agent: 'councillor-alpha',
-      alias: 'councillor-1',
-      resultSummary: 'ALPHA VERBATIM TEXT',
-    });
-    const args = await runCouncilCall(board, 'Question?\nSeats: councillor-1');
-    expect(args.prompt).toBe(
-      [
-        'Question?',
-        '',
-        '## Seat: councillor-alpha',
-        'ALPHA VERBATIM TEXT',
-      ].join('\n'),
-    );
-  });
-
   test('a seat owned by another parent is never resolved', async () => {
     const board = new BackgroundJobBoard();
     seedCompleted(board, {
@@ -274,7 +247,7 @@ describe('council seat assembly', () => {
     expect(args.prompt).not.toContain('STOLEN TEXT');
   });
 
-  test('unknown refs never throw and never leak; all-unknown leaves the prompt untouched', async () => {
+  test('unknown refs never throw and never leak; all-unknown leaves per-seat placeholders', async () => {
     const board = new BackgroundJobBoard();
     seedCompleted(board, {
       taskID: 'ses_alpha',
@@ -397,7 +370,7 @@ describe('council seat assembly', () => {
       '## Seat: councillor-gamma\n[no response — no output (cancelled)]',
     );
     expect(prompt).toContain(
-      '## Seat: councillor-delta\n[no response — no output (completed)]',
+      '## Seat: councillor-delta\n[no response — empty result]',
     );
   });
 
@@ -451,10 +424,9 @@ describe('council seat assembly', () => {
     const second = await runCouncilCall(board, assembled);
     expect(second.prompt).toBe(assembled);
     // Retry-then-resynthesize: a fresh Seats line on an already-assembled
-    // prompt is CONSUMED (the sentinel is gone — it used to blanket-skip
-    // this and silently drop the retried seat's new text). The new section
-    // is appended; the earlier sections stay. Duplication is the accepted
-    // residual — visible, input-leg, never silent loss.
+    // prompt is CONSUMED. The new section is appended; the earlier sections
+    // stay. Duplication is the accepted residual — visible, input-leg,
+    // never silent loss.
     const third = await runCouncilCall(
       board,
       `${assembled}\nSeats: councillor-1`,
@@ -531,8 +503,7 @@ describe('council seat assembly', () => {
     });
     // The question quotes an assembled-looking section (a seat's own
     // resultSummary can legitimately contain such headings — council.ts:81
-    // mandates the form). The old sentinel skipped assembly here and the
-    // tool-less council lost ALL answers; now the valid final trigger wins.
+    // mandates the form). The valid final trigger wins regardless.
     const prompt = [
       'Question quoting round-1 material:',
       '## Seat: councillor-alpha',
