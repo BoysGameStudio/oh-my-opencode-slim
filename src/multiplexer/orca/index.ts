@@ -35,7 +35,8 @@
  * (same stance as WezTerm, whose CLI cannot set a title at all).
  *
  * Working directory: `terminal split` has no `--cwd`, so panes open at the
- * worktree path rather than the project directory (documented limitation).
+ * worktree path rather than the project directory (documented limitation);
+ * the v2 `mini` viewer, which takes no directory, `cd`s there itself.
  */
 
 import { existsSync } from 'node:fs';
@@ -44,7 +45,16 @@ import type { MultiplexerLayout } from '../../config/schema';
 import { crossSpawn } from '../../utils/compat';
 import { isRecord } from '../../utils/guards';
 import { log } from '../../utils/logger';
-import { buildViewCommand, findBinary } from '../shared';
+import {
+  buildViewCommand,
+  findBinary,
+  isPosixShell,
+  normalizePathForShell,
+  quoteShellArg,
+  shellSupportsAndChain,
+  viewerNeedsPaneCwd,
+  withParentEnvPassword,
+} from '../shared';
 import type { Multiplexer, PaneResult, PaneSpawnOptions } from '../types';
 
 /** Platform timer handle; fake harnesses may return bare numeric ids. */
@@ -156,6 +166,24 @@ export class OrcaMultiplexer implements Multiplexer {
       return { success: false, error: 'not_found' };
     }
 
+    // v2 remote viewers authenticate with OPENCODE_PASSWORD and
+    // `terminal split` has no env flag, so the launch script reads the
+    // secret from this process's /proc environ. That needs Linux and a
+    // POSIX shell; anything else creates no pane rather than exposing it.
+    const needsSecretBridge =
+      options?.viewerFlavor === 'v2-remote' &&
+      options.viewerPassword !== undefined;
+    if (
+      needsSecretBridge &&
+      (process.platform !== 'linux' ||
+        !isPosixShell(process.env.SHELL || '/bin/sh'))
+    ) {
+      log('[orca] spawnPane: viewer password bridge unavailable; no pane', {
+        platform: process.platform,
+      });
+      return { success: false, error: 'unavailable' };
+    }
+
     const orca = await this.getBinary();
     if (!orca) {
       log('[orca] spawnPane: orca binary not found or app not running');
@@ -163,12 +191,21 @@ export class OrcaMultiplexer implements Multiplexer {
     }
 
     try {
-      const command = buildViewCommand(
+      const viewerCommand = buildViewCommand(
         sessionId,
         serverUrl,
         directory,
         options,
       );
+      // v2 mini omits the directory and `terminal split` has no cwd flag,
+      // so the command changes directory itself.
+      const withCwd =
+        viewerNeedsPaneCwd(options) && shellSupportsAndChain()
+          ? `cd ${quoteShellArg(normalizePathForShell(directory))} && ${viewerCommand}`
+          : viewerCommand;
+      const command = needsSecretBridge
+        ? withParentEnvPassword(withCwd)
+        : withCwd;
       const direction = splitDirection(this.layout);
       const run = await this.runCli(
         [

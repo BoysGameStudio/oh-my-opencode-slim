@@ -296,7 +296,7 @@ inside that pane).
 | `main_pane_size` | number | `60` | Main pane size percentage (`20`–`80`). Applied by tmux for the `main-*` layouts, and by Herdr (first agent-area split of the `main-*` layouts; the agent panes in the resulting column or row are then re-equalized after each spawn/close while the main pane keeps this share) and WezTerm (first agent split); ignored by Zellij, kitty, cmux-tui, and Orca |
 | `equalize_panes` | boolean | `true` | Herdr only: after each spawn and agent-pane close, equalize the `main-*` agent panes and re-assert the main pane's `main_pane_size` share through Herdr's socket API. Set `false` to keep manual pane sizes |
 | `cmux_tui_binary` | string | omitted | Explicit path to the cmux-tui binary. When omitted, the client resolves `cmux-tui` first, then `cmux`, on `PATH` |
-| `viewer` | string | `"tui"` on v1, `"mini"` on v2 | Subagent pane surface: `"tui"` (full interface) or `"mini"` (lightweight interface). Explicit values override the host default. On v1, `"mini"` requires OpenCode >= 1.17.10 and runs `opencode attach <url> --session <id> --dir <dir> --mini`, without additional pane-cwd pinning. On v2 it runs `opencode mini` without a positional directory, so adapters pin the cwd (herdr/kitty/WezTerm natively, tmux `-c`, Zellij `--cwd`, cmux-tui `cd` for POSIX shells and fish). Changing the value takes effect on the next opencode start |
+| `viewer` | string | `"tui"` on v1, `"mini"` on v2 | Subagent pane surface: `"tui"` (full interface) or `"mini"` (lightweight interface). Explicit values override the host default. On v1, `"mini"` requires OpenCode >= 1.17.10 and runs `opencode attach <url> --session <id> --dir <dir> --mini`, without additional pane-cwd pinning. On v2 it runs `opencode mini` without a positional directory, so adapters pin the cwd (herdr/kitty/WezTerm natively, tmux `-c`, Zellij `--cwd`, cmux-tui and Orca `cd` for POSIX shells and fish). Changing the value takes effect on the next opencode start |
 
 All `multiplexer.*` values are read by the client only. An invalid value
 disables pane management (fail-closed) with a once-per-process diagnostic.
@@ -484,7 +484,9 @@ produces one `multiplexer.host-unsupported` record per process; shared and
 - **Orca panes open at the worktree path.** `orca terminal split` has no
   `--cwd`, so the viewer starts in the directory Orca opens for the split
   (the worktree path) rather than the project directory; child sessions that
-  inherit the worktree directory are unaffected.
+  inherit the worktree directory are unaffected. The v2 `mini` viewer, which
+  has no directory argument, runs `cd <dir> && …` first (POSIX shells and
+  fish).
 - **Orca has no layout primitives.** `applyLayout` is a no-op and
   `main_pane_size` is ignored: the layout only picks the split direction at
   spawn time, every child splits the anchor terminal, and nothing is ever
@@ -534,13 +536,10 @@ produces one `multiplexer.host-unsupported` record per process; shared and
   `OPENCODE_PASSWORD`. Where the multiplexer CLI has a spawn-time env flag,
   the secret is injected there and exists only in the new pane's environment:
   tmux `split-window -e OPENCODE_PASSWORD=…`, herdr `pane split --env …`,
-  kitty `kitten @ launch --env …`. Zellij, WezTerm, and cmux-tui have no
+  kitty `kitten @ launch --env …`. Zellij, WezTerm, cmux-tui, and Orca have no
   such flag, so the pane launch script reads the value from the plugin process's own
   `/proc/<pid>/environ` (readable by the owning user only) and exports it
   before the viewer starts; the secret never enters command text or argv.
-  Orca has neither mechanism — no spawn-time environment flag and no `/proc`
-  bridge — so a v2 `--server` password is not forwarded to Orca panes and a
-  password-protected server cannot be viewed from one.
   This is the same `OPENCODE_PASSWORD` (falling back to
   `OPENCODE_SERVER_PASSWORD`) lookup the v2 client itself performs to
   connect, so a password-protected explicit server already requires it in

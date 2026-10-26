@@ -266,6 +266,41 @@ describe('OrcaMultiplexer', () => {
     ).toBe(true);
   });
 
+  test('a v2 mini viewer changes into the project directory first', async () => {
+    const { OrcaMultiplexer } = await importFreshOrca();
+    await spawnWith(new OrcaMultiplexer(), {
+      viewerFlavor: 'v2',
+      viewerSurface: 'mini',
+    });
+
+    const command = flagValue(splits()[0] as string[], '--command');
+    expect(command?.startsWith("cd '/repo' && ")).toBe(true);
+  });
+
+  test('a v2 remote password reaches the viewer through the env bridge', async () => {
+    const { OrcaMultiplexer } = await importFreshOrca();
+    await spawnWith(new OrcaMultiplexer(), {
+      viewerFlavor: 'v2-remote',
+      viewerPassword: 'pw-123',
+    });
+
+    const command = flagValue(splits()[0] as string[], '--command');
+    expect(command).toContain('OPENCODE_PASSWORD');
+    expect(command).not.toContain('pw-123');
+  });
+
+  test('a v2 remote password without the Linux bridge creates no pane', async () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    const { OrcaMultiplexer } = await importFreshOrca();
+    const result = await spawnWith(new OrcaMultiplexer(), {
+      viewerFlavor: 'v2-remote',
+      viewerPassword: 'pw-123',
+    });
+
+    expect(result).toMatchObject({ success: false, error: 'unavailable' });
+    expect(splits()).toHaveLength(0);
+  });
+
   test('without an anchor no orca command is issued', async () => {
     delete process.env.ORCA_TERMINAL_HANDLE;
     const { OrcaMultiplexer } = await importFreshOrca();
