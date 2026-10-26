@@ -72,7 +72,9 @@ create a new plugin generation and agent registry.
 
 ## Preset selection
 
-Marketplace activation lives under a preset's `marketplace` block. For example:
+Marketplace activation lives under a preset's `marketplace` block. A root-level
+`marketplace` block is the subsystem switch only (`{"enabled": false}`); an
+activation list placed at the root is inert. For example:
 
 ```jsonc
 {

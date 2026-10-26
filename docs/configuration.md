@@ -187,6 +187,32 @@ All config files support **JSONC** (JSON with Comments):
 
 ---
 
+## Minimal Setup
+
+Every optional subsystem has one switch, all defaulting to on. A
+council-and-observer-only setup turns off the rest:
+
+```jsonc
+{
+  "backgroundJobs": { "enabled": false },
+  "interview": { "enabled": false },
+  "marketplace": { "enabled": false },
+  "sidebar": false,
+  "liveConfigRefresh": false,
+  "disabled_hooks": ["auto-update-checker"],
+  "disabled_commands": ["deepwork", "reflect", "loop"],
+  "disabled_mcps": ["context7", "gh_grep"],
+}
+```
+
+A disabled subsystem is not constructed at all: no tools, listeners, timers,
+state files, or servers. With the managed lifecycle off, native OpenCode
+delegation, completion delivery, session continuation, and council seat
+assembly keep working. See [Background Orchestration](background-orchestration.md)
+and [Council](council.md) for what remains.
+
+---
+
 ## Full Option Reference
 
 | Option | Type | Default | Description |
