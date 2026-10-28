@@ -128,6 +128,28 @@ Local skill and MCP selections do **not** expand the marketplace package's
 core-tool permissions. Effective native rules can further restrict grants,
 and ambiguous MCP namespaces are rejected.
 
+For OpenCode v2 Code Mode, a standalone package or an extension of Designer
+or Fixer can explicitly include `"execute"` in its manifest `tools`. Extensions
+of the read-only Explorer, Oracle and Observer roles still reject this
+capability during construction, even though the manifest schema accepts it.
+This admits the dispatcher for supported packages through the existing tool
+ceiling; it does not grant shell, file-edit, delegation, or unselected MCP
+capabilities. Agent permissions and native host rules can further restrict
+`execute`. Packages that omit it remain denied, even if a local permission
+sets `execute: allow`. Selecting an MCP alone does not grant the dispatcher.
+
+This grants the host's Code Mode runtime, not an MCP-only wrapper. In
+OpenCode 2.1.4, that runtime also exposes a global `fetch` for HTTP requests
+which does not check the `webfetch` tool permission or MCP selection. Denying
+`webfetch` therefore does not disable those requests. The host controls this
+behavior; see [OpenCode PR #59354](https://github.com/anomalyco/opencode/pull/59354)
+for the proposed permission check. Evaluate the target host version before
+granting `execute`; plugin permission tests do not certify runtime confinement.
+
+Older plugin versions reject this tool name; packages using it must require
+a plugin release that includes this support. OpenCode v1 does not provide
+the v2 dispatcher.
+
 `external_directory` is an OpenCode safety guard, not a manifest tool
 capability: a package's `tools` list never grants it, and a manifest tool
 grant (for example `read`) never implies it. Owner configuration can declare

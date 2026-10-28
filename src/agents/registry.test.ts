@@ -1211,6 +1211,168 @@ describe('finalized existing-agent registry', () => {
     });
   });
 
+  test('Marketplace execute is opt-in and preserves child capability boundaries', () => {
+    for (const optedIn of [false, true]) {
+      const registry = build(
+        runtimeFor({
+          agents: {
+            'market-agent': {
+              permission: { '*': 'allow', execute: 'allow' },
+            },
+          },
+        }),
+        {
+          mcp: {
+            research: { type: 'local', codemode: true },
+            foreign: { type: 'local', codemode: true },
+          },
+        },
+        {
+          hostFlavor: 'v2',
+          ...marketplaceOptions(
+            ['team/research'],
+            marketplaceStore({
+              'team/research': marketplacePackage('team/research', {
+                schemaVersion: 3,
+                routing: {
+                  lane: 'Research',
+                  stats: ['Evidence'],
+                  delegateWhen: ['Research'],
+                  avoid: ['Implementation'],
+                },
+                tools: optedIn ? ['execute'] : [],
+                skills: [],
+                mcps: ['research'],
+              }),
+            }),
+          ),
+          nativePermissionsByAgent: {
+            'market-agent': [{ action: '*', resource: '*', effect: 'allow' }],
+          },
+        },
+      );
+      const registered = registry.nativePolicies['market-agent'];
+      const payload = [
+        ...registered.rules,
+        { action: '*', resource: '*', effect: 'allow' } as const,
+      ];
+      const compiled = registry.compileChildPermissions(
+        'market-agent',
+        payload,
+      );
+      const child = compilePermissionPolicy({
+        baselineRules: [],
+        hostRules: compiled,
+      });
+      for (const policy of [registered, child]) {
+        expect(policy.decide('execute', '*')).toBe(optedIn ? 'allow' : 'deny');
+        expect(policy.decide('research_lookup', '*')).toBe('allow');
+        for (const action of [
+          'shell',
+          'bash',
+          'read',
+          'edit',
+          'write',
+          'subagent',
+          'foreign_lookup',
+          'unlisted_tool',
+        ]) {
+          expect(policy.decide(action, '*')).toBe('deny');
+        }
+      }
+      const replayed = compilePermissionPolicy({
+        baselineRules: [],
+        hostRules: registry.compileChildPermissions('market-agent', compiled),
+      });
+      for (const action of [
+        'execute',
+        'shell',
+        'research_lookup',
+        'foreign_lookup',
+      ])
+        expect(replayed.decide(action, '*')).toBe(child.decide(action, '*'));
+      if (optedIn)
+        for (const effect of ['deny', 'ask'] as const) {
+          const restricted = compilePermissionPolicy({
+            baselineRules: [],
+            hostRules: registry.compileChildPermissions('market-agent', [
+              ...payload,
+              { action: 'execute', resource: '*', effect },
+              { action: 'research_lookup', resource: '*', effect },
+            ]),
+          });
+          expect(restricted.decide('execute', '*')).toBe(effect);
+          expect(restricted.decide('research_lookup', '*')).toBe(effect);
+        }
+    }
+  });
+
+  test('Marketplace execute respects owner effects and tool removal across identities', () => {
+    for (const effect of ['allow', 'ask', 'deny'] as const) {
+      for (const removal of ['none', 'canonical'] as const) {
+        const registry = build(
+          runtimeFor({
+            agents: {
+              'market-agent': {
+                displayName: 'MarketVisible',
+                permission: { '*': 'allow', execute: effect },
+              },
+            },
+          }),
+          {
+            agent:
+              removal === 'none'
+                ? {}
+                : {
+                    'market-agent': {
+                      tools: { execute: false },
+                    },
+                  },
+            mcp: {},
+          },
+          {
+            hostFlavor: 'v2',
+            ...marketplaceOptions(
+              ['team/execute'],
+              marketplaceStore({
+                'team/execute': marketplacePackage('team/execute', {
+                  tools: ['execute'],
+                  skills: [],
+                  mcps: [],
+                }),
+              }),
+            ),
+          },
+        );
+        for (const name of ['market-agent', 'MarketVisible']) {
+          const removed = removal === 'canonical';
+          const registered = registry.nativePolicies[name];
+          const child = compilePermissionPolicy({
+            baselineRules: [],
+            hostRules: registry.compileChildPermissions(name, registered.rules),
+          });
+          for (const policy of [registered, child]) {
+            expect(policy.decide('execute', '*')).toBe(
+              removed ? 'deny' : effect,
+            );
+            expect(policy.decide('shell', '*')).toBe('deny');
+            expect(policy.decide('webfetch', '*')).toBe('deny');
+          }
+          if (removed) {
+            const attemptedGrant = compilePermissionPolicy({
+              baselineRules: [],
+              hostRules: registry.compileChildPermissions(name, [
+                ...registered.rules,
+                { action: 'execute', resource: '*', effect: 'allow' },
+              ]),
+            });
+            expect(attemptedGrant.decide('execute', '*')).toBe('deny');
+          }
+        }
+      }
+    }
+  });
+
   test('projects marketplace SDK and v2 child policy with default-deny ceilings', () => {
     const runtime = runtimeFor({
       agents: { 'market-agent': { displayName: 'Market Visible' } },

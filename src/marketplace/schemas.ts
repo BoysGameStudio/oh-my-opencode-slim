@@ -126,6 +126,7 @@ export const MARKETPLACE_TOOL_NAMES = [
   'bash',
   'webfetch',
   'websearch',
+  'execute',
 ] as const;
 
 const MarketplaceToolSchema = z.enum(MARKETPLACE_TOOL_NAMES);
@@ -228,7 +229,7 @@ const ManifestFields = {
   mcps: UniqueSingleLineStringArraySchema,
   tools: z
     .array(MarketplaceToolSchema)
-    .max(11)
+    .max(MARKETPLACE_TOOL_NAMES.length)
     .refine((values) => new Set(values).size === values.length, {
       message: 'Tools must be unique',
     }),

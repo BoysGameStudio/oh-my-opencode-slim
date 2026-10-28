@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import {
   ActivatedMarketplaceBuiltinSchema,
   MARKETPLACE_ROUTING_LINE_MAX_LENGTH,
+  MARKETPLACE_TOOL_NAMES,
   MarketplaceAgentManifestSchema,
   MarketplaceAgentManifestSummaryV2Schema,
   MarketplaceAgentManifestSummaryV3Schema,
@@ -54,6 +55,22 @@ function withoutPrompt<T extends { prompt: string }>(manifest: T) {
 }
 
 describe('agents-only marketplace manifest schemas', () => {
+  test('accepts explicit execute and the complete tool list in V2 and V3', () => {
+    for (const base of [common, commonV3]) {
+      for (const tools of [['execute'], [...MARKETPLACE_TOOL_NAMES]]) {
+        expect(
+          MarketplacePackageManifestSchema.parse({ ...base, tools }).tools,
+        ).toEqual(tools);
+      }
+      for (const tools of [['execute', 'execute'], ['unknown-tool']]) {
+        expect(
+          MarketplacePackageManifestSchema.safeParse({ ...base, tools })
+            .success,
+        ).toBe(false);
+      }
+    }
+  });
+
   test('rejects non-canonical semantic-version aliases', () => {
     expect(MarketplaceVersionSchema.safeParse('v1.0.0').success).toBe(false);
     expect(

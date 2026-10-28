@@ -96,6 +96,52 @@ describe('createMarketplaceAgentDefinitions', () => {
     ]);
   });
 
+  test('execute is explicit for standalone and writable extensions, rejected for read-only extensions', () => {
+    for (const schemaVersion of [2, 3]) {
+      for (const builtin of [
+        undefined,
+        'designer',
+        'fixer',
+        'explorer',
+        'oracle',
+        'observer',
+      ]) {
+        const overrides = {
+          schemaVersion,
+          ...(schemaVersion === 3
+            ? {
+                routing: {
+                  lane: 'Research',
+                  stats: ['Evidence'],
+                  delegateWhen: ['Research'],
+                  avoid: ['Other work'],
+                },
+              }
+            : {}),
+          ...(builtin ? { extends: { builtin, promptMode: 'append' } } : {}),
+          tools: [],
+          skills: [],
+          mcps: [],
+        };
+        const baseline = build(admission('team/execute', overrides));
+        expect(baseline.metadata[0]?.capabilities.tools).not.toContain(
+          'execute',
+        );
+        const declared = admission('team/execute', {
+          ...overrides,
+          tools: ['execute'],
+        });
+        if (builtin && ['explorer', 'oracle', 'observer'].includes(builtin)) {
+          expect(() => build(declared)).toThrow(`read-only builtin ${builtin}`);
+        } else {
+          const result = build(declared);
+          expect(result.metadata[0]?.capabilities.tools).toEqual(['execute']);
+          expect(result.agents[0]?.config.tools).toEqual({ execute: true });
+        }
+      }
+    }
+  });
+
   test('read-only role extensions inherit builtin tools and MCP defaults', () => {
     const oracle = admission('team/oracle', {
       extends: { builtin: 'oracle', promptMode: 'append' },
