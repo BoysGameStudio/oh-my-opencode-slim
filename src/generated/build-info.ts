@@ -5,8 +5,8 @@
  * Logging-only — never enters prompt payloads or transforms.
  */
 
-export const BUILD_VERSION = '3.0.6';
-export const BUILD_TIME = '2026-10-24T14:08:44.007Z';
+export const BUILD_VERSION = '3.0.6-workbench.execute.1';
+export const BUILD_TIME = '2026-10-28T12:18:48.762Z';
 
 /** Plugin build identity for diagnostics logs. */
 export function getBuildInfo(): { version: string; buildTime: string } {
